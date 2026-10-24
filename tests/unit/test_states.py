@@ -2,11 +2,17 @@ import pytest
 
 from orqestra.domain.errors import InvalidTransitionError
 from orqestra.domain.states import (
+    ATTEMPT_TRANSITIONS,
     TASK_TRANSITIONS,
+    TERMINAL_ATTEMPT_STATES,
     TERMINAL_TASK_STATES,
+    AttemptState,
     TaskState,
+    allowed_sources,
     can_transition,
+    can_transition_attempt,
     transition,
+    transition_attempt,
 )
 
 pytestmark = pytest.mark.unit
@@ -61,3 +67,69 @@ def test_transition_table_covers_every_state() -> None:
 def test_transition_table_is_immutable() -> None:
     with pytest.raises(TypeError):
         TASK_TRANSITIONS[TaskState.SUCCEEDED] = frozenset({TaskState.QUEUED})  # type: ignore[index]
+
+
+@pytest.mark.parametrize("target", list(TaskState))
+def test_allowed_sources_are_derived_from_the_table(target: TaskState) -> None:
+    expected = {state for state in TaskState if can_transition(state, target)}
+    assert allowed_sources(target) == expected
+
+
+def test_allowed_sources_for_each_target() -> None:
+    assert allowed_sources(TaskState.QUEUED) == {TaskState.RUNNING}
+    assert allowed_sources(TaskState.RUNNING) == {TaskState.QUEUED}
+    assert allowed_sources(TaskState.SUCCEEDED) == {TaskState.RUNNING}
+    assert allowed_sources(TaskState.FAILED) == {TaskState.RUNNING}
+    assert allowed_sources(TaskState.CANCELLED) == {TaskState.QUEUED, TaskState.RUNNING}
+
+
+def test_storage_values_are_stable() -> None:
+    assert [state.value for state in TaskState] == [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ]
+    assert [state.value for state in AttemptState] == [
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ]
+
+
+ATTEMPT_ALLOWED = [
+    (AttemptState.RUNNING, AttemptState.SUCCEEDED),
+    (AttemptState.RUNNING, AttemptState.FAILED),
+    (AttemptState.RUNNING, AttemptState.CANCELLED),
+]
+ATTEMPT_DISALLOWED = [
+    (a, b) for a in AttemptState for b in AttemptState if (a, b) not in ATTEMPT_ALLOWED
+]
+
+
+@pytest.mark.parametrize(("current", "new"), ATTEMPT_ALLOWED)
+def test_allowed_attempt_transitions(current: AttemptState, new: AttemptState) -> None:
+    assert can_transition_attempt(current, new)
+    assert transition_attempt(current, new) is new
+
+
+@pytest.mark.parametrize(("current", "new"), ATTEMPT_DISALLOWED)
+def test_disallowed_attempt_transitions_raise(current: AttemptState, new: AttemptState) -> None:
+    assert not can_transition_attempt(current, new)
+    with pytest.raises(InvalidTransitionError, match=f"attempt.*{current.value}.*{new.value}"):
+        transition_attempt(current, new)
+
+
+def test_attempts_end_exactly_once() -> None:
+    assert set(ATTEMPT_TRANSITIONS) == set(AttemptState)
+    assert {AttemptState.SUCCEEDED, AttemptState.FAILED, AttemptState.CANCELLED} == (
+        TERMINAL_ATTEMPT_STATES
+    )
+    assert ATTEMPT_TRANSITIONS[AttemptState.RUNNING] == TERMINAL_ATTEMPT_STATES
+
+
+def test_attempt_transition_table_is_immutable() -> None:
+    with pytest.raises(TypeError):
+        ATTEMPT_TRANSITIONS[AttemptState.FAILED] = frozenset({AttemptState.RUNNING})  # type: ignore[index]

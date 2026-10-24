@@ -30,5 +30,37 @@ jobs:
         run: uv run ruff check .
       - name: Type check
         run: uv run mypy
-      - name: Unit tests with coverage
+      - name: Unit tests (coverage reported, enforced by the verify job)
         run: uv run pytest -m "not integration and not e2e and not performance" --cov
+
+  verify:
+    name: PostgreSQL integration, combined coverage, package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        # postgres:16.15, pinned by multi-arch index digest.
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_DB: orqestra_test
+          # Disposable service container reachable only from this job; no
+          # credentials are stored in the repository.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d orqestra_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ORQESTRA_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/orqestra_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: true
+      - name: Install Python (from .python-version) and locked dependencies
+        run: uv sync --locked
+      - name: Full verification
+        run: make verify

@@ -2,6 +2,10 @@ from pathlib import Path
 
 import pytest
 
+# Integration tests locate their dedicated database through this variable. It
+# is not a Settings field, so keeping it cannot alter application configuration.
+TEST_DATABASE_URL_ENV = "ORQESTRA_TEST_DATABASE_URL"
+
 
 @pytest.fixture(autouse=True)
 def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -9,6 +13,6 @@ def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     import os
 
     for key in list(os.environ):
-        if key.startswith("ORQESTRA_"):
+        if key.startswith("ORQESTRA_") and key != TEST_DATABASE_URL_ENV:
             monkeypatch.delenv(key)
     monkeypatch.chdir(tmp_path)
