@@ -11,10 +11,11 @@ invoice SaaS.
 
 ## Status
 
-Nothing in the planned column exists yet. No benchmark has been run. Do not read
-the architecture below as a claim about shipped behaviour.
+Nothing in the planned column exists yet. No benchmark has been run. Verification so far
+is local only (`make check` on one machine); the GitHub Actions workflow has not yet run.
+Do not read the architecture below as a claim about shipped behaviour.
 
-| Area | Implemented (verified by tests and CI) | Planned (not started) |
+| Area | Implemented (verified by local checks only) | Planned (not started) |
 | --- | --- | --- |
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` | — |
 | Domain contracts | `TaskState` lifecycle with an explicit transition table; `TransientError` / `PermanentError` taxonomy | `Job`, `Task`, `Attempt`, `Result` models and `JobState` (Day 2) |
@@ -24,7 +25,7 @@ the architecture below as a claim about shipped behaviour.
 | Queue and workers | — | queue contract, leases, retries, crash recovery (Days 3–4); technology undecided |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
-| CI | GitHub Actions: format, lint, type check, unit tests | integration lane with PostgreSQL (Day 2), security scans, load lane |
+| CI | Workflow file written (format, lint, type check, unit tests); not yet executed on GitHub | integration lane with PostgreSQL (Day 2), security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL and workers |
 
 ## Quickstart
@@ -51,5 +52,4 @@ from a local `.env` file. See `.env.example` for every setting.
   [`docs/adr/`](docs/adr/). Entries stay **Proposed** until the owner accepts them.
 - Short-lived branches, Conventional Commits, one scoped issue per feature, and the
   pull request template's verification section filled with commands actually run.
-- Shared assistant policy lives in [`AGENTS.md`](AGENTS.md). Tool-specific instruction
-  files (`CLAUDE.md`, `.claude/`) are deliberately git-ignored.
+- Contributor guidance, scope and engineering standards: [`docs/development.md`](docs/development.md).

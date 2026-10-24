@@ -13,7 +13,7 @@ asyncio vs threads for worker slots.
 ### DEC-001 — uv for dependency management and lockfile
 - **Status:** Proposed · **ADR:** 0002
 - **WHAT:** `uv` manages the virtualenv, resolves and locks dependencies (`uv.lock`), and runs tools.
-- **WHY:** One fast tool for lock, sync, run and Python installation; `--frozen` gives byte-identical installs locally and in CI.
+- **WHY:** One fast tool for lock, sync, run and Python installation; `uv sync --locked` in CI fails when `uv.lock` is stale; `--frozen` installs the lock as-is.
 - **RUNNER-UP:** Poetry — mature, but a slower resolver and a second configuration dialect.
 
 ### DEC-002 — Python 3.12
@@ -78,13 +78,13 @@ asyncio vs threads for worker slots.
 
 ### DEC-012 — GitHub Actions pinned by commit SHA with least privilege
 - **Status:** Proposed
-- **WHAT:** `permissions: contents: read`; actions pinned to full SHAs with the tag in a comment; `uv sync --frozen`.
+- **WHAT:** `permissions: contents: read`; actions pinned to full SHAs with the tag in a comment; `uv sync --locked`.
 - **WHY:** Immutable action references and read-only tokens are the charter's supply-chain baseline.
 - **RUNNER-UP:** Tag pins (`@v7`) — readable, mutable.
 
-### DEC-013 — AGENTS.md tracked; Claude-specific files git-ignored
+### DEC-013 — No assistant-specific files tracked; Claude-specific files git-ignored
 - **Status:** Proposed
-- **WHAT:** `AGENTS.md` is the shared assistant policy in Git; `CLAUDE.md`, `CLAUDE.local.md` and `.claude/` are ignored.
+- **WHAT:** No assistant-specific instruction file is tracked; general contributor guidance is in `docs/development.md`; `CLAUDE.md`, `CLAUDE.local.md` and `.claude/` are ignored.
 - **WHY:** Owner instruction: tool-specific instructions and session records stay local. Deviates from charter §7, which placed `CLAUDE.md` in the repo.
 - **RUNNER-UP:** Tracked `CLAUDE.md` — visible policy, but mixes tool-specific material into the public record.
 
