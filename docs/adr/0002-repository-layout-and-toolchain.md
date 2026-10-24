@@ -23,8 +23,9 @@ undecided, so the toolchain must not pre-empt them.
 - **Configuration:** pydantic-settings with `ORQESTRA_` prefix; secrets as `SecretStr`.
 - **CI:** one GitHub Actions job (format, lint, type check, unit tests) on pushes to
   `main` and on pull requests; actions pinned by SHA; read-only token.
-- **Assistant files:** none tracked; `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`
-  git-ignored. General contributor guidance lives in `docs/development.md`.
+- **Local tooling files:** none tracked; machine-local tool configuration and session
+  files are git-ignored (see `.gitignore`). General contributor guidance lives in
+  `docs/development.md`.
 
 ## Consequences
 

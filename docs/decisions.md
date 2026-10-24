@@ -82,11 +82,11 @@ asyncio vs threads for worker slots.
 - **WHY:** Immutable action references and read-only tokens are the charter's supply-chain baseline.
 - **RUNNER-UP:** Tag pins (`@v7`) — readable, mutable.
 
-### DEC-013 — No assistant-specific files tracked; Claude-specific files git-ignored
+### DEC-013 — Private tooling configuration is not tracked
 - **Status:** Proposed
-- **WHAT:** No assistant-specific instruction file is tracked; general contributor guidance is in `docs/development.md`; `CLAUDE.md`, `CLAUDE.local.md` and `.claude/` are ignored.
-- **WHY:** Owner instruction: tool-specific instructions and session records stay local. Deviates from charter §7, which placed `CLAUDE.md` in the repo.
-- **RUNNER-UP:** Tracked `CLAUDE.md` — visible policy, but mixes tool-specific material into the public record.
+- **WHAT:** Machine-local tool configuration and session files are git-ignored (patterns in `.gitignore`); general contributor guidance is tracked in `docs/development.md`.
+- **WHY:** Owner decision: local tool configuration and session records are specific to one machine, may hold private notes, and are not part of the product; tracked documentation should describe the software. Deviates from the initial planning layout, which proposed a tracked tool-specific instruction file.
+- **RUNNER-UP:** Track a tool-specific instruction file — visible to contributors, but mixes machine-local material into the public record.
 
 ### DEC-014 — Deferred on Day 1 (explicitly not chosen)
 - **Status:** Proposed

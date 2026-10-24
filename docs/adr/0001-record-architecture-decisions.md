@@ -5,9 +5,9 @@
 
 ## Context
 
-Orqestra is built by one engineer with AI assistants. Design is discussed across several
-chats; the charter rules that nothing discussed in chat is binding until recorded in the
-repository. Decisions therefore need a durable, reviewable home.
+Orqestra is developed by a single maintainer, and design is discussed in several places
+outside the repository. A discussion that is not recorded in the repository is not
+binding. Decisions therefore need a durable, reviewable home.
 
 ## Decision
 
@@ -22,8 +22,8 @@ repository. Decisions therefore need a durable, reviewable home.
 
 - Every pull request lists its material decisions or states "No material design
   decisions".
-- Assistants must read existing ADRs before proposing conflicting designs and flag
+- Contributors must read existing ADRs before proposing conflicting designs and flag
   conflicts instead of silently overriding them.
 
-**Runner-up:** free-form design notes in the wiki or chat — faster to write, impossible to
+**Runner-up:** free-form design notes in a wiki or ad hoc messages — faster to write, impossible to
 supersede cleanly or audit.

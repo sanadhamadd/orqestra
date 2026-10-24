@@ -45,8 +45,8 @@ from a local `.env` file. See `.env.example` for every setting.
 
 ## Engineering process
 
-- GitHub is the source of truth. A design discussed in chat is not a decision until it
-  is recorded here.
+- GitHub is the source of truth. A design that is discussed but not recorded in the
+  repository is a proposal, not an accepted decision.
 - Material choices are recorded as WHAT / WHY / RUNNER-UP entries in
   [`docs/decisions.md`](docs/decisions.md); cross-cutting ones become ADRs in
   [`docs/adr/`](docs/adr/). Entries stay **Proposed** until the owner accepts them.
