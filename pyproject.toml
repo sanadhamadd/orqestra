@@ -1,0 +1,75 @@
+[project]
+name = "orqestra"
+version = "0.1.0.dev0"
+description = "Distributed AI workload execution platform: concurrent workers, fault-tolerant task processing, cost-aware AI orchestration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-settings>=2.6,<3",
+]
+
+[project.scripts]
+orqestra = "orqestra.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orqestra"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "SIM",      # simplify
+    "RUF",      # ruff-specific
+    "PT",       # pytest style
+    "ANN",      # type annotations
+    "N",        # naming
+]
+ignore = ["ANN401"]  # explicit Any is sometimes the honest type at boundaries
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "unit: fast, isolated tests (default PR lane)",
+    "integration: tests needing PostgreSQL or other services",
+    "e2e: full submit -> process -> aggregate workflows",
+    "performance: load and benchmark tests (never in the PR lane)",
+]
+
+[tool.coverage.run]
+source = ["orqestra"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80

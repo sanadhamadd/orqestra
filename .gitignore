@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Orqestra: local assistant instructions and session files (never tracked)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
