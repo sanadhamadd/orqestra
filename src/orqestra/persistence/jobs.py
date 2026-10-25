@@ -1,4 +1,4 @@
-"""Transactional job submission and job and task reads.
+"""Transactional job submission, job and task reads, and derived job progress.
 
 ``submit_job`` inserts a job and all of its tasks in one short READ COMMITTED
 transaction that it owns: either everything is stored or nothing is. It
@@ -21,31 +21,30 @@ then ``submit_job`` refuses that connection.
 
 Every function reads rows through its own tuple-row cursor, so the
 connection's row factory does not matter.
+
+Job progress is derived from task states in one statement; no job state is
+stored (DEC-022, DEC-031).
 """
 
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
 
-import psycopg
-from psycopg.pq import TransactionStatus
-from psycopg.rows import TupleRow, tuple_row
 from psycopg.types.json import Jsonb
 
 from orqestra.domain.errors import OrqestraError
-from orqestra.domain.jobs import Job, JobSubmission, Task
+from orqestra.domain.jobs import Job, JobProgress, JobSubmission, Task, derive_job_status
 from orqestra.domain.states import TaskState
+from orqestra.persistence._shared import (
+    TASK_COLUMNS,
+    Conn,
+    owned_transaction,
+    task_from_row,
+    tuple_cursor,
+)
 
 logger = logging.getLogger(__name__)
-
-Conn = psycopg.Connection[Any]
-
-# Statuses in which the caller owns an open transaction (or a command is still
-# running). UNKNOWN means the connection is closed or broken.
-_CALLER_TRANSACTION = frozenset(
-    {TransactionStatus.ACTIVE, TransactionStatus.INTRANS, TransactionStatus.INERROR}
-)
 
 _INSERT_JOB = """
 INSERT INTO jobs (id, kind, idempotency_key) VALUES (%s, %s, %s)
@@ -78,10 +77,15 @@ WHERE j.idempotency_key = %(key)s
 """
 
 _JOB_COLUMNS = "id, kind, idempotency_key, created_at"
-_TASK_COLUMNS = (
-    "id, job_id, task_key, state, payload, result, max_attempts, attempt_count, "
-    "cancel_requested_at, created_at, updated_at, finished_at"
-)
+
+# One row per task state present; a job without tasks yields one row with a
+# NULL state and a zero count, and a missing job yields no rows.
+_TASK_COUNTS = """
+SELECT t.state, count(t.id)
+FROM jobs j LEFT JOIN tasks t ON t.job_id = j.id
+WHERE j.id = %s
+GROUP BY t.state
+"""
 
 
 class IdempotencyConflictError(OrqestraError):
@@ -109,20 +113,12 @@ def submit_job(conn: Conn, submission: JobSubmission) -> SubmissionResult:
     transaction. Database and connection errors, including the schema's named constraint
     violations, propagate after the whole submission has been rolled back.
     """
-    status = conn.info.transaction_status
-    if status in _CALLER_TRANSACTION:
-        msg = (
-            "submit_job runs its own transaction; call it outside any open transaction "
-            f"(connection status: {status.name})"
-        )
-        raise RuntimeError(msg)
     job_id = uuid.uuid4()
     key = submission.idempotency_key
     task_keys = [task.task_key for task in submission.tasks]
     payloads = [Jsonb(task.payload) for task in submission.tasks]
     max_attempts = [task.max_attempts for task in submission.tasks]
-    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cur:
-        cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    with owned_transaction(conn, "submit_job") as cur:
         inserted = cur.execute(_INSERT_JOB, (job_id, submission.kind, key)).fetchone()
         if inserted is not None:
             task_ids = [uuid.uuid4() for _ in task_keys]
@@ -159,16 +155,16 @@ def submit_job(conn: Conn, submission: JobSubmission) -> SubmissionResult:
 
 def get_job(conn: Conn, job_id: uuid.UUID) -> Job | None:
     """Return the job with ``job_id``, or ``None``."""
-    with conn.cursor(row_factory=tuple_row) as cur:
+    with tuple_cursor(conn) as cur:
         row = cur.execute(f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s", (job_id,)).fetchone()
     return None if row is None else Job(*row)
 
 
 def get_task(conn: Conn, task_id: uuid.UUID) -> Task | None:
     """Return the task with ``task_id``, or ``None``."""
-    with conn.cursor(row_factory=tuple_row) as cur:
-        row = cur.execute(f"SELECT {_TASK_COLUMNS} FROM tasks WHERE id = %s", (task_id,)).fetchone()
-    return None if row is None else _task(row)
+    with tuple_cursor(conn) as cur:
+        row = cur.execute(f"SELECT {TASK_COLUMNS} FROM tasks WHERE id = %s", (task_id,)).fetchone()
+    return None if row is None else task_from_row(row)
 
 
 def list_tasks(conn: Conn, job_id: uuid.UUID) -> tuple[Task, ...]:
@@ -177,14 +173,27 @@ def list_tasks(conn: Conn, job_id: uuid.UUID) -> tuple[Task, ...]:
     Keys are compared by code point (``COLLATE "C"``), the same order as
     Python's ``sorted``, so the order does not depend on the database locale.
     """
-    with conn.cursor(row_factory=tuple_row) as cur:
+    with tuple_cursor(conn) as cur:
         rows = cur.execute(
-            f'SELECT {_TASK_COLUMNS} FROM tasks WHERE job_id = %s ORDER BY task_key COLLATE "C"',
+            f'SELECT {TASK_COLUMNS} FROM tasks WHERE job_id = %s ORDER BY task_key COLLATE "C"',
             (job_id,),
         ).fetchall()
-    return tuple(_task(row) for row in rows)
+    return tuple(task_from_row(row) for row in rows)
 
 
-def _task(row: TupleRow) -> Task:
-    task_id, job_id, task_key, state, *rest = row
-    return Task(task_id, job_id, task_key, TaskState(state), *rest)
+def get_job_progress(conn: Conn, job_id: uuid.UUID) -> JobProgress | None:
+    """Return the job's derived status and task counts per state, or ``None``.
+
+    The counts come from one statement, so they are a consistent snapshot.
+    Raises ``ValueError`` for a job without tasks, which ``submit_job`` never
+    creates.
+    """
+    with tuple_cursor(conn) as cur:
+        rows = cur.execute(_TASK_COUNTS, (job_id,)).fetchall()
+    if not rows:
+        return None
+    counts = dict.fromkeys(TaskState, 0)
+    for state, count in rows:
+        if state is not None:
+            counts[TaskState(state)] = int(count)
+    return JobProgress(job_id, derive_job_status(counts), MappingProxyType(counts))
