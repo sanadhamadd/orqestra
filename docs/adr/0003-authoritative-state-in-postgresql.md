@@ -47,17 +47,20 @@ detect this: after `running → queued → running`, the state matches again.
 - Implemented and verified locally and in GitHub CI (PR #2): the schema, its constraints,
   the fencing guard, the migration runner and the lifecycle policy functions (see
   DEC-015 … DEC-020).
-- Implemented and verified locally (Step 2A): atomic, idempotent job submission and job and
-  task reads (DEC-024 … DEC-027). Submission creates queued tasks at generation 0 and does
-  not touch ownership.
-- Not yet implemented, and not proven by the current tests: generation-checked task
-  operations (attempt start and completion, cancellation writes), rejection of
-  stale results, concurrency between workers, at-least-once execution, leases,
-  heartbeats, crash recovery and the cancellation grace period. They must be verified by
-  their own tests before being described as working.
+- Implemented and verified locally and in GitHub CI (PR #3): atomic, idempotent job
+  submission and job and task reads (DEC-024 … DEC-027). Submission creates queued tasks
+  at generation 0 and does not touch ownership.
+- Implemented and verified locally (Step 2B): starting an explicitly identified task's
+  attempt, generation-checked completion with rejection of stale and duplicate results,
+  cooperative cancellation writes, and derived job status (DEC-028 … DEC-032), with
+  concurrency tests between separate connections.
+- Not yet implemented, and not proven by the current tests: discovering claimable tasks,
+  leases, heartbeats, revoking ownership of a running attempt, crash recovery and the
+  cancellation grace period. Until then a task whose worker dies stays `running`. They
+  must be verified by their own tests before being described as working.
 - Cross-table invariants (a running task has exactly one running attempt whose number
   equals `attempt_count`) are the responsibility of the transactional operations, not the
-  schema.
+  schema; the integration tests check them across the whole schema after every test.
 - Every started attempt consumes retry budget, including attempts lost to crashes.
 - Revoking an attempt's database ownership does not stop or un-bill an external AI call;
   usage records must be attributable to the attempt that incurred them even after it

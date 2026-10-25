@@ -137,7 +137,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** `tests/unit/test_states.py`, `tests/unit/test_policy.py`; `test_stored_state_values_match_the_domain`.
 
 ### DEC-019 — `tasks.attempt_count` is the ownership generation, guarded in the database
-- **Status:** Proposed · owner-approved direction · **ADR:** 0003 · guard implemented; generation-checked writes are Step 2
+- **Status:** Proposed · owner-approved direction · **ADR:** 0003 · guard implemented; generation-checked completion implemented in Step 2B (DEC-029)
 - **WHAT:** Attempt *N* holds generation *N*. The count starts at 0, changes only on a `queued → running` claim, by exactly +1, never decreases and never exceeds `max_attempts`. A narrow trigger (`tasks_attempt_count_fencing`) rejects any other change; it does not restate the transition table.
 - **WHY:** A state-only conditional write accepts a stale worker's result after the task was requeued and reclaimed. The generation guard is the one invariant whose violation would be silent, so the database enforces it.
 - **RUNNER-UP:** A separate `generation` column, or relying on write-path discipline and tests alone.
@@ -145,7 +145,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** trigger tests for legal claims, decreases, resets, skipped generations, unrelated increments, frozen terminal tasks and retry exhaustion.
 
 ### DEC-020 — Cooperative cancellation
-- **Status:** Proposed · owner-approved direction · policy and schema implemented; writes are Step 2, grace period later
+- **Status:** Proposed · owner-approved direction · policy, schema and writes implemented (Step 2B, DEC-032); grace period later
 - **WHAT:** A request cancels a queued task immediately. A running task records `cancel_requested_at` and keeps running. A legitimate success may still win; an outcome that would requeue cancels instead; other terminal outcomes are recorded truthfully. A future recovery step must revoke ownership after a bounded grace period.
 - **WHY:** Attempt and usage records stay truthful while work is in flight, and no retries start after a request.
 - **RUNNER-UP:** Immediate cancellation of running tasks, fencing off late results — simpler state, but the database would show no live attempt while a worker still spends.
@@ -153,7 +153,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** `next_task_state` and `state_after_cancel_request` decision tables; `tasks_cancel_request_not_queued`, `tasks_cancelled_was_requested`. Race tests are Step 2; the grace period needs its own design and tests.
 
 ### DEC-021 — READ COMMITTED, short transactions, task-before-attempt locking (direction)
-- **Status:** Proposed · owner-approved direction · partly implemented: job submission (DEC-024); task and attempt locking are Step 2
+- **Status:** Proposed · owner-approved direction · implemented: job submission (DEC-024) and the attempt lifecycle (DEC-028)
 - **WHAT:** Authoritative writes are single conditional statements or lock-then-decide transactions (`SELECT … FOR UPDATE` on the task, then its attempt) under READ COMMITTED. No transaction is held open during external or AI work.
 - **WHY:** Row locks plus re-checked conditions give compare-and-set without serialization-failure retry loops; one lock order prevents deadlocks.
 - **RUNNER-UP:** SERIALIZABLE isolation with retries.
@@ -161,7 +161,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** Step 2 concurrency tests (competing starts, stale generations, cancellation races).
 
 ### DEC-022 — Job status is derived from task states (direction)
-- **Status:** Proposed · owner-approved direction · not yet implemented
+- **Status:** Proposed · owner-approved direction · implemented; the rules are DEC-031
 - **WHAT:** No mutable job-state column; status is computed from task-state counts. Revisit only with a correctness need or reproducible measurements.
 - **WHY:** No redundant state to drift and no hot job row updated by every task.
 - **RUNNER-UP:** Stored job state or counters.
@@ -213,3 +213,66 @@ schema change was needed.
 - **RUNNER-UP:** A `position` column preserving submission order — a schema change with no demonstrated requirement yet.
 - **TRADE-OFF:** Clients that need submission order must encode it in their keys. The sort cannot use the `(job_id, task_key)` index, which follows the default collation; not measured.
 - **VERIFICATION:** `test_tasks_are_listed_in_code_point_order_whatever_the_locale`, which fails without the `COLLATE` clause against the `en_US.UTF-8` test database.
+
+## Day 2 — Step 2B: transactional attempt lifecycle
+
+Entries DEC-028 to DEC-032 record implementation choices within the approved Day 2
+direction (ADR-0003, DEC-019 to DEC-022). They stay **Proposed** until the owner accepts
+them in a reviewed change. No schema change, migration or dependency was needed, and the
+lifecycle policy functions and transition tables are unchanged.
+
+### DEC-028 — Lifecycle writes lock the task, then the attempt, decide with the policy, and commit
+- **Status:** Proposed · implemented (`orqestra.persistence.lifecycle`)
+- **WHAT:** `start_attempt`, `complete_attempt` and `request_cancellation` each own one short READ COMMITTED transaction (the guard shared with `submit_job`). Each one locks the task row (`SELECT … FOR UPDATE`) before anything else; completion then locks its attempt row. The domain functions decide (`can_transition`, `next_task_state`, `state_after_cancel_request`, `transition`, `transition_attempt`), the writes follow, and the transaction commits. Starting a task claims it (`queued → running`, `attempt_count + 1`) and inserts attempt *N = attempt_count* in the same transaction. No transaction spans task execution: a start commits before the work and a completion is a separate transaction.
+- **WHY:** One lock order (task, then attempt) on every path means no deadlocks. Every writer of a task serialises on its row, so each decision sees the latest committed state. Deciding in Python keeps the retry and cancellation rules in one place (DEC-008, DEC-020), and the lock gives a precise reason for every rejection.
+- **RUNNER-UP:** Single conditional `UPDATE … WHERE state = … AND attempt_count = …` statements — fewer round trips, but the policy would be restated in SQL and a rejection would need a second query to explain itself. SERIALIZABLE with retries — no explicit locks, but retry loops on every write path.
+- **TRADE-OFF:** Three to five statements per operation, and a hot task row serialises its writers (by design). A Python check that a queued task has attempts left was removed as unreachable: `tasks_queued_has_attempts_left` already guarantees it (DEC-026).
+- **VERIFICATION:** `tests/integration/test_attempt_lifecycle.py`: 20 rounds × 8 concurrent starters yield exactly one attempt each; a gated test observes the losing starter blocked on the winner's row lock (`pg_locks`), then refused; a failing attempt insert (constraint, or a test-only trigger reporting the task already `running` at generation 1) rolls the claim back; 5 rounds × 6 competing workers start exactly `max_attempts` attempts, numbered 1..5. A whole-schema invariant check runs at the end of every test and after every race round. Locally, removing the task lock on start failed 8 tests; removing it on completion failed 5; removing the start or completion transaction failed 10 and 13; disabling the transition-table check on start failed 19. Removing only the attempt lock failed none: the task lock alone serialises every writer, so the attempt lock is defence in depth.
+
+### DEC-029 — Completion is accepted only from the current generation; rejections are typed
+- **Status:** Proposed · implemented
+- **WHAT:** `complete_attempt(conn, attempt_id, generation=N, outcome=…)` takes effect only when the attempt's number is *N*, the task's `attempt_count` is *N*, and the attempt is still running. Otherwise it changes nothing and raises:
+  - `StaleAttemptError` — the generation does not match, or a newer one exists.
+  - `AttemptFinishedError` — the current attempt already ended (a duplicate completion).
+  - `NotFoundError` — an unknown task or attempt.
+
+  Starting a non-queued task raises `TaskNotStartableError`. A running attempt whose task is not running is reported as an invariant violation (`RuntimeError`) instead of being completed. Outcomes are typed records — `AttemptSucceeded(result)`, `AttemptFailed(kind, error_type, error_message)` and `AttemptCancelled()` — and `AttemptFailed.from_exception` classifies handler exceptions with `classify_failure`.
+- **WHY:** The attempt ID alone cannot tell a current worker from one whose task was requeued and restarted. The generation can, and requiring both catches mismatched pairs. Typed errors let a worker distinguish "my result was recorded earlier" from "someone else owns this task now", and neither is a task failure (DEC-009). Completion never classifies exceptions itself, and database errors during completion roll back and propagate, so infrastructure failures are never recorded as permanent handler failures.
+- **RUNNER-UP:** Accepting an identical duplicate completion as an idempotent success — friendlier to retried calls, but it needs a result comparison and hides which call took effect. Result enums instead of exceptions — they would force a check at every call site of an operation that normally succeeds.
+- **TRADE-OFF:** A worker that loses a completion's response (for example, its connection drops after the commit) learns the recorded outcome only through `AttemptFinishedError` or by reading the attempt. Nothing in this step revokes ownership of a running attempt; that is Day 3's lease recovery.
+- **VERIFICATION:** a generation older than the current one, its attempt already failed and requeued, cannot record success, permanent or transient failure, and the newer attempt's result stands. A test stand-in for future lease recovery revokes a running attempt; the slow worker then cannot overwrite the new result. Mismatched generations (0, older, future) are rejected. Five kinds of duplicate completion change nothing, including after a requeue. 20 rounds × 4 concurrent completions of one attempt record exactly one result. A completion that fails at the attempt update or at the task update leaves both untouched and can be retried. A connection terminated mid-completion records nothing. Locally, removing the generation check failed 5 tests, removing the finished check failed 10, and ignoring a pending cancellation request failed 4.
+
+### DEC-030 — Result contract: SQL NULL is "no result"; JSON null is a valid result
+- **Status:** Proposed · implemented; no schema change
+- **WHAT:** A succeeded attempt's result is stored as `jsonb` on its task, always as a JSON value: a result of `None` is stored as the jsonb value `'null'`, never SQL `NULL`. `Task.result` is meaningful only when `Task.state` is `SUCCEEDED`; every other task has SQL `NULL`, enforced by `tasks_result_iff_succeeded`.
+- **WHY:** The schema's existing constraint already makes the task's state the unambiguous signal of whether a result exists, so a result that is JSON null needs no new column and is not silently confused with "no result".
+- **RUNNER-UP:** Forbid JSON null results — simpler to read, but it rejects a legitimate JSON value. Wrap results (`{"value": …}`) or add a `has_result` column — unambiguous on their own, but either changes the stored format or needs a migration.
+- **TRADE-OFF:** Readers must check `state` before interpreting `result`; `None` alone does not mean "no result".
+- **VERIFICATION:** `test_a_success_stores_its_result_and_json_null_is_a_result` checks `result IS NULL` and `jsonb_typeof` for six result kinds, including `null`, `false` and `0`; storing JSON null as SQL NULL fails it.
+
+### DEC-031 — Job status rules
+- **Status:** Proposed · implemented (`derive_job_status`, `get_job_progress`)
+- **WHAT:** From the number of tasks in each state:
+  - `queued` — every task is queued, including tasks requeued for a retry.
+  - `running` — some task is queued or running, but not every task is queued.
+  - `succeeded` — every task succeeded.
+  - `failed` — every task finished and at least one failed.
+  - `cancelled` — every task finished, none failed and at least one was cancelled.
+
+  `get_job_progress` returns the status and the per-state counts from one statement.
+- **WHY:** No stored job state to drift (DEC-022). A failure needs attention more than a requested cancellation does, so it dominates. A job is finished exactly when its status is a terminal one.
+- **RUNNER-UP:** Partial statuses such as "completed with failures" — more nuanced, but the counts already carry that detail.
+- **TRADE-OFF:** A job whose only started tasks were all requeued reads as `queued`. A single failed task makes a large job `failed`; callers that need proportions use the counts. One aggregate query per read, not yet measured on large jobs.
+- **VERIFICATION:** `tests/unit/test_jobs.py` checks every combination of 0–2 tasks in each of the five states (242 cases) against an independent restatement of the rules. An integration test walks a four-task job through queued, running, requeued, mixed and failed states.
+
+### DEC-032 — Cancellation requests report what they did and never touch finished tasks
+- **Status:** Proposed · implemented (`request_cancellation`)
+- **WHAT:** `request_cancellation` returns one of four outcomes:
+  - `cancelled` — the task was queued; it now has `cancel_requested_at = finished_at`.
+  - `requested` — the task is running and keeps running (DEC-020).
+  - `already_requested` — the earlier request's timestamp is kept.
+  - `already_finished` — the task is terminal and nothing is written.
+- **WHY:** All four are normal outcomes, not errors. Recording a request on a finished task would falsely suggest it was pending while the task ran.
+- **RUNNER-UP:** Exceptions for repeated or late requests — they would turn a safe, idempotent call into an error path.
+- **TRADE-OFF:** There is no job-level cancellation yet, and no grace period after which a running attempt that ignores the request loses ownership (Day 3).
+- **VERIFICATION:** Cancelling a queued task makes it unstartable and keeps any earlier attempt history. A pending request turns a transient failure into cancellation, while a success, a permanent failure or an exhausted retry stands. Repeated requests keep the first timestamp, and finished tasks are unchanged. Deterministic gated tests force both commit orders for success and for transient failure, and 30-round races check the invariants.
