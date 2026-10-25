@@ -1,5 +1,5 @@
 """PostgreSQL persistence: the authoritative store for jobs, tasks and attempts.
 
-This package currently provides the schema and its migration runner.
-Transactional task operations build on this schema and live alongside it.
+``migrate`` owns the schema; ``jobs`` submits jobs transactionally and reads
+jobs and tasks. Attempt, claiming and cancellation writes are not implemented.
 """

@@ -44,10 +44,14 @@ detect this: after `running → queued → running`, the state matches again.
 
 ## Consequences
 
-- Implemented and verified locally: the schema, its constraints, the fencing guard, the
-  migration runner and the lifecycle policy functions (see DEC-015 … DEC-020).
+- Implemented and verified locally and in GitHub CI (PR #2): the schema, its constraints,
+  the fencing guard, the migration runner and the lifecycle policy functions (see
+  DEC-015 … DEC-020).
+- Implemented and verified locally (Step 2A): atomic, idempotent job submission and job and
+  task reads (DEC-024 … DEC-027). Submission creates queued tasks at generation 0 and does
+  not touch ownership.
 - Not yet implemented, and not proven by the current tests: generation-checked task
-  operations (submission, attempt start and completion, cancellation writes), rejection of
+  operations (attempt start and completion, cancellation writes), rejection of
   stale results, concurrency between workers, at-least-once execution, leases,
   heartbeats, crash recovery and the cancellation grace period. They must be verified by
   their own tests before being described as working.
