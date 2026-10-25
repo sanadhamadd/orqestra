@@ -153,7 +153,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** `next_task_state` and `state_after_cancel_request` decision tables; `tasks_cancel_request_not_queued`, `tasks_cancelled_was_requested`. Race tests are Step 2; the grace period needs its own design and tests.
 
 ### DEC-021 — READ COMMITTED, short transactions, task-before-attempt locking (direction)
-- **Status:** Proposed · owner-approved direction · not yet implemented (Step 2)
+- **Status:** Proposed · owner-approved direction · partly implemented: job submission (DEC-024); task and attempt locking are Step 2
 - **WHAT:** Authoritative writes are single conditional statements or lock-then-decide transactions (`SELECT … FOR UPDATE` on the task, then its attempt) under READ COMMITTED. No transaction is held open during external or AI work.
 - **WHY:** Row locks plus re-checked conditions give compare-and-set without serialization-failure retry loops; one lock order prevents deadlocks.
 - **RUNNER-UP:** SERIALIZABLE isolation with retries.
@@ -169,9 +169,47 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** Step 2 tests of the derivation.
 
 ### DEC-023 — Fast and full verification lanes
-- **Status:** Proposed · owner-approved direction · implemented locally; CI lane not yet run on GitHub
+- **Status:** Proposed · owner-approved direction · implemented; both lanes passed on GitHub for PR #2 and for `main` after its merge
 - **WHAT:** `make check` = format, lint, mypy, unit tests (coverage reported). `make verify` = lint, mypy, unit + PostgreSQL integration tests with `--cov-fail-under=80`, and a wheel check that every migration is packaged. It fails if `ORQESTRA_TEST_DATABASE_URL` is unset. Integration tests refuse any database other than a local `orqestra_test`. CI runs both lanes, the second against `postgres:16.15` pinned by digest.
 - **WHY:** "Verified" must mean the persistence tests ran; the threshold applies where persistence code is exercised.
 - **RUNNER-UP:** Keep the 80% threshold on the unit-only run — it fails once database code is covered only by integration tests.
 - **TRADE-OFF:** `make check` no longer proves coverage on its own; contributors need local PostgreSQL for `make verify`.
 - **VERIFICATION:** `make verify` without the URL exits non-zero; with it, the combined coverage is reported against the threshold; `tests/integration/test_fixture_safety.py`.
+
+## Day 2 — Step 2A: transactional job submission
+
+Entries DEC-024 to DEC-027 record implementation choices within the approved Day 2
+direction. They stay **Proposed** until the owner accepts them in a reviewed change. No
+schema change was needed.
+
+### DEC-024 — Submission owns one short READ COMMITTED transaction
+- **Status:** Proposed · implemented (`orqestra.persistence.jobs.submit_job`)
+- **WHAT:** `submit_job(conn, submission)` takes a caller's connection. It refuses one whose caller holds an open, failed or busy transaction (a `RuntimeError` naming the status), and leaves a closed or broken connection to psycopg's own connection error. It sets `READ COMMITTED` for its own transaction, inserts the job row and then every task in a single `INSERT … SELECT FROM unnest(…)`, and commits. Reads (`get_job`, `get_task`, `list_tasks`) are single statements; on a non-autocommit connection psycopg opens an implicit transaction for them that the caller ends. Every function reads through its own tuple-row cursor, so the connection's row factory does not matter.
+- **WHY:** Atomicity and idempotent replay depend on the submission committing on its own. A function that joined a caller's transaction could be held open or rolled back later, keeping other submitters with the same key waiting. Setting the isolation level makes behaviour independent of session, server and psycopg connection settings (DEC-021). Mapping rows by position from a cursor the function controls means a connection configured with, say, `dict_row` cannot turn rows into wrong records: before this was fixed, such a connection reported a conflicting submission as a successful replay of a garbage job. One statement for all tasks keeps the transaction to three round trips whatever the task count.
+- **RUNNER-UP:** Caller-managed transactions, so submission could be combined with other writes — more composable, but the commit point and its duration would no longer be the function's. Inserting tasks with `executemany` — equally atomic, but more statements per submission.
+- **TRADE-OFF:** A submission cannot share a transaction with other writes. A very large job is one transaction that holds its idempotency key until commit; large sizes have not been measured.
+- **VERIFICATION:** `tests/integration/test_job_submission.py`: rejected submissions, failing either at the job insert or at a task insert, leave no rows behind; a test-only trigger that fails the third task reports that the job and two tasks existed before rollback; the function refuses implicit, explicit and failed caller transactions and leaves them as they were; a closed or server-terminated connection raises `psycopg.OperationalError`; a connection lost mid-submission stores nothing and frees the key; it commits on a non-autocommit connection, and one connection stays usable after success, constraint failure, conflict and replay, in both modes; it works on a `dict_row` connection; a waiting duplicate still replays under a `serializable` session default and under psycopg's `isolation_level = SERIALIZABLE`.
+
+### DEC-025 — Idempotency: unique key, `ON CONFLICT DO NOTHING`, stored-content comparison
+- **Status:** Proposed · implemented
+- **WHAT:** `jobs_idempotency_key_unique` arbitrates. The job insert uses `ON CONFLICT ON CONSTRAINT jobs_idempotency_key_unique DO NOTHING`, so a concurrent submission with the same key waits for the first to commit or roll back. When the key is taken, one query loads the existing job and compares the request with its stored `kind` and tasks (`task_key`, `payload` by `jsonb` equality, `max_attempts`). An identical request returns the existing job with `created=False`; any difference raises `IdempotencyConflictError`.
+- **WHY:** The stored rows already hold the entire logical request, so no new column is needed. PostgreSQL's unique index gives one winner under any concurrency; comparing in SQL uses `jsonb` semantics rather than Python equality, where `True == 1`.
+- **RUNNER-UP:** A request-fingerprint column (hash of canonical JSON) — constant-cost comparison, but it needs a schema change and a canonical form every client must reproduce. An advisory lock on the key's hash, or SERIALIZABLE isolation with retries — extra mechanisms beside a unique index that already serialises the conflict.
+- **TRADE-OFF:** Replay costs a comparison proportional to the task count. Equivalence follows `jsonb`: object key order is ignored and numbers compare by value (`1` equals `1.0`, `10**30` equals `1e30`); strings compare exactly, without Unicode normalisation. Keys match exactly, including case and whitespace. Correctness relies on submission columns never being updated, which no code does but the schema does not forbid. Keys are global and never expire. The conflict error carries the existing job ID but leaves the key out of its message.
+- **VERIFICATION:** identical replays, including reordered tasks and reformatted JSON, store nothing; seven kinds of content change and eight JSON differences (type, order, float rounding, Unicode normalisation, case) are rejected; a replay the database cannot evaluate raises the database's error, not a conflict; a lock timeout while waiting on the key raises `LockNotAvailable` and leaves the connection reusable; 10 rounds × 8 concurrent identical submitters create exactly one job each; 10 rounds × 8 concurrent submitters split across two contents store one job and reject the losers. Deterministic gated tests observe the second submitter blocked on the first's transaction lock (`pg_locks`), then show it replaying after a commit, rejected after a conflicting commit, and taking the key after a rollback. Locally, removing `ON CONFLICT` failed 31 tests and removing the comparison failed 22.
+
+### DEC-026 — Job and task records are frozen, slotted dataclasses; value rules stay in the schema
+- **Status:** Proposed · implemented (`orqestra.domain.jobs`)
+- **WHAT:** `TaskSpec` and `JobSubmission` describe a request; `Job` and `Task` mirror stored rows, with `Task.state` as a `TaskState`. `JobSubmission` rejects an empty task list and repeated task keys. Non-blank text and the retry-limit range are left to the named database constraints and surface as `psycopg` integrity errors after rollback.
+- **WHY:** Standard library only, immutable and cheap, consistent with the approved direction. Checks that span the whole request belong to the request. Restating column rules in Python would create a second copy that could drift.
+- **RUNNER-UP:** Pydantic models — already a dependency and good at validation, but heavier for internal records and a second validation layer over the constraints.
+- **TRADE-OFF:** Value errors arrive as database errors with constraint names rather than as Python validation errors. Frozen dataclasses do not deep-freeze payload dicts.
+- **VERIFICATION:** `tests/unit/test_jobs.py`; the rejected-submission integration tests assert the violated constraint names.
+
+### DEC-027 — Tasks are listed by `task_key` in code-point order
+- **Status:** Proposed · implemented
+- **WHAT:** `list_tasks` orders by `task_key COLLATE "C"`. Task keys are unique within a job, so the order is total. Submission order is not stored.
+- **WHY:** Deterministic without a new column, and independent of the database locale: it matches Python's `sorted`, whereas the default `en_US.UTF-8` collation sorts `a` before `B`.
+- **RUNNER-UP:** A `position` column preserving submission order — a schema change with no demonstrated requirement yet.
+- **TRADE-OFF:** Clients that need submission order must encode it in their keys. The sort cannot use the `(job_id, task_key)` index, which follows the default collation; not measured.
+- **VERIFICATION:** `test_tasks_are_listed_in_code_point_order_whatever_the_locale`, which fails without the `COLLATE` clause against the `en_US.UTF-8` test database.
