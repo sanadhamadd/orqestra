@@ -3,10 +3,10 @@
 Retry policy depends on classifying failures, so the classification is a
 first-class domain concept rather than an afterthought in the worker.
 
-- ``TransientError``: the same attempt may succeed later (rate limit, timeout,
+- ``TransientError``: a later attempt may succeed (rate limit, timeout,
   temporary provider outage). Eligible for bounded retry.
 - ``PermanentError``: retrying cannot help (invalid input, business rule
-  violation, exhausted budget). Terminal for the attempt.
+  violation, exhausted budget). Terminal for the task.
 - Anything else (an unexpected exception, i.e. a bug) is treated as permanent:
   retrying a defect wastes time and money and hides the defect.
 """

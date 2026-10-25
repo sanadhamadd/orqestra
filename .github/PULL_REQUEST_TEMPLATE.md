@@ -8,6 +8,7 @@
 
 ```
 make check
+make verify   # required for persistence, migration or schema changes
 ```
 
 ## Risks and follow-ups

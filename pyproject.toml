@@ -5,6 +5,7 @@ description = "Distributed AI workload execution platform: concurrent workers, f
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "psycopg[binary]>=3.2,<4",
     "pydantic-settings>=2.6,<3",
 ]
 
@@ -72,4 +73,5 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
-fail_under = 80
+# The 80% threshold is enforced on the combined unit + integration run
+# (`make verify`); the unit-only lane reports coverage without enforcing it.

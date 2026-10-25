@@ -16,11 +16,42 @@ autonomous agent swarms, a polished dashboard.
 - One scoped GitHub issue per feature: acceptance criteria, non-goals, failure cases, tests.
 - Short-lived branches, Conventional Commits, reviewable pull requests; the maintainer
   approves merges.
-- `make check` (format check, lint, mypy strict, unit tests with coverage) must pass. CI
-  also runs relevant integration and failure tests as those lanes are added.
+- `make check` (format check, lint, mypy strict, unit tests) must pass. Changes that touch
+  persistence, migrations or the database schema must also pass `make verify`, which adds
+  the PostgreSQL integration tests, the 80% combined coverage threshold and a package
+  check. CI runs both.
 - Dependencies are locked: change `pyproject.toml`, run `uv lock`, commit `uv.lock`.
   Migrations are version-controlled. Docs change in the same pull request as behaviour.
 - Report commands and results truthfully, and state what was not run.
+
+## Integration database
+
+Integration tests need a dedicated, disposable, local PostgreSQL 16 database named
+`orqestra_test`:
+
+```sh
+createdb orqestra_test
+export ORQESTRA_TEST_DATABASE_URL=postgresql:///orqestra_test
+make verify
+```
+
+The suite checks the server-reported database name and refuses anything other than a
+local `orqestra_test`. A missing URL is an error, never a skip. Each test works in its own
+schema (prefix `orq_test_`), dropped afterwards; cleanup only drops schemas with that
+prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production database.
+
+## Migrations
+
+- One versioned file per change in `src/orqestra/persistence/migrations/`, named
+  `NNNN_snake_case.sql`, numbered contiguously from `0001`.
+- Forward-only: never edit or rename an applied migration (the runner rejects checksum
+  and history mismatches); fix mistakes with a new migration.
+- Each migration runs atomically inside the runner's transaction. Do not write `BEGIN`,
+  `COMMIT`, `ROLLBACK` or `SAVEPOINT`; PostgreSQL rejects them in this context, as it
+  rejects statements that cannot run in a transaction (`CREATE INDEX CONCURRENTLY`,
+  `VACUUM`).
+- Name every constraint so violations identify the exact rule, and add an integration
+  test for each new constraint.
 
 ## Distributed correctness
 
