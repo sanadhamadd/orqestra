@@ -4,9 +4,9 @@ Material engineering decisions in WHAT / WHY / RUNNER-UP form. A proposal is not
 decision: every entry stays **Proposed** until the owner marks it **Accepted** in a
 reviewed change. Trivial edits are not logged. Cross-cutting choices also get an ADR.
 
-Deliberately **undecided** (do not infer a choice from the code): task queue / broker,
-API framework, worker hosting, AI provider and models, asyncio vs threads for worker
-slots. The DB driver and migration tool are no longer open: see DEC-016 and DEC-017.
+Deliberately **undecided** (do not infer a choice from the code): API framework, worker
+hosting, AI provider and models, asyncio vs threads for worker slots. The DB driver,
+migration tool and task queue are no longer open: see DEC-016, DEC-017 and DEC-033.
 
 ## Day 1 — repository foundation
 
@@ -276,3 +276,26 @@ lifecycle policy functions and transition tables are unchanged.
 - **RUNNER-UP:** Exceptions for repeated or late requests — they would turn a safe, idempotent call into an error path.
 - **TRADE-OFF:** There is no job-level cancellation yet, and no grace period after which a running attempt that ignores the request loses ownership (Day 3).
 - **VERIFICATION:** Cancelling a queued task makes it unstartable and keeps any earlier attempt history. A pending request turns a transient failure into cancellation, while a success, a permanent failure or an exhausted retry stands. Repeated requests keep the first timestamp, and finished tasks are unchanged. Deterministic gated tests force both commit orders for success and for transient failure, and 30-round races check the invariants.
+
+## Day 3A — Slice 1: PostgreSQL task discovery
+
+### DEC-033 — PostgreSQL-native queue discovery using `SKIP LOCKED`
+- **Status:** Proposed · owner-approved direction (2026-10-25) · implemented (`claim_next_attempt`)
+- **WHAT:** PostgreSQL is the task queue; there is no separate broker. `claim_next_attempt(conn, worker_id)` locks the first claimable task with `SELECT … WHERE state = ANY(<sources of running>) ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED`, then claims it in the same transaction through the private `_claim` step it shares with `start_attempt`: transition check, generation advance and attempt insert. It returns the new attempt, or `None` when nothing is claimable. The claimable states come from the transition table (`allowed_sources`), not a literal.
+- **WHY:** Tasks already live in PostgreSQL (DEC-015), so claiming a row and starting its attempt is one transaction with no second system to keep consistent. `SKIP LOCKED` lets concurrent claimants take distinct tasks without waiting for each other or for a cancellation in progress. Sharing `_claim` keeps one authoritative implementation of the claim, guarded by the existing fencing trigger.
+- **RUNNER-UP:** An external broker (Redis, RabbitMQ) delivering task IDs — it pushes work and scales independently, but it is a second system that must agree with the authoritative rows (DEC-015's runner-up). Within PostgreSQL, a single `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED) RETURNING` saves a round trip, but it would restate the claim SQL and bypass the domain transition check.
+- **TRADE-OFF:**
+  - The order by `created_at`, then `id`, is a preference, not strict FIFO: locked tasks are skipped, and the tasks of one job share `created_at`.
+  - A requeued task keeps its `created_at`, so it is claimed again straight away. There is no backoff, and a transient failure can use up its retries back to back once a worker loop exists.
+  - Each claim scans and sorts the queued tasks until a partial index is added (planned with the lease migration).
+  - There is no lease, so a claimed task whose worker dies stays `running` (Day 3A Slice 2).
+  - `None` means "nothing claimable right now", not "the queue is empty".
+- **VERIFICATION:** `tests/integration/test_attempt_lifecycle.py`, section 16 (20 tests):
+  - Claims and empty queues; running and finished tasks are never claimed; one claim per generation; older tasks first.
+  - 20 rounds × 8 concurrent claimants over 8 tasks yield 8 distinct attempts; 20 rounds × 8 claimants over 3 tasks yield exactly 3.
+  - Gated tests hold a claimant mid-claim and show another claimant taking the next task, or returning `None`, under `lock_timeout = 200ms`, so no wait occurred.
+  - A task being cancelled is skipped and never claimed; a claim before a cancellation becomes a recorded request; 30-round claim-versus-cancel races leave no invalid claim.
+  - A failing attempt insert rolls the claim back.
+  - 6 competing claimants never exceed `max_attempts` across 10 tasks.
+
+  Locally, replacing `SKIP LOCKED` with a waiting `FOR UPDATE` failed 3 tests, removing the row lock failed 7 (the fencing trigger rejected the colliding claims), claiming from any state failed 11, removing the ordering failed 2, and removing the owned transaction failed 11.

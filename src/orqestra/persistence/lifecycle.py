@@ -1,4 +1,4 @@
-"""Transactional attempt lifecycle: start attempts, complete them, cancel tasks.
+"""Transactional attempt lifecycle: claim and start attempts, complete them, cancel tasks.
 
 Each write is one short READ COMMITTED transaction that the operation owns
 (DEC-028). It locks the task row first and then, when it needs it, the attempt
@@ -16,9 +16,9 @@ concurrency outcomes, not task failures (DEC-009).
 A task may run in several attempts over its lifetime, and generation fencing
 ensures that only one attempt's result can become the task's result. These
 operations are building blocks for at-least-once execution but do not provide
-it: nothing delivers tasks automatically. Task discovery, leases, a worker
-loop and crash recovery are not implemented, so a task whose worker stops is
-not retried.
+it: nothing delivers tasks automatically. ``claim_next_attempt`` discovers
+work, but leases, a worker loop and crash recovery are not implemented, so a
+task whose worker stops is not retried.
 """
 
 import logging
@@ -42,6 +42,7 @@ from orqestra.domain.states import (
     TERMINAL_TASK_STATES,
     AttemptState,
     TaskState,
+    allowed_sources,
     can_transition,
     transition,
     transition_attempt,
@@ -67,6 +68,15 @@ _LOCK_TASK_OF_ATTEMPT = (
     "WHERE id = (SELECT task_id FROM attempts WHERE id = %s) FOR UPDATE"
 )
 _LOCK_ATTEMPT = f"SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE id = %s FOR UPDATE"
+# Discovery (DEC-033): lock the first claimable task that no other transaction
+# has locked. Rows locked elsewhere are skipped, not waited for, and a row that
+# changed since the statement's snapshot is re-checked against the WHERE clause
+# once locked, so a task claimed or cancelled meanwhile is never returned.
+_LOCK_NEXT_CLAIMABLE_TASK = (
+    f"SELECT {TASK_COLUMNS} FROM tasks WHERE state = ANY(%s) "
+    "ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
+)
+_CLAIMABLE_STATES = [state.value for state in allowed_sources(TaskState.RUNNING)]
 
 _CLAIM_TASK = (
     "UPDATE tasks SET state = %s, attempt_count = attempt_count + 1, updated_at = now() "
@@ -161,29 +171,62 @@ class CancellationResult:
 def start_attempt(conn: Conn, task_id: uuid.UUID, worker_id: str) -> Attempt:
     """Start the next attempt of a queued task and return it.
 
-    In one transaction: lock the task, check with the transition table that it
-    may move to ``running`` (only a queued task may), advance ``attempt_count``
-    by one (the fencing trigger rejects any other change) and insert the
-    running attempt whose number is the new generation. Competing callers serialise on the task's
-    row lock, so exactly one of them starts each generation; the others get
-    ``TaskNotStartableError``. Raises ``NotFoundError`` for an unknown task.
+    In one transaction: lock the task, then claim it (see ``_claim``).
+    Competing callers serialise on the task's row lock, so exactly one of them
+    starts each generation; the others get ``TaskNotStartableError``. Raises
+    ``NotFoundError`` for an unknown task.
     """
     with owned_transaction(conn, "start_attempt") as cur:
-        task = _lock_task(cur, _LOCK_TASK, task_id, "task")
-        # Only a queued task may start, and tasks_queued_has_attempts_left
-        # guarantees a queued task has an attempt left, so this cannot exceed
-        # max_attempts.
-        if not can_transition(task.state, TaskState.RUNNING):
-            raise TaskNotStartableError(task_id, task.state)
-        (generation,) = _one(cur.execute(_CLAIM_TASK, (TaskState.RUNNING.value, task_id)))
-        attempt = attempt_from_row(
-            _one(cur.execute(_INSERT_ATTEMPT, (uuid.uuid4(), task_id, generation, worker_id)))
-        )
+        attempt = _claim(cur, _lock_task(cur, _LOCK_TASK, task_id, "task"), worker_id)
+    _log_started(attempt)
+    return attempt
+
+
+def claim_next_attempt(conn: Conn, worker_id: str) -> Attempt | None:
+    """Claim the next claimable task, start its attempt and return it; ``None`` if none.
+
+    In one transaction: lock the first queued task, by ``created_at`` then
+    ``id``, that no other transaction has locked, then claim it exactly as
+    ``start_attempt`` does. It never waits for a row lock: tasks being claimed
+    or cancelled elsewhere are skipped. The order is therefore a preference,
+    not strict FIFO, and ``None`` means "nothing claimable right now", which
+    includes queued tasks that are all locked by others.
+    """
+    with owned_transaction(conn, "claim_next_attempt") as cur:
+        row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES,)).fetchone()
+        if row is None:
+            return None
+        attempt = _claim(cur, task_from_row(row), worker_id)
+    _log_started(attempt)
+    return attempt
+
+
+def _claim(cur: Cursor, task: Task, worker_id: str) -> Attempt:
+    """Claim a task this transaction has locked, and insert its running attempt.
+
+    Checks with the transition table that the task may move to ``running``
+    (only a queued task may), advances ``attempt_count`` by one (the fencing
+    trigger rejects any other change) and inserts the attempt whose number is
+    the new generation. tasks_queued_has_attempts_left guarantees a queued
+    task has an attempt left, so this cannot exceed ``max_attempts``.
+    """
+    if not can_transition(task.state, TaskState.RUNNING):
+        raise TaskNotStartableError(task.id, task.state)
+    (generation,) = _one(cur.execute(_CLAIM_TASK, (TaskState.RUNNING.value, task.id)))
+    return attempt_from_row(
+        _one(cur.execute(_INSERT_ATTEMPT, (uuid.uuid4(), task.id, generation, worker_id)))
+    )
+
+
+def _log_started(attempt: Attempt) -> None:
     logger.info(
         "attempt started",
-        extra={"task_id": str(task_id), "attempt_id": str(attempt.id), "worker_id": worker_id},
+        extra={
+            "task_id": str(attempt.task_id),
+            "attempt_id": str(attempt.id),
+            "worker_id": attempt.worker_id,
+        },
     )
-    return attempt
 
 
 def complete_attempt(

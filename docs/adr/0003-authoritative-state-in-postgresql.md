@@ -50,13 +50,16 @@ detect this: after `running → queued → running`, the state matches again.
 - Implemented and verified locally and in GitHub CI (PR #3): atomic, idempotent job
   submission and job and task reads (DEC-024 … DEC-027). Submission creates queued tasks
   at generation 0 and does not touch ownership.
-- Implemented and verified locally (Step 2B): starting an explicitly identified task's
-  attempt, generation-checked completion with rejection of stale and duplicate results,
-  cooperative cancellation writes, and derived job status (DEC-028 … DEC-032), with
-  concurrency tests between separate connections.
-- Not yet implemented, and not proven by the current tests: discovering claimable tasks,
-  leases, heartbeats, revoking ownership of a running attempt, crash recovery and the
-  cancellation grace period. Until then a task whose worker dies stays `running`. They
+- Implemented and verified locally and in GitHub CI (PR #4): starting an explicitly
+  identified task's attempt, generation-checked completion with rejection of stale and
+  duplicate results, cooperative cancellation writes, and derived job status
+  (DEC-028 … DEC-032), with concurrency tests between separate connections.
+- Implemented and verified locally (Day 3A Slice 1): discovering and claiming the next
+  queued task with `FOR UPDATE SKIP LOCKED`, sharing the claim with `start_attempt`
+  (DEC-033).
+- Not yet implemented, and not proven by the current tests: leases, heartbeats, revoking
+  ownership of a running attempt, crash recovery, retry backoff and the cancellation
+  grace period. Until then a task whose worker dies stays `running`. They
   must be verified by their own tests before being described as working.
 - Cross-table invariants (a running task has exactly one running attempt whose number
   equals `attempt_count`) are the responsibility of the transactional operations, not the
