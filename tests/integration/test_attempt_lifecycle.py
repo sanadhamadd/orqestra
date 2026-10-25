@@ -1,4 +1,4 @@
-"""Attempt lifecycle against real PostgreSQL: start, complete, retry, cancel, job status.
+"""Attempt lifecycle against real PostgreSQL: start, discover, complete, retry, cancel.
 
 Every test ends by checking the cross-table invariants over the whole schema,
 and the race tests check them after every round. Concurrency tests use one
@@ -44,6 +44,7 @@ from orqestra.persistence.lifecycle import (
     NotFoundError,
     StaleAttemptError,
     TaskNotStartableError,
+    claim_next_attempt,
     complete_attempt,
     get_attempt,
     list_attempts,
@@ -1084,3 +1085,400 @@ def test_attempts_are_listed_by_number(checked: Conn) -> None:
     assert listed[-1] == last
     other = new_task(checked)
     assert list_attempts(checked, other.id) == ()
+
+
+# --- 16. discovery: claim_next_attempt (DEC-033) ------------------------------
+#
+# Claimants that must not wait run with a short lock_timeout, so any wait for a
+# row lock fails them with LockNotAvailable instead of passing by luck.
+
+Gate = Callable[[str, str], Callable[[], None]]
+
+
+@pytest.fixture
+def claim_gate(checked: Conn) -> Iterator[Callable[[str], Callable[[], None]]]:
+    """``claim_gate(worker_id)`` holds that worker's attempt insert until released.
+
+    Unlike the statement-level ``gate``, only the named worker is held, so other
+    claimants run freely while it keeps its task row locked mid-claim.
+    """
+    held: list[int] = []
+
+    def close(worker_id: str) -> Callable[[], None]:
+        key = secrets.randbits(62)
+        name = sql.Identifier(f"claim_gate_{len(held)}")
+        checked.execute(
+            sql.SQL("""
+                CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN PERFORM pg_advisory_xact_lock_shared({key}); RETURN NEW; END $$;
+                CREATE TRIGGER {name} BEFORE INSERT ON attempts FOR EACH ROW
+                    WHEN (NEW.worker_id = {worker}) EXECUTE FUNCTION {name}();
+            """).format(name=name, key=sql.Literal(key), worker=sql.Literal(worker_id))
+        )
+        checked.execute("SELECT pg_advisory_lock(%s)", (key,))
+        held.append(key)
+
+        def release() -> None:
+            if key in held:
+                checked.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                held.remove(key)
+
+        return release
+
+    yield close
+    for key in list(held):
+        checked.execute("SELECT pg_advisory_unlock(%s)", (key,))
+
+
+def no_wait(conn: Conn) -> Conn:
+    """Make any wait for a lock on ``conn`` fail fast instead of blocking."""
+    conn.execute("SET lock_timeout = '200ms'")
+    return conn
+
+
+def claim_all(db: Conn, worker_id: str = "w") -> list[Attempt]:
+    claimed = []
+    while (attempt := claim_next_attempt(db, worker_id)) is not None:
+        claimed.append(attempt)
+    return claimed
+
+
+# --- discovery: finding and claiming -----------------------------------------
+
+
+def test_a_queued_task_is_discovered_and_claimed(checked: Conn) -> None:
+    # Discovery is global, so this test owns every queued task in its schema.
+    task = new_task(checked)
+    attempt = claim_next_attempt(checked, "worker-1")
+
+    assert attempt is not None
+    assert (attempt.task_id, attempt.attempt_number) == (task.id, 1)
+    assert (attempt.worker_id, attempt.state) == ("worker-1", AttemptState.RUNNING)
+    claimed = task_now(checked, task.id)
+    assert (claimed.state, claimed.attempt_count) == (TaskState.RUNNING, 1)
+    assert claimed.updated_at == attempt.started_at
+    assert list_attempts(checked, task.id) == (attempt,)
+    # The claimed attempt completes through the existing lifecycle.
+    assert complete(checked, attempt, SUCCESS).task.state is TaskState.SUCCEEDED
+
+
+def test_an_empty_queue_returns_none_and_changes_nothing(checked: Conn) -> None:
+    before = snapshot(checked)
+    assert claim_next_attempt(checked, "w") is None
+    assert snapshot(checked) == before
+
+
+def test_running_and_finished_tasks_are_never_claimed(checked: Conn) -> None:
+    running, succeeded, failed, cancelled, exhausted = new_tasks(
+        checked, "running", "succeeded", "failed", "cancelled", "exhausted", max_attempts=1
+    )
+    start_attempt(checked, running.id, "w")
+    complete(checked, start_attempt(checked, succeeded.id, "w"), SUCCESS)
+    complete(checked, start_attempt(checked, failed.id, "w"), PERMANENT)
+    request_cancellation(checked, cancelled.id)
+    complete(checked, start_attempt(checked, exhausted.id, "w"), TRANSIENT)  # 1 of 1 used
+    assert task_now(checked, exhausted.id).state is TaskState.FAILED
+    before = snapshot(checked)
+
+    assert claim_next_attempt(checked, "w") is None
+    assert snapshot(checked) == before
+
+    queued = new_task(checked)
+    attempt = claim_next_attempt(checked, "w")
+    assert attempt is not None
+    assert attempt.task_id == queued.id
+
+
+def test_each_task_is_claimed_once_per_generation(checked: Conn) -> None:
+    tasks = new_tasks(checked, *[f"t{i}" for i in range(5)])
+    claimed = claim_all(checked)
+    assert sorted(a.task_id for a in claimed) == sorted(t.id for t in tasks)
+    assert {a.attempt_number for a in claimed} == {1}
+    for task in tasks:
+        assert task_now(checked, task.id).attempt_count == 1
+        assert len(list_attempts(checked, task.id)) == 1
+
+
+def test_claims_prefer_older_tasks(checked: Conn) -> None:
+    older = new_tasks(checked, "a", "b", "c")
+    newer = new_tasks(checked, "d", "e")  # a later transaction: a later created_at
+    claimed = [a.task_id for a in claim_all(checked)]
+    expected = [t.id for t in sorted(older, key=lambda t: t.id)]
+    expected += [t.id for t in sorted(newer, key=lambda t: t.id)]
+    assert claimed == expected  # created_at first, then id; uncontended, so exact
+
+
+def test_a_requeued_task_keeps_its_place(checked: Conn) -> None:
+    # A requeued task keeps its created_at, so without contention it is claimed
+    # again before newer tasks: there is no backoff in this slice.
+    first = new_task(checked)
+    later = new_task(checked)
+    attempt = claim_next_attempt(checked, "w")
+    assert attempt is not None
+    assert attempt.task_id == first.id
+    complete(checked, attempt, TRANSIENT)  # requeued
+    again = claim_next_attempt(checked, "w")
+    assert again is not None
+    assert (again.task_id, again.attempt_number) == (first.id, 2)
+    assert task_now(checked, later.id).state is TaskState.QUEUED
+
+
+# --- discovery: concurrent claimants -----------------------------------------
+
+
+def test_concurrent_claimants_claim_distinct_tasks(schema_url: str, checked: Conn) -> None:
+    rounds, claimants = 20, 8
+    for n in range(rounds):
+        tasks = new_tasks(checked, *[f"r{n}-{i}" for i in range(claimants)])
+        results = race(
+            schema_url,
+            [partial(claim_next_attempt, worker_id=f"w{i}") for i in range(claimants)],
+        )
+        claimed = [r for r in results if isinstance(r, Attempt)]
+        assert len(claimed) == claimants
+        assert sorted(a.task_id for a in claimed) == sorted(t.id for t in tasks)
+        assert {a.attempt_number for a in claimed} == {1}
+        assert_invariants(checked)
+
+
+def test_more_claimants_than_tasks_start_exactly_the_available_attempts(
+    schema_url: str, checked: Conn
+) -> None:
+    rounds, claimants, available = 20, 8, 3
+    for n in range(rounds):
+        tasks = new_tasks(checked, *[f"r{n}-{i}" for i in range(available)])
+        results = race(
+            schema_url,
+            [partial(claim_next_attempt, worker_id=f"w{i}") for i in range(claimants)],
+        )
+        claimed = [r for r in results if isinstance(r, Attempt)]
+        assert len(claimed) == available
+        assert results.count(None) == claimants - available
+        assert sorted(a.task_id for a in claimed) == sorted(t.id for t in tasks)
+        assert_invariants(checked)
+
+
+# --- discovery: skipping locked rows without waiting -------------------------
+
+
+def test_a_task_being_claimed_is_skipped_without_waiting(
+    checked: Conn, claim_gate: Callable[[str], Callable[[], None]], worker: Callable[[], Conn]
+) -> None:
+    first_task, second_task = sorted(new_tasks(checked, "a", "b"), key=lambda t: t.id)
+    release = claim_gate("holder")
+    holder, skipper = worker(), no_wait(worker())
+    with ThreadPoolExecutor(1) as pool:
+        held = pool.submit(claim_next_attempt, holder, "holder")
+        wait_for_lock(checked, holder, "advisory")  # first task locked and claimed, not committed
+        attempt = claim_next_attempt(skipper, "skipper")  # would raise LockNotAvailable on a wait
+        assert attempt is not None
+        assert attempt.task_id == second_task.id
+        release()
+        holder_attempt = held.result(timeout=20)
+    assert holder_attempt is not None
+    assert holder_attempt.task_id == first_task.id
+
+
+def test_returns_none_when_every_queued_task_is_locked(
+    checked: Conn, claim_gate: Callable[[str], Callable[[], None]], worker: Callable[[], Conn]
+) -> None:
+    task = new_task(checked)
+    release = claim_gate("holder")
+    holder, skipper = worker(), no_wait(worker())
+    with ThreadPoolExecutor(1) as pool:
+        held = pool.submit(claim_next_attempt, holder, "holder")
+        wait_for_lock(checked, holder, "advisory")
+        assert claim_next_attempt(skipper, "skipper") is None  # queued, but locked: no wait
+        release()
+        holder_attempt = held.result(timeout=20)
+    assert holder_attempt is not None
+    assert holder_attempt.task_id == task.id
+    # Once committed, the task is running and is not claimable either.
+    assert claim_next_attempt(skipper, "skipper") is None
+
+
+# --- discovery: cancellation racing discovery --------------------------------
+
+
+def test_a_task_being_cancelled_is_skipped_and_never_claimed(
+    checked: Conn, gate: Gate, worker: Callable[[], Conn]
+) -> None:
+    task = new_task(checked)
+    release = gate("UPDATE", "tasks")
+    canceller, claimant = worker(), no_wait(worker())
+    with ThreadPoolExecutor(1) as pool:
+        cancelling = pool.submit(request_cancellation, canceller, task.id)
+        wait_for_lock(checked, canceller, "advisory")  # task row locked by the cancellation
+        assert claim_next_attempt(claimant, "w") is None
+        release()
+        assert cancelling.result(timeout=20).outcome is CancellationOutcome.CANCELLED
+    assert claim_next_attempt(claimant, "w") is None  # cancelled: never claimable
+    assert list_attempts(checked, task.id) == ()
+
+
+def test_a_cancellation_after_a_claim_is_recorded_as_a_request(
+    checked: Conn, claim_gate: Callable[[str], Callable[[], None]], worker: Callable[[], Conn]
+) -> None:
+    task = new_task(checked)
+    release = claim_gate("w")
+    claimant, canceller = worker(), worker()
+    with ThreadPoolExecutor(2) as pool:
+        claiming = pool.submit(claim_next_attempt, claimant, "w")
+        wait_for_lock(checked, claimant, "advisory")  # claimed, not committed
+        cancelling = pool.submit(request_cancellation, canceller, task.id)
+        wait_for_lock(checked, canceller, "transactionid")  # waits for the claim
+        release()
+        attempt = claiming.result(timeout=20)
+        result = cancelling.result(timeout=20)
+    assert attempt is not None
+    assert result.outcome is CancellationOutcome.REQUESTED
+    assert result.task.state is TaskState.RUNNING
+    # The claimed attempt can acknowledge the cancellation through the lifecycle.
+    done = complete(checked, attempt, AttemptCancelled())
+    assert done.task.state is TaskState.CANCELLED
+
+
+def test_cancellation_racing_discovery_never_yields_an_invalid_claim(
+    schema_url: str, checked: Conn
+) -> None:
+    for _ in range(30):
+        task = new_task(checked)
+        claimed, cancelled = race(
+            schema_url,
+            [
+                partial(claim_next_attempt, worker_id="w"),
+                partial(request_cancellation, task_id=task.id),
+            ],
+        )
+        final = task_now(checked, task.id)
+        if claimed is None:  # the cancellation held or ended the task first
+            assert cancelled.outcome is CancellationOutcome.CANCELLED
+            assert final.state is TaskState.CANCELLED
+            assert list_attempts(checked, task.id) == ()
+        else:  # the claim committed first; the request waits for the attempt
+            assert claimed.task_id == task.id
+            assert cancelled.outcome is CancellationOutcome.REQUESTED
+            assert (final.state, final.attempt_count) == (TaskState.RUNNING, 1)
+        assert_invariants(checked)
+
+
+# --- discovery: atomic claim -------------------------------------------------
+
+
+def test_a_failed_insert_rolls_back_a_discovered_claim(checked: Conn) -> None:
+    task = new_task(checked)
+    before = snapshot(checked)
+    with pytest.raises(errors.CheckViolation) as info:
+        claim_next_attempt(checked, "   ")
+    assert info.value.diag.constraint_name == "attempts_worker_id_not_blank"
+    assert snapshot(checked) == before  # nothing at all changed: still queued at generation 0
+    attempt = claim_next_attempt(checked, "w")  # the generation was not consumed
+    assert attempt is not None
+    assert (attempt.task_id, attempt.attempt_number) == (task.id, 1)
+
+
+def test_the_discovered_claim_and_attempt_insert_are_one_transaction(checked: Conn) -> None:
+    # A test-only trigger fails the attempt insert and reports what the
+    # transaction had written by then, proving there was a claim to undo.
+    checked.execute("""
+        CREATE FUNCTION poison() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'poisoned with task % at generation %',
+                (SELECT state FROM tasks WHERE id = NEW.task_id),
+                (SELECT attempt_count FROM tasks WHERE id = NEW.task_id);
+        END $$;
+        CREATE TRIGGER poison BEFORE INSERT ON attempts
+            FOR EACH ROW WHEN (NEW.worker_id = 'poison') EXECUTE FUNCTION poison();
+    """)
+    task = new_task(checked)
+    with pytest.raises(errors.RaiseException, match="task running at generation 1"):
+        claim_next_attempt(checked, "poison")
+    assert task_now(checked, task.id) == task
+    assert list_attempts(checked, task.id) == ()
+
+
+# --- discovery: retry budget -------------------------------------------------
+
+
+def test_discovery_stops_at_the_retry_budget(checked: Conn) -> None:
+    task = new_task(checked, max_attempts=3)
+    for number in (1, 2, 3):
+        attempt = claim_next_attempt(checked, "w")
+        assert attempt is not None
+        assert (attempt.task_id, attempt.attempt_number) == (task.id, number)
+        complete(checked, attempt, TRANSIENT)
+    assert task_now(checked, task.id).state is TaskState.FAILED  # exhausted
+    assert claim_next_attempt(checked, "w") is None
+    assert len(list_attempts(checked, task.id)) == 3
+
+
+def test_competing_claimants_never_exceed_any_retry_budget(schema_url: str, checked: Conn) -> None:
+    max_attempts, claimants = 3, 6
+    tasks = new_tasks(checked, *[f"t{i}" for i in range(10)], max_attempts=max_attempts)
+    task_ids = [t.id for t in tasks]
+
+    def work(conn: Conn) -> int:
+        started = 0
+        while True:
+            attempt = claim_next_attempt(conn, f"pid-{conn.info.backend_pid}")
+            if attempt is None:
+                states = conn.execute(
+                    "SELECT count(*) FROM tasks "
+                    "WHERE id = ANY(%s) AND state IN ('queued', 'running')",
+                    (task_ids,),
+                ).fetchone()
+                if states is not None and states[0] == 0:
+                    return started
+                continue  # others hold the remaining tasks; they will requeue or fail
+            started += 1
+            complete_attempt(conn, attempt.id, generation=attempt.attempt_number, outcome=TRANSIENT)
+
+    per_worker = race(schema_url, [work] * claimants)
+    assert sum(per_worker) == max_attempts * len(tasks)
+    for task in tasks:
+        final = task_now(checked, task.id)
+        assert (final.state, final.attempt_count) == (TaskState.FAILED, max_attempts)
+        assert [a.attempt_number for a in list_attempts(checked, task.id)] == [1, 2, 3]
+    assert_invariants(checked)
+
+
+# --- discovery: start_attempt alongside discovery ----------------------------
+
+
+def test_start_attempt_and_discovery_share_one_claim(checked: Conn) -> None:
+    targeted, other = sorted(new_tasks(checked, "a", "b"), key=lambda t: t.id)
+    started = start_attempt(checked, targeted.id, "explicit")
+    discovered = claim_next_attempt(checked, "discovery")
+    assert discovered is not None
+    assert discovered.task_id == other.id  # the started task is running, not claimable
+    with pytest.raises(TaskNotStartableError):
+        start_attempt(checked, other.id, "explicit")  # discovered first
+    for attempt in (started, discovered):
+        assert attempt.attempt_number == 1
+        assert attempt.state is AttemptState.RUNNING
+
+
+def test_discovery_refuses_a_caller_transaction(checked: Conn) -> None:
+    new_task(checked)
+    before = snapshot(checked)
+    with checked.transaction(), pytest.raises(RuntimeError, match="outside any open transaction"):
+        claim_next_attempt(checked, "w")
+    assert snapshot(checked) == before
+
+
+def test_discovery_ignores_tasks_it_cannot_see_yet(
+    schema_url: str, checked: Conn, worker: Callable[[], Conn]
+) -> None:
+    # A submission that has not committed is invisible to discovery.
+    submitter = worker()
+    with submitter.transaction():
+        job_id = uuid.uuid4()
+        submitter.execute("INSERT INTO jobs (id, kind) VALUES (%s, 'k')", (job_id,))
+        submitter.execute(
+            "INSERT INTO tasks (id, job_id, task_key, payload, max_attempts) "
+            "VALUES (%s, %s, 't', '{}', 3)",
+            (uuid.uuid4(), job_id),
+        )
+        assert claim_next_attempt(checked, "w") is None
+    attempt = claim_next_attempt(checked, "w")
+    assert attempt is not None

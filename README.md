@@ -16,9 +16,11 @@ Step 1 (the PostgreSQL persistence foundation) was merged in PR #2; both CI lane
 the PostgreSQL integration lane, passed on GitHub for the pull request and for `main` after
 the merge. Day 2 Step 2A (transactional job submission and job and task reads) was merged
 in PR #3, with both CI lanes passing for the pull request and for `main`. Day 2 Step 2B
-(the transactional attempt lifecycle and derived job status) is implemented and verified
-locally only; it has not yet run in GitHub CI. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a claim about
-shipped behaviour.
+(the transactional attempt lifecycle and derived job status) was merged in PR #4, with both
+CI lanes passing for the pull request and for `main`. Day 3A Slice 1 (PostgreSQL task
+discovery) is implemented and verified locally only; it has not yet run in GitHub CI. No
+benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
 | --- | --- | --- |
@@ -26,8 +28,8 @@ shipped behaviour.
 | Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
-| Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; concurrency tests between separate connections | — |
-| Queue and workers | — | discovering claimable tasks, leases, heartbeats, crash recovery, bounded cancellation grace period, worker loop (Days 3–4); queue technology undecided |
+| Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; concurrency tests between separate connections | — |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker (DEC-033) | leases, heartbeats, crash recovery, bounded cancellation grace period, retry backoff, worker loop (Days 3–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -103,9 +105,9 @@ submitting again.
 
 ### Running attempts
 
-A worker that already knows a task's ID starts an attempt, does the work outside any
-database transaction, and reports the outcome with the attempt's generation. Finding
-claimable tasks, leases and heartbeats are not implemented yet.
+A worker claims the next queued task (or starts a task whose ID it already knows), does
+the work outside any database transaction, and reports the outcome with the attempt's
+generation. Leases, heartbeats and crash recovery are not implemented yet.
 
 ```python
 from typing import Any
@@ -135,6 +137,12 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
 - `start_attempt` moves a queued task to `running`, advances its generation
   (`attempt_count`) and creates attempt *N* for generation *N*, in one transaction.
   Concurrent callers get exactly one attempt; the others get `TaskNotStartableError`.
+- `claim_next_attempt(conn, worker_id)` finds the next queued task and claims it the same
+  way, returning its attempt, or `None` when nothing is claimable right now. It locks
+  with `FOR UPDATE SKIP LOCKED`, so it never waits for another claimant or a cancellation,
+  and concurrent claimants always get distinct tasks. Tasks are preferred by
+  `created_at`, then `id`. This is not strict FIFO: tasks locked by others are skipped, and
+  tasks of one job, which share `created_at`, are taken in `id` order.
 - `complete_attempt` takes effect only for the task's current, still-running generation:
   - A newer generation raises `StaleAttemptError`.
   - A repeated completion raises `AttemptFinishedError`.
@@ -168,15 +176,19 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
 
 ### Known limitations
 
-- Attempts start only for a task ID the caller already has; nothing discovers claimable
-  tasks yet. There are no leases or heartbeats, and nothing revokes ownership of a running
-  attempt, so a task whose worker dies stays `running` until crash recovery exists (Day 3).
-  For the same reason, the stale-generation tests simulate recovery with direct SQL.
+- Tasks can be discovered and claimed, but there are no leases or heartbeats, and nothing
+  revokes ownership of a running attempt, so a task whose worker dies stays `running`
+  until crash recovery exists (Day 3). For the same reason, the stale-generation tests
+  simulate recovery with direct SQL.
+- Discovery has no retry backoff: a requeued task keeps its original `created_at`, so it is
+  claimed again ahead of newer tasks straight away. Each claim scans and sorts the queued
+  tasks; there is no index for it yet (planned with the lease migration). `None` from
+  `claim_next_attempt` does not mean the queue is empty, only that nothing was claimable.
 - Cancellation is cooperative and has no grace period, and there is no job-level
   cancellation.
 - At-least-once execution is not provided yet. A task may run in several attempts, and
   generation fencing records only the current generation's result, but nothing delivers
-  tasks automatically: task discovery, leases, a worker loop and crash recovery are future
+  tasks automatically: there is no worker loop, and leases and crash recovery are future
   work.
 - A job whose started tasks were all requeued reads as `queued`; one failed task makes a
   whole job `failed` (the per-state counts give the detail).
