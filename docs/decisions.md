@@ -351,7 +351,7 @@ is not stopped (Day 3B).
 - **VERIFICATION:**
   - `test_a_heartbeat_does_not_lock_the_task`: a heartbeat succeeds under `lock_timeout` while another transaction holds the task row; a completion, as a control, cannot.
   - Rejection tests; both forced orders of heartbeat against recovery.
-  - A 40-round unforced race of heartbeat, completion, recovery and cancellation in which both completion and recovery win some rounds.
+  - A 40-round unforced race of heartbeat, completion, recovery and cancellation that asserts no deadlock, exactly one of completion or recovery per round, and the invariants. Which one wins is not asserted; `test_completion_and_recovery_in_either_order` forces both orders.
   - Locally, adding a task lock after the attempt lock made that race fail with `DeadlockDetected`; removing each check failed its test.
 - **Day 3A Slice 3 note:** the heartbeat also reads the task's `cancel_requested_at` without a lock, in the statement that reads the clock after the attempt lock, and refuses renewal with `CancellationRequestedError` once a request has committed. It still takes no task lock (DEC-040).
 
@@ -424,7 +424,7 @@ is not stopped (Day 3B).
   - Old and new code cannot run side by side: old code cannot read revoked attempts.
   - The claim-ordering index stays deferred until measured.
 - **VERIFICATION:**
-  - `tests/integration/test_migration_0002.py`: upgrade over terminal history; refusal while an attempt or a task is running; prompt `55P03` with no effect while a claim, a completion or an idle reader holds the tables; the READ COMMITTED requirement; legacy claims rejected afterwards; a 10-round race against legacy workers, in which the upgrade applies while they are still running and their next claims are rejected.
+  - `tests/integration/test_migration_0002.py`: upgrade over terminal history; refusal while an attempt or a task is running; prompt `55P03` with no effect while a claim, a completion or an idle reader holds the tables; the READ COMMITTED requirement; a live legacy worker's next claim rejected after the upgrade, with nothing changed; a 10-round race against legacy workers that asserts only outcomes valid under every schedule (applied or refused, no deadlock, no running attempt without a lease, the invariants).
   - A test for every new constraint and for the trigger, in `test_schema_constraints.py`; the domain/schema drift test now includes revocation reasons.
   - Locally, removing `NOWAIT` made a test fail after 10 s instead of refusing, and removing the refusal, the isolation check, the trigger or `attempts_lease_required` each failed tests.
 - **Day 3A Slice 3 note:** migration 0003 follows the same locking rule, `NOWAIT` before any change, but needs neither the running-work refusal nor the isolation check, because it changes no data-dependent state (DEC-041).

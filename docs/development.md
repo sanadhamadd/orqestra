@@ -77,6 +77,9 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   recovery, bounded retry with backoff and jitter, timeouts, cancellation, rate limits and
   backpressure.
 - Worker process count, concurrent task slots and host count are separate measures.
+- Concurrent stress tests assert invariants for all valid schedules. Specific race
+  outcomes require deterministic synchronization tests. Do not use a minimum random
+  winner count as evidence of correctness.
 
 ## Invoice and AI workloads
 

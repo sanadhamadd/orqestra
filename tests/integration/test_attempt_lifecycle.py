@@ -2113,11 +2113,12 @@ def test_heartbeats_completion_recovery_and_cancellation_never_deadlock(
     schema_url: str, checked: Conn
 ) -> None:
     # Unforced races on one task, rotating through sets of participants with
-    # seeded start jitter so that both completion and recovery win some rounds.
-    # Whatever the interleaving, nothing deadlocks (a DeadlockDetected would
-    # escape race()), exactly one of completion and recovery ends the attempt,
-    # and the invariants hold.
-    winners: set[str] = set()
+    # seeded start jitter. Whatever the interleaving, nothing deadlocks (a
+    # DeadlockDetected would escape race()), exactly one of completion and
+    # recovery ends the attempt, a revoked worker's completion and heartbeat
+    # are rejected, and the invariants hold. Which of them wins is left to
+    # scheduling and not asserted: both orders are forced deterministically by
+    # test_completion_and_recovery_in_either_order.
     for n in range(40):
         task = new_task(checked, max_attempts=2)
         expired = n % 4 != 0
@@ -2150,13 +2151,9 @@ def test_heartbeats_completion_recovery_and_cancellation_never_deadlock(
         completed, revoked = results["complete"], results["revoke"]
         assert isinstance(completed, AttemptCompletion) != isinstance(revoked, AttemptRevocation)
         if isinstance(revoked, AttemptRevocation):
-            winners.add("revoke")
             assert isinstance(completed, AttemptRevokedError)
             assert not isinstance(results.get("renew"), Attempt)
-        else:
-            winners.add("complete")
         assert_invariants(checked)
-    assert winners == {"complete", "revoke"}  # both orders were actually exercised
 
 
 # --- 21. cancellation grace periods (DEC-040) ----------------------------------
