@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-041
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-044
 
 ## Context
 
@@ -69,6 +69,13 @@ detect this: after `running → queued → running`, the state matches again.
   period set by the request on the running attempt's lease, refused heartbeats once a
   request has committed, the `cancellation_grace_expired` revocation reason that cancels
   the task, and additive migration 0003 (DEC-040, DEC-041).
+- Implemented and verified locally and in GitHub CI (PR #8): claims filtered by an explicit,
+  required set of job kinds inside the same atomic `SKIP LOCKED` claim (DEC-033 note).
+- Implemented and verified locally only (Day 3B Slice 1B-A): worker contracts, with no
+  worker process: the synchronous handler protocol with a read-only cancellation signal,
+  the job-kind handler registry, the pure mapping from what a handler did to an attempt
+  outcome (a checked copy of a valid result; control-plane signals are never recorded),
+  and validated worker timing settings with no defaults (DEC-042 … DEC-044).
 - Not yet implemented, and not proven by the current tests: a worker loop that renews
   leases, acts on cancellation and sweeps for expired attempts, worker self-fencing and
   handler interruption, bounded worker slots and retry backoff. Until a worker

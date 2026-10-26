@@ -23,18 +23,22 @@ Day 3A Slice 2 (attempt leases, execution deadlines, heartbeats and recovery ope
 with migration 0002) was merged in PR #6, with both CI lanes passing for `main` (run
 40260902718). Day 3A Slice 3 (bounded cancellation grace periods, with migration 0003)
 was merged in PR #7 (merge commit `d83afeb`), with both CI lanes passing for the pull
-request (run 40271111779) and for `main` after the merge (run 40271850302). No benchmark
-has been run. Nothing in the planned column exists yet; do not read it as a
+request (run 40271111779) and for `main` after the merge (run 40271850302). Day 3B Slice
+1A (job-kind-filtered claims) was merged in PR #8 (merge commit `46acdd9`), with both CI
+lanes passing for the pull request (run 40397331066) and for `main` (run 40397973812).
+Day 3B Slice 1B-A (worker contracts: the handler protocol and registry, handler-outcome
+mapping and validated worker settings) is implemented and verified locally only; it has
+not yet run in GitHub CI. There is no worker process yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
 | --- | --- | --- |
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
 | Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules | — |
-| Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; single-line JSON logs with job/task/attempt IDs | — |
+| Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041) | worker loop, scheduled recovery sweeps, worker self-fencing and handler interruption, the worker's response to cancellation, bounded worker slots, retry backoff (Days 3B–4) |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts only: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044) | the worker process: claim loop, heartbeats, self-fencing, the response to cancellation, completion and recovery sweeps; bounded worker slots; retry backoff (Days 3B–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -211,6 +215,63 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   `succeeded` (every task succeeded), `failed` (all finished, at least one failed) or
   `cancelled` (all finished, none failed, at least one cancelled).
 
+### Task handlers (contracts only)
+
+These contracts exist for the worker process, which is not built yet: nothing runs
+handlers on its own.
+
+```python
+from orqestra.domain.jobs import JsonValue
+from orqestra.worker.handlers import HandlerCancelled, HandlerRegistry, TaskContext
+
+
+def verify_invoice(context: TaskContext, payload: JsonValue) -> JsonValue:
+    if context.cancellation.is_set():  # set once the worker has seen a cancellation request
+        raise HandlerCancelled
+    return {"verified": True}  # any JSON value, including None (JSON null)
+
+
+registry = HandlerRegistry({"invoice_verification": verify_invoice})
+# claim_next_attempt(conn, worker_id, kinds=registry.kinds, policy=...)
+```
+
+- A handler is a synchronous function of a `TaskContext` (task and attempt IDs, attempt
+  number, job kind and a cancellation signal) and the task's payload. It gets no database
+  connection. It may raise `TransientError` or `PermanentError`. The signal is a
+  `CancellationSignal`: a read-only view of a `threading.Event` that only the worker holds
+  and sets, after it has seen a committed cancellation request. A context refuses the
+  event itself, and the view can report and wait but cannot set, clear or swap the event.
+  Python cannot stop deliberate introspection, so the database stays the authority: an
+  attempt is recorded as cancelled only after a committed request.
+- `HandlerRegistry` maps exact job kinds to handlers. It needs at least one kind, checks
+  kinds with the claim's own rule, refuses non-callable, coroutine and generator
+  functions, is immutable, and has no fallback for other kinds. `registry.kinds` is what
+  a worker passes to `claim_next_attempt`.
+- `run_handler(handler, context, payload)` turns what a handler did into one outcome,
+  without writing anything:
+  - a valid JSON result: `AttemptSucceeded` holding a checked copy (new lists and dicts,
+    the same keys, order and scalar values), equal to the result as JSON but not the
+    handler's object, so changing that object afterwards cannot change the outcome;
+  - an invalid result (anything but `None`, `bool`, `int`, finite `float`, `str`, `list`
+    and `dict` with `str` keys, exact types; a NUL character or unpaired surrogate in a
+    string; a cycle; nesting too deep to check): an unclassified `AttemptFailed` with
+    `error_type` `orqestra.worker.handlers.InvalidHandlerResult`. A returned coroutine or
+    generator is reported, never run; an unstarted coroutine is closed, which runs none
+    of its code and prevents a "never awaited" warning;
+  - an exception: `AttemptFailed.from_exception`, as before; `HandlerCancelled` is
+    `AttemptCancelled` only if the cancellation signal was set;
+  - `SystemExit`, `KeyboardInterrupt` or any other `BaseException` that is not an
+    `Exception`: a `ControlPlaneSignal`, for which no outcome may be recorded (DEC-009).
+
+  NUL characters and unpaired surrogates in failure text are stored as escapes
+  (`\u0000`, `\ud800`). Database errors are not handled here: they happen when the
+  outcome is recorded.
+- `WorkerSettings` reads the worker's timing settings from `ORQESTRA_WORKER_*` variables
+  (durations as ISO 8601, such as `PT30S`). Every value is required; there are no
+  defaults. It checks the lease rules, that a database call ends before the next
+  heartbeat is due, and that `heartbeat_interval + db_operation_timeout + fence_margin` is
+  shorter than the lease. The worker will use the existing `ORQESTRA_DATABASE_URL`.
+
 ### Verification
 
 ```sh
@@ -235,7 +296,16 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   attributed to the revoked attempt when cost tracking exists. Worker self-fencing after
   a lost lease is Day 3B.
 - There are no default or maximum lease values: callers choose them. Operational bounds
-  and per-job-kind policies are not decided yet.
+  and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing
+  value and has no defaults.
+- The worker contracts (Day 3B Slice 1B-A) are not a worker: nothing claims tasks, runs
+  handlers, renews leases, fences a worker or sweeps for expired attempts on its own.
+  `run_handler` cannot interrupt a handler. The existing `Settings.worker_concurrency`
+  (default 4) is validated but not read by anything; the worker will be single-slot.
+- Handler results are checked more strictly than `jsonb` requires: only exact built-in
+  types are accepted (a `tuple`, a `str` enum or a `dict` subclass is refused rather than
+  converted), and nesting deeper than about 1,000 levels is refused. Results and failure
+  messages have no size limit yet.
 - A heartbeat proves the worker is alive, not that its work progresses: a stuck handler
   keeps renewing its lease until the deadline, and only then is revoked.
 - A database outage longer than the lease makes every live attempt revocable once the

@@ -308,7 +308,7 @@ lifecycle policy functions and transition tables are unchanged.
 
   Locally, replacing `SKIP LOCKED` with a waiting `FOR UPDATE` failed 3 tests, removing the row lock failed 7 (the fencing trigger rejected the colliding claims), claiming from any state failed 11, removing the ordering failed 2, and removing the owned transaction failed 11.
 - **Day 3A Slice 2 note:** the lease migration (0002, DEC-039) does not add the claim-ordering index: it is a performance change and stays deferred until measured. Claims now take a lease policy (DEC-034), and a revoked task is requeued with its original `created_at`, so it too is claimed again without backoff.
-- **Day 3B Slice 1A note (job-kind filter):** Proposed · owner-approved scope (2026-10-26) · implemented locally, not yet in CI.
+- **Day 3B Slice 1A note (job-kind filter):** Proposed · owner-approved scope (2026-10-26) · implemented; merged in PR #8 (`46acdd9`), with both CI jobs passing for the pull request (run 40397331066) and for `main` (run 40397973812). Day 3B Slice 1B-A moved the kind check, unchanged, to `orqestra.domain.kinds.check_job_kinds`, shared with the handler registry (DEC-043).
   - **WHAT:** `claim_next_attempt(conn, worker_id, *, kinds, policy)` takes a required, non-empty collection of supported job kinds. Discovery adds `AND EXISTS (SELECT FROM jobs WHERE jobs.id = tasks.job_id AND jobs.kind = ANY(<kinds>))` to the same `FOR UPDATE SKIP LOCKED` query, so the filter is part of the atomic claim; ordering, the task-before-attempt lock order, `_claim`, fencing and the owned transaction are unchanged. Kinds match exactly. A bare string or bytes, a non-collection, an empty collection, a non-string kind, a blank kind or a kind with a NUL character raises `TypeError` or `ValueError` before any statement is sent; duplicates are accepted and collapsed. "Blank" is the database's rule for job kinds, `jobs_kind_not_blank` (`btrim(kind) <> ''`, where `btrim` trims spaces only), checked in Python as `kind.strip(" ")`, so every kind a job can have can be claimed, including one containing a tab or a newline. There is no unfiltered claim.
   - **WHY:** A worker can only run the kinds it has handlers for. Without the filter it would claim a task it cannot run, and could only fail or release it: that uses an attempt of the task's budget, records an outcome that says nothing about the task, and, because a requeued task keeps its place, can hold up the work behind it. Filtering inside the locking query means a claimant never locks, counts or reorders a task it cannot run.
   - **RUNNER-UP:** Denormalising the kind onto `tasks` (a `tasks.kind` column, possibly indexed with the claim order) avoids the per-candidate join, but needs a migration and a copy of an immutable job fact; deferred until claim cost is measured. Also rejected: one catch-all handler per worker, or filtering after the claim (which uses budget), or an optional `kinds` defaulting to "any" (a silent, unsafe fallback).
@@ -516,3 +516,86 @@ interruption and scheduled recovery remain Day 3B.
   - a 10-round race against live claims, heartbeats, completions and requests never deadlocks, and applies while work is still being claimed.
 
   The schema tests cover the new reason against `matches_lease`, and the drift test covers the reason values. Locally, removing the new value, removing `NOWAIT` (the test fails after 10 s instead of hanging), or also locking `tasks` each fail tests.
+
+## Day 3B — Slice 1B-A: worker contracts
+
+Entries DEC-042 to DEC-044 record the worker contracts agreed after the Day 3B design
+reconciliation (single-slot process, main-thread supervisor, handler thread, and the
+C1–C5 reliability contracts). They stay **Proposed** until the owner accepts them in a
+reviewed change; "implemented" means verified locally by the tests named, not yet in
+GitHub CI. These are contracts only: there is no worker process, supervisor, fencing
+watchdog, recovery scheduler or `worker` command yet.
+
+### DEC-042 — Handlers are synchronous functions; one pure boundary maps what they did to an outcome
+- **Status:** Proposed · owner-approved direction · implemented locally (`orqestra.worker.handlers`)
+- **WHAT:**
+  - A handler is `Callable[[TaskContext, JsonValue], JsonValue]`. `TaskContext` is frozen and holds the task and attempt IDs, the attempt number, the job kind and a `CancellationSignal`. It has no database connection.
+  - `CancellationSignal(event)` is a read-only view of a `threading.Event` the worker owns and sets once it has observed a committed cancellation request. It offers `is_set()` and `wait(timeout)` only; its event cannot be set, cleared, replaced or deleted through it, and `TaskContext` refuses anything but such a view, including the event itself.
+  - `run_handler(handler, context, payload)` returns exactly one `HandlerOutcome` and never raises for the handler:
+    - a valid JSON result is `AttemptSucceeded` holding a checked copy, JSON `null` included (DEC-030): new lists and dicts with the same keys, order and immutable scalar values, so it is equal to the result as JSON but is not the handler's object, and changes to that object afterwards cannot reach the outcome;
+    - an invalid result is `AttemptFailed`, unclassified, with `error_type` `orqestra.worker.handlers.InvalidHandlerResult`;
+    - an `Exception` goes through `AttemptFailed.from_exception` unchanged, except that `HandlerCancelled` is `AttemptCancelled` only when the cancellation signal is set;
+    - a `BaseException` that is not an `Exception` (`SystemExit`, `KeyboardInterrupt`, `GeneratorExit`, `asyncio.CancelledError`) is a `ControlPlaneSignal`, for which the worker must record no outcome.
+  - A valid result uses only `None`, `bool`, `int`, finite `float`, `str`, `list` and `dict` with `str` keys, as exact types, with no NUL character or unpaired surrogate in any string, no cycle, nesting within Python's recursion limit, and must encode with `json.dumps(allow_nan=False)`. Each container's entries are copied in one step, so another thread still changing it cannot break the copy. A returned coroutine or generator is reported and never run. An unstarted native coroutine is closed, which runs none of its code (it has no frame yet) and prevents the "never awaited" warning; a started coroutine, a generator or any other awaitable is left untouched, because closing it would run handler code.
+  - Failure text (`error_type`, `error_message`) is stored with NUL written as `\u0000` and unpaired surrogates as backslash escapes, the same way every time, so the stored text is exactly what was sent.
+- **WHY:**
+  - Every value PostgreSQL would refuse in a result or failure text is caught or escaped before anything is written, so a valid outcome is never lost to a predictable database error, and no database error is ever turned into a handler failure (DEC-009, DEC-029).
+  - Exact types and a copy mean the stored result is the JSON value the handler returned, fixed at the moment it was checked, which the worker will rely on to reconcile an uncertain completion. Without the copy, a handler (or a thread it started) could change its object after the check, so that an unchecked or different value would be written.
+  - A handler holding the worker's event could set it and turn its own `HandlerCancelled` into a cancelled outcome without any request. The database would still refuse to record it (`next_task_state` requires a committed request), but the worker would be driven onto its defect path; the read-only view removes that path through the handler's interface.
+  - Control-plane signals stay unclassified, as DEC-009 and `classify_failure` require; the existing domain policy is unchanged.
+  - `HandlerCancelled` without an observed request would make `next_task_state` raise; mapping it to an ordinary failure keeps the outcome valid.
+- **RUNNER-UP:**
+  - Async handlers, or a handler class with set-up and tear-down: more surface than one synchronous function needs, and async conflicts with the synchronous psycopg choice (DEC-016).
+  - Accepting anything `json.dumps` accepts: friendlier, but tuples, `str` enums and non-string keys would be silently converted, and `NaN` would be written as a value PostgreSQL rejects.
+  - Recording control-plane signals as an unclassified failure: rejected in review, because it contradicts DEC-009.
+  - Passing the `threading.Event` typed as a read-only protocol (the first implementation): rejected in review, because the event's `set()` is still callable at run time.
+  - Keeping the handler's own object as the result: rejected in review, because it can change after validation.
+  - Freezing results into tuples and read-only mappings: no copy needed later, but the stored types would no longer be the handler's `list` and `dict`.
+- **TRADE-OFF:**
+  - Stricter than `jsonb`: handlers must convert tuples, enums and dict subclasses, and nesting beyond about 1,000 levels is refused.
+  - There is no size limit on results or failure messages yet. Copying a result costs time and memory proportional to it, and a container shared in several places is copied once per place (as JSON storage would write it).
+  - The read-only view guards the intended interface only; deliberate introspection can still reach the event, so the database remains the authority for cancelled outcomes.
+  - A handler that raises a control-plane signal records nothing; once the worker exists, its attempt is recovered by lease expiry and uses retry budget.
+  - The boundary cannot interrupt a handler; interruption and fencing belong to the worker process.
+- **VERIFICATION:** `tests/unit/test_worker_handlers.py`:
+  - 16 valid results (JSON `null`, `false`, `0`, big integers, `-0.0`, nested, shared references) succeed as an equal copy of exactly the same types: every list and dict new, every scalar the same object, the sign of `-0.0` kept;
+  - changing the original afterwards (appending NaN, setting infinity and NUL, adding a tuple under a non-string key, deleting a key) leaves the outcome equal to the value checked; a shared list is copied once per place;
+  - 29 invalid results (NaN and infinities, nested; NUL and surrogates in values and keys; tuple, set, bytes, `Decimal`, date, UUID, `object`, `str` enum, dict subclass; non-string keys; cyclic lists and dicts; 5,000 levels of nesting; a 5,000-digit integer) are unclassified `InvalidHandlerResult` failures with a message naming the path;
+  - an unstarted coroutine is reported, closed without running its body or `finally`, and leaves no "never awaited" warning (a control test shows the warning without the boundary); a started coroutine, an unstarted and a suspended generator, and a custom awaitable with its own `close()` are reported and left untouched;
+  - the cancellation signal reports and waits, has no `set` or `clear`, refuses attribute assignment and deletion, and views only a `threading.Event`; a context refuses the raw event, `None` and other objects; a handler calling `set()` on its signal fails with `AttributeError` (an unclassified failure, never cancelled) and the worker's event stays unset; an event set by another thread while the handler waits on its signal is observed and cancels;
+  - transient, permanent, unclassified and message-less exceptions match `from_exception`, with and without an observed request;
+  - `HandlerCancelled` is cancelled only with an observed request;
+  - five control-plane signals, with and without a request, are `ControlPlaneSignal`, and `from_exception` still refuses them;
+  - NUL and surrogate escaping in messages and in a deliberately odd `error_type`;
+  - `run_handler` passes context and payload, contains `SystemExit` and `KeyboardInterrupt`, and covers cooperative, ignored and mid-run cancellation.
+
+  Locally, these mutants each failed tests: cancelling without an observed request (1), classifying control-plane signals (12), catching only `Exception` (1), accepting NaN (6), NUL (3), surrogates (2), tuples (2), non-string keys (4) or cycles (2), registering coroutine functions (2), and not escaping failure text (4). After review: a context accepting the raw event (3), a signal exposing `set()` (2), a signal with writable attributes (1), keeping the original object (7), not copying dicts (7) or lists (6), not closing an unstarted coroutine (1), closing every coroutine (1), and closing any awaitable with a `close()` (2).
+
+### DEC-043 — A handler registry of exact job kinds, checked with the claim's own rule
+- **Status:** Proposed · owner-approved direction · implemented locally (`HandlerRegistry`, `orqestra.domain.kinds`)
+- **WHAT:**
+  - `HandlerRegistry(mapping)` is an immutable `Mapping[str, Handler]` in kind order. It needs at least one kind; kinds are checked by `check_job_kinds`; every handler must be callable and not a coroutine, generator or async-generator function. Lookups are exact, and there is no fallback handler.
+  - `registry.kinds` is the sorted tuple a worker passes to `claim_next_attempt(..., kinds=...)`.
+  - `check_job_kinds` is the Slice 1A claim check moved, unchanged, from `lifecycle._supported_kinds` to `orqestra.domain.kinds`, so the claim and the registry share one rule: a non-empty collection of non-blank `str` kinds (blank as `btrim` defines it: spaces only) without NUL characters. The claim SQL is unchanged.
+- **WHY:** A worker must claim exactly the kinds it can run; any kind the registry accepts is one the claim accepts and a job can have. One function means the two rules cannot drift apart.
+- **RUNNER-UP:** A plain `dict` checked at worker start-up — no new type, but nothing would stop a later change from mutating it or claiming kinds it does not hold. Duplicating the check in the registry — no change to `lifecycle.py`, but two copies of one rule.
+- **TRADE-OFF:** A small change to `lifecycle.py` (an import and a deleted private function); its behaviour and messages are unchanged and covered by the 47 Slice 1A claim tests. Coroutine detection sees through functions and `functools.partial`, not through objects with an async `__call__`; those are still caught when they return a coroutine (DEC-042).
+- **VERIFICATION:** `tests/unit/test_kinds.py` (accepted kinds including tab, newline, CRLF and no-break space; 17 refused inputs); `tests/unit/test_worker_handlers.py` (exact, sorted kinds usable by the claim; no fallback for case, spacing, prefix or wildcard variants; immutability; callable objects and partials accepted; 14 refused registries). The existing section-22 claim tests in `tests/integration/test_attempt_lifecycle.py` pass against the moved check.
+
+### DEC-044 — Worker settings: every timing value required, with only the relationships safe operation needs
+- **Status:** Proposed · owner-approved direction · implemented locally (`orqestra.worker.settings.WorkerSettings`)
+- **WHAT:**
+  - `WorkerSettings` (pydantic-settings, prefix `ORQESTRA_WORKER_`, frozen) requires `lease`, `execution_timeout`, `heartbeat_interval`, `db_operation_timeout`, `fence_margin`, `poll_interval`, `recovery_interval`, `recovery_batch_limit` and `shutdown_timeout`. None has a default. Environment durations are ISO 8601 (`PT30S`) or `HH:MM:SS`; a bare number has no unit and is refused.
+  - Each duration is positive and representable, except `shutdown_timeout`, which may be zero. `recovery_batch_limit` is at least 1. `db_operation_timeout` is at least 1 ms, because PostgreSQL's `statement_timeout` counts whole milliseconds and 0 disables it.
+  - Relationships: `LeasePolicy(lease, execution_timeout)` is valid (`lease_policy`); `db_operation_timeout < heartbeat_interval`; `heartbeat_interval + db_operation_timeout + fence_margin < lease`.
+  - The database connection is the existing `ORQESTRA_DATABASE_URL`. The existing `Settings.worker_concurrency` (default 4) is unchanged and not read: the worker is single-slot by approved direction.
+- **WHY:**
+  - Operational values need the owner's approval (DEC-034), so none is invented.
+  - The relationships are the ones a healthy worker needs: a database call must end before the next heartbeat is due, and a heartbeat sent on time must be confirmed before the worker's local fencing margin is reached, or every worker would fence itself.
+  - Nothing promises recovery progress: no relationship involving `poll_interval`, `recovery_interval` or `recovery_batch_limit` is claimed.
+- **RUNNER-UP:** Defaults derived from the lease (for example a heartbeat every third of it), or extra fields on the existing `Settings` — fewer variables, but an invented production policy, and the worker's required values would become optional for every other command.
+- **TRADE-OFF:**
+  - Operators must set nine variables before a worker can start.
+  - `ORQESTRA_WORKER_CONCURRENCY` shares the worker prefix but belongs to `Settings`; `WorkerSettings` ignores it.
+  - Whether to require several heartbeats per lease, and how the cancellation grace relates to the heartbeat interval (DEC-040), are operator rules the settings cannot check.
+- **VERIFICATION:** `tests/unit/test_worker_settings.py`: valid settings and their lease policy; frozen; nothing has a default; each field required on its own; environment parsing in ISO 8601 and `HH:MM:SS`; four unit-less values refused; `worker_concurrency` neither read nor affected; zero, negative and unrepresentable durations refused for each field; `shutdown_timeout` zero allowed and negative refused; batch limit 1 allowed, 0 and -1 refused, non-integers refused; `db_operation_timeout` exactly 1 ms allowed and 1 µs less refused; lease equal to the execution timeout allowed and 1 µs shorter refused; database timeout 1 µs under the heartbeat interval allowed and equal refused; the fencing relationship 1 µs over allowed and at or under refused; a relationship is not reported while a field is invalid. Locally, mutants dropping or weakening each check (5) each failed tests.
