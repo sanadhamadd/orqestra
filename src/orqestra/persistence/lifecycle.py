@@ -60,6 +60,7 @@ from orqestra.domain.jobs import (
     AttemptSucceeded,
     Task,
 )
+from orqestra.domain.kinds import check_job_kinds
 from orqestra.domain.leases import (
     LeasePolicy,
     RevocationReason,
@@ -372,7 +373,7 @@ def claim_next_attempt(
     claimable right now", which includes queued tasks that are all locked by
     others.
     """
-    supported = _supported_kinds(kinds)
+    supported = check_job_kinds(kinds)
     with owned_transaction(conn, "claim_next_attempt") as cur:
         row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES, supported)).fetchone()
         if row is None:
@@ -380,29 +381,6 @@ def claim_next_attempt(
         attempt = _claim(cur, task_from_row(row), worker_id, policy)
     _log_started(attempt)
     return attempt
-
-
-def _supported_kinds(kinds: object) -> list[str]:
-    """The distinct job kinds a claim may take, checked; raise for anything else."""
-    if isinstance(kinds, str | bytes) or not isinstance(kinds, Collection):
-        msg = f"kinds must be a collection of job kinds, got {type(kinds).__name__}"
-        raise TypeError(msg)
-    if not kinds:
-        msg = "kinds must name at least one supported job kind"
-        raise ValueError(msg)
-    supported: set[str] = set()
-    for kind in kinds:
-        if not isinstance(kind, str):
-            msg = f"each kind must be a str, got {type(kind).__name__}"
-            raise TypeError(msg)
-        if not kind.strip(" "):  # the rule of jobs_kind_not_blank: btrim(kind) <> ''
-            msg = "a kind must not be blank"
-            raise ValueError(msg)
-        if "\x00" in kind:
-            msg = "a kind must not contain a NUL character"
-            raise ValueError(msg)
-        supported.add(kind)
-    return sorted(supported)
 
 
 def _claim(cur: Cursor, task: Task, worker_id: str, policy: LeasePolicy) -> Attempt:
