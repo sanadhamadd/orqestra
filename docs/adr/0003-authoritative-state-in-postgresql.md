@@ -65,7 +65,7 @@ detect this: after `running → queued → running`, the state matches again.
   deadlines from one claim instant; lease renewal that locks only the attempt; revocation
   of one expired attempt per transaction, moving its task by the retry and cancellation
   policy; and migration 0002 with its quiescent-upgrade contract (DEC-034 … DEC-039).
-- Implemented and verified locally only (Day 3A Slice 3): a bounded cancellation grace
+- Implemented and verified locally and in GitHub CI (PR #7): a bounded cancellation grace
   period set by the request on the running attempt's lease, refused heartbeats once a
   request has committed, the `cancellation_grace_expired` revocation reason that cancels
   the task, and additive migration 0003 (DEC-040, DEC-041).

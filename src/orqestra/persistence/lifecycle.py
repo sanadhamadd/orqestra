@@ -44,6 +44,7 @@ schedules recovery, and revoking an attempt does not stop its worker.
 
 import logging
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -102,12 +103,17 @@ _LOCK_ATTEMPT = f"SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE id = %s FOR UPDAT
 _LOCK_CURRENT_ATTEMPT = (
     f"SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE task_id = %s AND attempt_number = %s FOR UPDATE"
 )
-# Discovery (DEC-033): lock the first claimable task that no other transaction
-# has locked. Rows locked elsewhere are skipped, not waited for, and a row that
-# changed since the statement's snapshot is re-checked against the WHERE clause
-# once locked, so a task claimed or cancelled meanwhile is never returned.
+# Discovery (DEC-033): lock the first claimable task of a supported job kind
+# that no other transaction has locked. Rows locked elsewhere are skipped, not
+# waited for, and a row that changed since the statement's snapshot is
+# re-checked against the WHERE clause once locked, so a task claimed or
+# cancelled meanwhile is never returned. Only the task row is locked: the job
+# is read by the subquery, which takes no row lock and is not re-checked. That
+# relies on a job's kind never changing; no code path updates it, but the
+# database does not forbid it.
 _LOCK_NEXT_CLAIMABLE_TASK = (
     f"SELECT {TASK_COLUMNS} FROM tasks WHERE state = ANY(%s) "
+    "AND EXISTS (SELECT FROM jobs WHERE jobs.id = tasks.job_id AND jobs.kind = ANY(%s)) "
     "ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
 )
 _CLAIMABLE_STATES = [state.value for state in allowed_sources(TaskState.RUNNING)]
@@ -343,23 +349,60 @@ def start_attempt(
     return attempt
 
 
-def claim_next_attempt(conn: Conn, worker_id: str, *, policy: LeasePolicy) -> Attempt | None:
-    """Claim the next claimable task, start its attempt and return it; ``None`` if none.
+def claim_next_attempt(
+    conn: Conn, worker_id: str, *, kinds: Collection[str], policy: LeasePolicy
+) -> Attempt | None:
+    """Claim the next claimable task of a supported kind, start its attempt and return it.
 
-    In one transaction: lock the first queued task, by ``created_at`` then
-    ``id``, that no other transaction has locked, then claim it exactly as
-    ``start_attempt`` does. It never waits for a row lock: tasks being claimed
-    or cancelled elsewhere are skipped. The order is therefore a preference,
-    not strict FIFO, and ``None`` means "nothing claimable right now", which
-    includes queued tasks that are all locked by others.
+    ``kinds`` names the job kinds the caller can run. It must be a non-empty
+    collection of strings (a bare string is refused, since it would be read as
+    its characters), each a kind a job could have: not blank in the sense of
+    ``jobs_kind_not_blank`` (only spaces count, as for ``btrim``, so a tab or a
+    newline is a kind), and without a NUL character, which PostgreSQL text
+    cannot hold. Kinds match job kinds exactly. They are checked before
+    anything is sent to the database.
+
+    In one transaction: lock the first queued task of one of those kinds, by
+    ``created_at`` then ``id``, that no other transaction has locked, then
+    claim it exactly as ``start_attempt`` does. Tasks of other kinds are never
+    locked or claimed, so they keep their place and their retry budget, and
+    never hold up supported ones. It never waits for a row lock: tasks being
+    claimed or cancelled elsewhere are skipped. The order is therefore a
+    preference, not strict FIFO, and ``None`` means "nothing of these kinds
+    claimable right now", which includes queued tasks that are all locked by
+    others.
     """
+    supported = _supported_kinds(kinds)
     with owned_transaction(conn, "claim_next_attempt") as cur:
-        row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES,)).fetchone()
+        row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES, supported)).fetchone()
         if row is None:
             return None
         attempt = _claim(cur, task_from_row(row), worker_id, policy)
     _log_started(attempt)
     return attempt
+
+
+def _supported_kinds(kinds: object) -> list[str]:
+    """The distinct job kinds a claim may take, checked; raise for anything else."""
+    if isinstance(kinds, str | bytes) or not isinstance(kinds, Collection):
+        msg = f"kinds must be a collection of job kinds, got {type(kinds).__name__}"
+        raise TypeError(msg)
+    if not kinds:
+        msg = "kinds must name at least one supported job kind"
+        raise ValueError(msg)
+    supported: set[str] = set()
+    for kind in kinds:
+        if not isinstance(kind, str):
+            msg = f"each kind must be a str, got {type(kind).__name__}"
+            raise TypeError(msg)
+        if not kind.strip(" "):  # the rule of jobs_kind_not_blank: btrim(kind) <> ''
+            msg = "a kind must not be blank"
+            raise ValueError(msg)
+        if "\x00" in kind:
+            msg = "a kind must not contain a NUL character"
+            raise ValueError(msg)
+        supported.add(kind)
+    return sorted(supported)
 
 
 def _claim(cur: Cursor, task: Task, worker_id: str, policy: LeasePolicy) -> Attempt:
