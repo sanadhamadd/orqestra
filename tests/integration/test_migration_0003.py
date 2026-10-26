@@ -55,6 +55,7 @@ Conn = psycopg.Connection[TupleRow]
 INITIAL, LEASES, GRACE_REASON, *_ = load_migrations()
 UP_TO_0002 = [INITIAL, LEASES]
 BRIEF_GRACE = timedelta(microseconds=1)
+KINDS = ("cancellation",)  # the job kind new_tasks submits
 OLD_REASONS = {"lease_expired", "deadline_exceeded"}
 ALL_REASONS = {reason.value for reason in RevocationReason}
 
@@ -275,7 +276,7 @@ def test_a_retried_upgrade_applies_between_live_transactions_and_work_carries_on
     assert expired.value.reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
     done = complete_attempt(worker, held.id, generation=1, outcome=AttemptSucceeded({"ok": True}))
     assert done.task.state is TaskState.SUCCEEDED
-    claimed = claim_next_attempt(worker, "w", policy=POLICY)
+    claimed = claim_next_attempt(worker, "w", policy=POLICY, kinds=KINDS)
     assert claimed is not None
     assert claimed.task_id == queued.id
     # The request made before the upgrade ends in the new reason after it.
@@ -303,7 +304,9 @@ def upgrade_during_live_work(url: str) -> tuple[list[str], list[str]]:
         idle = random.Random(seed)
         with connect(url) as conn:
             barrier.wait()
-            while (attempt := claim_next_attempt(conn, f"w{seed}", policy=POLICY)) is not None:
+            while (
+                attempt := claim_next_attempt(conn, f"w{seed}", policy=POLICY, kinds=KINDS)
+            ) is not None:
                 # The worker would wind down after a refused heartbeat; it still completes below.
                 with contextlib.suppress(CancellationRequestedError):
                     renew_lease(

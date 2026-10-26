@@ -85,14 +85,17 @@ DEADLINE_EXPIRING = LeasePolicy(
 # Test value only: there is no default cancellation grace period (DEC-040). It
 # is shorter than POLICY's lease, so a request shortens a fresh lease.
 GRACE = timedelta(minutes=1)
+# The job kind new_tasks submits. Discovery claims only the kinds it is given.
+KIND = "invoice_verification"
+KINDS = (KIND,)
 
 
 # --- helpers -----------------------------------------------------------------
 
 
-def new_tasks(db: Conn, *keys: str, max_attempts: int = 3) -> list[Task]:
+def new_tasks(db: Conn, *keys: str, max_attempts: int = 3, kind: str = KIND) -> list[Task]:
     specs = tuple(TaskSpec(key, {"invoice": key}, max_attempts) for key in keys)
-    job = submit_job(db, JobSubmission("invoice_verification", specs)).job
+    job = submit_job(db, JobSubmission(kind, specs)).job
     return list(list_tasks(db, job.id))
 
 
@@ -1222,9 +1225,9 @@ def no_wait(conn: Conn) -> Conn:
     return conn
 
 
-def claim_all(db: Conn, worker_id: str = "w") -> list[Attempt]:
+def claim_all(db: Conn, worker_id: str = "w", kinds: tuple[str, ...] = KINDS) -> list[Attempt]:
     claimed = []
-    while (attempt := claim_next_attempt(db, worker_id, policy=POLICY)) is not None:
+    while (attempt := claim_next_attempt(db, worker_id, policy=POLICY, kinds=kinds)) is not None:
         claimed.append(attempt)
     return claimed
 
@@ -1235,7 +1238,7 @@ def claim_all(db: Conn, worker_id: str = "w") -> list[Attempt]:
 def test_a_queued_task_is_discovered_and_claimed(checked: Conn) -> None:
     # Discovery is global, so this test owns every queued task in its schema.
     task = new_task(checked)
-    attempt = claim_next_attempt(checked, "worker-1", policy=POLICY)
+    attempt = claim_next_attempt(checked, "worker-1", policy=POLICY, kinds=KINDS)
 
     assert attempt is not None
     assert (attempt.task_id, attempt.attempt_number) == (task.id, 1)
@@ -1250,7 +1253,7 @@ def test_a_queued_task_is_discovered_and_claimed(checked: Conn) -> None:
 
 def test_an_empty_queue_returns_none_and_changes_nothing(checked: Conn) -> None:
     before = snapshot(checked)
-    assert claim_next_attempt(checked, "w", policy=POLICY) is None
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
     assert snapshot(checked) == before
 
 
@@ -1268,11 +1271,11 @@ def test_running_and_finished_tasks_are_never_claimed(checked: Conn) -> None:
     assert task_now(checked, exhausted.id).state is TaskState.FAILED
     before = snapshot(checked)
 
-    assert claim_next_attempt(checked, "w", policy=POLICY) is None
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
     assert snapshot(checked) == before
 
     queued = new_task(checked)
-    attempt = claim_next_attempt(checked, "w", policy=POLICY)
+    attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
     assert attempt is not None
     assert attempt.task_id == queued.id
 
@@ -1301,11 +1304,11 @@ def test_a_requeued_task_keeps_its_place(checked: Conn) -> None:
     # again before newer tasks: there is no backoff in this slice.
     first = new_task(checked)
     later = new_task(checked)
-    attempt = claim_next_attempt(checked, "w", policy=POLICY)
+    attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
     assert attempt is not None
     assert attempt.task_id == first.id
     complete(checked, attempt, TRANSIENT)  # requeued
-    again = claim_next_attempt(checked, "w", policy=POLICY)
+    again = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
     assert again is not None
     assert (again.task_id, again.attempt_number) == (first.id, 2)
     assert task_now(checked, later.id).state is TaskState.QUEUED
@@ -1321,7 +1324,7 @@ def test_concurrent_claimants_claim_distinct_tasks(schema_url: str, checked: Con
         results = race(
             schema_url,
             [
-                partial(claim_next_attempt, worker_id=f"w{i}", policy=POLICY)
+                partial(claim_next_attempt, worker_id=f"w{i}", policy=POLICY, kinds=KINDS)
                 for i in range(claimants)
             ],
         )
@@ -1341,7 +1344,7 @@ def test_more_claimants_than_tasks_start_exactly_the_available_attempts(
         results = race(
             schema_url,
             [
-                partial(claim_next_attempt, worker_id=f"w{i}", policy=POLICY)
+                partial(claim_next_attempt, worker_id=f"w{i}", policy=POLICY, kinds=KINDS)
                 for i in range(claimants)
             ],
         )
@@ -1362,10 +1365,10 @@ def test_a_task_being_claimed_is_skipped_without_waiting(
     release = claim_gate("holder")
     holder, skipper = worker(), no_wait(worker())
     with ThreadPoolExecutor(1) as pool:
-        held = pool.submit(claim_next_attempt, holder, "holder", policy=POLICY)
+        held = pool.submit(claim_next_attempt, holder, "holder", policy=POLICY, kinds=KINDS)
         wait_for_lock(checked, holder, "advisory")  # first task locked and claimed, not committed
         attempt = claim_next_attempt(
-            skipper, "skipper", policy=POLICY
+            skipper, "skipper", policy=POLICY, kinds=KINDS
         )  # would raise LockNotAvailable on a wait
         assert attempt is not None
         assert attempt.task_id == second_task.id
@@ -1382,17 +1385,17 @@ def test_returns_none_when_every_queued_task_is_locked(
     release = claim_gate("holder")
     holder, skipper = worker(), no_wait(worker())
     with ThreadPoolExecutor(1) as pool:
-        held = pool.submit(claim_next_attempt, holder, "holder", policy=POLICY)
+        held = pool.submit(claim_next_attempt, holder, "holder", policy=POLICY, kinds=KINDS)
         wait_for_lock(checked, holder, "advisory")
         assert (
-            claim_next_attempt(skipper, "skipper", policy=POLICY) is None
+            claim_next_attempt(skipper, "skipper", policy=POLICY, kinds=KINDS) is None
         )  # queued, but locked: no wait
         release()
         holder_attempt = held.result(timeout=20)
     assert holder_attempt is not None
     assert holder_attempt.task_id == task.id
     # Once committed, the task is running and is not claimable either.
-    assert claim_next_attempt(skipper, "skipper", policy=POLICY) is None
+    assert claim_next_attempt(skipper, "skipper", policy=POLICY, kinds=KINDS) is None
 
 
 # --- discovery: cancellation racing discovery --------------------------------
@@ -1407,10 +1410,12 @@ def test_a_task_being_cancelled_is_skipped_and_never_claimed(
     with ThreadPoolExecutor(1) as pool:
         cancelling = pool.submit(request_cancellation, canceller, task.id, grace=GRACE)
         wait_for_lock(checked, canceller, "advisory")  # task row locked by the cancellation
-        assert claim_next_attempt(claimant, "w", policy=POLICY) is None
+        assert claim_next_attempt(claimant, "w", policy=POLICY, kinds=KINDS) is None
         release()
         assert cancelling.result(timeout=20).outcome is CancellationOutcome.CANCELLED
-    assert claim_next_attempt(claimant, "w", policy=POLICY) is None  # cancelled: never claimable
+    assert (
+        claim_next_attempt(claimant, "w", policy=POLICY, kinds=KINDS) is None
+    )  # cancelled: never claimable
     assert list_attempts(checked, task.id) == ()
 
 
@@ -1421,7 +1426,7 @@ def test_a_cancellation_after_a_claim_is_recorded_as_a_request(
     release = claim_gate("w")
     claimant, canceller = worker(), worker()
     with ThreadPoolExecutor(2) as pool:
-        claiming = pool.submit(claim_next_attempt, claimant, "w", policy=POLICY)
+        claiming = pool.submit(claim_next_attempt, claimant, "w", policy=POLICY, kinds=KINDS)
         wait_for_lock(checked, claimant, "advisory")  # claimed, not committed
         cancelling = pool.submit(request_cancellation, canceller, task.id, grace=GRACE)
         wait_for_lock(checked, canceller, "transactionid")  # waits for the claim
@@ -1444,7 +1449,7 @@ def test_cancellation_racing_discovery_never_yields_an_invalid_claim(
         claimed, cancelled = race(
             schema_url,
             [
-                partial(claim_next_attempt, worker_id="w", policy=POLICY),
+                partial(claim_next_attempt, worker_id="w", policy=POLICY, kinds=KINDS),
                 partial(request_cancellation, task_id=task.id, grace=GRACE),
             ],
         )
@@ -1467,10 +1472,12 @@ def test_a_failed_insert_rolls_back_a_discovered_claim(checked: Conn) -> None:
     task = new_task(checked)
     before = snapshot(checked)
     with pytest.raises(errors.CheckViolation) as info:
-        claim_next_attempt(checked, "   ", policy=POLICY)
+        claim_next_attempt(checked, "   ", policy=POLICY, kinds=KINDS)
     assert info.value.diag.constraint_name == "attempts_worker_id_not_blank"
     assert snapshot(checked) == before  # nothing at all changed: still queued at generation 0
-    attempt = claim_next_attempt(checked, "w", policy=POLICY)  # the generation was not consumed
+    attempt = claim_next_attempt(
+        checked, "w", policy=POLICY, kinds=KINDS
+    )  # the generation was not consumed
     assert attempt is not None
     assert (attempt.task_id, attempt.attempt_number) == (task.id, 1)
 
@@ -1490,7 +1497,7 @@ def test_the_discovered_claim_and_attempt_insert_are_one_transaction(checked: Co
     """)
     task = new_task(checked)
     with pytest.raises(errors.RaiseException, match="task running at generation 1"):
-        claim_next_attempt(checked, "poison", policy=POLICY)
+        claim_next_attempt(checked, "poison", policy=POLICY, kinds=KINDS)
     assert task_now(checked, task.id) == task
     assert list_attempts(checked, task.id) == ()
 
@@ -1501,12 +1508,12 @@ def test_the_discovered_claim_and_attempt_insert_are_one_transaction(checked: Co
 def test_discovery_stops_at_the_retry_budget(checked: Conn) -> None:
     task = new_task(checked, max_attempts=3)
     for number in (1, 2, 3):
-        attempt = claim_next_attempt(checked, "w", policy=POLICY)
+        attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
         assert attempt is not None
         assert (attempt.task_id, attempt.attempt_number) == (task.id, number)
         complete(checked, attempt, TRANSIENT)
     assert task_now(checked, task.id).state is TaskState.FAILED  # exhausted
-    assert claim_next_attempt(checked, "w", policy=POLICY) is None
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
     assert len(list_attempts(checked, task.id)) == 3
 
 
@@ -1518,7 +1525,9 @@ def test_competing_claimants_never_exceed_any_retry_budget(schema_url: str, chec
     def work(conn: Conn) -> int:
         started = 0
         while True:
-            attempt = claim_next_attempt(conn, f"pid-{conn.info.backend_pid}", policy=POLICY)
+            attempt = claim_next_attempt(
+                conn, f"pid-{conn.info.backend_pid}", policy=POLICY, kinds=KINDS
+            )
             if attempt is None:
                 states = conn.execute(
                     "SELECT count(*) FROM tasks "
@@ -1546,7 +1555,7 @@ def test_competing_claimants_never_exceed_any_retry_budget(schema_url: str, chec
 def test_start_attempt_and_discovery_share_one_claim(checked: Conn) -> None:
     targeted, other = sorted(new_tasks(checked, "a", "b"), key=lambda t: t.id)
     started = start_attempt(checked, targeted.id, "explicit", policy=POLICY)
-    discovered = claim_next_attempt(checked, "discovery", policy=POLICY)
+    discovered = claim_next_attempt(checked, "discovery", policy=POLICY, kinds=KINDS)
     assert discovered is not None
     assert discovered.task_id == other.id  # the started task is running, not claimable
     with pytest.raises(TaskNotStartableError):
@@ -1560,7 +1569,7 @@ def test_discovery_refuses_a_caller_transaction(checked: Conn) -> None:
     new_task(checked)
     before = snapshot(checked)
     with checked.transaction(), pytest.raises(RuntimeError, match="outside any open transaction"):
-        claim_next_attempt(checked, "w", policy=POLICY)
+        claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
     assert snapshot(checked) == before
 
 
@@ -1571,14 +1580,14 @@ def test_discovery_ignores_tasks_it_cannot_see_yet(
     submitter = worker()
     with submitter.transaction():
         job_id = uuid.uuid4()
-        submitter.execute("INSERT INTO jobs (id, kind) VALUES (%s, 'k')", (job_id,))
+        submitter.execute("INSERT INTO jobs (id, kind) VALUES (%s, %s)", (job_id, KIND))
         submitter.execute(
             "INSERT INTO tasks (id, job_id, task_key, payload, max_attempts) "
             "VALUES (%s, %s, 't', '{}', 3)",
             (uuid.uuid4(), job_id),
         )
-        assert claim_next_attempt(checked, "w", policy=POLICY) is None
-    attempt = claim_next_attempt(checked, "w", policy=POLICY)
+        assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
+    attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
     assert attempt is not None
 
 
@@ -1589,7 +1598,7 @@ def claim_by(how: str, db: Conn, task: Task, policy: LeasePolicy) -> Attempt:
     """Claim ``task`` by starting it explicitly or by discovery (the only queued task)."""
     if how == "start":
         return start_attempt(db, task.id, "w", policy=policy)
-    attempt = claim_next_attempt(db, "w", policy=policy)
+    attempt = claim_next_attempt(db, "w", policy=policy, kinds=KINDS)
     assert attempt is not None
     assert attempt.task_id == task.id
     return attempt
@@ -1892,7 +1901,7 @@ def test_a_revocation_moves_the_task_by_the_retry_and_cancellation_policy(
     progress = get_job_progress(checked, task.job_id)
     assert progress is not None
     if expected is TaskState.QUEUED:
-        assert claim_next_attempt(checked, "w", policy=POLICY) is not None
+        assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is not None
     else:
         with pytest.raises(TaskNotStartableError):
             start_attempt(checked, task.id, "w", policy=POLICY)
@@ -2337,7 +2346,7 @@ def test_an_ignored_cancellation_is_revoked_when_its_grace_ends(
     final = revocation.task
     assert (final.state, final.attempt_count) == (TaskState.CANCELLED, 1)
     assert final.finished_at == revocation.attempt.finished_at
-    assert claim_next_attempt(checked, "w", policy=POLICY) is None
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
     progress = get_job_progress(checked, task.job_id)
     assert progress is not None
     assert progress.status is JobStatus.CANCELLED
@@ -2617,4 +2626,356 @@ def test_cancellation_heartbeats_completion_and_recovery_never_deadlock(
             assert completion.task.state is TaskState.SUCCEEDED  # a success stands (DEC-020)
             # The attempt is finished, so recovery finds nothing to revoke.
             assert revoke_next_expired(checked) is None
+        assert_invariants(checked)
+
+
+# --- 22. job-kind filtered discovery (DEC-033 amendment) ----------------------
+#
+# Claimants that must not wait run with no_wait(), so any wait for a row lock
+# fails them instead of passing by luck. Other kinds are never locked, so they
+# keep their state, their generation and their place.
+
+OTHER = "purchase_order_matching"
+
+
+def task_rows(db: Conn, tasks: list[Task]) -> list[tuple[Any, ...]]:
+    return db.execute(
+        "SELECT * FROM tasks WHERE id = ANY(%s) ORDER BY id", ([t.id for t in tasks],)
+    ).fetchall()
+
+
+def kind_of(db: Conn, attempt: Attempt) -> str:
+    row = db.execute(
+        "SELECT j.kind FROM tasks t JOIN jobs j ON j.id = t.job_id WHERE t.id = %s",
+        (attempt.task_id,),
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def test_only_tasks_of_supported_kinds_are_claimed(checked: Conn) -> None:
+    unsupported = new_tasks(checked, "o1", "o2", kind=OTHER)
+    supported = new_tasks(checked, "s1", "s2")
+    untouched = task_rows(checked, unsupported)
+
+    claimed = claim_all(checked)
+    assert sorted(a.task_id for a in claimed) == sorted(t.id for t in supported)
+    assert {kind_of(checked, a) for a in claimed} == {KIND}
+    assert claim_next_attempt(checked, "w", kinds=KINDS, policy=POLICY) is None
+    # Never locked or claimed: state, generation and every other column as they were.
+    assert task_rows(checked, unsupported) == untouched
+    assert all(list_attempts(checked, t.id) == () for t in unsupported)
+
+
+def test_a_failed_filtered_claim_rolls_back_and_leaves_every_kind_queued(checked: Conn) -> None:
+    (unsupported,) = new_tasks(checked, "older", kind=OTHER)
+    (supported,) = new_tasks(checked, "newer")
+    before = snapshot(checked)
+    with pytest.raises(errors.CheckViolation) as info:
+        claim_next_attempt(checked, "   ", kinds=KINDS, policy=POLICY)  # the insert fails
+    assert info.value.diag.constraint_name == "attempts_worker_id_not_blank"
+    assert snapshot(checked) == before  # neither task changed, nor any generation
+    attempt = claim_next_attempt(checked, "w", kinds=KINDS, policy=POLICY)
+    assert attempt is not None
+    assert (attempt.task_id, attempt.attempt_number) == (supported.id, 1)
+    assert list_attempts(checked, unsupported.id) == ()
+
+
+def test_an_older_unsupported_task_never_holds_up_supported_work(checked: Conn) -> None:
+    # Older, and with a single attempt it could not afford to lose.
+    (older,) = new_tasks(checked, "older", kind=OTHER, max_attempts=1)
+    (newer,) = new_tasks(checked, "newer")
+    before = task_rows(checked, [older])
+
+    attempt = claim_next_attempt(checked, "w", kinds=KINDS, policy=POLICY)
+    assert attempt is not None
+    assert attempt.task_id == newer.id  # the older task is passed over, not claimed
+    complete(checked, attempt, SUCCESS)
+    for _ in range(3):  # claiming again and again never reaches it either
+        assert claim_next_attempt(checked, "w", kinds=KINDS, policy=POLICY) is None
+    assert task_rows(checked, [older]) == before  # still queued at generation 0
+
+    # A claimant that supports its kind still finds it, with its budget intact.
+    attempt = claim_next_attempt(checked, "w", kinds=(OTHER,), policy=POLICY)
+    assert attempt is not None
+    assert (attempt.task_id, attempt.attempt_number) == (older.id, 1)
+
+
+def test_a_claimant_supporting_several_kinds_keeps_the_age_order(checked: Conn) -> None:
+    first = new_tasks(checked, "a", kind=OTHER)
+    second = new_tasks(checked, "b")
+    third = new_tasks(checked, "c", kind=OTHER)
+    claimed = [a.task_id for a in claim_all(checked, kinds=(KIND, OTHER))]
+    assert claimed == [t.id for t in (*first, *second, *third)]  # created_at, then id
+
+
+@pytest.mark.parametrize(
+    ("job_kind", "kinds", "claimed"),
+    [
+        ("invoice", ("Invoice",), False),  # case-sensitive
+        ("invoice", ("invoice ",), False),  # no trimming
+        ("invoice", ("%",), False),  # no wildcards
+        ("invoice", ("inv",), False),  # no prefixes
+        ("in%oice", ("in%oice",), True),  # special characters are plain text
+        ("invoice", ("other", "invoice"), True),
+        ("\t", ("\t",), True),  # a tab is a kind, as the database allows
+        ("\n", ("\n",), True),  # so is a newline
+        ("\t", ("\n",), False),
+        ("a\tb", ("a b",), False),  # a tab is not a space
+        ("invoice\n", ("invoice",), False),  # nor is a trailing newline trimmed
+    ],
+    ids=[
+        "case",
+        "whitespace",
+        "wildcard",
+        "prefix",
+        "literal-percent",
+        "one-of-several",
+        "tab",
+        "newline",
+        "tab-is-not-newline",
+        "tab-is-not-space",
+        "newline-not-trimmed",
+    ],
+)
+def test_kinds_match_job_kinds_exactly(
+    checked: Conn, job_kind: str, kinds: tuple[str, ...], claimed: bool
+) -> None:
+    (task,) = new_tasks(checked, "t", kind=job_kind)
+    attempt = claim_next_attempt(checked, "w", kinds=kinds, policy=POLICY)
+    assert (attempt is not None) is claimed
+    if attempt is not None:
+        assert attempt.task_id == task.id
+
+
+@pytest.mark.parametrize(
+    ("kinds", "error", "message"),
+    [
+        ([], ValueError, "at least one"),
+        ((), ValueError, "at least one"),
+        (set(), ValueError, "at least one"),
+        (frozenset(), ValueError, "at least one"),
+        ("invoice_verification", TypeError, "collection of job kinds"),
+        (b"invoice_verification", TypeError, "collection of job kinds"),
+        (None, TypeError, "collection of job kinds"),
+        (42, TypeError, "collection of job kinds"),
+        (iter([KIND]), TypeError, "collection of job kinds"),
+        ([""], ValueError, "must not be blank"),
+        ([" "], ValueError, "must not be blank"),
+        (["   "], ValueError, "must not be blank"),
+        ([KIND, ""], ValueError, "must not be blank"),
+        (["\x00"], ValueError, "NUL character"),
+        (["invoice\x00verification"], ValueError, "NUL character"),
+        ([KIND, "\x00"], ValueError, "NUL character"),
+        ([None], TypeError, "must be a str"),
+        ([1], TypeError, "must be a str"),
+    ],
+    ids=[
+        "empty-list",
+        "empty-tuple",
+        "empty-set",
+        "empty-frozenset",
+        "bare-str",
+        "bytes",
+        "none",
+        "int",
+        "iterator",
+        "blank",
+        "space",
+        "spaces",
+        "one-blank",
+        "nul",
+        "embedded-nul",
+        "one-nul",
+        "none-item",
+        "int-item",
+    ],
+)
+def test_invalid_kinds_are_refused_before_any_database_work(
+    checked: Conn, kinds: Any, error: type[Exception], message: str
+) -> None:
+    new_tasks(checked, "t")
+    before = snapshot(checked)
+    with pytest.raises(error, match=message):
+        claim_next_attempt(checked, "w", kinds=kinds, policy=POLICY)
+    # Inside a caller's transaction the validation error still comes first,
+    # before the transaction guard or any statement is reached.
+    with checked.transaction(), pytest.raises(error, match=message):
+        claim_next_attempt(checked, "w", kinds=kinds, policy=POLICY)
+    assert snapshot(checked) == before
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [" ", "   ", "\t", "\n", "\r\n", " \t ", "\u00a0", " x "],
+    ids=["space", "spaces", "tab", "newline", "crlf", "spaced-tab", "nbsp", "spaced"],
+)
+def test_a_kind_is_refused_as_blank_exactly_when_the_database_refuses_it(
+    checked: Conn, kind: str
+) -> None:
+    # jobs_kind_not_blank is btrim(kind) <> '', and btrim trims spaces only.
+    row = checked.execute("SELECT btrim(%s) <> ''", (kind,)).fetchone()
+    assert row is not None
+    if not row[0]:
+        with pytest.raises(errors.CheckViolation, match="jobs_kind_not_blank"):
+            new_tasks(checked, "t", kind=kind)
+        with pytest.raises(ValueError, match="must not be blank"):
+            claim_next_attempt(checked, "w", kinds=(kind,), policy=POLICY)
+        return
+    (task,) = new_tasks(checked, "t", kind=kind)
+    attempt = claim_next_attempt(checked, "w", kinds=(kind,), policy=POLICY)
+    assert attempt is not None
+    assert attempt.task_id == task.id
+
+
+def test_repeated_kinds_are_accepted(checked: Conn) -> None:
+    (task,) = new_tasks(checked, "t")
+    attempt = claim_next_attempt(checked, "w", kinds=[KIND, KIND], policy=POLICY)
+    assert attempt is not None
+    assert attempt.task_id == task.id
+
+
+def test_a_task_being_claimed_is_skipped_by_every_kind_without_waiting(
+    checked: Conn, claim_gate: Callable[[str], Callable[[], None]], worker: Callable[[], Conn]
+) -> None:
+    held_task, next_task = sorted(new_tasks(checked, "a", "b"), key=lambda t: t.id)
+    (other_task,) = new_tasks(checked, "o", kind=OTHER)
+    release = claim_gate("holder")
+    holder, same_kind, other_kind = worker(), no_wait(worker()), no_wait(worker())
+    with ThreadPoolExecutor(1) as pool:
+        held = pool.submit(claim_next_attempt, holder, "holder", kinds=KINDS, policy=POLICY)
+        wait_for_lock(checked, holder, "advisory")  # first task locked and claimed, not committed
+        # Neither claimant waits: one skips the held task, the other never considers it.
+        attempt = claim_next_attempt(same_kind, "w", kinds=KINDS, policy=POLICY)
+        assert attempt is not None
+        assert attempt.task_id == next_task.id
+        other = claim_next_attempt(other_kind, "w", kinds=(OTHER,), policy=POLICY)
+        assert other is not None
+        assert other.task_id == other_task.id
+        assert claim_next_attempt(same_kind, "w", kinds=KINDS, policy=POLICY) is None
+        release()
+        holder_attempt = held.result(timeout=20)
+    assert holder_attempt is not None
+    assert holder_attempt.task_id == held_task.id
+
+
+def test_a_claim_takes_no_lock_on_the_job_row(
+    checked: Conn, claim_gate: Callable[[str], Callable[[], None]], worker: Callable[[], Conn]
+) -> None:
+    lock_job = "SELECT FROM jobs WHERE id = %s FOR UPDATE NOWAIT"
+    first, second = sorted(new_tasks(checked, "a", "b"), key=lambda t: t.id)
+    # A job row held in the strongest row-lock mode does not stop a claim of
+    # its task: a claim that locked the job would wait (failing at once under
+    # no_wait), or with SKIP LOCKED pass over the task and return None.
+    other = worker()
+    with other.transaction():
+        other.execute(lock_job, (first.job_id,))
+        attempt = claim_next_attempt(no_wait(worker()), "w", kinds=KINDS, policy=POLICY)
+        assert attempt is not None
+        assert attempt.task_id == first.id
+    # And the other way round: while a claim holds its task row, mid-claim,
+    # the job row can still be locked by anyone, without waiting.
+    release = claim_gate("holder")
+    holder = worker()
+    with ThreadPoolExecutor(1) as pool:
+        held = pool.submit(claim_next_attempt, holder, "holder", kinds=KINDS, policy=POLICY)
+        wait_for_lock(checked, holder, "advisory")  # task locked and claimed, not committed
+        with other.transaction():
+            other.execute(lock_job, (second.job_id,))  # raises LockNotAvailable if held
+        release()
+        holder_attempt = held.result(timeout=20)
+    assert holder_attempt is not None
+    assert holder_attempt.task_id == second.id
+
+
+def test_an_eligible_task_is_claimed_past_earlier_candidates_locked_by_others(
+    checked: Conn, claim_gate: Callable[[str], Callable[[], None]], worker: Callable[[], Conn]
+) -> None:
+    # In claim order: two supported tasks held mid-claim by two claimants (one
+    # supporting both kinds), an unsupported task, then the one left to claim.
+    first, second = sorted(new_tasks(checked, "a", "b"), key=lambda t: t.id)
+    (unsupported,) = new_tasks(checked, "o", kind=OTHER)
+    (last,) = new_tasks(checked, "z")
+    untouched = task_rows(checked, [unsupported])
+    gates = [claim_gate("h1"), claim_gate("h2")]
+    holders = [worker(), worker()]
+    with ThreadPoolExecutor(2) as pool:
+        held = []
+        for worker_id, holder, kinds in zip(
+            ("h1", "h2"), holders, (KINDS, (KIND, OTHER)), strict=True
+        ):
+            held.append(
+                pool.submit(claim_next_attempt, holder, worker_id, kinds=kinds, policy=POLICY)
+            )
+            wait_for_lock(checked, holder, "advisory")  # its task locked, not committed
+        attempt = claim_next_attempt(no_wait(worker()), "w", kinds=KINDS, policy=POLICY)
+        assert attempt is not None
+        assert (attempt.task_id, attempt.attempt_number) == (last.id, 1)
+        for release in gates:
+            release()
+        held_attempts = [f.result(timeout=20) for f in held]
+    assert [a.task_id if a else None for a in held_attempts] == [first.id, second.id]
+    assert task_rows(checked, [unsupported]) == untouched  # still queued at generation 0
+
+
+def test_concurrent_claimants_of_disjoint_kinds_claim_only_their_own(
+    schema_url: str, checked: Conn
+) -> None:
+    rounds, per_kind = 20, 4
+    for n in range(rounds):
+        mine = new_tasks(checked, *[f"r{n}-k{i}" for i in range(per_kind)])
+        theirs = new_tasks(checked, *[f"r{n}-o{i}" for i in range(per_kind)], kind=OTHER)
+        claimants = [(KIND,)] * per_kind + [(OTHER,)] * per_kind
+        results = race(
+            schema_url,
+            [
+                partial(claim_next_attempt, worker_id=f"w{i}", kinds=k, policy=POLICY)
+                for i, k in enumerate(claimants)
+            ],
+        )
+        # One eligible task per claimant of each kind, so every claimant gets one.
+        assert all(isinstance(r, Attempt) for r in results)
+        for kinds, attempt in zip(claimants, results, strict=True):
+            assert kind_of(checked, attempt) in kinds
+            assert attempt.attempt_number == 1
+        claimed = sorted(a.task_id for a in results)
+        assert claimed == sorted(t.id for t in (*mine, *theirs))  # each exactly once
+        assert_invariants(checked)
+
+
+def test_concurrent_claimants_of_overlapping_kinds_never_share_a_generation(
+    schema_url: str, checked: Conn
+) -> None:
+    # Which claimant takes which task depends on the schedule and is not
+    # asserted; what holds for every schedule is.
+    rounds = 20
+    claimants = [(KIND,)] * 2 + [(OTHER,)] * 2 + [(KIND, OTHER)] * 4
+    for n in range(rounds):
+        tasks = [
+            *new_tasks(checked, *[f"r{n}-k{i}" for i in range(3)]),
+            *new_tasks(checked, *[f"r{n}-o{i}" for i in range(3)], kind=OTHER),
+        ]
+        results = race(
+            schema_url,
+            [
+                partial(claim_next_attempt, worker_id=f"w{i}", kinds=k, policy=POLICY)
+                for i, k in enumerate(claimants)
+            ],
+        )
+        attempts = [r for r in results if isinstance(r, Attempt)]
+        assert all(r is None or isinstance(r, Attempt) for r in results)
+        for kinds, result in zip(claimants, results, strict=True):
+            if isinstance(result, Attempt):
+                assert kind_of(checked, result) in kinds
+        task_ids = [a.task_id for a in attempts]
+        assert len(task_ids) == len(set(task_ids))  # no task claimed twice
+        # A claimant returns None only once every task of its kinds is taken.
+        # Each task has six eligible claimants but only five other tasks exist,
+        # so in every schedule every task is claimed and two claimants get None.
+        assert sorted(task_ids) == sorted(t.id for t in tasks)
+        assert results.count(None) == len(claimants) - len(tasks)
+        assert {a.attempt_number for a in attempts} <= {1}
+        for task in tasks:
+            now = task_now(checked, task.id)
+            assert (now.state, now.attempt_count) == (TaskState.RUNNING, 1)
         assert_invariants(checked)

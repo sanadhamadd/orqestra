@@ -33,6 +33,7 @@ INITIAL, LEASES, *_ = load_migrations()
 # These tests are about the upgrade from 0001 to 0002, so they apply exactly
 # that; later migrations have their own tests.
 UP_TO_0002 = [INITIAL, LEASES]
+LEGACY_KINDS = ("legacy",)  # the job kind legacy_job inserts
 LEASE_COLUMNS = ("lease_expires_at", "deadline_at", "revoked_reason")
 
 
@@ -252,13 +253,15 @@ def test_upgrades_a_quiescent_database_and_keeps_its_history(
     # The upgraded schema serves the new code: both queued tasks are claimable.
     claimed = {
         a.task_id: a
-        for a in (claim_next_attempt(conn, "w", policy=POLICY) for _ in range(2))
+        for a in (
+            claim_next_attempt(conn, "w", policy=POLICY, kinds=LEGACY_KINDS) for _ in range(2)
+        )
         if a is not None
     }
     assert set(claimed) == {requeued, queued}
     assert claimed[requeued].attempt_number == 2
     assert all(a.lease_expires_at is not None for a in claimed.values())
-    assert claim_next_attempt(conn, "w", policy=POLICY) is None
+    assert claim_next_attempt(conn, "w", policy=POLICY, kinds=LEGACY_KINDS) is None
     assert_invariants(conn)
 
 

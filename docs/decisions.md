@@ -308,18 +308,32 @@ lifecycle policy functions and transition tables are unchanged.
 
   Locally, replacing `SKIP LOCKED` with a waiting `FOR UPDATE` failed 3 tests, removing the row lock failed 7 (the fencing trigger rejected the colliding claims), claiming from any state failed 11, removing the ordering failed 2, and removing the owned transaction failed 11.
 - **Day 3A Slice 2 note:** the lease migration (0002, DEC-039) does not add the claim-ordering index: it is a performance change and stays deferred until measured. Claims now take a lease policy (DEC-034), and a revoked task is requeued with its original `created_at`, so it too is claimed again without backoff.
+- **Day 3B Slice 1A note (job-kind filter):** Proposed · owner-approved scope (2026-10-26) · implemented locally, not yet in CI.
+  - **WHAT:** `claim_next_attempt(conn, worker_id, *, kinds, policy)` takes a required, non-empty collection of supported job kinds. Discovery adds `AND EXISTS (SELECT FROM jobs WHERE jobs.id = tasks.job_id AND jobs.kind = ANY(<kinds>))` to the same `FOR UPDATE SKIP LOCKED` query, so the filter is part of the atomic claim; ordering, the task-before-attempt lock order, `_claim`, fencing and the owned transaction are unchanged. Kinds match exactly. A bare string or bytes, a non-collection, an empty collection, a non-string kind, a blank kind or a kind with a NUL character raises `TypeError` or `ValueError` before any statement is sent; duplicates are accepted and collapsed. "Blank" is the database's rule for job kinds, `jobs_kind_not_blank` (`btrim(kind) <> ''`, where `btrim` trims spaces only), checked in Python as `kind.strip(" ")`, so every kind a job can have can be claimed, including one containing a tab or a newline. There is no unfiltered claim.
+  - **WHY:** A worker can only run the kinds it has handlers for. Without the filter it would claim a task it cannot run, and could only fail or release it: that uses an attempt of the task's budget, records an outcome that says nothing about the task, and, because a requeued task keeps its place, can hold up the work behind it. Filtering inside the locking query means a claimant never locks, counts or reorders a task it cannot run.
+  - **RUNNER-UP:** Denormalising the kind onto `tasks` (a `tasks.kind` column, possibly indexed with the claim order) avoids the per-candidate join, but needs a migration and a copy of an immutable job fact; deferred until claim cost is measured. Also rejected: one catch-all handler per worker, or filtering after the claim (which uses budget), or an optional `kinds` defaulting to "any" (a silent, unsafe fallback).
+  - **TRADE-OFF:**
+    - Breaking API change: every caller must name its kinds.
+    - The SQL guarantees only which task is locked: the first queued task of a supported kind, by `created_at` then `id`, not locked elsewhere. How the planner evaluates the `EXISTS` (for example per candidate or as a semi-join), and what a backlog of unsupported tasks costs, has not been measured; it should be judged from reproducible query plans and a benchmark when claim cost matters, before any index or denormalisation.
+    - The job row is read without a lock and is not re-checked once the task is locked. That is correct only while a job's kind never changes. No application code path updates `jobs.kind`, but the database does not enforce it: there is no trigger or permission against it (adding one needs a migration, out of scope here).
+    - A task whose kind no worker supports waits forever; detecting that is left to monitoring, which does not exist yet.
+    - Within a claimant's kinds the order is still `created_at`, then `id`; there is no per-kind fairness or priority.
+  - **VERIFICATION:** `tests/integration/test_attempt_lifecycle.py`, section 22 (13 tests, 47 cases): only supported kinds are claimed; a failed filtered claim rolls back completely; a kind is refused as blank exactly when PostgreSQL's own `btrim` rule refuses it (8 samples: only spaces are refused; tabs, newlines, CRLF and a no-break space are kinds); tabs and newlines match exactly and are never trimmed or confused with spaces; NUL characters are refused before any statement; a claim takes no lock on the job row, in either direction, under `lock_timeout` and `NOWAIT`; an eligible task is claimed past earlier candidates held mid-claim by two other claimants and an unsupported task; an older unsupported task with one attempt left never holds up newer supported work and keeps its state, generation and budget, then is claimed at generation 1 by a claimant supporting it; several kinds keep the age order; exact matching (case, whitespace, wildcard, prefix, literal `%`); 18 invalid inputs refused before any database work, also inside a caller's transaction, leaving every row unchanged; repeated kinds accepted; a gated claim is skipped without waiting by claimants of the same and another kind; 20 rounds of concurrent claimants of disjoint kinds each take only their own kind, and 20 rounds of overlapping kinds never claim a task twice and, as holds for every schedule, claim every task. The existing section 16 and Day 3A tests pass with `kinds` added.
+
+    Locally, each of these mutations failed at least one section-22 test: blank checked with `strip()` (8 tests), no NUL check (3), the `EXISTS` taking `FOR SHARE` on `jobs` (1), a `FOR KEY SHARE` lock on the job after discovery (1), a waiting `FOR UPDATE` (3), and no kind filter (28).
 
 ## Day 3A — Slice 2: attempt leases, execution deadlines and recovery
 
 Entries DEC-034 to DEC-039 record the Slice 2 design the owner approved on 2026-10-26 after
 an architecture audit, an independent review and a PostgreSQL locking investigation. They
 stay **Proposed** until the owner accepts them in a reviewed change. "Implemented" means
-verified locally by the tests named; none of this has run in GitHub CI yet. These are
+verified by the tests named, locally and in GitHub CI: Slice 2 was merged in PR #6
+(`a031666`), with both CI jobs passing for `main` (run 40260902718). These are
 building blocks: there is no worker loop, nothing schedules recovery, and a revoked worker
 is not stopped (Day 3B).
 
 ### DEC-034 — Attempt leases with a non-renewable execution deadline, under an explicit policy
-- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`orqestra.domain.leases`, migration 0002)
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented (`orqestra.domain.leases`, migration 0002)
 - **WHAT:** Each attempt stores `lease_expires_at` and `deadline_at`, set at claim from one instant: the deadline is the claim instant plus `execution_timeout`, the lease the claim instant plus `lease`, capped at the deadline. A heartbeat sets the lease to `policy.lease` from now, capped at the deadline and never lower than before. The deadline never changes, enforced by the trigger `attempts_deadline_immutable`. An attempt may be revoked once the database time reaches `lease_expires_at`. The reason follows from the stored facts: a lease that reached its deadline cap means `deadline_exceeded`, any other expired lease `lease_expired`. `LeasePolicy(lease, execution_timeout)` is a required keyword argument of `start_attempt` and `claim_next_attempt`. Both values must be positive `timedelta`s within the representable range, `lease` cannot exceed `execution_timeout`, and a deadline beyond `datetime`'s range rolls the claim back with `ValueError`. There are no defaults.
 - **WHY:** A heartbeat proves that a worker is alive, not that its work progresses: a worker whose handler hangs can renew its lease forever. A deadline that no heartbeat can extend bounds that case (R-EXEC-04). Capping the lease at the deadline leaves recovery with one predicate. Keeping leases on the attempt keeps, with each attempt's history, the facts its revocation was decided on. The policy is required because an optional "no lease" would bring back work that nobody recovers, and numeric defaults are an operational decision not yet made.
 - **RUNNER-UP:** The lease on the task row: one place to look, but it loses per-attempt history. An independent deadline checked beside the lease: two predicates, and a precedence rule when both have expired. Defaults in `Settings`: convenient, but they invent operational values.
@@ -332,7 +346,7 @@ is not stopped (Day 3B).
 - **Day 3A Slice 3 note:** the revocation reason has a third case. In order: a lease at its deadline is `deadline_exceeded`; otherwise a lease that ended after a cancellation request made while it held is `cancellation_grace_expired`; otherwise `lease_expired`. A cancellation request is the one write besides a heartbeat that sets the lease, and it may shorten it (DEC-040).
 
 ### DEC-035 — One claim instant, and a database clock read after the locks
-- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented
 - **WHAT:** The claim's `UPDATE tasks … SET updated_at = statement_timestamp() … RETURNING updated_at` is the claim instant. It becomes the attempt's `started_at` and the base of its lease and deadline. `renew_lease` and `revoke_next_expired` read `statement_timestamp()` in a separate statement after taking the row locks their decision depends on, and decide expiry in Python against the freshly locked rows. Other timestamps still use `now()`.
 - **WHY:** `now()` is fixed when the transaction starts, before any lock wait. A claim that waited for a task row would get a shorter lease, possibly one that had already expired by its commit. The claim `UPDATE` runs after the task lock is held on both claim paths, so its statement timestamp leaves the wait out. One value keeps `started_at`, the lease, the deadline and the task's `updated_at` consistent. Reading the clock after the locks means a decision is never older than the rows it compares.
 - **RUNNER-UP:** `clock_timestamp()` captured once after the lock: equally fresh, but evaluated on every call, so a later edit could give the columns different instants. `statement_timestamp()` of the locking statement: taken before that statement's own wait.
@@ -341,7 +355,7 @@ is not stopped (Day 3B).
 - **Day 3A Slice 3 note:** a cancellation request's instant (`cancel_requested_at`, and for a queued task `finished_at` and `updated_at`) is now `statement_timestamp()` of its task update, taken after its locks, because the revocation reason compares it with the lease (DEC-040).
 
 ### DEC-036 — The heartbeat renews under the attempt lock alone and refuses expired leases
-- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`renew_lease`)
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented (`renew_lease`)
 - **WHAT:** `renew_lease(conn, attempt_id, *, generation, worker_id, policy)` locks only the attempt row. It checks the generation, the worker, that the attempt is running and that its lease has not expired, then writes the renewed lease. It rejects with `NotFoundError`, `StaleAttemptError`, `WorkerMismatchError`, `AttemptRevokedError`, `AttemptFinishedError` or `LeaseExpiredError` (with the reason), changing nothing. To describe a stale rejection it reads the task's generation without a lock.
 - **WHY:** Heartbeats are the most frequent write. A transaction that holds a single row lock and never waits for another while holding it cannot take part in a lock cycle with the task-first operations. The heartbeat does not update `task_id`, so the foreign-key check takes no lock on the task, and the deadline trigger does not read `tasks`. Refusing to renew an expired lease makes eligibility monotonic: once recovery may revoke an attempt, nothing makes it ineligible again, and the worker learns at once that it must stop.
 - **RUNNER-UP:** Lock the task, then the attempt, like the other writes: also free of deadlocks, but it contends with every writer of the task. Accept renewals until a revocation commits (proposed during the audit): saves a late heartbeat, but recovery eligibility could flip back.
@@ -356,7 +370,7 @@ is not stopped (Day 3B).
 - **Day 3A Slice 3 note:** the heartbeat also reads the task's `cancel_requested_at` without a lock, in the statement that reads the clock after the attempt lock, and refuses renewal with `CancellationRequestedError` once a request has committed. It still takes no task lock (DEC-040).
 
 ### DEC-037 — Recovery revokes one expired attempt per transaction; ownership ends at its commit
-- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`revoke_next_expired`)
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented (`revoke_next_expired`)
 - **WHAT:** `revoke_next_expired(conn)` works in five steps:
   1. Lock, with `FOR UPDATE OF t SKIP LOCKED`, the task of the most overdue running attempt whose lease has expired.
   2. Lock that attempt.
@@ -387,7 +401,7 @@ is not stopped (Day 3B).
   - Locally, mutants that skip the re-check, drop `SKIP LOCKED`, stop locking the task, or report a revoked completion as a plain finished one each fail tests.
 
 ### DEC-038 — Revoked attempts: a distinct state; the task follows the transient-failure rule
-- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented
 - **WHAT:** `AttemptState.REVOKED` is terminal and carries `revoked_reason`; it has no failure kind or error details. For a revoked attempt, `next_task_state` returns `queued` while attempts remain (`cancelled` if a request is pending) and `failed` once none remain, whether or not a request is pending.
 - **WHY:**
   - DEC-009: lost ownership is a recovery event, not a handler failure, so the attempt records what happened.
@@ -402,7 +416,7 @@ is not stopped (Day 3B).
 - **Day 3A Slice 3 note:** the anticipated rule now exists: a `cancellation_grace_expired` revocation cancels the task whatever budget is left, and requires a pending request. `next_task_state` takes the revocation reason for every revoked outcome (DEC-040).
 
 ### DEC-039 — Migration 0002: additive schema and a quiescent upgrade with `NOWAIT` locks
-- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`0002_attempt_leases.sql`)
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented (`0002_attempt_leases.sql`)
 - **WHAT:** Migration 0002 runs in order:
   1. Require READ COMMITTED.
   2. `LOCK TABLE tasks IN EXCLUSIVE MODE NOWAIT`, then `LOCK TABLE attempts IN ACCESS EXCLUSIVE MODE NOWAIT`. If either fails, raise `lock_not_available` (`55P03`) with an operator message.
@@ -433,12 +447,14 @@ is not stopped (Day 3B).
 
 Entries DEC-040 and DEC-041 record the Slice 3 design the owner approved after an
 architecture review and an independent review. They stay **Proposed** until the owner
-accepts them in a reviewed change; "implemented" means verified locally by the tests
-named, not yet in GitHub CI. The worker's response to a cancellation, handler
+accepts them in a reviewed change; "implemented" means verified by the tests named,
+locally and in GitHub CI: Slice 3 was merged in PR #7 (`d83afeb`), with both CI jobs
+passing for the pull request (run 40271111779) and for `main` after the merge (run
+40271850302). The worker's response to a cancellation, handler
 interruption and scheduled recovery remain Day 3B.
 
 ### DEC-040 — A cancellation request sets the running attempt's lease to a grace period
-- **Status:** Proposed · owner-approved direction · implemented locally
+- **Status:** Proposed · owner-approved direction · implemented
 - **WHAT:** `request_cancellation(conn, task_id, *, grace)` requires a positive, representable `timedelta`, checked before any write, with no default. For a running task, in one transaction, it:
   1. locks the task, then its running attempt;
   2. records `cancel_requested_at` at one instant taken after those locks;
@@ -480,7 +496,7 @@ interruption and scheduled recovery remain Day 3B.
   - Locally, 17 mutants, including a heartbeat that ignores the request, a request that does not lock the attempt or does not reset the lease, a request that revives an expired lease, swapped precedence, a budget-dependent outcome, a request timed by `now()`, and a heartbeat that locks the task, each fail tests.
 
 ### DEC-041 — Migration 0003 widens the revocation reasons; versions switch together
-- **Status:** Proposed · owner-approved direction · implemented locally (`0003_cancellation_grace.sql`)
+- **Status:** Proposed · owner-approved direction · implemented (`0003_cancellation_grace.sql`)
 - **WHAT:** 0003 takes `LOCK TABLE attempts IN ACCESS EXCLUSIVE MODE NOWAIT` (`55P03` with an operator message if any session uses it), then replaces `attempts_revoked_reason_valid` to admit `cancellation_grace_expired`. It keeps `attempts_revoked_reason_matches_lease`, which already admits the new reason exactly when the lease ended before the deadline, and every other 0002 constraint and trigger. It adds no column or index, takes no `tasks` lock, has no running-work refusal and no isolation check. Rollout: stop all application processes → apply 0003 → start only Slice 3 code; draining first is preferable.
 - **WHY:**
   - Every stored row satisfies the widened rule and running attempts are unaffected, so the schema change needs no quiescence.

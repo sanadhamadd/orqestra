@@ -21,9 +21,10 @@ CI lanes passing for the pull request and for `main`. Day 3A Slice 1 (PostgreSQL
 discovery) was merged in PR #5, with both CI lanes passing for `main` (run 40209662634).
 Day 3A Slice 2 (attempt leases, execution deadlines, heartbeats and recovery operations,
 with migration 0002) was merged in PR #6, with both CI lanes passing for `main` (run
-40260902718). Day 3A Slice 3 (bounded cancellation grace periods, with migration 0003) is
-implemented and verified locally only; it has not yet run in GitHub CI. No benchmark has
-been run. Nothing in the planned column exists yet; do not read it as a
+40260902718). Day 3A Slice 3 (bounded cancellation grace periods, with migration 0003)
+was merged in PR #7 (merge commit `d83afeb`), with both CI lanes passing for the pull
+request (run 40271111779) and for `main` after the merge (run 40271850302). No benchmark
+has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
@@ -153,8 +154,17 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   `timedelta`s, with the lease no longer than the timeout. The attempt gets a lease and a
   non-renewable deadline, both measured from one claim instant on the database clock, read
   after the task lock is held, so waiting for that lock does not shorten the lease.
-- `claim_next_attempt(conn, worker_id, policy=...)` finds the next queued task and claims it the same
-  way, returning its attempt, or `None` when nothing is claimable right now. It locks
+- `claim_next_attempt(conn, worker_id, kinds=..., policy=...)` finds the next queued task
+  whose job kind is one of `kinds` and claims it the same way, returning its attempt, or
+  `None` when nothing of those kinds is claimable right now. `kinds` is required: a
+  non-empty collection of strings, matched exactly (no case folding, trimming or
+  wildcards). A bare string, an empty collection, a kind of only spaces or a kind with a
+  NUL character is refused before anything is sent to the database; there is no
+  unfiltered claim. "Blank" follows the database rule for job kinds (`btrim`, which trims
+  spaces only), so a kind containing a tab or a newline is valid and must be named exactly.
+  Tasks of other kinds are
+  never locked or claimed: they stay queued with their attempt budget intact and do not
+  hold up the kinds a claimant supports. It locks
   with `FOR UPDATE SKIP LOCKED`, so it never waits for another claimant or a cancellation,
   and concurrent claimants always get distinct tasks. Tasks are preferred by
   `created_at`, then `id`. This is not strict FIFO: tasks locked by others are skipped, and
@@ -235,6 +245,11 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   claim scans and sorts the queued tasks; there is no index for it yet (deferred until it
   is measured). `None` from `claim_next_attempt` or `revoke_next_expired` means only that
   nothing was claimed or revoked by that call.
+- A task whose job kind no claimant supports stays `queued` indefinitely: nothing reports
+  or expires it yet. Each claim now also reads the job of the queued tasks it considers;
+  how PostgreSQL plans that, and what unsupported backlogs cost, has not been measured.
+- The claim reads a job's kind without locking the job, which relies on kinds never
+  changing. No code path updates a job's kind, but the database does not forbid it.
 - Cancellation is bounded by the grace period only at the database: nothing tells a
   worker except a refused heartbeat, nothing interrupts its handler, and nothing revokes
   the attempt until some caller runs recovery (Day 3B). There are no default or maximum
