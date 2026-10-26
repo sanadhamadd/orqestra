@@ -17,6 +17,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import ClassVar
 
+from orqestra.domain.leases import RevocationReason
 from orqestra.domain.policy import FailureKind, classify_failure
 from orqestra.domain.states import AttemptState, TaskState
 
@@ -97,6 +98,10 @@ class Attempt:
     ``attempt_number`` is the generation the attempt holds: attempt N was
     started when the task's ``attempt_count`` became N, and only it may write
     the task's outcome while that is still the current generation (ADR-0003).
+
+    ``lease_expires_at`` and ``deadline_at`` are set for every attempt claimed
+    since migration 0002, and only for those; ``revoked_reason`` is set exactly
+    when ``state`` is ``REVOKED``.
     """
 
     id: uuid.UUID
@@ -109,6 +114,9 @@ class Attempt:
     error_message: str | None
     started_at: datetime
     finished_at: datetime | None
+    lease_expires_at: datetime | None
+    deadline_at: datetime | None
+    revoked_reason: RevocationReason | None
 
 
 @dataclass(frozen=True, slots=True)

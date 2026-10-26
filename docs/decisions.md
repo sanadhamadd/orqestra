@@ -5,7 +5,8 @@ decision: every entry stays **Proposed** until the owner marks it **Accepted** i
 reviewed change. Trivial edits are not logged. Cross-cutting choices also get an ADR.
 
 Deliberately **undecided** (do not infer a choice from the code): API framework, worker
-hosting, AI provider and models, asyncio vs threads for worker slots. The DB driver,
+hosting, AI provider and models, asyncio vs threads for worker slots, operational lease
+and execution-timeout values and any per-job-kind policy (DEC-034). The DB driver,
 migration tool and task queue are no longer open: see DEC-016, DEC-017 and DEC-033.
 
 ## Day 1 — repository foundation
@@ -66,6 +67,7 @@ migration tool and task queue are no longer open: see DEC-016, DEC-017 and DEC-0
 - **WHY:** Retrying a defect spends time and AI budget and hides the bug; transient classes must be opted into explicitly.
 - **RUNNER-UP:** Retry everything except known-permanent errors — more forgiving, more expensive, masks defects.
 - **Day 2 clarification (owner-approved direction, 2026-10-24):** the rule applies to exceptions raised by task handlers, classified by `classify_failure` as transient, permanent or unclassified (unclassified is recorded explicitly and not retried). Worker crashes, lost ownership and lease expiry are recovery events, not handler failures. Database or infrastructure errors must not be recorded as permanent task failures. Cancellation and shutdown signals are control-plane events and are not classified. A rejected stale write is an expected concurrency outcome, not an `InvalidTransitionError` or a task failure. `is_retryable` and the error hierarchy are unchanged.
+- **Day 3A Slice 2 clarification:** an attempt whose lease or deadline expired is recorded as `revoked` with a revocation reason, never as a failed attempt with a failure kind or error details (DEC-038). A task that uses up its budget through revocations ends `failed` because its retries are exhausted, not because a handler failed permanently.
 
 ### DEC-010 — Stdlib logging with a JSON formatter
 - **Status:** Proposed
@@ -142,6 +144,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **WHY:** A state-only conditional write accepts a stale worker's result after the task was requeued and reclaimed. The generation guard is the one invariant whose violation would be silent, so the database enforces it.
 - **RUNNER-UP:** A separate `generation` column, or relying on write-path discipline and tests alone.
 - **TRADE-OFF:** Every started attempt consumes retry budget, including attempts lost to crashes; returning budget later needs a separate counter.
+- **Day 3A Slice 2 note:** revoked attempts use budget like any other, and recovery fails a task whose budget is used up (DEC-038); no separate counter was added.
 - **VERIFICATION:** trigger tests for legal claims, decreases, resets, skipped generations, unrelated increments, frozen terminal tasks and retry exhaustion.
 
 ### DEC-020 — Cooperative cancellation
@@ -151,6 +154,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **RUNNER-UP:** Immediate cancellation of running tasks, fencing off late results — simpler state, but the database would show no live attempt while a worker still spends.
 - **TRADE-OFF:** Running tasks are not terminal the moment cancellation is requested. Revoking database ownership is not proof that an external AI call stopped or was not billed.
 - **VERIFICATION:** `next_task_state` and `state_after_cancel_request` decision tables; `tasks_cancel_request_not_queued`, `tasks_cancelled_was_requested`. Race tests are Step 2; the grace period needs its own design and tests.
+- **Day 3A Slice 2 note:** a revocation counts as an outcome that would requeue while attempts remain, so a pending request cancels the task instead; an exhausted revocation fails it, as an exhausted transient failure does (DEC-038). Until the grace period exists, the execution deadline bounds how long a running attempt can ignore a request. A revocation caused by the request itself (Slice 3) will need its own rule.
 
 ### DEC-021 — READ COMMITTED, short transactions, task-before-attempt locking (direction)
 - **Status:** Proposed · owner-approved direction · implemented: job submission (DEC-024) and the attempt lifecycle (DEC-028)
@@ -159,6 +163,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **RUNNER-UP:** SERIALIZABLE isolation with retries.
 - **TRADE-OFF:** Cross-table invariants rely on the write paths and their tests.
 - **VERIFICATION:** Step 2 concurrency tests (competing starts, stale generations, cancellation races).
+- **Day 3A Slice 2 note:** the heartbeat is the one write that locks only the attempt row (DEC-036).
 
 ### DEC-022 — Job status is derived from task states (direction)
 - **Status:** Proposed · owner-approved direction · implemented; the rules are DEC-031
@@ -240,6 +245,7 @@ lifecycle policy functions and transition tables are unchanged.
 - **WHY:** The attempt ID alone cannot tell a current worker from one whose task was requeued and restarted. The generation can, and requiring both catches mismatched pairs. Typed errors let a worker distinguish "my result was recorded earlier" from "someone else owns this task now", and neither is a task failure (DEC-009). Completion never classifies exceptions itself, and database errors during completion roll back and propagate, so infrastructure failures are never recorded as permanent handler failures.
 - **RUNNER-UP:** Accepting an identical duplicate completion as an idempotent success — friendlier to retried calls, but it needs a result comparison and hides which call took effect. Result enums instead of exceptions — they would force a check at every call site of an operation that normally succeeds.
 - **TRADE-OFF:** A worker that loses a completion's response (for example, its connection drops after the commit) learns the recorded outcome only through `AttemptFinishedError` or by reading the attempt. Nothing in this step revokes ownership of a running attempt; that is Day 3's lease recovery.
+- **Day 3A Slice 2 note:** a completion of a revoked attempt raises `AttemptRevokedError`, a subclass of `AttemptFinishedError`, so a worker can tell "my outcome was recorded" from "I lost ownership and nothing I report counts" (DEC-037).
 - **VERIFICATION:** a generation older than the current one, its attempt already failed and requeued, cannot record success, permanent or transient failure, and the newer attempt's result stands. A test stand-in for future lease recovery revokes a running attempt; the slow worker then cannot overwrite the new result. Mismatched generations (0, older, future) are rejected. Five kinds of duplicate completion change nothing, including after a requeue. 20 rounds × 4 concurrent completions of one attempt record exactly one result. A completion that fails at the attempt update or at the task update leaves both untouched and can be retried. A connection terminated mid-completion records nothing. Locally, removing the generation check failed 5 tests, removing the finished check failed 10, and ignoring a pending cancellation request failed 4.
 
 ### DEC-030 — Result contract: SQL NULL is "no result"; JSON null is a valid result
@@ -299,3 +305,119 @@ lifecycle policy functions and transition tables are unchanged.
   - 6 competing claimants never exceed `max_attempts` across 10 tasks.
 
   Locally, replacing `SKIP LOCKED` with a waiting `FOR UPDATE` failed 3 tests, removing the row lock failed 7 (the fencing trigger rejected the colliding claims), claiming from any state failed 11, removing the ordering failed 2, and removing the owned transaction failed 11.
+- **Day 3A Slice 2 note:** the lease migration (0002, DEC-039) does not add the claim-ordering index: it is a performance change and stays deferred until measured. Claims now take a lease policy (DEC-034), and a revoked task is requeued with its original `created_at`, so it too is claimed again without backoff.
+
+## Day 3A — Slice 2: attempt leases, execution deadlines and recovery
+
+Entries DEC-034 to DEC-039 record the Slice 2 design the owner approved on 2026-10-26 after
+an architecture audit, an independent review and a PostgreSQL locking investigation. They
+stay **Proposed** until the owner accepts them in a reviewed change. "Implemented" means
+verified locally by the tests named; none of this has run in GitHub CI yet. These are
+building blocks: there is no worker loop, nothing schedules recovery, and a revoked worker
+is not stopped (Day 3B).
+
+### DEC-034 — Attempt leases with a non-renewable execution deadline, under an explicit policy
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`orqestra.domain.leases`, migration 0002)
+- **WHAT:** Each attempt stores `lease_expires_at` and `deadline_at`, set at claim from one instant: the deadline is the claim instant plus `execution_timeout`, the lease the claim instant plus `lease`, capped at the deadline. A heartbeat sets the lease to `policy.lease` from now, capped at the deadline and never lower than before. The deadline never changes, enforced by the trigger `attempts_deadline_immutable`. An attempt may be revoked once the database time reaches `lease_expires_at`. The reason follows from the stored facts: a lease that reached its deadline cap means `deadline_exceeded`, any other expired lease `lease_expired`. `LeasePolicy(lease, execution_timeout)` is a required keyword argument of `start_attempt` and `claim_next_attempt`. Both values must be positive `timedelta`s within the representable range, `lease` cannot exceed `execution_timeout`, and a deadline beyond `datetime`'s range rolls the claim back with `ValueError`. There are no defaults.
+- **WHY:** A heartbeat proves that a worker is alive, not that its work progresses: a worker whose handler hangs can renew its lease forever. A deadline that no heartbeat can extend bounds that case (R-EXEC-04). Capping the lease at the deadline leaves recovery with one predicate. Keeping leases on the attempt keeps, with each attempt's history, the facts its revocation was decided on. The policy is required because an optional "no lease" would bring back work that nobody recovers, and numeric defaults are an operational decision not yet made.
+- **RUNNER-UP:** The lease on the task row: one place to look, but it loses per-attempt history. An independent deadline checked beside the lease: two predicates, and a precedence rule when both have expired. Defaults in `Settings`: convenient, but they invent operational values.
+- **TRADE-OFF:**
+  - A slow but healthy attempt is revoked at its deadline even while it heartbeats; choosing the timeout for each kind of work is open.
+  - A worker that dies in its last lease window before the deadline is recorded as `deadline_exceeded`.
+  - Every caller must pass a policy; the existing test call sites were updated.
+  - Operational bounds (maximum lease and timeout, heartbeat interval, per-job-kind policies) are undecided and need owner approval before Day 3B.
+- **VERIFICATION:** `tests/unit/test_leases.py` (validation, expiry at the exact instant and one microsecond either side, the cap, never shortening, representability); `tests/integration/test_attempt_lifecycle.py` sections 17 and 18, including a lease kept alive by heartbeats until its deadline and then revoked as `deadline_exceeded`.
+
+### DEC-035 — One claim instant, and a database clock read after the locks
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally
+- **WHAT:** The claim's `UPDATE tasks … SET updated_at = statement_timestamp() … RETURNING updated_at` is the claim instant. It becomes the attempt's `started_at` and the base of its lease and deadline. `renew_lease` and `revoke_next_expired` read `statement_timestamp()` in a separate statement after taking the row locks their decision depends on, and decide expiry in Python against the freshly locked rows. Other timestamps still use `now()`.
+- **WHY:** `now()` is fixed when the transaction starts, before any lock wait. A claim that waited for a task row would get a shorter lease, possibly one that had already expired by its commit. The claim `UPDATE` runs after the task lock is held on both claim paths, so its statement timestamp leaves the wait out. One value keeps `started_at`, the lease, the deadline and the task's `updated_at` consistent. Reading the clock after the locks means a decision is never older than the rows it compares.
+- **RUNNER-UP:** `clock_timestamp()` captured once after the lock: equally fresh, but evaluated on every call, so a later edit could give the columns different instants. `statement_timestamp()` of the locking statement: taken before that statement's own wait.
+- **TRADE-OFF:** A claimant that stalls between its claim `UPDATE` and its commit still loses that time from its lease, which is right: it was not running the task. The claim's `updated_at` moves from transaction start to the claim statement. Expiry depends on one database clock: a step forward can expire leases early (fencing still holds), and a step back is absorbed because a lease never shrinks.
+- **VERIFICATION:** `test_a_claim_that_waited_for_the_task_lock_still_gets_its_full_lease`, for `start_attempt` and `claim_next_attempt`, with and without server-side prepared statements. A holder keeps the claimant waiting (observed in `pg_locks`) and reads `clock_timestamp()` before releasing; the attempt must start after that. Locally, deriving the instant from `now()` fails it.
+
+### DEC-036 — The heartbeat renews under the attempt lock alone and refuses expired leases
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`renew_lease`)
+- **WHAT:** `renew_lease(conn, attempt_id, *, generation, worker_id, policy)` locks only the attempt row. It checks the generation, the worker, that the attempt is running and that its lease has not expired, then writes the renewed lease. It rejects with `NotFoundError`, `StaleAttemptError`, `WorkerMismatchError`, `AttemptRevokedError`, `AttemptFinishedError` or `LeaseExpiredError` (with the reason), changing nothing. To describe a stale rejection it reads the task's generation without a lock.
+- **WHY:** Heartbeats are the most frequent write. A transaction that holds a single row lock and never waits for another while holding it cannot take part in a lock cycle with the task-first operations. The heartbeat does not update `task_id`, so the foreign-key check takes no lock on the task, and the deadline trigger does not read `tasks`. Refusing to renew an expired lease makes eligibility monotonic: once recovery may revoke an attempt, nothing makes it ineligible again, and the worker learns at once that it must stop.
+- **RUNNER-UP:** Lock the task, then the attempt, like the other writes: also free of deadlocks, but it contends with every writer of the task. Accept renewals until a revocation commits (proposed during the audit): saves a late heartbeat, but recovery eligibility could flip back.
+- **TRADE-OFF:**
+  - It is an exception to the lock order of DEC-021 and DEC-028 that later changes must preserve: no trigger on `attempts` may lock `tasks`, and `task_id` must stay unchanged.
+  - A worker whose heartbeat is later than its lease can no longer renew, even if recovery has not run; its completion is still accepted until a revocation commits (DEC-037).
+- **VERIFICATION:**
+  - `test_a_heartbeat_does_not_lock_the_task`: a heartbeat succeeds under `lock_timeout` while another transaction holds the task row; a completion, as a control, cannot.
+  - Rejection tests; both forced orders of heartbeat against recovery.
+  - A 40-round unforced race of heartbeat, completion, recovery and cancellation in which both completion and recovery win some rounds.
+  - Locally, adding a task lock after the attempt lock made that race fail with `DeadlockDetected`; removing each check failed its test.
+
+### DEC-037 — Recovery revokes one expired attempt per transaction; ownership ends at its commit
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`revoke_next_expired`)
+- **WHAT:** `revoke_next_expired(conn)` works in five steps:
+  1. Lock, with `FOR UPDATE OF t SKIP LOCKED`, the task of the most overdue running attempt whose lease has expired.
+  2. Lock that attempt.
+  3. Re-check, against the locked rows and a fresh clock reading, that the attempt is still the task's running generation and that its lease has expired.
+  4. Record the attempt as `revoked`, with its reason and `finished_at` at that instant, and move the task as `next_task_state` decides.
+  5. Commit.
+
+  It returns `AttemptRevocation` or `None`. Afterwards `complete_attempt` raises `AttemptRevokedError` (a subclass of `AttemptFinishedError`), or `StaleAttemptError` once a newer generation exists; `renew_lease` raises `AttemptRevokedError`.
+- **WHY:**
+  - Recovery locks task-then-attempt like every other writer except the heartbeat.
+  - `SKIP LOCKED` lets concurrent recoverers, and tasks that are busy, proceed without waiting.
+  - Re-checking after the locks closes the gap between discovery and lock: a heartbeat or a completion that commits in between wins.
+  - Expiry only makes an attempt eligible; the committed revocation is the single authority boundary. A completion that commits first therefore counts (R-EXEC-05), and completion needs no clock comparison.
+  - One attempt per short transaction keeps locks brief; sweeping repeatedly belongs to the worker runtime.
+- **RUNNER-UP:** Revoking a batch in one transaction: fewer round trips, but many task locks held at once. Folding recovery into `claim_next_attempt`: one call for workers, but two concerns in one, and slower claims.
+- **TRADE-OFF:**
+  - `None` means "nothing revoked by this call", including a candidate renewed or locked meanwhile, not "nothing expired".
+  - Nothing schedules recovery yet.
+  - Revocation does not stop the worker or an external AI call and does not un-bill it (R-COST-01, Day 3B and later).
+  - After a database outage longer than the lease, every live attempt is revocable at once (R-OPS-01).
+- **VERIFICATION:** `tests/integration/test_attempt_lifecycle.py` sections 19 and 20:
+  - Exactly-once revocation, over 10 rounds of 6 concurrent recoverers.
+  - Skipping a locked task without waiting.
+  - A completion before revocation counts; after it, the old worker is fenced before and after a new claim.
+  - Both forced orders of completion against recovery and of heartbeat against recovery.
+  - A poisoned write, and a terminated connection, each roll back both rows.
+  - An invariant that every revoked attempt's lease had expired when it was revoked.
+  - Locally, mutants that skip the re-check, drop `SKIP LOCKED`, stop locking the task, or report a revoked completion as a plain finished one each fail tests.
+
+### DEC-038 — Revoked attempts: a distinct state; the task follows the transient-failure rule
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally
+- **WHAT:** `AttemptState.REVOKED` is terminal and carries `revoked_reason`; it has no failure kind or error details. For a revoked attempt, `next_task_state` returns `queued` while attempts remain (`cancelled` if a request is pending) and `failed` once none remain, whether or not a request is pending.
+- **WHY:**
+  - DEC-009: lost ownership is a recovery event, not a handler failure, so the attempt records what happened.
+  - DEC-019: every started attempt uses budget, so exhaustion fails the task.
+  - DEC-020: a pending request cancels only an outcome that would requeue. An exhausted revocation would not requeue, and Slice 2's reasons (an expired lease, an exceeded deadline) are failures not caused by the request, so the task fails truthfully and its job reads `failed` (DEC-031).
+- **RUNNER-UP:** Exhausted with a pending request ends `cancelled`: matches the user's intent, but hides a task that hung or lost every attempt. Recording a revocation as a failed attempt with failure kind `transient` (what the replaced test helper did): no new state, but it contradicts DEC-009.
+- **TRADE-OFF:**
+  - A user who requested cancellation can see `failed`; the attempt's `revoked_reason` explains why.
+  - A deterministic hang is retried up to `max_attempts` times the execution timeout, with no backoff (DEC-033).
+  - The cancellation-grace revocation of Slice 3 is caused by the request and will need its own rule.
+- **VERIFICATION:** `tests/unit/test_policy.py` decision table, plus a check that a revocation moves the task exactly as a transient failure does for every count and request; the integration outcome table (six cases, including a single-attempt task with a pending request); invariant rules on attempt history.
+
+### DEC-039 — Migration 0002: additive schema and a quiescent upgrade with `NOWAIT` locks
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`0002_attempt_leases.sql`)
+- **WHAT:** Migration 0002 runs in order:
+  1. Require READ COMMITTED.
+  2. `LOCK TABLE tasks IN EXCLUSIVE MODE NOWAIT`, then `LOCK TABLE attempts IN ACCESS EXCLUSIVE MODE NOWAIT`. If either fails, raise `lock_not_available` (`55P03`) with an operator message.
+  3. Refuse (`55000`) while any task or attempt is running.
+  4. Add the nullable columns `lease_expires_at`, `deadline_at` and `revoked_reason`, and replace `attempts_state_valid`.
+  5. Add the named constraints `attempts_lease_iff_deadline`, `attempts_lease_required`, `attempts_lease_after_start`, `attempts_lease_within_deadline`, `attempts_revoked_reason_valid`, `attempts_revoked_reason_iff_revoked` and `attempts_revoked_reason_matches_lease`, and the trigger `attempts_deadline_immutable`.
+
+  It adds no index. The operational precondition is: stop workers and claimers → let running attempts finish → migrate → deploy.
+- **WHY:**
+  - A probe of a blocking design (the same two locks without `NOWAIT`) showed it froze unrelated claims while it waited, and could deadlock with a session that read `attempts` and then locked a task.
+  - With `NOWAIT` the migration never waits while holding a lock, so it can do neither, and a lock it cannot take means the database is not quiescent.
+  - Refusing running work avoids silently reassigning attempts whose workers may still be alive.
+  - `attempts_lease_required` makes claims from pre-0002 code fail closed afterwards.
+  - The existing partial index on running attempts already serves recovery's lookup.
+- **RUNNER-UP:** Blocking locks with a `lock_timeout`: waits out brief activity, but still freezes writers up to the timeout and needs a number. Expiring legacy running attempts, or giving them a grace lease: no drain needed, but it reassigns, or guesses about, work that may be live.
+- **TRADE-OFF:**
+  - Any session using the tables, even an idle reader, makes the upgrade fail; the operator retries.
+  - Attempts of dead legacy workers must be resolved by hand before upgrading.
+  - Old and new code cannot run side by side: old code cannot read revoked attempts.
+  - The claim-ordering index stays deferred until measured.
+- **VERIFICATION:**
+  - `tests/integration/test_migration_0002.py`: upgrade over terminal history; refusal while an attempt or a task is running; prompt `55P03` with no effect while a claim, a completion or an idle reader holds the tables; the READ COMMITTED requirement; legacy claims rejected afterwards; a 10-round race against legacy workers, in which the upgrade applies while they are still running and their next claims are rejected.
+  - A test for every new constraint and for the trigger, in `test_schema_constraints.py`; the domain/schema drift test now includes revocation reasons.
+  - Locally, removing `NOWAIT` made a test fail after 10 s instead of refusing, and removing the refusal, the isolation check, the trigger or `attempts_lease_required` each failed tests.

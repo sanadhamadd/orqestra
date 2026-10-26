@@ -14,6 +14,7 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import TupleRow, tuple_row
 
 from orqestra.domain.jobs import Attempt, Task
+from orqestra.domain.leases import RevocationReason
 from orqestra.domain.policy import FailureKind
 from orqestra.domain.states import AttemptState, TaskState
 
@@ -32,7 +33,7 @@ TASK_COLUMNS = (
 )
 ATTEMPT_COLUMNS = (
     "id, task_id, attempt_number, worker_id, state, failure_kind, error_type, error_message, "
-    "started_at, finished_at"
+    "started_at, finished_at, lease_expires_at, deadline_at, revoked_reason"
 )
 
 
@@ -66,6 +67,33 @@ def task_from_row(row: TupleRow) -> Task:
 
 
 def attempt_from_row(row: TupleRow) -> Attempt:
-    attempt_id, task_id, number, worker_id, state, failure_kind, *rest = row
-    kind = None if failure_kind is None else FailureKind(failure_kind)
-    return Attempt(attempt_id, task_id, number, worker_id, AttemptState(state), kind, *rest)
+    (
+        attempt_id,
+        task_id,
+        number,
+        worker_id,
+        state,
+        failure_kind,
+        error_type,
+        error_message,
+        started_at,
+        finished_at,
+        lease_expires_at,
+        deadline_at,
+        revoked_reason,
+    ) = row
+    return Attempt(
+        attempt_id,
+        task_id,
+        number,
+        worker_id,
+        AttemptState(state),
+        None if failure_kind is None else FailureKind(failure_kind),
+        error_type,
+        error_message,
+        started_at,
+        finished_at,
+        lease_expires_at,
+        deadline_at,
+        None if revoked_reason is None else RevocationReason(revoked_reason),
+    )

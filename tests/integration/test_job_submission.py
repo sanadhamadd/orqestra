@@ -71,7 +71,9 @@ def unrelated(db: Conn) -> dict[str, list[tuple[Any, ...]]]:
     (task,) = list_tasks(db, other.id)
     db.execute("UPDATE tasks SET state = 'running', attempt_count = 1 WHERE id = %s", (task.id,))
     db.execute(
-        "INSERT INTO attempts (id, task_id, attempt_number, worker_id) VALUES (%s, %s, 1, 'w1')",
+        "INSERT INTO attempts (id, task_id, attempt_number, worker_id, lease_expires_at, "
+        "deadline_at) VALUES (%s, %s, 1, 'w1', now() + interval '5 minutes', "
+        "now() + interval '1 hour')",
         (uuid.uuid4(), task.id),
     )
     return snapshot(db)

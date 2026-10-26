@@ -96,6 +96,7 @@ def test_storage_values_are_stable() -> None:
         "succeeded",
         "failed",
         "cancelled",
+        "revoked",
     ]
 
 
@@ -103,6 +104,7 @@ ATTEMPT_ALLOWED = [
     (AttemptState.RUNNING, AttemptState.SUCCEEDED),
     (AttemptState.RUNNING, AttemptState.FAILED),
     (AttemptState.RUNNING, AttemptState.CANCELLED),
+    (AttemptState.RUNNING, AttemptState.REVOKED),
 ]
 ATTEMPT_DISALLOWED = [
     (a, b) for a in AttemptState for b in AttemptState if (a, b) not in ATTEMPT_ALLOWED
@@ -124,9 +126,12 @@ def test_disallowed_attempt_transitions_raise(current: AttemptState, new: Attemp
 
 def test_attempts_end_exactly_once() -> None:
     assert set(ATTEMPT_TRANSITIONS) == set(AttemptState)
-    assert {AttemptState.SUCCEEDED, AttemptState.FAILED, AttemptState.CANCELLED} == (
-        TERMINAL_ATTEMPT_STATES
-    )
+    assert {
+        AttemptState.SUCCEEDED,
+        AttemptState.FAILED,
+        AttemptState.CANCELLED,
+        AttemptState.REVOKED,
+    } == TERMINAL_ATTEMPT_STATES
     assert ATTEMPT_TRANSITIONS[AttemptState.RUNNING] == TERMINAL_ATTEMPT_STATES
 
 

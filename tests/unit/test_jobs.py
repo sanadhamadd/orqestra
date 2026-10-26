@@ -1,7 +1,7 @@
 import dataclasses
 import itertools
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -21,17 +21,22 @@ from orqestra.domain.jobs import (
     TaskSpec,
     derive_job_status,
 )
+from orqestra.domain.leases import LeasePolicy, RevocationReason
 from orqestra.domain.policy import FailureKind
 from orqestra.domain.states import TERMINAL_TASK_STATES, AttemptState, TaskState
 from orqestra.persistence.jobs import IdempotencyConflictError, SubmissionResult
 from orqestra.persistence.lifecycle import (
     AttemptCompletion,
     AttemptFinishedError,
+    AttemptRevocation,
+    AttemptRevokedError,
     CancellationOutcome,
     CancellationResult,
+    LeaseExpiredError,
     NotFoundError,
     StaleAttemptError,
     TaskNotStartableError,
+    WorkerMismatchError,
 )
 
 pytestmark = pytest.mark.unit
@@ -64,7 +69,19 @@ def test_records_are_frozen_and_slotted() -> None:
     task_id, job_id = uuid.uuid4(), uuid.uuid4()
     task = Task(task_id, job_id, "k", TaskState.QUEUED, {}, None, 3, 0, None, NOW, NOW, None)
     attempt = Attempt(
-        uuid.uuid4(), task_id, 1, "w", AttemptState.RUNNING, None, None, None, NOW, None
+        uuid.uuid4(),
+        task_id,
+        1,
+        "w",
+        AttemptState.RUNNING,
+        None,
+        None,
+        None,
+        NOW,
+        None,
+        NOW + timedelta(minutes=5),
+        NOW + timedelta(hours=1),
+        None,
     )
     records: list[Any] = [
         spec(),
@@ -76,6 +93,8 @@ def test_records_are_frozen_and_slotted() -> None:
         AttemptSucceeded(None),
         AttemptFailed(FailureKind.PERMANENT, "E"),
         AttemptCompletion(attempt, task),
+        AttemptRevocation(attempt, task),
+        LeasePolicy(timedelta(seconds=1), timedelta(seconds=2)),
         CancellationResult(CancellationOutcome.CANCELLED, task),
         JobProgress(job_id, JobStatus.QUEUED, MappingProxyType({TaskState.QUEUED: 1})),
     ]
@@ -237,6 +256,21 @@ def test_lifecycle_errors_carry_their_identifiers() -> None:
     assert (stale.attempt_id, stale.generation, stale.current_generation) == (attempt_id, 1, 2)
     finished = AttemptFinishedError(attempt_id, AttemptState.FAILED)
     assert (finished.attempt_id, finished.state) == (attempt_id, AttemptState.FAILED)
-    for exc in (not_found, not_startable, stale, finished):
+    revoked = AttemptRevokedError(attempt_id, RevocationReason.DEADLINE_EXCEEDED)
+    assert isinstance(revoked, AttemptFinishedError)  # handled wherever "finished" is
+    assert (revoked.attempt_id, revoked.state, revoked.reason) == (
+        attempt_id,
+        AttemptState.REVOKED,
+        RevocationReason.DEADLINE_EXCEEDED,
+    )
+    assert "revoked (deadline_exceeded)" in str(revoked)
+    assert "finished as" not in str(revoked)  # it does not claim an outcome was recorded
+    expired = LeaseExpiredError(attempt_id, RevocationReason.LEASE_EXPIRED, NOW, NOW)
+    assert (expired.attempt_id, expired.reason) == (attempt_id, RevocationReason.LEASE_EXPIRED)
+    assert (expired.lease_expires_at, expired.deadline_at) == (NOW, NOW)
+    assert NOW.isoformat() in str(expired)
+    mismatch = WorkerMismatchError(attempt_id, "intruder", "owner")
+    assert (mismatch.worker_id, mismatch.owner) == ("intruder", "owner")
+    for exc in (not_found, not_startable, stale, finished, revoked, expired, mismatch):
         assert isinstance(exc, OrqestraError)
         assert not is_retryable(exc)

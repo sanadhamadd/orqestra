@@ -14,6 +14,7 @@ from psycopg import errors
 from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
+from orqestra.domain.leases import RevocationReason
 from orqestra.domain.policy import FailureKind
 from orqestra.domain.states import AttemptState, TaskState
 
@@ -63,14 +64,27 @@ def task_row(db: Conn, task_id: uuid.UUID) -> tuple[Any, ...]:
     return row
 
 
+# A valid lease for a row inserted now: a running or revoked attempt needs one.
+LEASE = {
+    "lease_expires_at": "now() + interval '5 minutes'",
+    "deadline_at": "now() + interval '1 hour'",
+}
+LEASE_COLUMNS = ", ".join(LEASE)
+LEASE_VALUES = ", ".join(LEASE.values())
+
+
 def new_attempt(db: Conn, task_id: uuid.UUID, number: int, **columns: Any) -> uuid.UUID:
+    """Insert an attempt; it gets a valid lease unless ``columns`` set lease columns."""
     attempt_id = uuid.uuid4()
     values = {"id": attempt_id, "task_id": task_id, "attempt_number": number, "worker_id": "w1"}
     values.update(columns)
-    names = ", ".join(values)
-    placeholders = ", ".join(["%s"] * len(values))
+    names = list(values)
+    placeholders = ["%s"] * len(values)
+    if not set(LEASE) & set(values):
+        names += LEASE
+        placeholders += LEASE.values()
     db.execute(
-        f"INSERT INTO attempts ({names}) VALUES ({placeholders})",
+        f"INSERT INTO attempts ({', '.join(names)}) VALUES ({', '.join(placeholders)})",
         tuple(values.values()),
     )
     return attempt_id
@@ -102,6 +116,9 @@ def test_stored_state_values_match_the_domain(db: Conn) -> None:
     assert check_values(db, "tasks_state_valid") == {state.value for state in TaskState}
     assert check_values(db, "attempts_state_valid") == {state.value for state in AttemptState}
     assert check_values(db, "attempts_failure_kind_valid") == {kind.value for kind in FailureKind}
+    assert check_values(db, "attempts_revoked_reason_valid") == {
+        reason.value for reason in RevocationReason
+    }
 
 
 # --- jobs --------------------------------------------------------------------
@@ -397,7 +414,8 @@ def test_at_most_one_running_attempt_per_task(db: Conn, running_task: uuid.UUID)
     new_attempt(db, running_task, 1)
     rejected(
         db,
-        "INSERT INTO attempts (id, task_id, attempt_number, worker_id) VALUES (%s, %s, 2, 'w2')",
+        f"INSERT INTO attempts (id, task_id, attempt_number, worker_id, {LEASE_COLUMNS}) "
+        f"VALUES (%s, %s, 2, 'w2', {LEASE_VALUES})",
         (uuid.uuid4(), running_task),
         constraint="attempts_one_running_per_task",
     )
@@ -435,7 +453,8 @@ def test_attempt_number_is_unique_per_task(db: Conn, running_task: uuid.UUID) ->
     new_attempt(db, running_task, 1, state="cancelled", finished_at="now")
     rejected(
         db,
-        "INSERT INTO attempts (id, task_id, attempt_number, worker_id) VALUES (%s, %s, 1, 'w')",
+        f"INSERT INTO attempts (id, task_id, attempt_number, worker_id, {LEASE_COLUMNS}) "
+        f"VALUES (%s, %s, 1, 'w', {LEASE_VALUES})",
         (uuid.uuid4(), running_task),
         constraint="attempts_task_number_unique",
     )
@@ -444,7 +463,8 @@ def test_attempt_number_is_unique_per_task(db: Conn, running_task: uuid.UUID) ->
 def test_attempt_requires_an_existing_task(db: Conn) -> None:
     rejected(
         db,
-        "INSERT INTO attempts (id, task_id, attempt_number, worker_id) VALUES (%s, %s, 1, 'w')",
+        f"INSERT INTO attempts (id, task_id, attempt_number, worker_id, {LEASE_COLUMNS}) "
+        f"VALUES (%s, %s, 1, 'w', {LEASE_VALUES})",
         (uuid.uuid4(), uuid.uuid4()),
         constraint="attempts_task_fk",
     )
@@ -504,3 +524,169 @@ def test_failed_attempt_records_its_classification(
     )
     row = db.execute("SELECT state, failure_kind FROM attempts WHERE id = %s", (attempt_id,))
     assert row.fetchone() == ("failed", kind)
+
+
+# --- attempt leases and revocation (migration 0002) ---------------------------
+
+
+def test_finished_attempts_need_no_lease_but_running_ones_do(
+    db: Conn, running_task: uuid.UUID
+) -> None:
+    # History from before 0002 has no lease; every running attempt must have one.
+    new_attempt(
+        db,
+        running_task,
+        1,
+        state="succeeded",
+        finished_at="now",
+        lease_expires_at=None,
+        deadline_at=None,
+    )
+    rejected(
+        db,
+        "INSERT INTO attempts (id, task_id, attempt_number, worker_id) VALUES (%s, %s, 2, 'w')",
+        (uuid.uuid4(), running_task),
+        constraint="attempts_lease_required",
+    )
+
+
+@pytest.mark.parametrize(
+    ("lease", "deadline", "constraint"),
+    [
+        ("now() + interval '5 minutes'", "NULL", "attempts_lease_iff_deadline"),
+        ("NULL", "now() + interval '1 hour'", "attempts_lease_iff_deadline"),
+        ("now() - interval '1 second'", "now() + interval '1 hour'", "attempts_lease_after_start"),
+        ("now()", "now() + interval '1 hour'", "attempts_lease_after_start"),
+        (
+            "now() + interval '2 hours'",
+            "now() + interval '1 hour'",
+            "attempts_lease_within_deadline",
+        ),
+    ],
+    ids=["no-deadline", "no-lease", "lease-before-start", "lease-at-start", "lease-past-deadline"],
+)
+def test_a_lease_must_lie_between_start_and_deadline(
+    db: Conn, running_task: uuid.UUID, lease: str, deadline: str, constraint: str
+) -> None:
+    rejected(
+        db,
+        "INSERT INTO attempts (id, task_id, attempt_number, worker_id, lease_expires_at, "
+        f"deadline_at) VALUES (%s, %s, 1, 'w', {lease}, {deadline})",
+        (uuid.uuid4(), running_task),
+        constraint=constraint,
+    )
+
+
+def test_a_lease_may_reach_but_not_pass_its_deadline(db: Conn, running_task: uuid.UUID) -> None:
+    attempt_id = new_attempt(db, running_task, 1)
+    db.execute("UPDATE attempts SET lease_expires_at = deadline_at WHERE id = %s", (attempt_id,))
+    rejected(
+        db,
+        "UPDATE attempts SET lease_expires_at = deadline_at + interval '1 microsecond' "
+        "WHERE id = %s",
+        (attempt_id,),
+        constraint="attempts_lease_within_deadline",
+    )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "deadline_at = deadline_at + interval '1 second'",
+        "deadline_at = deadline_at - interval '1 second'",
+        "deadline_at = NULL, lease_expires_at = NULL, state = 'succeeded', finished_at = now()",
+    ],
+    ids=["extend", "shorten", "erase"],
+)
+def test_an_attempt_deadline_never_changes(
+    db: Conn, running_task: uuid.UUID, assignment: str
+) -> None:
+    attempt_id = new_attempt(db, running_task, 1)
+    error = rejected(
+        db,
+        f"UPDATE attempts SET {assignment} WHERE id = %s",
+        (attempt_id,),
+        constraint="attempts_deadline_immutable",
+    )
+    assert "deadline_at cannot change" in str(error)
+    # Updates that leave the deadline alone are not affected by the guard.
+    db.execute(
+        "UPDATE attempts SET deadline_at = deadline_at, lease_expires_at = deadline_at "
+        "WHERE id = %s",
+        (attempt_id,),
+    )
+
+
+@pytest.mark.parametrize("reason", [reason.value for reason in RevocationReason])
+def test_a_revoked_attempt_records_a_reason_matching_its_lease(
+    db: Conn, running_task: uuid.UUID, reason: str
+) -> None:
+    attempt_id = new_attempt(db, running_task, 1)
+    if reason == RevocationReason.DEADLINE_EXCEEDED:
+        db.execute(
+            "UPDATE attempts SET lease_expires_at = deadline_at WHERE id = %s", (attempt_id,)
+        )
+    db.execute(
+        "UPDATE attempts SET state = 'revoked', revoked_reason = %s, finished_at = now() "
+        "WHERE id = %s",
+        (reason, attempt_id),
+    )
+    row = db.execute(
+        "SELECT state, revoked_reason, failure_kind, error_type FROM attempts WHERE id = %s",
+        (attempt_id,),
+    ).fetchone()
+    assert row == ("revoked", reason, None, None)
+
+
+@pytest.mark.parametrize(
+    ("columns", "constraint"),
+    [
+        (
+            "state = 'revoked', revoked_reason = 'worker_crashed', finished_at = now()",
+            "attempts_revoked_reason_valid",
+        ),
+        ("state = 'revoked', finished_at = now()", "attempts_revoked_reason_iff_revoked"),
+        ("revoked_reason = 'lease_expired'", "attempts_revoked_reason_iff_revoked"),
+        (
+            "state = 'revoked', revoked_reason = 'deadline_exceeded', finished_at = now()",
+            "attempts_revoked_reason_matches_lease",
+        ),
+        (
+            "state = 'revoked', revoked_reason = 'lease_expired', finished_at = now(), "
+            "lease_expires_at = deadline_at",
+            "attempts_revoked_reason_matches_lease",
+        ),
+        (
+            "state = 'revoked', revoked_reason = 'lease_expired', finished_at = now(), "
+            "failure_kind = 'transient'",
+            "attempts_failure_kind_iff_failed",
+        ),
+        ("state = 'revoked', revoked_reason = 'lease_expired'", "attempts_finished_iff_terminal"),
+    ],
+    ids=[
+        "unknown-reason",
+        "revoked-without-reason",
+        "reason-without-revocation",
+        "deadline-reason-before-deadline",
+        "lease-reason-at-deadline",
+        "revoked-as-failure",
+        "revoked-without-finish",
+    ],
+)
+def test_a_revoked_attempt_rejects_inconsistent_records(
+    db: Conn, running_task: uuid.UUID, columns: str, constraint: str
+) -> None:
+    attempt_id = new_attempt(db, running_task, 1)
+    rejected(
+        db, f"UPDATE attempts SET {columns} WHERE id = %s", (attempt_id,), constraint=constraint
+    )
+
+
+def test_a_revoked_attempt_must_keep_its_lease(db: Conn, running_task: uuid.UUID) -> None:
+    rejected(
+        db,
+        "INSERT INTO attempts (id, task_id, attempt_number, worker_id, state, revoked_reason, "
+        "finished_at) VALUES (%s, %s, 1, 'w', 'revoked', 'lease_expired', now())",
+        (uuid.uuid4(), running_task),
+        constraint="attempts_lease_required",
+    )

@@ -1,29 +1,41 @@
-"""Transactional attempt lifecycle: claim and start attempts, complete them, cancel tasks.
+"""Transactional attempt lifecycle: claim, start, renew, complete, revoke and cancel.
 
 Each write is one short READ COMMITTED transaction that the operation owns
 (DEC-028). It locks the task row first and then, when it needs it, the attempt
 row; decides with the domain policy and transition tables; writes; and
-commits. No transaction stays open while a worker executes: ``start_attempt``
-commits before the work begins and ``complete_attempt`` runs afterwards.
+commits. No transaction stays open while a worker executes: a claim commits
+before the work begins, and each heartbeat and the completion are separate
+transactions. ``renew_lease`` is the one exception to the lock order: it
+locks only the attempt row and never waits for a task lock while holding it,
+so it cannot form a lock cycle with the task-first operations (DEC-036).
 
 Ownership (ADR-0003, DEC-029): attempt N holds generation N, the value of the
-task's ``attempt_count`` when it started. ``complete_attempt`` takes effect
-only for the attempt that is still the task's current, running generation.
-Any other write is rejected with ``StaleAttemptError`` or
-``AttemptFinishedError`` and changes nothing. Rejections are expected
-concurrency outcomes, not task failures (DEC-009).
+task's ``attempt_count`` when it started. ``complete_attempt`` and
+``renew_lease`` take effect only for the attempt that is still the task's
+current, running generation. Any other write is rejected with a typed error
+and changes nothing. Rejections are expected concurrency outcomes, not task
+failures (DEC-009).
 
-A task may run in several attempts over its lifetime, and generation fencing
-ensures that only one attempt's result can become the task's result. These
-operations are building blocks for at-least-once execution but do not provide
-it: nothing delivers tasks automatically. ``claim_next_attempt`` discovers
-work, but leases, a worker loop and crash recovery are not implemented, so a
-task whose worker stops is not retried.
+Leases (DEC-034, DEC-035): every claim gives its attempt a lease and a
+non-renewable execution deadline, both measured from one claim instant that
+the claim's task UPDATE reads after the task lock is held, so a claim that
+waited for that lock still gets its full lease. ``renew_lease`` extends the
+lease up to the deadline. ``revoke_next_expired`` revokes one attempt whose
+lease has expired and moves its task by the policy (DEC-037, DEC-038); from
+that commit on, the old worker's completions and heartbeats are rejected. A
+completion that commits before the revocation still counts. Every instant
+that decides expiry comes from the database clock, read after the locks the
+decision depends on.
+
+These operations are building blocks for at-least-once execution but do not
+provide it: nothing runs them automatically. There is no worker loop, nothing
+schedules recovery, and revoking an attempt does not stop its worker.
 """
 
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from psycopg.rows import TupleRow
@@ -36,6 +48,13 @@ from orqestra.domain.jobs import (
     AttemptOutcome,
     AttemptSucceeded,
     Task,
+)
+from orqestra.domain.leases import (
+    LeasePolicy,
+    RevocationReason,
+    initial_lease,
+    renewed_lease,
+    revocation_reason,
 )
 from orqestra.domain.policy import next_task_state, state_after_cancel_request
 from orqestra.domain.states import (
@@ -78,13 +97,21 @@ _LOCK_NEXT_CLAIMABLE_TASK = (
 )
 _CLAIMABLE_STATES = [state.value for state in allowed_sources(TaskState.RUNNING)]
 
+# The database clock at the start of the current statement. Operations read it
+# after taking the locks a decision depends on, so it is never older than the
+# rows it is compared with, however long they waited for those locks (DEC-035).
+_NOW = "SELECT statement_timestamp()"
+# The claim instant: this statement runs after the task row is locked, so its
+# statement_timestamp() excludes any wait for that lock. The attempt's
+# started_at, lease and deadline are all derived from the same instant.
 _CLAIM_TASK = (
-    "UPDATE tasks SET state = %s, attempt_count = attempt_count + 1, updated_at = now() "
-    "WHERE id = %s RETURNING attempt_count"
+    "UPDATE tasks SET state = %s, attempt_count = attempt_count + 1, "
+    "updated_at = statement_timestamp() WHERE id = %s RETURNING attempt_count, updated_at"
 )
 _INSERT_ATTEMPT = (
-    "INSERT INTO attempts (id, task_id, attempt_number, worker_id) VALUES (%s, %s, %s, %s) "
-    f"RETURNING {ATTEMPT_COLUMNS}"
+    "INSERT INTO attempts "
+    "(id, task_id, attempt_number, worker_id, started_at, lease_expires_at, deadline_at) "
+    f"VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {ATTEMPT_COLUMNS}"
 )
 _FINISH_ATTEMPT = (
     "UPDATE attempts SET state = %s, failure_kind = %s, error_type = %s, error_message = %s, "
@@ -101,6 +128,35 @@ _CANCEL_QUEUED_TASK = (
 )
 _RECORD_CANCEL_REQUEST = (
     "UPDATE tasks SET cancel_requested_at = now(), updated_at = now() "
+    f"WHERE id = %s RETURNING {TASK_COLUMNS}"
+)
+# Read without a lock, only to describe a rejected heartbeat: renew_lease never
+# locks the task (DEC-036).
+_TASK_GENERATION = "SELECT attempt_count FROM tasks WHERE id = %s"
+_RENEW_LEASE = (
+    f"UPDATE attempts SET lease_expires_at = %s WHERE id = %s RETURNING {ATTEMPT_COLUMNS}"
+)
+# Recovery (DEC-037): lock the task of the most overdue running attempt that no
+# other transaction has locked; the attempt itself is locked and every
+# condition re-checked by the next statements. The literal states let the
+# planner use the partial index attempts_one_running_per_task.
+_LOCK_NEXT_EXPIRED_TASK = (
+    "SELECT {task_columns}, a.id FROM tasks t JOIN attempts a "
+    "ON a.task_id = t.id AND a.attempt_number = t.attempt_count "
+    "WHERE t.state = '{running_task}' AND a.state = '{running_attempt}' "
+    "AND a.lease_expires_at <= statement_timestamp() "
+    "ORDER BY a.lease_expires_at, a.id LIMIT 1 FOR UPDATE OF t SKIP LOCKED"
+).format(
+    task_columns=", ".join(f"t.{column}" for column in TASK_COLUMNS.split(", ")),
+    running_task=TaskState.RUNNING.value,
+    running_attempt=AttemptState.RUNNING.value,
+)
+_REVOKE_ATTEMPT = (
+    "UPDATE attempts SET state = %s, revoked_reason = %s, finished_at = %s "
+    f"WHERE id = %s RETURNING {ATTEMPT_COLUMNS}"
+)
+_RECOVER_TASK = (
+    "UPDATE tasks SET state = %s, updated_at = %s, finished_at = %s "
     f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
 
@@ -145,9 +201,67 @@ class AttemptFinishedError(OrqestraError):
         self.state = state
 
 
+class AttemptRevokedError(AttemptFinishedError):
+    """Recovery revoked the attempt: its worker lost ownership and nothing it reports counts.
+
+    Unlike its base class, this does not mean the worker's own outcome was
+    recorded: the attempt ended as ``REVOKED``, for ``reason``.
+    """
+
+    def __init__(self, attempt_id: uuid.UUID, reason: RevocationReason) -> None:
+        OrqestraError.__init__(
+            self, f"attempt {attempt_id} was revoked ({reason.value}); it no longer owns its task"
+        )
+        self.attempt_id = attempt_id
+        self.state = AttemptState.REVOKED
+        self.reason = reason
+
+
+class LeaseExpiredError(OrqestraError):
+    """The attempt's lease has expired, so it cannot be renewed; recovery may revoke it.
+
+    The worker should stop: its attempt still holds the task until recovery
+    commits a revocation, but it can no longer extend that.
+    """
+
+    def __init__(
+        self,
+        attempt_id: uuid.UUID,
+        reason: RevocationReason,
+        lease_expires_at: datetime,
+        deadline_at: datetime,
+    ) -> None:
+        super().__init__(
+            f"attempt {attempt_id}'s lease expired at {lease_expires_at.isoformat()} "
+            f"({reason.value}); it cannot be renewed"
+        )
+        self.attempt_id = attempt_id
+        self.reason = reason
+        self.lease_expires_at = lease_expires_at
+        self.deadline_at = deadline_at
+
+
+class WorkerMismatchError(OrqestraError):
+    """The attempt belongs to a different worker than the one that presented it."""
+
+    def __init__(self, attempt_id: uuid.UUID, worker_id: str, owner: str) -> None:
+        super().__init__(f"attempt {attempt_id} belongs to worker {owner!r}, not {worker_id!r}")
+        self.attempt_id = attempt_id
+        self.worker_id = worker_id
+        self.owner = owner
+
+
 @dataclass(frozen=True, slots=True)
 class AttemptCompletion:
     """The finished attempt and its task as stored by ``complete_attempt``."""
+
+    attempt: Attempt
+    task: Task
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRevocation:
+    """The revoked attempt and its task as stored by ``revoke_next_expired``."""
 
     attempt: Attempt
     task: Task
@@ -168,21 +282,25 @@ class CancellationResult:
     task: Task
 
 
-def start_attempt(conn: Conn, task_id: uuid.UUID, worker_id: str) -> Attempt:
+def start_attempt(
+    conn: Conn, task_id: uuid.UUID, worker_id: str, *, policy: LeasePolicy
+) -> Attempt:
     """Start the next attempt of a queued task and return it.
 
-    In one transaction: lock the task, then claim it (see ``_claim``).
-    Competing callers serialise on the task's row lock, so exactly one of them
-    starts each generation; the others get ``TaskNotStartableError``. Raises
-    ``NotFoundError`` for an unknown task.
+    In one transaction: lock the task, then claim it (see ``_claim``) with a
+    lease and deadline from ``policy``. Competing callers serialise on the
+    task's row lock, so exactly one of them starts each generation; the others
+    get ``TaskNotStartableError``. Raises ``NotFoundError`` for an unknown
+    task, and ``ValueError`` if the deadline is not representable.
     """
     with owned_transaction(conn, "start_attempt") as cur:
-        attempt = _claim(cur, _lock_task(cur, _LOCK_TASK, task_id, "task"), worker_id)
+        task = _lock_task(cur, _LOCK_TASK, task_id, "task")
+        attempt = _claim(cur, task, worker_id, policy)
     _log_started(attempt)
     return attempt
 
 
-def claim_next_attempt(conn: Conn, worker_id: str) -> Attempt | None:
+def claim_next_attempt(conn: Conn, worker_id: str, *, policy: LeasePolicy) -> Attempt | None:
     """Claim the next claimable task, start its attempt and return it; ``None`` if none.
 
     In one transaction: lock the first queued task, by ``created_at`` then
@@ -196,26 +314,40 @@ def claim_next_attempt(conn: Conn, worker_id: str) -> Attempt | None:
         row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES,)).fetchone()
         if row is None:
             return None
-        attempt = _claim(cur, task_from_row(row), worker_id)
+        attempt = _claim(cur, task_from_row(row), worker_id, policy)
     _log_started(attempt)
     return attempt
 
 
-def _claim(cur: Cursor, task: Task, worker_id: str) -> Attempt:
+def _claim(cur: Cursor, task: Task, worker_id: str, policy: LeasePolicy) -> Attempt:
     """Claim a task this transaction has locked, and insert its running attempt.
 
     Checks with the transition table that the task may move to ``running``
     (only a queued task may), advances ``attempt_count`` by one (the fencing
     trigger rejects any other change) and inserts the attempt whose number is
-    the new generation. tasks_queued_has_attempts_left guarantees a queued
-    task has an attempt left, so this cannot exceed ``max_attempts``.
+    the new generation, started at the claim instant with its lease and
+    deadline. tasks_queued_has_attempts_left guarantees a queued task has an
+    attempt left, so this cannot exceed ``max_attempts``.
     """
     if not can_transition(task.state, TaskState.RUNNING):
         raise TaskNotStartableError(task.id, task.state)
-    (generation,) = _one(cur.execute(_CLAIM_TASK, (TaskState.RUNNING.value, task.id)))
-    return attempt_from_row(
-        _one(cur.execute(_INSERT_ATTEMPT, (uuid.uuid4(), task.id, generation, worker_id)))
+    generation, claimed_at = _one(cur.execute(_CLAIM_TASK, (TaskState.RUNNING.value, task.id)))
+    lease_expires_at, deadline_at = initial_lease(policy, claimed_at)
+    row = _one(
+        cur.execute(
+            _INSERT_ATTEMPT,
+            (
+                uuid.uuid4(),
+                task.id,
+                generation,
+                worker_id,
+                claimed_at,
+                lease_expires_at,
+                deadline_at,
+            ),
+        )
     )
+    return attempt_from_row(row)
 
 
 def _log_started(attempt: Attempt) -> None:
@@ -238,13 +370,16 @@ def complete_attempt(
     The write takes effect only if the attempt still holds the task's current
     generation and is running; then the attempt and the task are updated
     together, with the task's next state chosen by ``next_task_state``.
-    A succeeded attempt's result becomes the task's result.
+    A succeeded attempt's result becomes the task's result. An attempt whose
+    lease expired still completes until recovery has committed its revocation.
 
     Raises, without changing anything: ``StaleAttemptError`` when the
     generation does not match the attempt or a newer generation exists;
-    ``AttemptFinishedError`` when the attempt already ended (a duplicate
-    completion); ``NotFoundError`` for an unknown attempt; ``ValueError`` from
-    the policy for a cancelled outcome without a cancellation request.
+    ``AttemptRevokedError`` when recovery revoked the attempt;
+    ``AttemptFinishedError`` when the attempt already ended otherwise (a
+    duplicate completion); ``NotFoundError`` for an unknown attempt;
+    ``ValueError`` from the policy for a cancelled outcome without a
+    cancellation request.
     """
     with owned_transaction(conn, "complete_attempt") as cur:
         task = _lock_task(cur, _LOCK_TASK_OF_ATTEMPT, attempt_id, "attempt")
@@ -252,7 +387,7 @@ def complete_attempt(
         if generation != current.attempt_number or generation != task.attempt_count:
             raise StaleAttemptError(attempt_id, generation, task.attempt_count)
         if current.state is not AttemptState.RUNNING:
-            raise AttemptFinishedError(attempt_id, current.state)
+            raise _finished(current)
         if task.state is not TaskState.RUNNING:
             msg = (
                 f"invariant violated: attempt {attempt_id} is running at the current "
@@ -300,13 +435,131 @@ def complete_attempt(
     return completion
 
 
+def renew_lease(
+    conn: Conn,
+    attempt_id: uuid.UUID,
+    *,
+    generation: int,
+    worker_id: str,
+    policy: LeasePolicy,
+) -> Attempt:
+    """Extend a running attempt's lease (a heartbeat) and return the attempt.
+
+    The new lease is ``policy.lease`` from now, capped at the attempt's
+    deadline, and never shorter than the current one; the deadline itself
+    never moves. In one transaction that locks only the attempt row (DEC-036).
+
+    Raises, without changing anything: ``NotFoundError`` for an unknown
+    attempt; ``StaleAttemptError`` when ``generation`` is not the attempt's;
+    ``WorkerMismatchError`` when ``worker_id`` does not own it;
+    ``AttemptRevokedError`` when recovery revoked it; ``AttemptFinishedError``
+    when it already ended otherwise; ``LeaseExpiredError`` when its lease has
+    expired, including at the deadline. A heartbeat therefore cannot revive an
+    expired lease or a revoked attempt.
+    """
+    with owned_transaction(conn, "renew_lease") as cur:
+        current = attempt_from_row(_locked(cur, _LOCK_ATTEMPT, attempt_id, "attempt"))
+        if generation != current.attempt_number:
+            (current_generation,) = _one(cur.execute(_TASK_GENERATION, (current.task_id,)))
+            raise StaleAttemptError(attempt_id, generation, current_generation)
+        if worker_id != current.worker_id:
+            raise WorkerMismatchError(attempt_id, worker_id, current.worker_id)
+        if current.state is not AttemptState.RUNNING:
+            raise _finished(current)
+        lease_expires_at, deadline_at = _lease_of(current)
+        now = _now(cur)
+        reason = revocation_reason(
+            lease_expires_at=lease_expires_at, deadline_at=deadline_at, now=now
+        )
+        if reason is not None:
+            raise LeaseExpiredError(attempt_id, reason, lease_expires_at, deadline_at)
+        renewed = renewed_lease(
+            policy, now=now, lease_expires_at=lease_expires_at, deadline_at=deadline_at
+        )
+        attempt = attempt_from_row(_one(cur.execute(_RENEW_LEASE, (renewed, attempt_id))))
+    logger.debug(
+        "lease renewed",
+        extra={"task_id": str(attempt.task_id), "attempt_id": str(attempt_id)},
+    )
+    return attempt
+
+
+def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
+    """Revoke one running attempt whose lease has expired, and move its task.
+
+    In one transaction: lock the task of the most overdue expired attempt that
+    no other transaction has locked, then the attempt; re-check against the
+    committed rows and the current database time that the attempt is still
+    the task's running generation and that its lease has expired; then record
+    the attempt as ``REVOKED`` with the reason its stored lease shows, and
+    move the task as ``next_task_state`` decides for a revoked attempt (DEC-038).
+    Ownership ends when this commits.
+
+    Returns the revoked attempt and its task, or ``None`` when this call
+    revoked nothing: no expired attempt was unlocked, or the one found was
+    renewed before it could be locked. It revokes at most one attempt;
+    sweeping repeatedly is the caller's job.
+    """
+    with owned_transaction(conn, "revoke_next_expired") as cur:
+        row = cur.execute(_LOCK_NEXT_EXPIRED_TASK).fetchone()
+        if row is None:
+            return None
+        *task_columns, attempt_id = row
+        task = task_from_row(tuple(task_columns))
+        current = attempt_from_row(_one(cur.execute(_LOCK_ATTEMPT, (attempt_id,))))
+        if (  # pragma: no cover - the task lock and its re-checked join exclude this
+            current.state is not AttemptState.RUNNING
+            or current.attempt_number != task.attempt_count
+        ):
+            msg = (
+                f"invariant violated: task {task.id} is running at generation "
+                f"{task.attempt_count} but attempt {current.id} is {current.state.value!r} "
+                f"at generation {current.attempt_number}"
+            )
+            raise RuntimeError(msg)
+        lease_expires_at, deadline_at = _lease_of(current)
+        now = _now(cur)
+        reason = revocation_reason(
+            lease_expires_at=lease_expires_at, deadline_at=deadline_at, now=now
+        )
+        if reason is None:
+            return None  # a heartbeat renewed the lease after discovery saw it expired
+        next_state = transition(
+            TaskState.RUNNING,
+            next_task_state(
+                AttemptState.REVOKED,
+                None,
+                attempt_count=task.attempt_count,
+                max_attempts=task.max_attempts,
+                cancel_requested=task.cancel_requested_at is not None,
+            ),
+        )
+        attempt_state = transition_attempt(AttemptState.RUNNING, AttemptState.REVOKED)
+        attempt_row = _one(
+            cur.execute(_REVOKE_ATTEMPT, (attempt_state.value, reason.value, now, current.id))
+        )
+        finished_at = now if next_state in TERMINAL_TASK_STATES else None
+        task_row = _one(cur.execute(_RECOVER_TASK, (next_state.value, now, finished_at, task.id)))
+        revocation = AttemptRevocation(attempt_from_row(attempt_row), task_from_row(task_row))
+    logger.warning(
+        "attempt revoked: %s",
+        reason.value,
+        extra={
+            "task_id": str(task.id),
+            "attempt_id": str(current.id),
+            "worker_id": current.worker_id,
+        },
+    )
+    return revocation
+
+
 def request_cancellation(conn: Conn, task_id: uuid.UUID) -> CancellationResult:
     """Request cancellation of a task (cooperative; DEC-020).
 
     A queued task is cancelled at once. A running task records the request and
-    keeps running; its attempt decides the outcome when it completes. Repeated
-    requests and requests for finished tasks change nothing. Raises
-    ``NotFoundError`` for an unknown task.
+    keeps running; its attempt decides the outcome when it completes or is
+    revoked. Repeated requests and requests for finished tasks change nothing.
+    Raises ``NotFoundError`` for an unknown task.
     """
     with owned_transaction(conn, "request_cancellation") as cur:
         task = _lock_task(cur, _LOCK_TASK, task_id, "task")
@@ -346,10 +599,37 @@ def list_attempts(conn: Conn, task_id: uuid.UUID) -> tuple[Attempt, ...]:
     return tuple(attempt_from_row(row) for row in rows)
 
 
+def _finished(attempt: Attempt) -> AttemptFinishedError:
+    """The rejection for a write to an attempt that already ended."""
+    if attempt.revoked_reason is not None:  # set exactly when the attempt was revoked
+        return AttemptRevokedError(attempt.id, attempt.revoked_reason)
+    return AttemptFinishedError(attempt.id, attempt.state)
+
+
+def _lease_of(attempt: Attempt) -> tuple[datetime, datetime]:
+    """A running attempt's ``(lease_expires_at, deadline_at)``."""
+    if attempt.lease_expires_at is None or attempt.deadline_at is None:  # pragma: no cover
+        msg = f"invariant violated: running attempt {attempt.id} has no lease"  # lease_required
+        raise RuntimeError(msg)
+    return attempt.lease_expires_at, attempt.deadline_at
+
+
+def _now(cur: Cursor) -> datetime:
+    (now,) = _one(cur.execute(_NOW))
+    if not isinstance(now, datetime):  # pragma: no cover - statement_timestamp() is timestamptz
+        msg = f"statement_timestamp() returned {now!r}"
+        raise TypeError(msg)
+    return now
+
+
 def _one(cur: Cursor) -> TupleRow:
-    """The single row an UPDATE or INSERT ... RETURNING on a locked row produces."""
+    """The single row a statement cannot fail to return.
+
+    That is a write to a row this transaction has locked, a read of a row a
+    locked row refers to, or a clock read.
+    """
     row = cur.fetchone()
-    if row is None:  # pragma: no cover - the row is locked by this transaction
+    if row is None:  # pragma: no cover - guaranteed by the locks and foreign keys
         msg = "a write on a locked row returned no row"
         raise RuntimeError(msg)
     return row
