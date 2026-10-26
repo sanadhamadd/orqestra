@@ -10,6 +10,7 @@ from orqestra.domain.errors import (
     TransientError,
     is_retryable,
 )
+from orqestra.domain.leases import RevocationReason
 from orqestra.domain.policy import (
     FailureKind,
     classify_failure,
@@ -78,8 +79,10 @@ def test_failure_kind_values_are_stable() -> None:
     assert [kind.value for kind in FailureKind] == ["transient", "permanent", "unclassified"]
 
 
-# (outcome, failure kind, attempts left?, cancel requested?) -> next task state
-EXPECTED: dict[tuple[AttemptState, FailureKind | None, bool, bool], TaskState] = {}
+# (outcome, failure kind or revocation reason, attempts left?, cancel requested?)
+# -> next task state
+Cause = FailureKind | RevocationReason | None
+EXPECTED: dict[tuple[AttemptState, Cause, bool, bool], TaskState] = {}
 for left, cancel in itertools.product([True, False], repeat=2):
     EXPECTED[(AttemptState.SUCCEEDED, None, left, cancel)] = TaskState.SUCCEEDED
     EXPECTED[(AttemptState.FAILED, FailureKind.PERMANENT, left, cancel)] = TaskState.FAILED
@@ -89,11 +92,19 @@ for left, cancel in itertools.product([True, False], repeat=2):
     )
     if cancel:
         EXPECTED[(AttemptState.CANCELLED, None, left, cancel)] = TaskState.CANCELLED
-    # Revocation is not a handler failure, but it moves the task like a transient
-    # one; with no attempts left it fails, even with a request pending (DEC-038).
-    EXPECTED[(AttemptState.REVOKED, None, left, cancel)] = (
-        (TaskState.CANCELLED if cancel else TaskState.QUEUED) if left else TaskState.FAILED
-    )
+    # Revocation is not a handler failure. For its lease or deadline it moves
+    # the task like a transient failure; with no attempts left it fails, even
+    # with a request pending (DEC-038).
+    for reason in (RevocationReason.LEASE_EXPIRED, RevocationReason.DEADLINE_EXCEEDED):
+        EXPECTED[(AttemptState.REVOKED, reason, left, cancel)] = (
+            (TaskState.CANCELLED if cancel else TaskState.QUEUED) if left else TaskState.FAILED
+        )
+    # The request caused a grace revocation: cancelled whatever budget is left
+    # (DEC-040). Without a request it cannot happen (tested below).
+    if cancel:
+        EXPECTED[
+            (AttemptState.REVOKED, RevocationReason.CANCELLATION_GRACE_EXPIRED, left, cancel)
+        ] = TaskState.CANCELLED
 
 
 def _attempts(left: bool) -> tuple[int, int]:
@@ -103,16 +114,17 @@ def _attempts(left: bool) -> tuple[int, int]:
 
 @pytest.mark.parametrize(("case", "expected"), list(EXPECTED.items()))
 def test_next_task_state_decision_table(
-    case: tuple[AttemptState, FailureKind | None, bool, bool], expected: TaskState
+    case: tuple[AttemptState, Cause, bool, bool], expected: TaskState
 ) -> None:
-    outcome, kind, left, cancel = case
+    outcome, cause, left, cancel = case
     attempt_count, max_attempts = _attempts(left)
     result = next_task_state(
         outcome,
-        kind,
+        cause if isinstance(cause, FailureKind) else None,
         attempt_count=attempt_count,
         max_attempts=max_attempts,
         cancel_requested=cancel,
+        revocation_reason=cause if isinstance(cause, RevocationReason) else None,
     )
     assert result is expected
     # Every decision is a legal move out of RUNNING, and a requeued task stays
@@ -124,8 +136,11 @@ def test_next_task_state_decision_table(
 
 @pytest.mark.parametrize("max_attempts", [1, 2, 3])
 @pytest.mark.parametrize("cancel", [False, True])
-def test_a_revocation_moves_the_task_exactly_like_a_transient_failure(
-    max_attempts: int, cancel: bool
+@pytest.mark.parametrize(
+    "reason", [RevocationReason.LEASE_EXPIRED, RevocationReason.DEADLINE_EXCEEDED]
+)
+def test_a_lease_or_deadline_revocation_moves_the_task_exactly_like_a_transient_failure(
+    max_attempts: int, cancel: bool, reason: RevocationReason
 ) -> None:
     for attempt_count in range(1, max_attempts + 1):
         revoked = next_task_state(
@@ -134,6 +149,7 @@ def test_a_revocation_moves_the_task_exactly_like_a_transient_failure(
             attempt_count=attempt_count,
             max_attempts=max_attempts,
             cancel_requested=cancel,
+            revocation_reason=reason,
         )
         transient = next_task_state(
             AttemptState.FAILED,
@@ -143,6 +159,54 @@ def test_a_revocation_moves_the_task_exactly_like_a_transient_failure(
             cancel_requested=cancel,
         )
         assert revoked is transient
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2, 3])
+def test_a_grace_revocation_cancels_whatever_budget_is_left(max_attempts: int) -> None:
+    for attempt_count in range(1, max_attempts + 1):
+        result = next_task_state(
+            AttemptState.REVOKED,
+            None,
+            attempt_count=attempt_count,
+            max_attempts=max_attempts,
+            cancel_requested=True,
+            revocation_reason=RevocationReason.CANCELLATION_GRACE_EXPIRED,
+        )
+        assert result is TaskState.CANCELLED
+
+
+def test_a_grace_revocation_without_a_request_is_rejected() -> None:
+    with pytest.raises(ValueError, match="after a cancellation request"):
+        next_task_state(
+            AttemptState.REVOKED,
+            None,
+            attempt_count=1,
+            max_attempts=3,
+            cancel_requested=False,
+            revocation_reason=RevocationReason.CANCELLATION_GRACE_EXPIRED,
+        )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason"),
+    [
+        (AttemptState.REVOKED, None),
+        (AttemptState.SUCCEEDED, RevocationReason.LEASE_EXPIRED),
+        (AttemptState.CANCELLED, RevocationReason.CANCELLATION_GRACE_EXPIRED),
+    ],
+)
+def test_revocation_reason_must_match_outcome(
+    outcome: AttemptState, reason: RevocationReason | None
+) -> None:
+    with pytest.raises(ValueError, match="revocation_reason"):
+        next_task_state(
+            outcome,
+            None,
+            attempt_count=1,
+            max_attempts=3,
+            cancel_requested=True,
+            revocation_reason=reason,
+        )
 
 
 def test_single_attempt_task_fails_on_first_transient_error() -> None:

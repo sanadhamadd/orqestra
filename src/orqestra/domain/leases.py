@@ -13,6 +13,12 @@ revocation, so a completion that commits first still counts (ADR-0003).
 A lease proves that a worker is alive, not that its work progresses: a
 worker can keep renewing the lease of a hung task. The deadline bounds that
 case, because no heartbeat can move the lease past it.
+
+Cancellation (DEC-040): a request for a running attempt whose lease still
+holds sets that lease to end one grace period after the request, never past
+the deadline; it may shorten or lengthen the lease, and heartbeats no longer
+renew it. A request made once the lease had expired leaves it unchanged, so a
+request never revives an expired lease.
 """
 
 from dataclasses import dataclass
@@ -29,6 +35,22 @@ class RevocationReason(StrEnum):
 
     LEASE_EXPIRED = "lease_expired"  # the heartbeats stopped before the deadline
     DEADLINE_EXCEEDED = "deadline_exceeded"  # the lease ran out at its deadline cap
+    # A cancellation request, made while the lease held, set the lease to end
+    # after its grace period, and the attempt did not finish before then.
+    CANCELLATION_GRACE_EXPIRED = "cancellation_grace_expired"
+
+
+def check_duration(name: str, value: object) -> None:
+    """Raise unless ``value`` is a positive ``timedelta`` within the representable range."""
+    if not isinstance(value, timedelta):
+        msg = f"{name} must be a timedelta, got {type(value).__name__}"
+        raise TypeError(msg)
+    if value <= timedelta(0):
+        msg = f"{name} must be positive, got {value}"
+        raise ValueError(msg)
+    if value > _LONGEST_REPRESENTABLE:
+        msg = f"{name} {value} is longer than any representable timestamp range"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,17 +67,8 @@ class LeasePolicy:
     execution_timeout: timedelta
 
     def __post_init__(self) -> None:
-        for name in ("lease", "execution_timeout"):
-            value = getattr(self, name)
-            if not isinstance(value, timedelta):
-                msg = f"{name} must be a timedelta, got {type(value).__name__}"
-                raise TypeError(msg)
-            if value <= timedelta(0):
-                msg = f"{name} must be positive, got {value}"
-                raise ValueError(msg)
-            if value > _LONGEST_REPRESENTABLE:
-                msg = f"{name} {value} is longer than any representable timestamp range"
-                raise ValueError(msg)
+        check_duration("lease", self.lease)
+        check_duration("execution_timeout", self.execution_timeout)
         if self.lease > self.execution_timeout:
             msg = (
                 f"lease {self.lease} must not exceed execution_timeout "
@@ -91,18 +104,46 @@ def renewed_lease(
     return max(lease_expires_at, candidate)
 
 
+def cancellation_lease(
+    *, requested_at: datetime, grace: timedelta, lease_expires_at: datetime, deadline_at: datetime
+) -> datetime:
+    """Return the lease a cancellation request made at ``requested_at`` leaves the attempt.
+
+    While the lease holds, it ends ``grace`` after the request, capped at the
+    deadline; this may shorten or lengthen it. Once the lease has expired
+    (inclusively, as in ``revocation_reason``) it is returned unchanged.
+    """
+    if requested_at >= lease_expires_at:
+        return lease_expires_at
+    try:
+        return min(requested_at + grace, deadline_at)
+    except OverflowError:
+        return deadline_at
+
+
 def revocation_reason(
-    *, lease_expires_at: datetime, deadline_at: datetime, now: datetime
+    *,
+    lease_expires_at: datetime,
+    deadline_at: datetime,
+    cancel_requested_at: datetime | None,
+    now: datetime,
 ) -> RevocationReason | None:
     """Return why an attempt may be revoked at ``now``, or ``None`` while its lease holds.
 
     A lease expires at its ``lease_expires_at`` instant, inclusively. The
     reason follows from the stored facts alone, not from when recovery runs:
-    a lease that reached its deadline cap exceeded the deadline; any other
-    expired lease was not renewed in time.
+
+    1. A lease that reached its deadline cap exceeded the deadline, even if
+       cancellation was requested (DEC-040).
+    2. Otherwise, a lease that expired after a cancellation request ran out its
+       grace period: the request was made while the lease still held.
+    3. Any other expired lease was not renewed in time; a request made after
+       it expired does not change that.
     """
     if now < lease_expires_at:
         return None
     if lease_expires_at >= deadline_at:
         return RevocationReason.DEADLINE_EXCEEDED
+    if cancel_requested_at is not None and cancel_requested_at < lease_expires_at:
+        return RevocationReason.CANCELLATION_GRACE_EXPIRED
     return RevocationReason.LEASE_EXPIRED

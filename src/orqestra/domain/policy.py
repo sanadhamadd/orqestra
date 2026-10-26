@@ -11,17 +11,19 @@ outcomes that end the task on their own (success, permanent or unclassified
 failure, exhausted retries) are recorded as they happened.
 
 A revoked attempt is not a handler failure (DEC-009): recovery took
-ownership back because the attempt's lease or deadline expired. For the task
-it counts like a transient failure: it used one attempt of the budget
-(DEC-019), requeues the task while attempts remain, cancels it instead when a
-request is pending, and fails it once the budget is exhausted, whether or not
-a request is pending. Revoking ownership after a bounded cancellation grace
-period is a later contract and is not implemented here.
+ownership back because the attempt's lease or deadline expired. When its lease
+or its deadline ran out, it counts for the task like a transient failure: it
+used one attempt of the budget (DEC-019), requeues the task while attempts
+remain, cancels it instead when a request is pending, and fails it once the
+budget is exhausted, whether or not a request is pending (DEC-038). When its
+cancellation grace period ran out, the request caused the revocation, so the
+task is cancelled whatever budget remains (DEC-040).
 """
 
 from enum import StrEnum
 
 from orqestra.domain.errors import PermanentError, is_retryable
+from orqestra.domain.leases import RevocationReason
 from orqestra.domain.states import AttemptState, TaskState
 
 
@@ -59,19 +61,24 @@ def next_task_state(
     attempt_count: int,
     max_attempts: int,
     cancel_requested: bool,
+    revocation_reason: RevocationReason | None = None,
 ) -> TaskState:
     """Return the task state after its current attempt ends with ``outcome``.
 
     ``attempt_count`` is the task's generation, i.e. the number of the attempt
     that ended. ``failure_kind`` is required for a failed attempt and must be
-    ``None`` otherwise, including for a revoked one. Raises ``ValueError`` for
-    inputs no valid caller can produce.
+    ``None`` otherwise, including for a revoked one. ``revocation_reason`` is
+    required for a revoked attempt and must be ``None`` otherwise. Raises
+    ``ValueError`` for inputs no valid caller can produce.
     """
     if not 1 <= attempt_count <= max_attempts:
         msg = f"attempt_count must be in 1..{max_attempts}, got {attempt_count}"
         raise ValueError(msg)
     if (outcome is AttemptState.FAILED) != (failure_kind is not None):
         msg = "failure_kind is required for a failed attempt and only for a failed attempt"
+        raise ValueError(msg)
+    if (outcome is AttemptState.REVOKED) != (revocation_reason is not None):
+        msg = "revocation_reason is required for a revoked attempt and only for a revoked attempt"
         raise ValueError(msg)
     match outcome:
         case AttemptState.RUNNING:
@@ -88,6 +95,13 @@ def next_task_state(
             return _retry_unless_exhausted(attempt_count, max_attempts, cancel_requested)
         case AttemptState.FAILED:
             return TaskState.FAILED
+        case AttemptState.REVOKED if (
+            revocation_reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
+        ):
+            if not cancel_requested:
+                msg = "a cancellation grace period can only expire after a cancellation request"
+                raise ValueError(msg)
+            return TaskState.CANCELLED
         case AttemptState.REVOKED:
             return _retry_unless_exhausted(attempt_count, max_attempts, cancel_requested)
 

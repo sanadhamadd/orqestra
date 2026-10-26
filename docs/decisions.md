@@ -8,6 +8,7 @@ Deliberately **undecided** (do not infer a choice from the code): API framework,
 hosting, AI provider and models, asyncio vs threads for worker slots, operational lease
 and execution-timeout values and any per-job-kind policy (DEC-034). The DB driver,
 migration tool and task queue are no longer open: see DEC-016, DEC-017 and DEC-033.
+Operational cancellation grace periods are undecided too (DEC-040).
 
 ## Day 1 — repository foundation
 
@@ -155,6 +156,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **TRADE-OFF:** Running tasks are not terminal the moment cancellation is requested. Revoking database ownership is not proof that an external AI call stopped or was not billed.
 - **VERIFICATION:** `next_task_state` and `state_after_cancel_request` decision tables; `tasks_cancel_request_not_queued`, `tasks_cancelled_was_requested`. Race tests are Step 2; the grace period needs its own design and tests.
 - **Day 3A Slice 2 note:** a revocation counts as an outcome that would requeue while attempts remain, so a pending request cancels the task instead; an exhausted revocation fails it, as an exhausted transient failure does (DEC-038). Until the grace period exists, the execution deadline bounds how long a running attempt can ignore a request. A revocation caused by the request itself (Slice 3) will need its own rule.
+- **Day 3A Slice 3 note:** the bounded grace period now exists (DEC-040). A request carries a grace duration and sets the running attempt's lease to end that long after it; heartbeats stop renewing it, and recovery then cancels the task whatever budget is left. The cooperative rules above are unchanged within the grace period.
 
 ### DEC-021 — READ COMMITTED, short transactions, task-before-attempt locking (direction)
 - **Status:** Proposed · owner-approved direction · implemented: job submission (DEC-024) and the attempt lifecycle (DEC-028)
@@ -327,6 +329,7 @@ is not stopped (Day 3B).
   - Every caller must pass a policy; the existing test call sites were updated.
   - Operational bounds (maximum lease and timeout, heartbeat interval, per-job-kind policies) are undecided and need owner approval before Day 3B.
 - **VERIFICATION:** `tests/unit/test_leases.py` (validation, expiry at the exact instant and one microsecond either side, the cap, never shortening, representability); `tests/integration/test_attempt_lifecycle.py` sections 17 and 18, including a lease kept alive by heartbeats until its deadline and then revoked as `deadline_exceeded`.
+- **Day 3A Slice 3 note:** the revocation reason has a third case. In order: a lease at its deadline is `deadline_exceeded`; otherwise a lease that ended after a cancellation request made while it held is `cancellation_grace_expired`; otherwise `lease_expired`. A cancellation request is the one write besides a heartbeat that sets the lease, and it may shorten it (DEC-040).
 
 ### DEC-035 — One claim instant, and a database clock read after the locks
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally
@@ -335,6 +338,7 @@ is not stopped (Day 3B).
 - **RUNNER-UP:** `clock_timestamp()` captured once after the lock: equally fresh, but evaluated on every call, so a later edit could give the columns different instants. `statement_timestamp()` of the locking statement: taken before that statement's own wait.
 - **TRADE-OFF:** A claimant that stalls between its claim `UPDATE` and its commit still loses that time from its lease, which is right: it was not running the task. The claim's `updated_at` moves from transaction start to the claim statement. Expiry depends on one database clock: a step forward can expire leases early (fencing still holds), and a step back is absorbed because a lease never shrinks.
 - **VERIFICATION:** `test_a_claim_that_waited_for_the_task_lock_still_gets_its_full_lease`, for `start_attempt` and `claim_next_attempt`, with and without server-side prepared statements. A holder keeps the claimant waiting (observed in `pg_locks`) and reads `clock_timestamp()` before releasing; the attempt must start after that. Locally, deriving the instant from `now()` fails it.
+- **Day 3A Slice 3 note:** a cancellation request's instant (`cancel_requested_at`, and for a queued task `finished_at` and `updated_at`) is now `statement_timestamp()` of its task update, taken after its locks, because the revocation reason compares it with the lease (DEC-040).
 
 ### DEC-036 — The heartbeat renews under the attempt lock alone and refuses expired leases
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`renew_lease`)
@@ -349,6 +353,7 @@ is not stopped (Day 3B).
   - Rejection tests; both forced orders of heartbeat against recovery.
   - A 40-round unforced race of heartbeat, completion, recovery and cancellation in which both completion and recovery win some rounds.
   - Locally, adding a task lock after the attempt lock made that race fail with `DeadlockDetected`; removing each check failed its test.
+- **Day 3A Slice 3 note:** the heartbeat also reads the task's `cancel_requested_at` without a lock, in the statement that reads the clock after the attempt lock, and refuses renewal with `CancellationRequestedError` once a request has committed. It still takes no task lock (DEC-040).
 
 ### DEC-037 — Recovery revokes one expired attempt per transaction; ownership ends at its commit
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`revoke_next_expired`)
@@ -394,6 +399,7 @@ is not stopped (Day 3B).
   - A deterministic hang is retried up to `max_attempts` times the execution timeout, with no backoff (DEC-033).
   - The cancellation-grace revocation of Slice 3 is caused by the request and will need its own rule.
 - **VERIFICATION:** `tests/unit/test_policy.py` decision table, plus a check that a revocation moves the task exactly as a transient failure does for every count and request; the integration outcome table (six cases, including a single-attempt task with a pending request); invariant rules on attempt history.
+- **Day 3A Slice 3 note:** the anticipated rule now exists: a `cancellation_grace_expired` revocation cancels the task whatever budget is left, and requires a pending request. `next_task_state` takes the revocation reason for every revoked outcome (DEC-040).
 
 ### DEC-039 — Migration 0002: additive schema and a quiescent upgrade with `NOWAIT` locks
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`0002_attempt_leases.sql`)
@@ -421,3 +427,76 @@ is not stopped (Day 3B).
   - `tests/integration/test_migration_0002.py`: upgrade over terminal history; refusal while an attempt or a task is running; prompt `55P03` with no effect while a claim, a completion or an idle reader holds the tables; the READ COMMITTED requirement; legacy claims rejected afterwards; a 10-round race against legacy workers, in which the upgrade applies while they are still running and their next claims are rejected.
   - A test for every new constraint and for the trigger, in `test_schema_constraints.py`; the domain/schema drift test now includes revocation reasons.
   - Locally, removing `NOWAIT` made a test fail after 10 s instead of refusing, and removing the refusal, the isolation check, the trigger or `attempts_lease_required` each failed tests.
+- **Day 3A Slice 3 note:** migration 0003 follows the same locking rule, `NOWAIT` before any change, but needs neither the running-work refusal nor the isolation check, because it changes no data-dependent state (DEC-041).
+
+## Day 3A — Slice 3: bounded cancellation grace period
+
+Entries DEC-040 and DEC-041 record the Slice 3 design the owner approved after an
+architecture review and an independent review. They stay **Proposed** until the owner
+accepts them in a reviewed change; "implemented" means verified locally by the tests
+named, not yet in GitHub CI. The worker's response to a cancellation, handler
+interruption and scheduled recovery remain Day 3B.
+
+### DEC-040 — A cancellation request sets the running attempt's lease to a grace period
+- **Status:** Proposed · owner-approved direction · implemented locally
+- **WHAT:** `request_cancellation(conn, task_id, *, grace)` requires a positive, representable `timedelta`, checked before any write, with no default. For a running task, in one transaction, it:
+  1. locks the task, then its running attempt;
+  2. records `cancel_requested_at` at one instant taken after those locks;
+  3. if the attempt's lease still holds, sets it to `least(request + grace, deadline_at)`, which may shorten or lengthen it; an expired lease is left alone, never revived.
+
+  The generation, worker, deadline and state of the attempt do not change. A repeated request changes nothing. From the request's commit on, `renew_lease` raises `CancellationRequestedError` (with the lease end). Recovery is unchanged except for the reason it records, decided in this order:
+  - a lease at its deadline: `deadline_exceeded`;
+  - else, if the request came strictly before the lease ended: `cancellation_grace_expired`;
+  - else `lease_expired`.
+
+  A grace expiry cancels the task whatever budget is left; the other reasons keep DEC-038's rule.
+- **WHY:**
+  - A grace period that is just the remaining lease was rejected in review: with `lease == execution_timeout` it lasts until the deadline, where the task would end `failed`, and a request near the end of a lease leaves almost no time to wind down.
+  - Setting the lease bounds cancellation to the grace period independently of the lease and timeout, needs no new column (the grace lives in the lease) and no new recovery query.
+  - Locking the attempt makes the race with heartbeats strict. A heartbeat that commits first is reset by the request, which reads the fresh lease. A request that commits first is seen by every later heartbeat.
+  - The reason follows from stored facts, and the deadline still wins, so a hang that reached its limit stays visible as a failure.
+- **RUNNER-UP:** The grace is the remaining lease, with no new parameter. A grace duration stored per attempt at claim (a policy field and a column). A separate grace deadline checked by recovery beside the lease.
+- **WHY NOT:** The first fails the reviewed case on latency and outcome. The second needs a migration column, a fallback for attempts already running, and a policy field. The third needs a column and a second recovery predicate, for the same effect.
+- **TRADE-OFF:**
+  - A lease is no longer an absolute promise: a request can reset it, and the worker hears only at its next heartbeat, so Day 3B must keep the heartbeat interval shorter than any grace in use.
+  - If the worker is already dead, a grace longer than its remaining lease delays recovery.
+  - A worker that died in the lease window before a request is recorded as a grace expiry, so the task is cancelled.
+  - When the deadline falls inside the grace, a task with no attempts left ends `failed`.
+  - `request_cancellation` gained a required argument.
+- **VERIFICATION:**
+  - Unit: `tests/unit/test_leases.py` (the reason at, before and after expiry; deadline precedence; shortening, lengthening, the deadline cap, no revival, overflow; grace validation) and `tests/unit/test_policy.py` (the grace outcome for every budget; required reasons).
+  - Integration: `tests/integration/test_attempt_lifecycle.py` section 21:
+    - the lease rules;
+    - refused heartbeats;
+    - the reviewed case, cancelled with one attempt allowed;
+    - the deadline inside the grace;
+    - a request after expiry;
+    - completion within the grace counted, and rejected after revocation;
+    - a request timed after a lock wait;
+    - forced orders of heartbeat against request, and of request against recovery (request against completion in section 11);
+    - failed writes and a lost connection rolling back;
+    - a corrupted running task refused;
+    - a 40-round stress test (unforced, seeded start windows) asserting no deadlock, exactly one of completion or recovery per round, and the outcome each implies; which one wins is not asserted, because the forced-order and sequential tests above force each.
+  - Locally, 17 mutants, including a heartbeat that ignores the request, a request that does not lock the attempt or does not reset the lease, a request that revives an expired lease, swapped precedence, a budget-dependent outcome, a request timed by `now()`, and a heartbeat that locks the task, each fail tests.
+
+### DEC-041 — Migration 0003 widens the revocation reasons; versions switch together
+- **Status:** Proposed · owner-approved direction · implemented locally (`0003_cancellation_grace.sql`)
+- **WHAT:** 0003 takes `LOCK TABLE attempts IN ACCESS EXCLUSIVE MODE NOWAIT` (`55P03` with an operator message if any session uses it), then replaces `attempts_revoked_reason_valid` to admit `cancellation_grace_expired`. It keeps `attempts_revoked_reason_matches_lease`, which already admits the new reason exactly when the lease ended before the deadline, and every other 0002 constraint and trigger. It adds no column or index, takes no `tasks` lock, has no running-work refusal and no isolation check. Rollout: stop all application processes → apply 0003 → start only Slice 3 code; draining first is preferable.
+- **WHY:**
+  - Every stored row satisfies the widened rule and running attempts are unaffected, so the schema change needs no quiescence.
+  - The real hazard is mixed application versions after the migration: older code cannot read the new reason, and its heartbeats ignore cancellation.
+  - A running-work refusal would not prevent that, so the rollout order is documented instead.
+  - `NOWAIT` keeps the DEC-039 rule: never wait while holding a lock.
+- **RUNNER-UP:** The 0002 contract again: lock both tables, require READ COMMITTED, refuse running work.
+- **WHY NOT:** It adds checks that protect no data in this migration and still does not stop older processes from running afterwards.
+- **TRADE-OFF:**
+  - The database does not enforce the version switch.
+  - Slice 3 code on a 0002 schema fails closed: its grace revocations are rejected and roll back until 0003 is applied.
+- **VERIFICATION:** `tests/integration/test_migration_0003.py`:
+  - upgrade from 0002 keeps revoked history and running attempts, whose heartbeats then behave as before;
+  - the new reason is rejected by 0002 (the revocation rolls back both rows) and accepted after;
+  - an idle reader or a held attempt row makes it fail at once with no history row and the old reasons;
+  - a held task row does not;
+  - a 10-round race against live claims, heartbeats, completions and requests never deadlocks, and applies while work is still being claimed.
+
+  The schema tests cover the new reason against `matches_lease`, and the drift test covers the reason values. Locally, removing the new value, removing `NOWAIT` (the test fails after 10 s instead of hanging), or also locking `tasks` each fail tests.

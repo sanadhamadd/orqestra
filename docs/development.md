@@ -62,6 +62,12 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   any session uses the tables, and requires READ COMMITTED. Attempts left running by dead
   workers must be resolved by the maintainer before upgrading; the migration never expires
   or reassigns them.
+- Upgrading to 0003 is additive at the database: it takes only `attempts`, with `NOWAIT`
+  (`55P03` while any session uses it), and may run while attempts are running. Application
+  versions are the constraint the database cannot enforce: stop all application processes,
+  run `orqestra migrate`, then start only code from Slice 3 or later, because older code
+  cannot read the `cancellation_grace_expired` reason and does not stop heartbeats after
+  a cancellation request. Stopping claims and draining work first is preferable.
 
 ## Distributed correctness
 

@@ -48,12 +48,17 @@ def _tables(url: str) -> set[str]:
 def test_applies_packaged_schema_to_an_empty_schema(schema_url: str) -> None:
     assert _tables(schema_url) == set()
     applied = migrate(schema_url)
-    assert [m.label for m in applied] == ["0001_initial_schema", "0002_attempt_leases"]
+    assert [m.label for m in applied] == [
+        "0001_initial_schema",
+        "0002_attempt_leases",
+        "0003_cancellation_grace",
+    ]
     assert _tables(schema_url) == {"schema_migrations", "jobs", "tasks", "attempts"}
-    initial, leases = load_migrations()
+    initial, leases, grace = load_migrations()
     assert _history(schema_url) == [
         (1, "initial_schema", initial.checksum),
         (2, "attempt_leases", leases.checksum),
+        (3, "cancellation_grace", grace.checksum),
     ]
 
 
@@ -276,8 +281,9 @@ def test_many_concurrent_runners_apply_each_migration_exactly_once(
         assert sorted(label for result in results for label in result) == [
             "0001_initial_schema",
             "0002_attempt_leases",
+            "0003_cancellation_grace",
         ]
-        assert len(_history(url)) == 2
+        assert len(_history(url)) == 3
 
 
 def test_cli_migrate_applies_the_schema(
@@ -287,7 +293,7 @@ def test_cli_migrate_applies_the_schema(
     assert main(["migrate"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "status": "ok",
-        "applied": ["0001_initial_schema", "0002_attempt_leases"],
+        "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace"],
     }
     assert main(["migrate"]) == 0
     assert json.loads(capsys.readouterr().out) == {"status": "ok", "applied": []}

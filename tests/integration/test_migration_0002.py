@@ -29,7 +29,10 @@ pytestmark = pytest.mark.integration
 
 Conn = psycopg.Connection[TupleRow]
 
-INITIAL, LEASES = load_migrations()
+INITIAL, LEASES, *_ = load_migrations()
+# These tests are about the upgrade from 0001 to 0002, so they apply exactly
+# that; later migrations have their own tests.
+UP_TO_0002 = [INITIAL, LEASES]
 LEASE_COLUMNS = ("lease_expires_at", "deadline_at", "revoked_reason")
 
 
@@ -180,7 +183,7 @@ def upgrade_refused(url: str) -> MigrationError:
 
 def _try_migrate(url: str) -> BaseException | object:
     try:
-        return migrate(url)
+        return migrate(url, UP_TO_0002)
     except Exception as exc:  # returned to the test thread, which inspects it
         return exc
 
@@ -232,7 +235,7 @@ def test_upgrades_a_quiescent_database_and_keeps_its_history(
     )
     before = snapshot(conn)
 
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
 
     assert versions(conn) == [1, 2]
     assert snapshot(conn) == before  # every task and every finished attempt as it was
@@ -274,7 +277,7 @@ def test_refuses_to_upgrade_while_an_attempt_is_running(
     assert snapshot(conn) == before  # legacy work is not expired or revoked
 
     legacy_finish(conn, task, attempt, attempt_state="succeeded", task_state="succeeded")
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
     finished = get_attempt(conn, attempt)
     assert finished is not None
     assert (finished.state.value, finished.lease_expires_at) == ("succeeded", None)
@@ -334,7 +337,7 @@ def test_fails_at_once_while_a_completion_holds_its_rows(
 
     completer.execute("ROLLBACK")
     legacy_finish(conn, task, attempt, attempt_state="succeeded", task_state="succeeded")
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
 
 
 def test_fails_at_once_while_a_reader_holds_attempts(
@@ -354,7 +357,7 @@ def test_fails_at_once_while_a_reader_holds_attempts(
             conn.execute("SELECT id FROM tasks WHERE id = %s FOR UPDATE", (task,))
         reader.rollback()
 
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
 
 
 def test_requires_read_committed(schema_url: str, legacy: Callable[[], Conn]) -> None:
@@ -374,7 +377,7 @@ def test_after_the_upgrade_a_claim_without_a_lease_is_rejected(
 ) -> None:
     conn = legacy()
     (task,) = legacy_job(conn, 1)
-    migrate(schema_url)
+    migrate(schema_url, UP_TO_0002)
     with pytest.raises(errors.CheckViolation) as info:
         legacy_claim(conn, task)  # code from before the upgrade, still running
     assert info.value.diag.constraint_name == "attempts_lease_required"
@@ -423,7 +426,7 @@ def upgrade_during_legacy_work(url: str) -> tuple[list[str], list[str]]:
         outcomes: list[str] = []
         for _ in range(2000):  # retried at once, as a script would; each refusal is instant
             try:
-                outcomes.append(",".join(m.label for m in migrate(url)))
+                outcomes.append(",".join(m.label for m in migrate(url, UP_TO_0002)))
                 break
             except MigrationError as exc:
                 outcomes.append(str(exc.sqlstate))
