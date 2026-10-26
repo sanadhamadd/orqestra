@@ -89,6 +89,11 @@ for left, cancel in itertools.product([True, False], repeat=2):
     )
     if cancel:
         EXPECTED[(AttemptState.CANCELLED, None, left, cancel)] = TaskState.CANCELLED
+    # Revocation is not a handler failure, but it moves the task like a transient
+    # one; with no attempts left it fails, even with a request pending (DEC-038).
+    EXPECTED[(AttemptState.REVOKED, None, left, cancel)] = (
+        (TaskState.CANCELLED if cancel else TaskState.QUEUED) if left else TaskState.FAILED
+    )
 
 
 def _attempts(left: bool) -> tuple[int, int]:
@@ -115,6 +120,29 @@ def test_next_task_state_decision_table(
     assert result in TASK_TRANSITIONS[TaskState.RUNNING]
     if result is TaskState.QUEUED:
         assert attempt_count < max_attempts
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2, 3])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_a_revocation_moves_the_task_exactly_like_a_transient_failure(
+    max_attempts: int, cancel: bool
+) -> None:
+    for attempt_count in range(1, max_attempts + 1):
+        revoked = next_task_state(
+            AttemptState.REVOKED,
+            None,
+            attempt_count=attempt_count,
+            max_attempts=max_attempts,
+            cancel_requested=cancel,
+        )
+        transient = next_task_state(
+            AttemptState.FAILED,
+            FailureKind.TRANSIENT,
+            attempt_count=attempt_count,
+            max_attempts=max_attempts,
+            cancel_requested=cancel,
+        )
+        assert revoked is transient
 
 
 def test_single_attempt_task_fails_on_first_transient_error() -> None:
@@ -152,6 +180,7 @@ def test_running_is_not_an_outcome() -> None:
         (AttemptState.FAILED, None),
         (AttemptState.SUCCEEDED, FailureKind.TRANSIENT),
         (AttemptState.CANCELLED, FailureKind.PERMANENT),
+        (AttemptState.REVOKED, FailureKind.TRANSIENT),
     ],
 )
 def test_failure_kind_must_match_outcome(outcome: AttemptState, kind: FailureKind | None) -> None:

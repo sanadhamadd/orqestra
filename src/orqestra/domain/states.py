@@ -19,7 +19,10 @@ Task lifecycle::
 An attempt is one execution of a task by one worker. It is created running
 and ends exactly once::
 
-    running ──> succeeded | failed | cancelled
+    running ──> succeeded | failed | cancelled | revoked
+
+``revoked`` is not reported by a worker: recovery records it when an
+attempt's lease expired and it took ownership back (see ``leases``).
 """
 
 from enum import StrEnum
@@ -84,16 +87,23 @@ class AttemptState(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REVOKED = "revoked"
 
 
 ATTEMPT_TRANSITIONS: MappingProxyType[AttemptState, frozenset[AttemptState]] = MappingProxyType(
     {
         AttemptState.RUNNING: frozenset(
-            {AttemptState.SUCCEEDED, AttemptState.FAILED, AttemptState.CANCELLED}
+            {
+                AttemptState.SUCCEEDED,
+                AttemptState.FAILED,
+                AttemptState.CANCELLED,
+                AttemptState.REVOKED,
+            }
         ),
         AttemptState.SUCCEEDED: frozenset(),
         AttemptState.FAILED: frozenset(),
         AttemptState.CANCELLED: frozenset(),
+        AttemptState.REVOKED: frozenset(),
     }
 )
 

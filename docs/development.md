@@ -52,6 +52,16 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   `VACUUM`).
 - Name every constraint so violations identify the exact rule, and add an integration
   test for each new constraint.
+- A migration that must not run beside live work (such as 0002) takes every table lock it
+  needs before any change, in the lifecycle's task-before-attempt order, already in the
+  mode its DDL needs, and with `NOWAIT`, so it fails at once instead of waiting while
+  holding a lock. Never upgrade a lock later in the same migration.
+- Upgrading to 0002 is a quiescent operation: stop every worker and claimer, let running
+  attempts finish, run `orqestra migrate`, then deploy the new code. The migration refuses
+  (SQLSTATE `55000`) while any task or attempt is running, fails at once (`55P03`) while
+  any session uses the tables, and requires READ COMMITTED. Attempts left running by dead
+  workers must be resolved by the maintainer before upgrading; the migration never expires
+  or reassigns them.
 
 ## Distributed correctness
 

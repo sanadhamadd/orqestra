@@ -27,11 +27,16 @@ def _write(directory: Path, files: dict[str, str | bytes]) -> Path:
 
 def test_packaged_migrations_load() -> None:
     migrations = load_migrations()
-    assert [migration.label for migration in migrations] == ["0001_initial_schema"]
-    initial = migrations[0]
-    assert initial.version == 1
+    assert [migration.label for migration in migrations] == [
+        "0001_initial_schema",
+        "0002_attempt_leases",
+    ]
+    initial, leases = migrations
+    assert (initial.version, leases.version) == (1, 2)
     assert "CREATE TABLE tasks" in initial.sql
-    assert initial.checksum == hashlib.sha256(initial.sql.encode("utf-8")).hexdigest()
+    assert "ADD COLUMN lease_expires_at" in leases.sql
+    for migration in migrations:
+        assert migration.checksum == hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()
 
 
 def test_migrations_are_ordered_by_version(tmp_path: Path) -> None:
