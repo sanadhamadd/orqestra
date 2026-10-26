@@ -29,7 +29,10 @@ pytestmark = pytest.mark.integration
 
 Conn = psycopg.Connection[TupleRow]
 
-INITIAL, LEASES = load_migrations()
+INITIAL, LEASES, *_ = load_migrations()
+# These tests are about the upgrade from 0001 to 0002, so they apply exactly
+# that; later migrations have their own tests.
+UP_TO_0002 = [INITIAL, LEASES]
 LEASE_COLUMNS = ("lease_expires_at", "deadline_at", "revoked_reason")
 
 
@@ -180,7 +183,7 @@ def upgrade_refused(url: str) -> MigrationError:
 
 def _try_migrate(url: str) -> BaseException | object:
     try:
-        return migrate(url)
+        return migrate(url, UP_TO_0002)
     except Exception as exc:  # returned to the test thread, which inspects it
         return exc
 
@@ -232,7 +235,7 @@ def test_upgrades_a_quiescent_database_and_keeps_its_history(
     )
     before = snapshot(conn)
 
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
 
     assert versions(conn) == [1, 2]
     assert snapshot(conn) == before  # every task and every finished attempt as it was
@@ -274,7 +277,7 @@ def test_refuses_to_upgrade_while_an_attempt_is_running(
     assert snapshot(conn) == before  # legacy work is not expired or revoked
 
     legacy_finish(conn, task, attempt, attempt_state="succeeded", task_state="succeeded")
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
     finished = get_attempt(conn, attempt)
     assert finished is not None
     assert (finished.state.value, finished.lease_expires_at) == ("succeeded", None)
@@ -334,7 +337,7 @@ def test_fails_at_once_while_a_completion_holds_its_rows(
 
     completer.execute("ROLLBACK")
     legacy_finish(conn, task, attempt, attempt_state="succeeded", task_state="succeeded")
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
 
 
 def test_fails_at_once_while_a_reader_holds_attempts(
@@ -354,7 +357,7 @@ def test_fails_at_once_while_a_reader_holds_attempts(
             conn.execute("SELECT id FROM tasks WHERE id = %s FOR UPDATE", (task,))
         reader.rollback()
 
-    assert [m.label for m in migrate(schema_url)] == [LEASES.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
 
 
 def test_requires_read_committed(schema_url: str, legacy: Callable[[], Conn]) -> None:
@@ -372,14 +375,23 @@ def test_requires_read_committed(schema_url: str, legacy: Callable[[], Conn]) ->
 def test_after_the_upgrade_a_claim_without_a_lease_is_rejected(
     schema_url: str, legacy: Callable[[], Conn]
 ) -> None:
+    # A live legacy worker: it has already claimed and finished work on this
+    # connection, and is idle between transactions when the upgrade applies.
+    # Its next claim is rejected by attempts_lease_required and rolls back
+    # completely. This is the outcome the unforced race below may or may not
+    # reach; here it is forced.
     conn = legacy()
-    (task,) = legacy_job(conn, 1)
-    migrate(schema_url)
+    done, task = legacy_job(conn, 2)
+    attempt = legacy_claim(conn, done)
+    legacy_finish(conn, done, attempt, attempt_state="succeeded", task_state="succeeded")
+    assert [m.label for m in migrate(schema_url, UP_TO_0002)] == [LEASES.label]
+    before = snapshot(conn)
     with pytest.raises(errors.CheckViolation) as info:
         legacy_claim(conn, task)  # code from before the upgrade, still running
     assert info.value.diag.constraint_name == "attempts_lease_required"
+    assert snapshot(conn) == before  # nothing changed: the whole claim rolled back
     row = conn.execute("SELECT state, attempt_count FROM tasks WHERE id = %s", (task,)).fetchone()
-    assert row == ("queued", 0)  # the whole claim rolled back
+    assert row == ("queued", 0)
     assert list_attempts(conn, task) == ()
 
 
@@ -423,7 +435,7 @@ def upgrade_during_legacy_work(url: str) -> tuple[list[str], list[str]]:
         outcomes: list[str] = []
         for _ in range(2000):  # retried at once, as a script would; each refusal is instant
             try:
-                outcomes.append(",".join(m.label for m in migrate(url)))
+                outcomes.append(",".join(m.label for m in migrate(url, UP_TO_0002)))
                 break
             except MigrationError as exc:
                 outcomes.append(str(exc.sqlstate))
@@ -444,9 +456,11 @@ def test_upgrading_while_legacy_work_runs_never_deadlocks_or_strands_work(
     # Unforced races. Every attempt to upgrade either applies or refuses with
     # one of its own errors, never deadlocks (a DeadlockDetected would escape a
     # worker or the upgrade), and never leaves a running attempt without a
-    # lease. Legacy workers drain the queue or, once the upgrade applied under
-    # them, have their next claim rejected; across the rounds both happen.
-    rejected_rounds = 0
+    # lease. Each legacy worker either drains the queue or, if the upgrade
+    # applied under it, has its next claim rejected. Which of these happens is
+    # left to scheduling and not asserted: the rejection of a live worker's
+    # claim is forced deterministically by
+    # test_after_the_upgrade_a_claim_without_a_lease_is_rejected.
     for _ in range(10):
         url = schema_factory()
         migrate(url, [INITIAL])
@@ -456,7 +470,6 @@ def test_upgrading_while_legacy_work_runs_never_deadlocks_or_strands_work(
         assert outcomes[-1] == LEASES.label
         assert set(outcomes[:-1]) <= {"55P03", "55000"}
         assert set(stops) <= {"drained", "attempts_lease_required"}
-        rejected_rounds += "attempts_lease_required" in stops
         with connect(url) as conn:
             assert versions(conn) == [1, 2]
             row = conn.execute(
@@ -464,4 +477,3 @@ def test_upgrading_while_legacy_work_runs_never_deadlocks_or_strands_work(
             ).fetchone()
             assert row == (0,)
             assert_invariants(conn)
-    assert rejected_rounds > 0  # the upgrade did apply under live legacy workers

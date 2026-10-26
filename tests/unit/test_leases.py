@@ -5,6 +5,8 @@ import pytest
 from orqestra.domain.leases import (
     LeasePolicy,
     RevocationReason,
+    cancellation_lease,
+    check_duration,
     initial_lease,
     renewed_lease,
     revocation_reason,
@@ -117,10 +119,24 @@ def test_a_renewal_near_the_end_of_time_is_capped_not_overflowed() -> None:
 # --- revocation_reason ---------------------------------------------------------
 
 
+def reason_at(
+    now: datetime,
+    *,
+    lease: datetime,
+    deadline: datetime,
+    requested: datetime | None = None,
+) -> RevocationReason | None:
+    return revocation_reason(
+        lease_expires_at=lease, deadline_at=deadline, cancel_requested_at=requested, now=now
+    )
+
+
 def test_a_lease_holds_until_its_expiry_instant() -> None:
     lease, deadline = T0 + timedelta(minutes=5), T0 + timedelta(hours=1)
     for now in (T0, lease - MICROSECOND):
-        assert revocation_reason(lease_expires_at=lease, deadline_at=deadline, now=now) is None
+        assert reason_at(now, lease=lease, deadline=deadline) is None
+        # A pending request does not end the lease early either.
+        assert reason_at(now, lease=lease, deadline=deadline, requested=T0) is None
 
 
 @pytest.mark.parametrize("after", [timedelta(0), MICROSECOND, timedelta(days=30)])
@@ -128,18 +144,114 @@ def test_an_expired_lease_short_of_the_deadline_was_not_renewed(after: timedelta
     # Expiry is inclusive, and the reason does not depend on when recovery runs:
     # even long after the deadline, a lease that stopped short of it expired.
     lease, deadline = T0 + timedelta(minutes=5), T0 + timedelta(hours=1)
-    reason = revocation_reason(lease_expires_at=lease, deadline_at=deadline, now=lease + after)
-    assert reason is RevocationReason.LEASE_EXPIRED
+    assert (
+        reason_at(lease + after, lease=lease, deadline=deadline) is RevocationReason.LEASE_EXPIRED
+    )
 
 
 @pytest.mark.parametrize("after", [timedelta(0), MICROSECOND, timedelta(days=30)])
 def test_a_lease_capped_at_the_deadline_exceeded_it(after: timedelta) -> None:
     deadline = T0 + timedelta(hours=1)
-    reason = revocation_reason(
-        lease_expires_at=deadline, deadline_at=deadline, now=deadline + after
-    )
+    reason = reason_at(deadline + after, lease=deadline, deadline=deadline)
+    assert reason is RevocationReason.DEADLINE_EXCEEDED
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (T0, RevocationReason.CANCELLATION_GRACE_EXPIRED),
+        (T0 + timedelta(minutes=5) - MICROSECOND, RevocationReason.CANCELLATION_GRACE_EXPIRED),
+        # At or after expiry the lease was already lost: a later request does
+        # not turn that into a grace expiry.
+        (T0 + timedelta(minutes=5), RevocationReason.LEASE_EXPIRED),
+        (T0 + timedelta(minutes=6), RevocationReason.LEASE_EXPIRED),
+    ],
+    ids=["well-before", "just-before", "at-expiry", "after-expiry"],
+)
+def test_a_lease_that_ran_out_after_a_request_ran_out_its_grace(
+    requested: datetime, expected: RevocationReason
+) -> None:
+    lease, deadline = T0 + timedelta(minutes=5), T0 + timedelta(hours=1)
+    for now in (lease, lease + timedelta(days=30)):
+        assert reason_at(now, lease=lease, deadline=deadline, requested=requested) is expected
+
+
+def test_the_deadline_takes_precedence_over_a_grace_period() -> None:
+    # A request made while the lease held, but the lease had reached the deadline.
+    deadline = T0 + timedelta(hours=1)
+    reason = reason_at(deadline, lease=deadline, deadline=deadline, requested=T0)
     assert reason is RevocationReason.DEADLINE_EXCEEDED
 
 
 def test_revocation_reason_values_are_stable() -> None:
-    assert [reason.value for reason in RevocationReason] == ["lease_expired", "deadline_exceeded"]
+    assert [reason.value for reason in RevocationReason] == [
+        "lease_expired",
+        "deadline_exceeded",
+        "cancellation_grace_expired",
+    ]
+
+
+# --- cancellation_lease and grace durations -----------------------------------
+
+GRACE = timedelta(minutes=1)
+
+
+def grant(
+    requested: datetime, lease: datetime, deadline: datetime, grace: timedelta = GRACE
+) -> datetime:
+    return cancellation_lease(
+        requested_at=requested, grace=grace, lease_expires_at=lease, deadline_at=deadline
+    )
+
+
+def test_a_request_shortens_a_long_lease_to_the_grace() -> None:
+    assert grant(T0, T0 + timedelta(minutes=30), T0 + timedelta(hours=1)) == T0 + GRACE
+
+
+def test_a_request_near_the_end_of_a_short_lease_lengthens_it_to_the_grace() -> None:
+    lease = T0 + timedelta(seconds=5)
+    assert grant(T0 + timedelta(seconds=4), lease, T0 + timedelta(hours=1)) == (
+        T0 + timedelta(seconds=4) + GRACE
+    )
+    # Even one microsecond before expiry the lease still holds.
+    assert grant(lease - MICROSECOND, lease, T0 + timedelta(hours=1)) == lease - MICROSECOND + GRACE
+
+
+@pytest.mark.parametrize("requested", [T0 + timedelta(seconds=5), T0 + timedelta(days=1)])
+def test_a_request_at_or_after_expiry_never_revives_the_lease(requested: datetime) -> None:
+    lease = T0 + timedelta(seconds=5)
+    assert grant(requested, lease, T0 + timedelta(days=2)) == lease
+
+
+def test_a_request_never_extends_past_the_deadline() -> None:
+    deadline = T0 + timedelta(seconds=30)
+    assert grant(T0, T0 + timedelta(seconds=10), deadline) == deadline  # grace outlasts it
+    assert grant(T0, deadline, deadline) == deadline  # lease already at the deadline
+
+
+def test_a_request_near_the_end_of_time_is_capped_not_overflowed() -> None:
+    end = datetime.max.replace(tzinfo=UTC)
+    now = end - timedelta(days=1)
+    assert grant(now, end, end, grace=timedelta(days=2)) == end
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        (timedelta(0), ValueError, "grace must be positive"),
+        (-MICROSECOND, ValueError, "grace must be positive"),
+        (timedelta.max, ValueError, "longer than any representable"),
+        (60, TypeError, "grace must be a timedelta"),
+        (None, TypeError, "grace must be a timedelta"),
+    ],
+)
+def test_invalid_grace_durations_are_rejected(
+    value: object, error: type[Exception], message: str
+) -> None:
+    with pytest.raises(error, match=message):
+        check_duration("grace", value)
+
+
+def test_valid_grace_durations_are_accepted() -> None:
+    for value in (MICROSECOND, GRACE, datetime.max - datetime.min):
+        check_duration("grace", value)

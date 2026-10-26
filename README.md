@@ -20,18 +20,20 @@ in PR #3, with both CI lanes passing for the pull request and for `main`. Day 2 
 CI lanes passing for the pull request and for `main`. Day 3A Slice 1 (PostgreSQL task
 discovery) was merged in PR #5, with both CI lanes passing for `main` (run 40209662634).
 Day 3A Slice 2 (attempt leases, execution deadlines, heartbeats and recovery operations,
-with migration 0002) is implemented and verified locally only; it has not yet run in
-GitHub CI. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+with migration 0002) was merged in PR #6, with both CI lanes passing for `main` (run
+40260902718). Day 3A Slice 3 (bounded cancellation grace periods, with migration 0003) is
+implemented and verified locally only; it has not yet run in GitHub CI. No benchmark has
+been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
 | --- | --- | --- |
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
-| Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules | — |
+| Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
-| Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; quiescent-upgrade migration 0002; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker (DEC-033); the operations a worker runtime needs to renew leases and recover expired attempts (DEC-034 … DEC-039) | worker loop, scheduled recovery sweeps, worker self-fencing and handler interruption, bounded worker slots, cancellation grace period, retry backoff (Days 3B–4) |
+| Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041) | worker loop, scheduled recovery sweeps, worker self-fencing and handler interruption, the worker's response to cancellation, bounded worker slots, retry backoff (Days 3B–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -61,7 +63,9 @@ creates, drops or resets a database.
 ```sh
 createdb orqestra
 export ORQESTRA_DATABASE_URL=postgresql:///orqestra
-uv run orqestra migrate             # {"status": "ok", "applied": ["0001_initial_schema"]}
+uv run orqestra migrate
+# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace"]}
+uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 ```
 
 ### Submitting jobs
@@ -167,19 +171,30 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   heartbeat: it extends the lease by `policy.lease` from now, never past the deadline and
   never shorter. It locks only the attempt row. It rejects a wrong generation
   (`StaleAttemptError`), another worker (`WorkerMismatchError`), a revoked attempt
-  (`AttemptRevokedError`), a finished one (`AttemptFinishedError`) and an expired lease
-  (`LeaseExpiredError`, with the reason): a worker that sees any of these must stop.
-- `revoke_next_expired(conn)` revokes at most one running attempt whose lease has expired:
-  it records the attempt as `revoked` with `lease_expired`, or `deadline_exceeded` when
-  the lease had reached its deadline, and moves the task like a transient failure: requeued
-  while attempts remain, cancelled instead if a request is pending, failed once the budget
-  is used up. It returns `None` when it revoked nothing. Ownership ends when the revocation
+  (`AttemptRevokedError`), a finished one (`AttemptFinishedError`), an expired lease
+  (`LeaseExpiredError`, with the reason) and a task whose cancellation was requested
+  (`CancellationRequestedError`, with the end of the grace period). A worker that sees
+  any of these must stop; after a cancellation request it should complete the attempt as
+  cancelled before its lease ends.
+- `revoke_next_expired(conn)` revokes at most one running attempt whose lease has expired
+  and records why: `deadline_exceeded` when the lease had reached its deadline;
+  otherwise `cancellation_grace_expired` when cancellation was requested while the lease
+  still held; otherwise `lease_expired`. A grace expiry cancels the task whatever retry
+  budget is left. The other reasons move the task like a transient failure: requeued while
+  attempts remain, cancelled instead if a request is pending, failed once the budget is
+  used up. It returns `None` when it revoked nothing. Ownership ends when the revocation
   commits: a completion that commits first still counts, and afterwards the old worker's
   completion raises `AttemptRevokedError` (or `StaleAttemptError` once the task was
   claimed again).
-- `request_cancellation` cancels a queued task at once. On a running task it records a
-  request: a later success still stands, and a transient failure or a revocation then
-  cancels instead of requeueing.
+- `request_cancellation(conn, task_id, grace=...)` takes a required, positive grace period
+  (a `timedelta`; there is no default). It cancels a queued task at once. On a running
+  task it records the request and, if the attempt's lease still holds, sets that lease to
+  end one grace period after the request, never past the deadline. This can shorten a
+  long lease or lengthen one about to expire. From then on heartbeats are refused. Within
+  the grace period the attempt may still complete: a success stands, and a transient
+  failure cancels instead of requeueing. Once the grace period has run out, recovery
+  revokes the attempt and cancels the task. A repeated request changes nothing and does
+  not extend the grace period.
 - A succeeded task's result may be JSON `null`; check `task.state` before reading
   `task.result`.
 - Job status is derived from task states: `queued` (every task queued), `running`,
@@ -220,9 +235,14 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   claim scans and sorts the queued tasks; there is no index for it yet (deferred until it
   is measured). `None` from `claim_next_attempt` or `revoke_next_expired` means only that
   nothing was claimed or revoked by that call.
-- Cancellation is cooperative and has no grace period; a running attempt that ignores a
-  request runs until it finishes or its deadline passes. There is no job-level
-  cancellation.
+- Cancellation is bounded by the grace period only at the database: nothing tells a
+  worker except a refused heartbeat, nothing interrupts its handler, and nothing revokes
+  the attempt until some caller runs recovery (Day 3B). There are no default or maximum
+  grace values, and the heartbeat interval must be shorter than any grace used for a
+  worker to hear in time. There is no job-level cancellation.
+- A request resets a valid lease to one grace period, so if the worker is already dead,
+  recovery waits for the grace period instead of the lease it had left; a grace longer
+  than that lease delays recovery.
 - At-least-once execution is not provided yet. A task may run in several attempts, and
   generation fencing records only the current generation's result, but nothing delivers
   tasks or recovers them automatically.
@@ -230,6 +250,11 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   attempts finish, migrate, then deploy. It refuses while any task or attempt is running
   or any session is using those tables. Code from before 0002 cannot run against the new
   schema: it cannot read revoked attempts, and its claims are rejected.
+- Migration 0003 is additive and may run while attempts are running, but it fails at once
+  while any session uses `attempts`. Code from before 0003 must not run once the new code
+  can write `cancellation_grace_expired`: it cannot read that reason, and its heartbeats
+  ignore cancellation. Stop all application processes, apply 0003, then start only
+  Slice 3 code; draining first is preferable. The database does not enforce this order.
 - A job whose started tasks were all requeued reads as `queued`; one failed task makes a
   whole job `failed` (the per-state counts give the detail).
 - Idempotency keys are global (not scoped per job kind or client) and never expire.

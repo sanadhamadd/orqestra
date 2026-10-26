@@ -6,8 +6,9 @@ row; decides with the domain policy and transition tables; writes; and
 commits. No transaction stays open while a worker executes: a claim commits
 before the work begins, and each heartbeat and the completion are separate
 transactions. ``renew_lease`` is the one exception to the lock order: it
-locks only the attempt row and never waits for a task lock while holding it,
-so it cannot form a lock cycle with the task-first operations (DEC-036).
+locks only the attempt row, reads the task without a lock, and never waits
+for a task lock while holding the attempt, so it cannot form a lock cycle
+with the task-first operations (DEC-036).
 
 Ownership (ADR-0003, DEC-029): attempt N holds generation N, the value of the
 task's ``attempt_count`` when it started. ``complete_attempt`` and
@@ -27,6 +28,15 @@ completion that commits before the revocation still counts. Every instant
 that decides expiry comes from the database clock, read after the locks the
 decision depends on.
 
+Cancellation (DEC-020, DEC-040): ``request_cancellation`` takes a grace
+period. For a running task it locks the task, then its running attempt, and
+in that transaction records the request and sets the attempt's lease to end
+one grace period later, capped at the deadline, unless the lease had already
+expired. From that commit on, heartbeats are refused with
+``CancellationRequestedError``; the worker may still complete the attempt
+(as cancelled, or with its real result) until recovery revokes it, and
+recovery then cancels the task whatever retry budget is left.
+
 These operations are building blocks for at-least-once execution but do not
 provide it: nothing runs them automatically. There is no worker loop, nothing
 schedules recovery, and revoking an attempt does not stop its worker.
@@ -35,7 +45,7 @@ schedules recovery, and revoking an attempt does not stop its worker.
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 
 from psycopg.rows import TupleRow
@@ -52,6 +62,8 @@ from orqestra.domain.jobs import (
 from orqestra.domain.leases import (
     LeasePolicy,
     RevocationReason,
+    cancellation_lease,
+    check_duration,
     initial_lease,
     renewed_lease,
     revocation_reason,
@@ -87,6 +99,9 @@ _LOCK_TASK_OF_ATTEMPT = (
     "WHERE id = (SELECT task_id FROM attempts WHERE id = %s) FOR UPDATE"
 )
 _LOCK_ATTEMPT = f"SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE id = %s FOR UPDATE"
+_LOCK_CURRENT_ATTEMPT = (
+    f"SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE task_id = %s AND attempt_number = %s FOR UPDATE"
+)
 # Discovery (DEC-033): lock the first claimable task that no other transaction
 # has locked. Rows locked elsewhere are skipped, not waited for, and a row that
 # changed since the statement's snapshot is re-checked against the WHERE clause
@@ -122,20 +137,27 @@ _FINISH_TASK = (
     "finished_at = CASE WHEN %s THEN now() END "
     f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
+# A request's instant is this statement's timestamp, taken after the task row
+# (and, for a running task, its attempt row) is locked, like the claim instant.
 _CANCEL_QUEUED_TASK = (
-    "UPDATE tasks SET state = %s, cancel_requested_at = now(), finished_at = now(), "
-    f"updated_at = now() WHERE id = %s RETURNING {TASK_COLUMNS}"
+    "UPDATE tasks SET state = %s, cancel_requested_at = statement_timestamp(), "
+    "finished_at = statement_timestamp(), updated_at = statement_timestamp() "
+    f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
 _RECORD_CANCEL_REQUEST = (
-    "UPDATE tasks SET cancel_requested_at = now(), updated_at = now() "
-    f"WHERE id = %s RETURNING {TASK_COLUMNS}"
+    "UPDATE tasks SET cancel_requested_at = statement_timestamp(), "
+    f"updated_at = statement_timestamp() WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
 # Read without a lock, only to describe a rejected heartbeat: renew_lease never
 # locks the task (DEC-036).
 _TASK_GENERATION = "SELECT attempt_count FROM tasks WHERE id = %s"
-_RENEW_LEASE = (
-    f"UPDATE attempts SET lease_expires_at = %s WHERE id = %s RETURNING {ATTEMPT_COLUMNS}"
-)
+# The heartbeat's clock reading and the task's cancellation request, read
+# together without locking the task, after the attempt row is locked. A request
+# that committed before this statement is seen; one that has not committed yet
+# is waiting for the attempt lock this heartbeat holds, and will reset the
+# lease this heartbeat writes (DEC-036, DEC-040).
+_NOW_AND_CANCELLATION = "SELECT statement_timestamp(), cancel_requested_at FROM tasks WHERE id = %s"
+_SET_LEASE = f"UPDATE attempts SET lease_expires_at = %s WHERE id = %s RETURNING {ATTEMPT_COLUMNS}"
 # Recovery (DEC-037): lock the task of the most overdue running attempt that no
 # other transaction has locked; the attempt itself is locked and every
 # condition re-checked by the next statements. The literal states let the
@@ -239,6 +261,27 @@ class LeaseExpiredError(OrqestraError):
         self.reason = reason
         self.lease_expires_at = lease_expires_at
         self.deadline_at = deadline_at
+
+
+class CancellationRequestedError(OrqestraError):
+    """Cancellation of the attempt's task was requested, so its lease is no longer renewed.
+
+    The worker should stop and complete the attempt as cancelled before
+    ``lease_expires_at``, the end of its grace period: it still owns the task
+    until recovery commits a revocation, but it can no longer extend that.
+    """
+
+    def __init__(
+        self, attempt_id: uuid.UUID, cancel_requested_at: datetime, lease_expires_at: datetime
+    ) -> None:
+        super().__init__(
+            f"cancellation of attempt {attempt_id}'s task was requested at "
+            f"{cancel_requested_at.isoformat()}; its lease is no longer renewed and ends at "
+            f"{lease_expires_at.isoformat()}"
+        )
+        self.attempt_id = attempt_id
+        self.cancel_requested_at = cancel_requested_at
+        self.lease_expires_at = lease_expires_at
 
 
 class WorkerMismatchError(OrqestraError):
@@ -447,15 +490,19 @@ def renew_lease(
 
     The new lease is ``policy.lease`` from now, capped at the attempt's
     deadline, and never shorter than the current one; the deadline itself
-    never moves. In one transaction that locks only the attempt row (DEC-036).
+    never moves. In one transaction that locks only the attempt row and reads
+    the task without a lock (DEC-036).
 
     Raises, without changing anything: ``NotFoundError`` for an unknown
     attempt; ``StaleAttemptError`` when ``generation`` is not the attempt's;
     ``WorkerMismatchError`` when ``worker_id`` does not own it;
     ``AttemptRevokedError`` when recovery revoked it; ``AttemptFinishedError``
     when it already ended otherwise; ``LeaseExpiredError`` when its lease has
-    expired, including at the deadline. A heartbeat therefore cannot revive an
-    expired lease or a revoked attempt.
+    expired, including at the deadline or at the end of a cancellation grace
+    period; ``CancellationRequestedError`` when cancellation of its task was
+    requested (DEC-040). A heartbeat therefore cannot revive an expired lease
+    or a revoked attempt, nor extend a lease once a cancellation request has
+    committed.
     """
     with owned_transaction(conn, "renew_lease") as cur:
         current = attempt_from_row(_locked(cur, _LOCK_ATTEMPT, attempt_id, "attempt"))
@@ -467,16 +514,21 @@ def renew_lease(
         if current.state is not AttemptState.RUNNING:
             raise _finished(current)
         lease_expires_at, deadline_at = _lease_of(current)
-        now = _now(cur)
+        now, cancel_requested_at = _one(cur.execute(_NOW_AND_CANCELLATION, (current.task_id,)))
         reason = revocation_reason(
-            lease_expires_at=lease_expires_at, deadline_at=deadline_at, now=now
+            lease_expires_at=lease_expires_at,
+            deadline_at=deadline_at,
+            cancel_requested_at=cancel_requested_at,
+            now=now,
         )
         if reason is not None:
             raise LeaseExpiredError(attempt_id, reason, lease_expires_at, deadline_at)
+        if cancel_requested_at is not None:
+            raise CancellationRequestedError(attempt_id, cancel_requested_at, lease_expires_at)
         renewed = renewed_lease(
             policy, now=now, lease_expires_at=lease_expires_at, deadline_at=deadline_at
         )
-        attempt = attempt_from_row(_one(cur.execute(_RENEW_LEASE, (renewed, attempt_id))))
+        attempt = attempt_from_row(_one(cur.execute(_SET_LEASE, (renewed, attempt_id))))
     logger.debug(
         "lease renewed",
         extra={"task_id": str(attempt.task_id), "attempt_id": str(attempt_id)},
@@ -491,9 +543,10 @@ def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
     no other transaction has locked, then the attempt; re-check against the
     committed rows and the current database time that the attempt is still
     the task's running generation and that its lease has expired; then record
-    the attempt as ``REVOKED`` with the reason its stored lease shows, and
-    move the task as ``next_task_state`` decides for a revoked attempt (DEC-038).
-    Ownership ends when this commits.
+    the attempt as ``REVOKED`` with the reason its stored lease, deadline and
+    cancellation request show, and move the task as ``next_task_state``
+    decides for that reason (DEC-038, DEC-040). Ownership ends when this
+    commits.
 
     Returns the revoked attempt and its task, or ``None`` when this call
     revoked nothing: no expired attempt was unlocked, or the one found was
@@ -520,7 +573,10 @@ def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
         lease_expires_at, deadline_at = _lease_of(current)
         now = _now(cur)
         reason = revocation_reason(
-            lease_expires_at=lease_expires_at, deadline_at=deadline_at, now=now
+            lease_expires_at=lease_expires_at,
+            deadline_at=deadline_at,
+            cancel_requested_at=task.cancel_requested_at,
+            now=now,
         )
         if reason is None:
             return None  # a heartbeat renewed the lease after discovery saw it expired
@@ -532,6 +588,7 @@ def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
                 attempt_count=task.attempt_count,
                 max_attempts=task.max_attempts,
                 cancel_requested=task.cancel_requested_at is not None,
+                revocation_reason=reason,
             ),
         )
         attempt_state = transition_attempt(AttemptState.RUNNING, AttemptState.REVOKED)
@@ -553,14 +610,23 @@ def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
     return revocation
 
 
-def request_cancellation(conn: Conn, task_id: uuid.UUID) -> CancellationResult:
-    """Request cancellation of a task (cooperative; DEC-020).
+def request_cancellation(conn: Conn, task_id: uuid.UUID, *, grace: timedelta) -> CancellationResult:
+    """Request cancellation of a task (cooperative, with a bounded grace period).
 
-    A queued task is cancelled at once. A running task records the request and
-    keeps running; its attempt decides the outcome when it completes or is
-    revoked. Repeated requests and requests for finished tasks change nothing.
-    Raises ``NotFoundError`` for an unknown task.
+    ``grace`` must be a positive ``timedelta``; it is checked before anything
+    is written, whatever the task's state. A queued task is cancelled at once.
+    For a running task, in one transaction: lock the task, then its running
+    attempt; record the request at one instant taken after those locks; and,
+    if the attempt's lease still holds, set it to end ``grace`` after the
+    request, capped at the deadline (DEC-040). The attempt's generation,
+    worker, deadline and state do not change. Its worker may still complete it
+    until recovery revokes it once that lease ends.
+
+    Repeated requests and requests for finished tasks change nothing; a
+    repeated request does not extend the grace period. Raises
+    ``NotFoundError`` for an unknown task.
     """
+    check_duration("grace", grace)
     with owned_transaction(conn, "request_cancellation") as cur:
         task = _lock_task(cur, _LOCK_TASK, task_id, "task")
         target = state_after_cancel_request(task.state)
@@ -573,11 +639,43 @@ def request_cancellation(conn: Conn, task_id: uuid.UUID) -> CancellationResult:
         elif task.cancel_requested_at is not None:
             row, outcome = None, CancellationOutcome.ALREADY_REQUESTED
         else:
-            row = _one(cur.execute(_RECORD_CANCEL_REQUEST, (task_id,)))
+            row = _record_running_request(cur, task, grace)
             outcome = CancellationOutcome.REQUESTED
         result = CancellationResult(outcome, task if row is None else task_from_row(row))
     logger.info("cancellation request: %s", outcome.value, extra={"task_id": str(task_id)})
     return result
+
+
+def _record_running_request(cur: Cursor, task: Task, grace: timedelta) -> TupleRow:
+    """Record a request for a running task this transaction has locked; return its row.
+
+    Locks the task's current attempt, so that a heartbeat in progress commits
+    first and the lease it renewed is the one reset here, and any later
+    heartbeat sees the request.
+    """
+    row = cur.execute(_LOCK_CURRENT_ATTEMPT, (task.id, task.attempt_count)).fetchone()
+    current = None if row is None else attempt_from_row(row)
+    if current is None or current.state is not AttemptState.RUNNING:
+        msg = (
+            f"invariant violated: task {task.id} is running at generation "
+            f"{task.attempt_count} without a running attempt"
+        )
+        raise RuntimeError(msg)
+    lease_expires_at, deadline_at = _lease_of(current)
+    task_row = _one(cur.execute(_RECORD_CANCEL_REQUEST, (task.id,)))
+    requested_at = task_from_row(task_row).cancel_requested_at
+    if requested_at is None:  # pragma: no cover - the statement above sets it
+        msg = f"cancellation request for task {task.id} was not recorded"
+        raise RuntimeError(msg)
+    granted = cancellation_lease(
+        requested_at=requested_at,
+        grace=grace,
+        lease_expires_at=lease_expires_at,
+        deadline_at=deadline_at,
+    )
+    if granted != lease_expires_at:
+        cur.execute(_SET_LEASE, (granted, current.id))
+    return task_row
 
 
 def get_attempt(conn: Conn, attempt_id: uuid.UUID) -> Attempt | None:

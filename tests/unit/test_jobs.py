@@ -31,6 +31,7 @@ from orqestra.persistence.lifecycle import (
     AttemptRevocation,
     AttemptRevokedError,
     CancellationOutcome,
+    CancellationRequestedError,
     CancellationResult,
     LeaseExpiredError,
     NotFoundError,
@@ -271,6 +272,14 @@ def test_lifecycle_errors_carry_their_identifiers() -> None:
     assert NOW.isoformat() in str(expired)
     mismatch = WorkerMismatchError(attempt_id, "intruder", "owner")
     assert (mismatch.worker_id, mismatch.owner) == ("intruder", "owner")
-    for exc in (not_found, not_startable, stale, finished, revoked, expired, mismatch):
+    later = NOW + timedelta(minutes=1)
+    requested = CancellationRequestedError(attempt_id, NOW, later)
+    assert (requested.attempt_id, requested.cancel_requested_at, requested.lease_expires_at) == (
+        attempt_id,
+        NOW,
+        later,
+    )
+    assert later.isoformat() in str(requested)
+    for exc in (not_found, not_startable, stale, finished, revoked, expired, mismatch, requested):
         assert isinstance(exc, OrqestraError)
         assert not is_retryable(exc)

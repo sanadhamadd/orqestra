@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-039
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-041
 
 ## Context
 
@@ -35,8 +35,8 @@ detect this: after `running → queued → running`, the state matches again.
   bounded attempts, a queued task always has attempts left, terminal timestamps, and
   cancellation provenance.
 - Cancellation is cooperative (DEC-020): queued tasks are cancelled at once; running tasks
-  record a request and finish through their current attempt or, later, through recovery
-  after a bounded grace period.
+  record a request and finish through their current attempt or, once a bounded grace
+  period given with the request has run out, through recovery (DEC-040).
 - Every claim gives its attempt a lease and a non-renewable execution deadline. An attempt
   whose lease has expired may be revoked; ownership ends only when a recovery transaction
   commits the revocation, after which the attempt's writes are rejected like any other
@@ -61,13 +61,17 @@ detect this: after `running → queued → running`, the state matches again.
 - Implemented and verified locally and in GitHub CI (PR #5): discovering and claiming the
   next queued task with `FOR UPDATE SKIP LOCKED`, sharing the claim with `start_attempt`
   (DEC-033).
-- Implemented and verified locally only (Day 3A Slice 2): attempt leases and execution
+- Implemented and verified locally and in GitHub CI (PR #6): attempt leases and execution
   deadlines from one claim instant; lease renewal that locks only the attempt; revocation
   of one expired attempt per transaction, moving its task by the retry and cancellation
   policy; and migration 0002 with its quiescent-upgrade contract (DEC-034 … DEC-039).
+- Implemented and verified locally only (Day 3A Slice 3): a bounded cancellation grace
+  period set by the request on the running attempt's lease, refused heartbeats once a
+  request has committed, the `cancellation_grace_expired` revocation reason that cancels
+  the task, and additive migration 0003 (DEC-040, DEC-041).
 - Not yet implemented, and not proven by the current tests: a worker loop that renews
-  leases and sweeps for expired attempts, worker self-fencing and handler interruption,
-  bounded worker slots, retry backoff and the cancellation grace period. Until a worker
+  leases, acts on cancellation and sweeps for expired attempts, worker self-fencing and
+  handler interruption, bounded worker slots and retry backoff. Until a worker
   runtime calls recovery, a task whose worker dies stays `running`. They must be verified
   by their own tests before being described as working.
 - Cross-table invariants (a running task has exactly one running attempt whose number

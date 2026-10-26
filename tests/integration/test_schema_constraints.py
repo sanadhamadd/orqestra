@@ -621,6 +621,9 @@ def test_an_attempt_deadline_never_changes(
 def test_a_revoked_attempt_records_a_reason_matching_its_lease(
     db: Conn, running_task: uuid.UUID, reason: str
 ) -> None:
+    # Only a lease that reached its deadline exceeded it; the other reasons,
+    # including a cancellation grace period (migration 0003), need a lease
+    # that ended before the deadline.
     attempt_id = new_attempt(db, running_task, 1)
     if reason == RevocationReason.DEADLINE_EXCEEDED:
         db.execute(
@@ -657,6 +660,11 @@ def test_a_revoked_attempt_records_a_reason_matching_its_lease(
             "attempts_revoked_reason_matches_lease",
         ),
         (
+            "state = 'revoked', revoked_reason = 'cancellation_grace_expired', "
+            "finished_at = now(), lease_expires_at = deadline_at",
+            "attempts_revoked_reason_matches_lease",
+        ),
+        (
             "state = 'revoked', revoked_reason = 'lease_expired', finished_at = now(), "
             "failure_kind = 'transient'",
             "attempts_failure_kind_iff_failed",
@@ -669,6 +677,7 @@ def test_a_revoked_attempt_records_a_reason_matching_its_lease(
         "reason-without-revocation",
         "deadline-reason-before-deadline",
         "lease-reason-at-deadline",
+        "grace-reason-at-deadline",
         "revoked-as-failure",
         "revoked-without-finish",
     ],

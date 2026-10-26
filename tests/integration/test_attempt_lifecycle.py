@@ -1,5 +1,5 @@
 """Attempt lifecycle against real PostgreSQL: start, discover, complete, retry, cancel,
-renew leases and recover expired attempts.
+renew leases, recover expired attempts and enforce cancellation grace periods.
 
 Every test ends by checking the cross-table invariants over the whole schema,
 and the race tests check them after every round. Concurrency tests use one
@@ -48,6 +48,7 @@ from orqestra.persistence.lifecycle import (
     AttemptRevocation,
     AttemptRevokedError,
     CancellationOutcome,
+    CancellationRequestedError,
     LeaseExpiredError,
     NotFoundError,
     StaleAttemptError,
@@ -81,6 +82,9 @@ EXPIRING = LeasePolicy(lease=timedelta(microseconds=1), execution_timeout=timede
 DEADLINE_EXPIRING = LeasePolicy(
     lease=timedelta(microseconds=1), execution_timeout=timedelta(microseconds=1)
 )
+# Test value only: there is no default cancellation grace period (DEC-040). It
+# is shorter than POLICY's lease, so a request shortens a fresh lease.
+GRACE = timedelta(minutes=1)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -149,7 +153,7 @@ def snapshot(db: Conn) -> Snapshot:
 
 # Each query returns (rule, task_id) for every task that breaks the rule. The
 # history rules hold for the operations implemented so far, where a task is only
-# requeued after a transient failure or a revocation.
+# requeued after a transient failure or a revocation for its lease or deadline.
 INVARIANTS = """
 SELECT 'running task has exactly one running attempt at its generation', t.id
 FROM tasks t WHERE t.state = 'running' AND (
@@ -180,24 +184,34 @@ FROM attempts a JOIN tasks t ON t.id = a.task_id
 WHERE a.attempt_number < t.attempt_count
     AND NOT (a.state = 'revoked' OR (a.state = 'failed' AND a.failure_kind = 'transient'))
 UNION ALL
-SELECT 'a queued task''s last attempt failed transiently or was revoked', t.id
+SELECT 'a queued task''s last attempt failed transiently or lost its lease or deadline', t.id
 FROM tasks t JOIN attempts a ON a.task_id = t.id AND a.attempt_number = t.attempt_count
-WHERE t.state = 'queued'
-    AND NOT (a.state = 'revoked' OR (a.state = 'failed' AND a.failure_kind = 'transient'))
+WHERE t.state = 'queued' AND NOT (
+    (a.state = 'revoked' AND a.revoked_reason <> 'cancellation_grace_expired')
+    OR (a.state = 'failed' AND a.failure_kind = 'transient')
+)
 UNION ALL
 SELECT 'a failed task''s last attempt failed for good or used the last attempt', t.id
 FROM tasks t LEFT JOIN attempts a ON a.task_id = t.id AND a.attempt_number = t.attempt_count
 WHERE t.state = 'failed' AND NOT (
     (a.state = 'failed' AND (a.failure_kind <> 'transient' OR t.attempt_count = t.max_attempts))
-    OR (a.state = 'revoked' AND t.attempt_count = t.max_attempts)
+    OR (a.state = 'revoked' AND a.revoked_reason <> 'cancellation_grace_expired'
+        AND t.attempt_count = t.max_attempts)
 )
 UNION ALL
 SELECT 'a cancelled task''s last attempt was cancelled, or would have been retried', t.id
 FROM tasks t JOIN attempts a ON a.task_id = t.id AND a.attempt_number = t.attempt_count
 WHERE t.state = 'cancelled' AND NOT (
     a.state = 'cancelled'
+    OR a.revoked_reason = 'cancellation_grace_expired'
     OR ((a.state = 'revoked' OR (a.state = 'failed' AND a.failure_kind = 'transient'))
         AND t.attempt_count < t.max_attempts)
+)
+UNION ALL
+SELECT 'a cancellation grace ran out after a request made while the lease held', a.task_id
+FROM attempts a JOIN tasks t ON t.id = a.task_id
+WHERE a.revoked_reason = 'cancellation_grace_expired' AND NOT (
+    t.state = 'cancelled' AND t.cancel_requested_at < a.lease_expires_at
 )
 UNION ALL
 SELECT 'a revoked attempt''s lease had expired when it was revoked', a.task_id
@@ -366,7 +380,7 @@ def test_unknown_records_are_reported_as_not_found(checked: Conn) -> None:
     with pytest.raises(NotFoundError, match="attempt"):
         complete_attempt(checked, missing, generation=1, outcome=SUCCESS)
     with pytest.raises(NotFoundError, match="task"):
-        request_cancellation(checked, missing)
+        request_cancellation(checked, missing, grace=GRACE)
     assert get_attempt(checked, missing) is None
     assert list_attempts(checked, missing) == ()
 
@@ -375,7 +389,7 @@ def test_unknown_records_are_reported_as_not_found(checked: Conn) -> None:
     "operation",
     [
         lambda conn, task: start_attempt(conn, task.id, "w", policy=POLICY),
-        lambda conn, task: request_cancellation(conn, task.id),
+        lambda conn, task: request_cancellation(conn, task.id, grace=GRACE),
         lambda conn, task: complete_attempt(conn, uuid.uuid4(), generation=1, outcome=SUCCESS),
         lambda conn, task: renew_lease(
             conn, uuid.uuid4(), generation=1, worker_id="w", policy=POLICY
@@ -404,7 +418,9 @@ def test_operations_work_on_a_connection_with_any_row_factory(
         done = complete_attempt(conn, attempt.id, generation=1, outcome=SUCCESS)
         assert done.task == task_now(checked, first.id)
         assert list_attempts(conn, first.id) == (done.attempt,)
-        assert request_cancellation(conn, second.id).task == task_now(checked, second.id)
+        assert request_cancellation(conn, second.id, grace=GRACE).task == task_now(
+            checked, second.id
+        )
 
 
 # --- 2. competing starts -----------------------------------------------------
@@ -805,7 +821,7 @@ def test_completion_refuses_a_corrupted_running_attempt(checked: Conn) -> None:
 
 def test_cancelling_a_queued_task_cancels_it_at_once(checked: Conn, unrelated: Snapshot) -> None:
     task = new_task(checked)
-    result = request_cancellation(checked, task.id)
+    result = request_cancellation(checked, task.id, grace=GRACE)
     assert result.outcome is CancellationOutcome.CANCELLED
     assert result.task == task_now(checked, task.id)
     assert result.task.state is TaskState.CANCELLED
@@ -823,7 +839,7 @@ def test_cancelling_a_requeued_task_keeps_its_attempt_history(checked: Conn) -> 
     failed = complete(
         checked, start_attempt(checked, task.id, "w", policy=POLICY), TRANSIENT
     ).attempt
-    result = request_cancellation(checked, task.id)
+    result = request_cancellation(checked, task.id, grace=GRACE)
     assert result.outcome is CancellationOutcome.CANCELLED
     assert list_attempts(checked, task.id) == (failed,)
 
@@ -867,14 +883,14 @@ def test_cancellation_and_completion_in_either_order(
     cancel_conn, worker_conn = worker(), worker()
     with ThreadPoolExecutor(2) as pool:
         if first == "cancel":
-            cancel = pool.submit(request_cancellation, cancel_conn, task.id)
+            cancel = pool.submit(request_cancellation, cancel_conn, task.id, grace=GRACE)
             wait_for_lock(checked, cancel_conn, "advisory")  # holds the task row lock
             finish = pool.submit(complete, worker_conn, attempt, outcome)
             wait_for_lock(checked, worker_conn, "transactionid")  # waits for the task row
         else:
             finish = pool.submit(complete, worker_conn, attempt, outcome)
             wait_for_lock(checked, worker_conn, "advisory")  # attempt updated, task row locked
-            cancel = pool.submit(request_cancellation, cancel_conn, task.id)
+            cancel = pool.submit(request_cancellation, cancel_conn, task.id, grace=GRACE)
             wait_for_lock(checked, cancel_conn, "transactionid")
         release()
         done = finish.result(timeout=20)
@@ -898,7 +914,7 @@ def test_cancellation_racing_success_never_loses_the_result(schema_url: str, che
             schema_url,
             [
                 partial(complete, attempt=attempt, outcome=SUCCESS),
-                partial(request_cancellation, task_id=task.id),
+                partial(request_cancellation, task_id=task.id, grace=GRACE),
             ],
         )
         final = task_now(checked, task.id)
@@ -922,7 +938,7 @@ def test_cancellation_racing_a_transient_failure_always_cancels(
             schema_url,
             [
                 partial(complete, attempt=attempt, outcome=TRANSIENT),
-                partial(request_cancellation, task_id=task.id),
+                partial(request_cancellation, task_id=task.id, grace=GRACE),
             ],
         )
         # Request first: the failure cancels instead of requeueing. Failure
@@ -954,7 +970,7 @@ def test_a_pending_request_decides_how_the_attempt_ends(
 ) -> None:
     task = new_task(checked, max_attempts=max_attempts)
     attempt = start_attempt(checked, task.id, "w", policy=POLICY)
-    requested = request_cancellation(checked, task.id)
+    requested = request_cancellation(checked, task.id, grace=GRACE)
     assert requested.outcome is CancellationOutcome.REQUESTED
     assert requested.task.state is TaskState.RUNNING  # cooperative: still running
 
@@ -970,9 +986,9 @@ def test_a_pending_request_decides_how_the_attempt_ends(
 def test_repeated_requests_keep_the_first(checked: Conn) -> None:
     task = new_task(checked)
     start_attempt(checked, task.id, "w", policy=POLICY)
-    first = request_cancellation(checked, task.id)
+    first = request_cancellation(checked, task.id, grace=GRACE)
     before = snapshot(checked)
-    again = request_cancellation(checked, task.id)
+    again = request_cancellation(checked, task.id, grace=GRACE)
     assert again.outcome is CancellationOutcome.ALREADY_REQUESTED
     assert again.task == first.task
     assert snapshot(checked) == before
@@ -993,11 +1009,11 @@ def test_an_unrequested_cancellation_is_refused(checked: Conn) -> None:
 def finish_as(db: Conn, how: str) -> tuple[Task, Attempt | None]:
     task = new_task(db, max_attempts=3)
     if how == "cancelled-while-queued":
-        request_cancellation(db, task.id)
+        request_cancellation(db, task.id, grace=GRACE)
         return task_now(db, task.id), None
     attempt = start_attempt(db, task.id, "w", policy=POLICY)
     if how == "cancelled-while-running":
-        request_cancellation(db, task.id)
+        request_cancellation(db, task.id, grace=GRACE)
     outcomes: dict[str, AttemptOutcome] = {
         "succeeded": SUCCESS,
         "failed": PERMANENT,
@@ -1018,7 +1034,10 @@ def test_finished_tasks_cannot_change(checked: Conn, how: str) -> None:
     with pytest.raises(TaskNotStartableError) as info:
         start_attempt(checked, task.id, "w", policy=POLICY)
     assert info.value.state is task.state
-    assert request_cancellation(checked, task.id).outcome is CancellationOutcome.ALREADY_FINISHED
+    assert (
+        request_cancellation(checked, task.id, grace=GRACE).outcome
+        is CancellationOutcome.ALREADY_FINISHED
+    )
     if attempt is not None:
         for outcome in (SUCCESS, PERMANENT, TRANSIENT, AttemptCancelled()):
             with pytest.raises(AttemptFinishedError):
@@ -1048,7 +1067,7 @@ def test_job_status_follows_its_tasks(checked: Conn) -> None:
     complete(checked, start_attempt(checked, a.id, "w", policy=POLICY), SUCCESS)
     assert status() == (JobStatus.RUNNING, {"queued": 3, "succeeded": 1})
     complete(checked, start_attempt(checked, b.id, "w", policy=POLICY), SUCCESS)
-    request_cancellation(checked, c.id)
+    request_cancellation(checked, c.id, grace=GRACE)
     assert status() == (JobStatus.RUNNING, {"queued": 1, "succeeded": 2, "cancelled": 1})
     complete(checked, start_attempt(checked, d.id, "w", policy=POLICY), PERMANENT)
     assert status() == (JobStatus.FAILED, {"succeeded": 2, "cancelled": 1, "failed": 1})
@@ -1079,7 +1098,7 @@ def test_a_finished_job_status_reflects_its_outcomes(
     tasks = new_tasks(checked, *[f"t{i}" for i in range(len(outcomes))])
     for task, how in zip(tasks, outcomes, strict=True):
         if how == "cancel":
-            request_cancellation(checked, task.id)
+            request_cancellation(checked, task.id, grace=GRACE)
         else:
             complete(
                 checked,
@@ -1242,7 +1261,7 @@ def test_running_and_finished_tasks_are_never_claimed(checked: Conn) -> None:
     start_attempt(checked, running.id, "w", policy=POLICY)
     complete(checked, start_attempt(checked, succeeded.id, "w", policy=POLICY), SUCCESS)
     complete(checked, start_attempt(checked, failed.id, "w", policy=POLICY), PERMANENT)
-    request_cancellation(checked, cancelled.id)
+    request_cancellation(checked, cancelled.id, grace=GRACE)
     complete(
         checked, start_attempt(checked, exhausted.id, "w", policy=POLICY), TRANSIENT
     )  # 1 of 1 used
@@ -1386,7 +1405,7 @@ def test_a_task_being_cancelled_is_skipped_and_never_claimed(
     release = gate("UPDATE", "tasks")
     canceller, claimant = worker(), no_wait(worker())
     with ThreadPoolExecutor(1) as pool:
-        cancelling = pool.submit(request_cancellation, canceller, task.id)
+        cancelling = pool.submit(request_cancellation, canceller, task.id, grace=GRACE)
         wait_for_lock(checked, canceller, "advisory")  # task row locked by the cancellation
         assert claim_next_attempt(claimant, "w", policy=POLICY) is None
         release()
@@ -1404,7 +1423,7 @@ def test_a_cancellation_after_a_claim_is_recorded_as_a_request(
     with ThreadPoolExecutor(2) as pool:
         claiming = pool.submit(claim_next_attempt, claimant, "w", policy=POLICY)
         wait_for_lock(checked, claimant, "advisory")  # claimed, not committed
-        cancelling = pool.submit(request_cancellation, canceller, task.id)
+        cancelling = pool.submit(request_cancellation, canceller, task.id, grace=GRACE)
         wait_for_lock(checked, canceller, "transactionid")  # waits for the claim
         release()
         attempt = claiming.result(timeout=20)
@@ -1426,7 +1445,7 @@ def test_cancellation_racing_discovery_never_yields_an_invalid_claim(
             schema_url,
             [
                 partial(claim_next_attempt, worker_id="w", policy=POLICY),
-                partial(request_cancellation, task_id=task.id),
+                partial(request_cancellation, task_id=task.id, grace=GRACE),
             ],
         )
         final = task_now(checked, task.id)
@@ -1859,7 +1878,7 @@ def test_a_revocation_moves_the_task_by_the_retry_and_cancellation_policy(
         complete(checked, start_attempt(checked, task.id, "w", policy=POLICY), TRANSIENT)
     attempt = start_attempt(checked, task.id, "w", policy=EXPIRING)
     if cancel:
-        requested = request_cancellation(checked, task.id)
+        requested = request_cancellation(checked, task.id, grace=GRACE)
         assert requested.outcome is CancellationOutcome.REQUESTED
     until_expired(checked, attempt)
     revocation = revoke(checked)
@@ -2073,9 +2092,15 @@ def test_completion_and_recovery_in_either_order(
     assert_invariants(checked)
 
 
-def jittered(call: Callable[[Conn], Any], seed: int) -> Callable[[Conn], Any]:
-    """``call``, started up to 3 ms late: varies unforced interleavings, synchronises nothing."""
-    delay = random.Random(seed).uniform(0, 0.003)
+def jittered(
+    call: Callable[[Conn], Any], seed: int, *, earliest: float = 0.0, latest: float = 0.003
+) -> Callable[[Conn], Any]:
+    """``call``, started a seeded ``earliest``..``latest`` seconds late.
+
+    It varies unforced interleavings and synchronises nothing: correctness
+    never depends on the delays, only how often each interleaving occurs.
+    """
+    delay = random.Random(seed).uniform(earliest, latest)
 
     def run(conn: Conn) -> Any:
         time.sleep(delay)
@@ -2088,11 +2113,12 @@ def test_heartbeats_completion_recovery_and_cancellation_never_deadlock(
     schema_url: str, checked: Conn
 ) -> None:
     # Unforced races on one task, rotating through sets of participants with
-    # seeded start jitter so that both completion and recovery win some rounds.
-    # Whatever the interleaving, nothing deadlocks (a DeadlockDetected would
-    # escape race()), exactly one of completion and recovery ends the attempt,
-    # and the invariants hold.
-    winners: set[str] = set()
+    # seeded start jitter. Whatever the interleaving, nothing deadlocks (a
+    # DeadlockDetected would escape race()), exactly one of completion and
+    # recovery ends the attempt, a revoked worker's completion and heartbeat
+    # are rejected, and the invariants hold. Which of them wins is left to
+    # scheduling and not asserted: both orders are forced deterministically by
+    # test_completion_and_recovery_in_either_order.
     for n in range(40):
         task = new_task(checked, max_attempts=2)
         expired = n % 4 != 0
@@ -2103,7 +2129,7 @@ def test_heartbeats_completion_recovery_and_cancellation_never_deadlock(
             "renew": partial(renew, attempt=attempt),
             "complete": partial(complete, attempt=attempt, outcome=SUCCESS if n % 3 else TRANSIENT),
             "revoke": revoke_next_expired,
-            "cancel": partial(request_cancellation, task_id=task.id),
+            "cancel": partial(request_cancellation, task_id=task.id, grace=GRACE),
         }
         if n % 4 == 2:
             del participants["cancel"]
@@ -2125,10 +2151,470 @@ def test_heartbeats_completion_recovery_and_cancellation_never_deadlock(
         completed, revoked = results["complete"], results["revoke"]
         assert isinstance(completed, AttemptCompletion) != isinstance(revoked, AttemptRevocation)
         if isinstance(revoked, AttemptRevocation):
-            winners.add("revoke")
             assert isinstance(completed, AttemptRevokedError)
             assert not isinstance(results.get("renew"), Attempt)
-        else:
-            winners.add("complete")
         assert_invariants(checked)
-    assert winners == {"complete", "revoke"}  # both orders were actually exercised
+
+
+# --- 21. cancellation grace periods (DEC-040) ----------------------------------
+
+# A grace period that has run out by the time any later statement runs; see
+# ``until_expired``.
+BRIEF_GRACE = timedelta(microseconds=1)
+
+
+def request(db: Conn, task: Task, grace: timedelta = GRACE) -> CancellationOutcome:
+    return request_cancellation(db, task.id, grace=grace).outcome
+
+
+def attempt_now(db: Conn, attempt_id: uuid.UUID) -> Attempt:
+    attempt = get_attempt(db, attempt_id)
+    assert attempt is not None
+    return attempt
+
+
+def test_a_request_shortens_a_long_lease_and_changes_nothing_else(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)  # five-minute lease
+    result = request_cancellation(checked, task.id, grace=GRACE)
+
+    assert result.outcome is CancellationOutcome.REQUESTED
+    requested_at = result.task.cancel_requested_at
+    assert requested_at is not None
+    assert result.task == task_now(checked, task.id)
+    assert (result.task.state, result.task.attempt_count) == (TaskState.RUNNING, 1)
+    assert result.task.updated_at == requested_at
+    after = attempt_now(checked, attempt.id)
+    assert after.lease_expires_at == requested_at + GRACE  # one grace period, not five minutes
+    # Only the lease changed: same generation, worker, deadline and state.
+    assert after == dataclasses.replace(attempt, lease_expires_at=after.lease_expires_at)
+
+
+def test_a_request_lengthens_a_short_lease_that_still_holds(checked: Conn) -> None:
+    task = new_task(checked)
+    short = LeasePolicy(lease=timedelta(seconds=10), execution_timeout=timedelta(hours=2))
+    attempt = start_attempt(checked, task.id, "w", policy=short)
+    result = request_cancellation(checked, task.id, grace=timedelta(hours=1))
+    requested_at = result.task.cancel_requested_at
+    assert requested_at is not None
+    after = attempt_now(checked, attempt.id)
+    assert attempt.lease_expires_at is not None
+    assert after.lease_expires_at == requested_at + timedelta(hours=1)
+    assert after.lease_expires_at > attempt.lease_expires_at  # the worker gets its full grace
+
+
+def test_a_request_never_extends_past_the_deadline(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)  # one-hour deadline
+    request_cancellation(checked, task.id, grace=timedelta(days=1))
+    after = attempt_now(checked, attempt.id)
+    assert after.lease_expires_at == after.deadline_at == attempt.deadline_at
+
+
+def test_a_request_never_revives_an_expired_lease(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=EXPIRING)
+    until_expired(checked, attempt)
+    assert request(checked, task, timedelta(hours=1)) is CancellationOutcome.REQUESTED
+    assert attempt_now(checked, attempt.id).lease_expires_at == attempt.lease_expires_at
+    with pytest.raises(LeaseExpiredError) as info:
+        renew(checked, attempt)
+    assert info.value.reason is RevocationReason.LEASE_EXPIRED  # not turned into a grace expiry
+
+
+def test_a_repeated_request_cannot_extend_the_grace(checked: Conn) -> None:
+    task = new_task(checked)
+    start_attempt(checked, task.id, "w", policy=POLICY)
+    request(checked, task)
+    before = snapshot(checked)
+    assert request(checked, task, timedelta(hours=1)) is CancellationOutcome.ALREADY_REQUESTED
+    assert snapshot(checked) == before
+
+
+@pytest.mark.parametrize(
+    ("grace", "error"),
+    [
+        (timedelta(0), ValueError),
+        (timedelta(seconds=-1), ValueError),
+        (timedelta.max, ValueError),
+        (30, TypeError),
+        (None, TypeError),
+    ],
+    ids=["zero", "negative", "unrepresentable", "int", "none"],
+)
+@pytest.mark.parametrize("state", ["queued", "running", "finished"])
+def test_an_invalid_grace_is_refused_before_anything_is_written(
+    checked: Conn, grace: Any, error: type[Exception], state: str
+) -> None:
+    task = new_task(checked)
+    if state != "queued":
+        attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+        if state == "finished":
+            complete(checked, attempt, SUCCESS)
+    before = snapshot(checked)
+    with pytest.raises(error, match="grace"):
+        request_cancellation(checked, task.id, grace=grace)
+    assert snapshot(checked) == before
+
+
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_a_request_that_waited_for_the_task_lock_is_timed_after_it(
+    checked: Conn, worker: Callable[[], Conn], state: str
+) -> None:
+    task = new_task(checked)
+    if state == "running":
+        start_attempt(checked, task.id, "w", policy=POLICY)
+    holder, requester = worker(), worker()
+    holder.execute("BEGIN")
+    holder.execute("SELECT id FROM tasks WHERE id = %s FOR UPDATE", (task.id,))
+    with ThreadPoolExecutor(1) as pool:
+        requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
+        wait_for_lock(checked, requester, "transactionid")
+        row = holder.execute("SELECT clock_timestamp()").fetchone()
+        assert row is not None
+        released_at: datetime = row[0]
+        holder.execute("COMMIT")
+        result = requesting.result(timeout=20)
+    requested_at = result.task.cancel_requested_at
+    assert requested_at is not None
+    assert requested_at > released_at
+    assert result.task.updated_at == requested_at
+    if state == "queued":
+        assert result.task.finished_at == requested_at
+    else:
+        attempt = list_attempts(checked, task.id)[0]
+        assert attempt.lease_expires_at == requested_at + GRACE
+
+
+def test_a_heartbeat_after_a_request_is_refused(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    result = request_cancellation(checked, task.id, grace=GRACE)
+    before = snapshot(checked)
+    with pytest.raises(CancellationRequestedError) as info:
+        renew(checked, attempt)
+    assert info.value.attempt_id == attempt.id
+    assert info.value.cancel_requested_at == result.task.cancel_requested_at
+    assert info.value.lease_expires_at == attempt_now(checked, attempt.id).lease_expires_at
+    assert snapshot(checked) == before
+    # Older protections come first: a wrong generation or worker is still that.
+    with pytest.raises(StaleAttemptError):
+        renew_lease(checked, attempt.id, generation=2, worker_id="w", policy=POLICY)
+    with pytest.raises(WorkerMismatchError):
+        renew_lease(checked, attempt.id, generation=1, worker_id="other", policy=POLICY)
+
+
+def test_an_acknowledged_cancellation_ends_the_attempt_as_cancelled(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    request(checked, task)
+    done = complete(checked, attempt, AttemptCancelled())
+    assert (done.attempt.state, done.task.state) == (AttemptState.CANCELLED, TaskState.CANCELLED)
+    assert revoke_next_expired(checked) is None
+
+
+@pytest.mark.parametrize("max_attempts", [1, 3])
+def test_an_ignored_cancellation_is_revoked_when_its_grace_ends(
+    checked: Conn, max_attempts: int
+) -> None:
+    # The reviewed case: a lease as long as the execution timeout. The grace
+    # period, not the deadline, bounds how long the request is ignored, and
+    # the task is cancelled whatever budget is left.
+    task = new_task(checked, max_attempts=max_attempts)
+    whole = LeasePolicy(lease=timedelta(hours=1), execution_timeout=timedelta(hours=1))
+    attempt = start_attempt(checked, task.id, "w", policy=whole)
+    assert attempt.lease_expires_at == attempt.deadline_at
+    request(checked, task, BRIEF_GRACE)
+    shortened = attempt_now(checked, attempt.id)
+    until_expired(checked, shortened)
+    with pytest.raises(LeaseExpiredError) as info:
+        renew(checked, attempt)
+    assert info.value.reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
+
+    revocation = revoke(checked)
+    assert revocation.attempt.revoked_reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
+    assert (revocation.attempt.failure_kind, revocation.attempt.error_type) == (None, None)
+    final = revocation.task
+    assert (final.state, final.attempt_count) == (TaskState.CANCELLED, 1)
+    assert final.finished_at == revocation.attempt.finished_at
+    assert claim_next_attempt(checked, "w", policy=POLICY) is None
+    progress = get_job_progress(checked, task.job_id)
+    assert progress is not None
+    assert progress.status is JobStatus.CANCELLED
+
+
+def test_a_deadline_reached_during_the_grace_still_counts_as_the_deadline(
+    checked: Conn,
+) -> None:
+    task = new_task(checked, max_attempts=1)
+    policy = LeasePolicy(lease=timedelta(seconds=1), execution_timeout=timedelta(seconds=2))
+    attempt = start_attempt(checked, task.id, "w", policy=policy)
+    request(checked, task, timedelta(hours=1))  # the grace would outlast the deadline
+    capped = attempt_now(checked, attempt.id)
+    assert capped.lease_expires_at == capped.deadline_at
+    until_expired(checked, capped)
+    revocation = revoke(checked)
+    assert revocation.attempt.revoked_reason is RevocationReason.DEADLINE_EXCEEDED
+    assert revocation.task.state is TaskState.FAILED  # exhausted: DEC-038, not cancelled
+
+
+@pytest.mark.parametrize(
+    ("max_attempts", "expected"), [(1, TaskState.FAILED), (3, TaskState.CANCELLED)]
+)
+def test_a_request_after_the_lease_expired_is_not_a_grace_expiry(
+    checked: Conn, max_attempts: int, expected: TaskState
+) -> None:
+    task = new_task(checked, max_attempts=max_attempts)
+    attempt = start_attempt(checked, task.id, "w", policy=EXPIRING)
+    until_expired(checked, attempt)
+    request(checked, task)  # the worker was lost before anyone asked to cancel
+    revocation = revoke(checked)
+    assert revocation.attempt.revoked_reason is RevocationReason.LEASE_EXPIRED
+    assert revocation.task.state is expected
+
+
+def test_a_completion_within_the_grace_counts_and_after_revocation_does_not(
+    checked: Conn,
+) -> None:
+    first, second = new_tasks(checked, "within", "after")
+    within = start_attempt(checked, first.id, "w", policy=POLICY)
+    after = start_attempt(checked, second.id, "w", policy=POLICY)
+    request(checked, first, BRIEF_GRACE)
+    request(checked, second, BRIEF_GRACE)
+    until_expired(checked, attempt_now(checked, within.id), attempt_now(checked, after.id))
+
+    # Expired but not yet revoked: a legitimate late success still stands.
+    done = complete(checked, within, SUCCESS)
+    assert (done.task.state, done.task.result) == (TaskState.SUCCEEDED, SUCCESS.result)
+    assert done.task.cancel_requested_at is not None
+
+    assert revoke(checked).attempt.id == after.id
+    before = snapshot(checked)
+    for outcome in (SUCCESS, AttemptCancelled(), TRANSIENT):
+        with pytest.raises(AttemptRevokedError) as info:
+            complete(checked, after, outcome)
+        assert info.value.reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
+    with pytest.raises(AttemptRevokedError):
+        renew(checked, after)
+    assert snapshot(checked) == before
+    assert revoke_next_expired(checked) is None
+
+
+# Forced orders, as in section 20: the first transaction is held at a gate
+# while holding its row locks, and the second is observed waiting for them.
+
+
+def test_a_heartbeat_first_then_the_request_resets_the_renewed_lease(
+    checked: Conn, gate: Gate, worker: Callable[[], Conn]
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    release = gate("UPDATE", "attempts")
+    beater, requester = worker(), worker()
+    with ThreadPoolExecutor(2) as pool:
+        beating = pool.submit(renew, beater, attempt)
+        wait_for_lock(checked, beater, "advisory")  # attempt locked, no request seen
+        requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
+        wait_for_lock(checked, requester, "transactionid")  # task locked, waits for the attempt
+        release()
+        renewed = beating.result(timeout=20)
+        result = requesting.result(timeout=20)
+    requested_at = result.task.cancel_requested_at
+    assert requested_at is not None
+    final = attempt_now(checked, attempt.id)
+    assert final.lease_expires_at == requested_at + GRACE  # the request read the fresh lease
+    assert renewed.lease_expires_at is not None
+    assert final.lease_expires_at < renewed.lease_expires_at  # the renewal did not survive
+    with pytest.raises(CancellationRequestedError):
+        renew(checked, attempt)
+
+
+def test_a_request_first_then_the_heartbeat_is_refused(
+    checked: Conn, gate: Gate, worker: Callable[[], Conn]
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    release = gate("UPDATE", "tasks")
+    requester, beater = worker(), worker()
+    with ThreadPoolExecutor(2) as pool:
+        requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
+        wait_for_lock(checked, requester, "advisory")  # task and attempt locked
+        beating = pool.submit(renew, beater, attempt)
+        wait_for_lock(checked, beater, "transactionid")  # waits for the attempt row
+        release()
+        result = requesting.result(timeout=20)
+        with pytest.raises(CancellationRequestedError):
+            beating.result(timeout=20)
+    requested_at = result.task.cancel_requested_at
+    assert requested_at is not None
+    assert attempt_now(checked, attempt.id).lease_expires_at == requested_at + GRACE
+
+
+@pytest.mark.parametrize("first", ["recover", "request"])
+def test_a_request_and_recovery_in_either_order(
+    checked: Conn, gate: Gate, worker: Callable[[], Conn], first: str
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=EXPIRING)
+    until_expired(checked, attempt)
+    release = gate("UPDATE", "tasks")
+    recoverer, requester = worker(), worker()
+    with ThreadPoolExecutor(2) as pool:
+        if first == "recover":
+            recovering = pool.submit(revoke_next_expired, recoverer)
+            wait_for_lock(checked, recoverer, "advisory")  # attempt revoked, task not yet
+            requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
+            wait_for_lock(checked, requester, "transactionid")
+            release()
+            assert recovering.result(timeout=20) is not None
+            # Requeued by the recovery, then cancelled at once by the request.
+            assert requesting.result(timeout=20).outcome is CancellationOutcome.CANCELLED
+        else:
+            requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
+            wait_for_lock(checked, requester, "advisory")  # task and attempt locked
+            assert revoke_next_expired(no_wait(recoverer)) is None  # skips the locked task
+            release()
+            assert requesting.result(timeout=20).outcome is CancellationOutcome.REQUESTED
+            assert revoke(recoverer).task.state is TaskState.CANCELLED
+    revoked = attempt_now(checked, attempt.id)
+    assert revoked.revoked_reason is RevocationReason.LEASE_EXPIRED  # expired before the request
+    assert task_now(checked, task.id).state is TaskState.CANCELLED
+
+
+def test_a_failed_request_rolls_back_the_request_and_the_lease(checked: Conn) -> None:
+    # A test-only trigger fails the lease update, after the task row was
+    # already updated in the same transaction.
+    checked.execute("""
+        CREATE FUNCTION poison() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'poisoned lease'; END $$;
+        CREATE TRIGGER poison BEFORE UPDATE ON attempts FOR EACH ROW
+            WHEN (NEW.lease_expires_at IS DISTINCT FROM OLD.lease_expires_at)
+            EXECUTE FUNCTION poison();
+    """)
+    task = new_task(checked)
+    start_attempt(checked, task.id, "w", policy=POLICY)
+    before = snapshot(checked)
+    with pytest.raises(errors.RaiseException, match="poisoned lease"):
+        request(checked, task)
+    assert snapshot(checked) == before
+    assert task_now(checked, task.id).cancel_requested_at is None
+    checked.execute("DROP TRIGGER poison ON attempts")
+    assert request(checked, task) is CancellationOutcome.REQUESTED
+
+
+def test_a_failed_grace_revocation_rolls_back_both_records(checked: Conn) -> None:
+    checked.execute("""
+        CREATE FUNCTION poison() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'poisoned cancellation'; END $$;
+        CREATE TRIGGER poison BEFORE UPDATE ON tasks
+            FOR EACH ROW WHEN (NEW.state = 'cancelled') EXECUTE FUNCTION poison();
+    """)
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    request(checked, task, BRIEF_GRACE)
+    until_expired(checked, attempt_now(checked, attempt.id))
+    before = snapshot(checked)
+    with pytest.raises(errors.RaiseException, match="poisoned cancellation"):
+        revoke_next_expired(checked)
+    assert snapshot(checked) == before
+    checked.execute("DROP TRIGGER poison ON tasks")
+    assert revoke(checked).task.state is TaskState.CANCELLED
+
+
+def test_a_connection_lost_mid_request_records_nothing(
+    checked: Conn, gate: Gate, worker: Callable[[], Conn]
+) -> None:
+    task = new_task(checked)
+    start_attempt(checked, task.id, "w", policy=POLICY)
+    before = snapshot(checked)
+    release = gate("UPDATE", "attempts")
+    conn = worker()
+    with ThreadPoolExecutor(1) as pool:
+        requesting = pool.submit(request_cancellation, conn, task.id, grace=GRACE)
+        wait_for_lock(
+            checked, conn, "advisory"
+        )  # request recorded in its transaction, lease not yet
+        checked.execute("SELECT pg_terminate_backend(%s)", (conn.info.backend_pid,))
+        with pytest.raises(psycopg.OperationalError):
+            requesting.result(timeout=20)
+    release()
+    assert snapshot(checked) == before
+    assert request(checked, task) is CancellationOutcome.REQUESTED
+
+
+def test_a_request_refuses_a_running_task_without_its_running_attempt(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    # Corrupt the cross-table invariant behind the operations' back.
+    checked.execute(
+        "UPDATE attempts SET state = 'failed', failure_kind = 'permanent', error_type = 'x', "
+        "finished_at = now() WHERE id = %s",
+        (attempt.id,),
+    )
+    before = snapshot(checked)
+    with pytest.raises(RuntimeError, match="invariant violated"):
+        request(checked, task)
+    assert snapshot(checked) == before
+    # Restore the invariant so the fixture's final check describes the operations.
+    checked.execute(
+        "UPDATE tasks SET state = 'failed', finished_at = now() WHERE id = %s", (task.id,)
+    )
+
+
+def test_cancellation_heartbeats_completion_and_recovery_never_deadlock(
+    schema_url: str, checked: Conn
+) -> None:
+    # Unforced races on one task with a valid lease: a request with a brief
+    # grace, a heartbeat, a completion and two recoverers, with seeded start
+    # jitter. Whatever the interleaving, nothing deadlocks (a DeadlockDetected
+    # would escape race()), exactly one of completion and recovery ends the
+    # attempt, a completion's success stands, a grace revocation always cancels
+    # the task, and the invariants hold.
+    #
+    # Which of them wins is left to scheduling and not asserted. Each outcome
+    # is forced deterministically elsewhere: completion first and recovery
+    # first in test_completion_and_recovery_in_either_order, and for a grace
+    # period in test_a_completion_within_the_grace_counts_and_after_revocation_does_not
+    # and test_an_ignored_cancellation_is_revoked_when_its_grace_ends. The start
+    # windows below, in seconds, only vary which interleavings occur.
+    windows = {
+        "request": (0.0, 0.001),
+        "renew": (0.0, 0.004),
+        "complete": (0.0, 0.006),
+        "revoke": (0.001, 0.004),
+        "revoke-again": (0.002, 0.006),
+    }
+    for n in range(40):
+        task = new_task(checked, max_attempts=1 if n % 2 else 3)
+        attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+        participants: dict[str, Callable[[Conn], Any]] = {
+            "request": partial(request_cancellation, task_id=task.id, grace=BRIEF_GRACE),
+            "renew": partial(renew, attempt=attempt),
+            "complete": partial(complete, attempt=attempt, outcome=SUCCESS),
+            "revoke": revoke_next_expired,
+            "revoke-again": revoke_next_expired,
+        }
+        calls = [
+            jittered(call, seed=n * 10 + i, earliest=windows[name][0], latest=windows[name][1])
+            for i, (name, call) in enumerate(participants.items())
+        ]
+        results = dict(zip(participants, race(schema_url, calls), strict=True))
+        revocations = [
+            r
+            for key in ("revoke", "revoke-again")
+            if isinstance(r := results[key], AttemptRevocation)
+        ]
+        completion = results["complete"]
+        completed = isinstance(completion, AttemptCompletion)
+        assert len(revocations) + completed == 1
+        if revocations:
+            (revocation,) = revocations
+            assert revocation.attempt.revoked_reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
+            assert revocation.task.state is TaskState.CANCELLED
+            assert isinstance(completion, AttemptRevokedError)
+        else:
+            assert isinstance(completion, AttemptCompletion)
+            assert completion.task.state is TaskState.SUCCEEDED  # a success stands (DEC-020)
+            # The attempt is finished, so recovery finds nothing to revoke.
+            assert revoke_next_expired(checked) is None
+        assert_invariants(checked)
