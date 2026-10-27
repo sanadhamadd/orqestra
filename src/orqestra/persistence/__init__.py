@@ -4,5 +4,5 @@
 jobs, tasks and derived job progress; ``lifecycle`` discovers and claims
 tasks with a lease, starts, renews and completes attempts, cancels tasks
 with a bounded grace period, and revokes attempts whose lease expired.
-Nothing runs these operations on a schedule yet: there is no worker loop.
+The worker runtime (``orqestra.worker.runtime``) runs them on a schedule.
 """

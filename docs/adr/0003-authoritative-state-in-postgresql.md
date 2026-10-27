@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-044
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-046
 
 ## Context
 
@@ -71,16 +71,28 @@ detect this: after `running → queued → running`, the state matches again.
   the task, and additive migration 0003 (DEC-040, DEC-041).
 - Implemented and verified locally and in GitHub CI (PR #8): claims filtered by an explicit,
   required set of job kinds inside the same atomic `SKIP LOCKED` claim (DEC-033 note).
-- Implemented and verified locally only (Day 3B Slice 1B-A): worker contracts, with no
-  worker process: the synchronous handler protocol with a read-only cancellation signal,
-  the job-kind handler registry, the pure mapping from what a handler did to an attempt
-  outcome (a checked copy of a valid result; control-plane signals are never recorded),
-  and validated worker timing settings with no defaults (DEC-042 … DEC-044).
-- Not yet implemented, and not proven by the current tests: a worker loop that renews
-  leases, acts on cancellation and sweeps for expired attempts, worker self-fencing and
-  handler interruption, bounded worker slots and retry backoff. Until a worker
-  runtime calls recovery, a task whose worker dies stays `running`. They must be verified
-  by their own tests before being described as working.
+- Implemented and verified locally and in GitHub CI (PR #9): worker contracts: the
+  synchronous handler protocol with a read-only cancellation signal, the job-kind handler
+  registry, the pure mapping from what a handler did to an attempt outcome (a checked copy
+  of a valid result; control-plane signals are never recorded), and validated worker
+  timing settings with no defaults (DEC-042 … DEC-044).
+- Implemented and verified locally only (Day 3B Slice 1B-B1): a first single-slot worker
+  runtime. It claims supported kinds, runs one handler thread, renews the lease, sweeps for
+  expired attempts while idle or busy, and records outcomes through the Day 3A operations.
+  A local watchdog ends the process when the worker cannot establish that it still owns a
+  running task, or when a database call stalls; an ambiguous completion also ends it
+  (DEC-045, DEC-046).
+- Not yet implemented, and not proven by the current tests:
+  - a command or service that runs workers;
+  - telling handlers about cancellation;
+  - reconciling ambiguous completions (C4);
+  - graceful shutdown;
+  - stopping handlers that hold the GIL or detach processes;
+  - bounded worker slots;
+  - retry backoff.
+
+  A task whose worker dies is recovered only while some worker runs. These must be
+  verified by their own tests before being described as working.
 - Cross-table invariants (a running task has exactly one running attempt whose number
   equals `attempt_count`) are the responsibility of the transactional operations, not the
   schema; the integration tests check them across the whole schema after every test.

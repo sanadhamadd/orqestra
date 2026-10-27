@@ -80,6 +80,18 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 - Concurrent stress tests assert invariants for all valid schedules. Specific race
   outcomes require deterministic synchronization tests. Do not use a minimum random
   winner count as evidence of correctness.
+- Anything that ends a process (the worker's watchdog and its other exits) is tested in a
+  real subprocess (`tests/integration/test_worker_process.py`, which starts
+  `python -m tests.integration.worker_process`), not only with a mocked `os._exit`.
+  In-process worker tests inject a recording watchdog and a `terminate` that raises.
+- Network failure is simulated with `tests/integration/pg_proxy.py`. It can:
+  - stall a connection (TCP stays up, so neither keepalives nor `statement_timeout` end
+    the call);
+  - refuse connections;
+  - cut a completion either just after or just before its `COMMIT` reaches the server.
+- "Ended before its lease" is checked against PostgreSQL's own clock and the stored
+  `lease_expires_at`, with a margin of at least the fencing margin. Worker test timings
+  are test values only, not recommendations (DEC-034).
 
 ## Invoice and AI workloads
 

@@ -1,9 +1,11 @@
-"""Worker contracts: task handlers, the handler registry and runtime settings.
+"""The worker: task handlers, runtime settings, the runtime and its local fence.
 
 ``handlers`` defines what a task handler is, which job kinds a worker
 supports, and how a handler's return value or exception becomes an attempt
-outcome; ``settings`` validates the worker's runtime configuration. Both are
-pure: no I/O, no threads, no database access. There is no worker process yet:
-nothing claims tasks, runs handlers, renews leases or sweeps for expired
-attempts on its own (Day 3B, later slices).
+outcome; ``settings`` validates the worker's runtime configuration (both pure).
+``runtime`` is the first single-slot worker: a supervisor that claims, runs one
+handler thread, renews leases, sweeps for expired attempts and records
+outcomes; ``fence`` is the watchdog that ends the process when the worker
+cannot establish that it still owns a running task. There is no command or
+service that runs a worker yet.
 """
