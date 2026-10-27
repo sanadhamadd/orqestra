@@ -17,8 +17,15 @@ committed, the attempt still runs and the same outcome is written again, or
 recovery revoked it. The handler never runs again for it. If that cannot be
 established before the attempt's deadline, the process ends.
 
-Not in this slice (Day 3B, later): telling the handler about a cancellation
-request, graceful shutdown with draining, and a command to run a worker.
+Cancellation is cooperative (DEC-048): when a heartbeat shows that a
+cancellation request has committed, the supervisor stops renewing, moves the
+fence to the end of the grace period, and sets the attempt's cancellation
+event, which the handler sees through its read-only ``CancellationSignal``.
+Notice arrives only with a heartbeat, so it is not guaranteed before the
+grace period ends.
+
+Not in this slice (Day 3B, later): graceful shutdown with draining, and a
+command to run a worker.
 """
 
 import logging
@@ -228,6 +235,9 @@ class _Running:
     thread: threading.Thread
     done: threading.Event
     outcome: list[HandlerOutcome]
+    # Set once a heartbeat has confirmed a committed cancellation request; the
+    # handler sees it only through its read-only CancellationSignal (DEC-048).
+    cancel: threading.Event
     heartbeat_due: float | None
     completion_due: float = 0.0
     # An earlier write of this outcome may have committed: read the evidence
@@ -426,12 +436,13 @@ class Worker:
             return False
         token = self._watchdog.arm(Guard.OWNERSHIP, deadline, context)
         handler = self._registry[kind]
+        cancel = threading.Event()  # this attempt's own, unset until a request is confirmed
         task_context = TaskContext(
             attempt.task_id,
             attempt.id,
             attempt.attempt_number,
             kind,
-            CancellationSignal(threading.Event()),  # never set in this slice
+            CancellationSignal(cancel),
         )
         done = threading.Event()
         outcome: list[HandlerOutcome] = []
@@ -454,6 +465,7 @@ class Worker:
             thread=thread,
             done=done,
             outcome=outcome,
+            cancel=cancel,
             heartbeat_due=anchor + self._settings.heartbeat_interval.total_seconds(),
         )
         thread.start()
@@ -478,13 +490,20 @@ class Worker:
                 running.context,
             )
         except CancellationRequestedError as exc:
-            # The lease is not renewed again and may now end sooner: fence at
-            # the end of the grace period. The handler is not told in this slice.
+            # A committed request (renew_lease read it): the lease is not renewed
+            # again and may now end sooner. Fence at the end of the grace period
+            # first, so fencing holds whatever follows; then tell the handler.
             running.heartbeat_due = None
             self._watchdog.restrict(
                 running.token, running.local(exc.lease_expires_at) - self._margin()
             )
-            self._event(logging.WARNING, "cancellation_requested", "renewals stop", running.context)
+            running.cancel.set()
+            self._event(
+                logging.WARNING,
+                "cancellation_requested",
+                "renewals stop; the handler is told",
+                running.context,
+            )
             return
         except _OWNERSHIP_LOST as exc:
             if running.done.is_set():
