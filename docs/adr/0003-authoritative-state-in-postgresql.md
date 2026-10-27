@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-047
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-048
 
 ## Context
 
@@ -81,14 +81,17 @@ detect this: after `running → queued → running`, the state matches again.
   expired attempts while idle or busy, and records outcomes through the Day 3A operations.
   A local watchdog ends the process when the worker cannot establish that it still owns a
   running task, or when a database call stalls (DEC-045, DEC-046).
-- Implemented and verified locally only (Day 3B Slice B2a-1): a completion whose answer was
+- Implemented and verified locally and in GitHub CI (PR #11): a completion whose answer was
   lost is reconciled from one consistent PostgreSQL read of the attempt and its task, with
   results compared by `jsonb` equality: it committed, the same outcome is written again, or
   recovery revoked it. The handler never runs again; an outcome unresolved by the attempt's
   deadline ends the process (DEC-047).
+- Implemented and verified locally only (Day 3B Slice B2a-2): cooperative cancellation. A
+  heartbeat that confirms a committed request restricts the fence to the end of the grace
+  period and then tells the handler through its read-only signal; a handler that
+  cooperates ends the attempt cancelled. Notice is only as timely as heartbeats (DEC-048).
 - Not yet implemented, and not proven by the current tests:
   - a command or service that runs workers;
-  - telling handlers about cancellation;
   - graceful shutdown;
   - stopping handlers that hold the GIL or detach processes;
   - bounded worker slots;

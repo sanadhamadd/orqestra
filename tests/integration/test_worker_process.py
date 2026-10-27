@@ -273,3 +273,38 @@ def test_an_unresolved_reconciliation_ends_the_process_at_the_deadline(
     ]  # nothing committed; recovery decides
     assert no_failure_recorded(handler_db, task)
     assert runs(handler_db) == 1
+
+
+def test_a_cooperative_handler_is_cancelled_and_the_process_carries_on(
+    handler_db: Conn, start: Any
+) -> None:
+    (task,) = submit(handler_db, "cooperative", {})
+    worker = start()
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    request_cancellation(handler_db, task.id, grace=timedelta(seconds=30))
+    eventually(lambda: task_states(handler_db, [task]) == [("cancelled", 1)], "the cancellation")
+    assert rows(
+        handler_db, "SELECT state, revoked_reason FROM attempts WHERE task_id = %s", task.id
+    ) == [("cancelled", None)]  # recorded by the worker, not revoked by recovery
+    assert worker.process.poll() is None  # no exit: the worker carries on
+    assert no_failure_recorded(handler_db, task)
+    assert runs(handler_db) == 1
+
+
+def test_a_lost_connection_is_never_mistaken_for_a_cancellation(
+    schema_url: str, handler_db: Conn, start: Any
+) -> None:
+    (task,) = submit(handler_db, "cooperative", {})
+    with PgProxy(schema_url) as proxy:
+        worker = start(proxy.url(schema_url))
+        eventually(lambda: renewed(handler_db, task), "a renewal")
+        proxy.refuse()  # heartbeats now fail unconfirmed; nothing was requested
+        code, lines = worker.exit()
+    assert code == ExitCode.FENCED
+    assert lines[-1]["event"] == "ownership_deadline_passed"
+    assert not any(line.get("event") == "cancellation_requested" for line in lines)
+    assert rows(handler_db, "SELECT cancel_requested_at FROM tasks WHERE id = %s", task.id) == [
+        (None,)
+    ]
+    assert task_states(handler_db, [task]) == [("running", 1)]  # the handler never ended it
+    assert no_failure_recorded(handler_db, task)

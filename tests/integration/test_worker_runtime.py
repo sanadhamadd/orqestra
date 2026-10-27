@@ -787,3 +787,166 @@ def test_an_unresolved_reconciliation_ends_at_the_attempts_deadline(
     assert probe.terminations == [(ExitCode.AMBIGUOUS, "reconciliation_unresolved")]
     assert len(returning.gate.runs) == 1  # never rerun
     assert sorted(task_states(checked, [first, second])) == [("queued", 0), ("running", 1)]
+
+
+# --- cooperative cancellation (DEC-048) --------------------------------------------------
+
+
+@dataclass
+class Cooperative:
+    """Waits for its cancellation signal, then does ``then``; records what it saw.
+
+    With ``hold`` set, it waits for ``proceed`` after seeing the signal, so a test
+    can act while the request is known and the handler has not ended yet.
+    """
+
+    then: str = "cancel"  # cancel | succeed | transient | permanent
+    hold: bool = False
+    runs: list[uuid.UUID] = field(default_factory=list)
+    observed: threading.Event = field(default_factory=threading.Event)
+    proceed: threading.Event = field(default_factory=threading.Event)
+
+    def handler(self, ctx: TaskContext, payload: JsonValue) -> JsonValue:
+        self.runs.append(ctx.attempt_id)
+        if not ctx.cancellation.wait(60):
+            return {"never": "told"}
+        self.observed.set()
+        if self.hold:
+            assert self.proceed.wait(60)
+        match self.then:
+            case "cancel":
+                raise HandlerCancelled
+            case "transient":
+                raise TransientError("stopping")
+            case "permanent":
+                raise PermanentError("stopping")
+            case _:
+                return {"finished": "anyway"}
+
+
+GRACE = timedelta(seconds=30)  # test value: far longer than a heartbeat interval
+
+
+def lease_of(db: Conn, task: Task) -> Any:
+    return rows(db, "SELECT lease_expires_at FROM attempts WHERE task_id = %s", task.id)[0][0]
+
+
+@pytest.mark.parametrize(
+    ("then", "attempt_state", "failure_kind", "task_state"),
+    [
+        ("cancel", "cancelled", None, "cancelled"),
+        ("succeed", "succeeded", None, "succeeded"),  # a success may still win (DEC-020)
+        ("transient", "failed", "transient", "cancelled"),  # a request cancels, never requeues
+        ("permanent", "failed", "permanent", "failed"),  # the failure policy is unchanged
+    ],
+    ids=["cancelled", "success-stands", "transient-cancels", "permanent-fails"],
+)
+def test_a_handler_told_of_a_committed_request_ends_by_the_existing_policy(
+    schema_url: str,
+    checked: Conn,
+    caplog: pytest.LogCaptureFixture,
+    then: str,
+    attempt_state: str,
+    failure_kind: str | None,
+    task_state: str,
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    cooperative = Cooperative(then)
+    (task,) = submit(checked, "cooperative", {})
+    with running_worker(schema_url, {"cooperative": cooperative.handler}) as probe:
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        request_cancellation(checked, task.id, grace=GRACE)
+        assert cooperative.observed.wait(WAIT)  # told at the next heartbeat
+        eventually(lambda: task_states(checked, [task]) == [(task_state, 1)], "the outcome")
+    assert attempt_rows(checked, task) == [(1, attempt_state, failure_kind, None)]  # not revoked
+    assert probe.terminations == []  # the worker carries on
+    assert probe.expiries == []
+    assert len(cooperative.runs) == 1
+    assert "cancellation_requested" in events(caplog)
+
+
+def test_a_request_after_the_completion_committed_changes_nothing(
+    schema_url: str, checked: Conn
+) -> None:
+    returning = Returning({"ok": True})
+    returning.gate.release.set()
+    (task,) = submit(checked, "returning", {})
+    with running_worker(schema_url, {"returning": returning.handler}):
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the success")
+        result = request_cancellation(checked, task.id, grace=GRACE)
+    assert result.outcome.value == "already_finished"
+    assert task_states(checked, [task]) == [("succeeded", 1)]
+    assert attempt_rows(checked, task) == [(1, "succeeded", None, None)]
+
+
+def test_a_success_after_a_committed_request_still_stands(schema_url: str, checked: Conn) -> None:
+    # The request commits first; the handler (which ignores the signal) then succeeds.
+    returning = Returning({"ok": True})
+    (task,) = submit(checked, "returning", {})
+    with running_worker(schema_url, {"returning": returning.handler}) as probe:
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        assert request_cancellation(checked, task.id, grace=GRACE).outcome.value == "requested"
+        returning.gate.release.set()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the success")
+    assert rows(
+        checked, "SELECT cancel_requested_at IS NOT NULL FROM tasks WHERE id = %s", task.id
+    ) == [(True,)]
+    assert probe.terminations == []
+
+
+def test_a_grace_that_ends_before_the_next_heartbeat_fences_without_notice(
+    schema_url: str, checked: Conn
+) -> None:
+    cooperative = Cooperative()
+    (task,) = submit(checked, "cooperative", {})
+    with running_worker(schema_url, {"cooperative": cooperative.handler}) as probe:
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        # A 1 µs grace has ended before any heartbeat can see the request.
+        request_cancellation(checked, task.id, grace=timedelta(microseconds=1))
+        eventually(lambda: probe.terminations, "the worker to fence itself")
+    assert probe.terminations[0] == (ExitCode.FENCED, "ownership_lost")
+    assert not cooperative.observed.is_set()  # no notice: it was never guaranteed
+    assert attempt_rows(checked, task) == [(1, "running", None, None)]  # nothing recorded
+    revocation = revoke_next_expired(checked)  # recovery then cancels it (DEC-040)
+    assert revocation is not None
+    assert task_states(checked, [task]) == [("cancelled", 1)]
+
+
+def test_a_repeated_request_neither_extends_the_grace_nor_runs_the_handler_again(
+    schema_url: str, checked: Conn
+) -> None:
+    cooperative = Cooperative(hold=True)
+    (task,) = submit(checked, "cooperative", {})
+    with running_worker(schema_url, {"cooperative": cooperative.handler}) as probe:
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        request_cancellation(checked, task.id, grace=GRACE)
+        assert cooperative.observed.wait(WAIT)
+        first_lease = lease_of(checked, task)
+        again = request_cancellation(checked, task.id, grace=timedelta(hours=1))
+        assert again.outcome.value == "already_requested"
+        assert lease_of(checked, task) == first_lease  # not extended
+        cooperative.proceed.set()
+        eventually(lambda: task_states(checked, [task]) == [("cancelled", 1)], "the task")
+    assert len(cooperative.runs) == 1
+    assert probe.terminations == []
+
+
+def test_a_cancelled_outcome_whose_answer_was_lost_is_reconciled(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    cooperative = Cooperative()
+    (task,) = submit(checked, "cooperative", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"cooperative": cooperative.handler}) as probe,
+    ):
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        proxy.drop_completion(committed=True)  # the cancelled completion commits, unheard
+        request_cancellation(checked, task.id, grace=GRACE)
+        eventually(lambda: "completion_reconciled" in events(caplog), "reconciliation")
+    assert proxy.drop_count == 1
+    assert task_states(checked, [task]) == [("cancelled", 1)]
+    assert attempt_rows(checked, task) == [(1, "cancelled", None, None)]
+    assert len(cooperative.runs) == 1
+    assert probe.terminations == []

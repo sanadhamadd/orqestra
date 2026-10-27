@@ -706,6 +706,7 @@ runs a worker yet.
     - lost ownership ignored;
     - an ambiguous completion retried;
     - a cancellation not shortening the fence.
+- **Day 3B Slice B2a-2 note:** "the handler is not told in this slice", and the trade-off that handlers are not yet told, no longer hold. When a heartbeat confirms a committed request, the supervisor still stops renewing and restricts the fence to the end of the grace period first, then sets the attempt's cancellation event for the handler (DEC-048). A handler that ignores it is still fenced at the end of the grace period.
 
 ### DEC-046 — Slice 1B-B1 outcome policy: database errors are never handler failures; an ambiguous completion ends the process
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); temporary for the ambiguous case until C4 reconciliation
@@ -749,8 +750,10 @@ runs a worker yet.
 
 Entry DEC-047 records the C4 reconciliation agreed in the Day 3B Slice 1B-B2 design audit.
 It stays **Proposed** until the owner accepts it in a reviewed change; "implemented" means
-verified locally by the tests named, not yet in GitHub CI. Cooperative cancellation
-(Slice B2a-2) and graceful shutdown (Slice B2b) are not part of it.
+verified by the tests named, locally and in GitHub CI: Slice B2a-1 was merged in PR #11
+(`278cb74`), with both CI jobs passing for the pull request (run 40520647309) and for
+`main` (run 40524368913). Cooperative cancellation (Slice B2a-2, DEC-048) and graceful
+shutdown (Slice B2b) are not part of it.
 
 ### DEC-047 — A lost completion answer is reconciled from one consistent PostgreSQL read; the handler never runs again
 - **Status:** Proposed · owner-approved direction (2026-10-27) · implemented locally (`read_completion_evidence`, `Worker`)
@@ -840,3 +843,69 @@ verified locally by the tests named, not yet in GitHub CI. Cooperative cancellat
     - inferring from a rejection instead of re-reading;
     - never ending an unresolved reconciliation;
     - writing again when the evidence matches.
+
+## Day 3B — Slice B2a-2: cooperative cancellation
+
+Entry DEC-048 records cooperative cancellation, agreed in the Day 3B Slice 1B-B2 design
+audit. It stays **Proposed** until the owner accepts it in a reviewed change;
+"implemented" means verified locally by the tests named, not yet in GitHub CI. Graceful
+shutdown (Slice B2b) is not part of it.
+
+### DEC-048 — A heartbeat that confirms a committed request tells the handler, after fencing at the grace end
+- **Status:** Proposed · owner-approved direction (2026-10-27) · implemented locally (`Worker`)
+- **WHAT:**
+  - **One event per attempt.** `_Running` keeps a `threading.Event`, created unset when the handler starts. The handler receives only the existing read-only `CancellationSignal` over it, in `TaskContext.cancellation`.
+  - **Telling the handler.** When `renew_lease` raises `CancellationRequestedError`, which it does only after reading a committed `cancel_requested_at`, the supervisor:
+    1. stops renewing;
+    2. restricts the ownership fence to the end of the grace period, less `fence_margin`;
+    3. only then sets the event, and logs `cancellation_requested`.
+
+    Restricting first means fencing holds even if anything later fails.
+  - **Nothing else sets it:** not an unconfirmed heartbeat (a database error or a failed connect), lost ownership (`LeaseExpiredError`, `AttemptRevokedError`, `StaleAttemptError`, …), or another attempt's request.
+  - **No new mechanism.** There is no polling loop, no new lock and no new outcome mapping. `run_handler` already makes `HandlerCancelled` an `AttemptCancelled` only when the signal is set, and the database already accepts a cancelled outcome only after a committed request.
+- **WHY:**
+  - The pieces existed (DEC-040, DEC-042) but the event was created and discarded, so a handler that could stop cleanly was fenced instead.
+  - Heartbeats already carry the committed request, so telling the handler there adds no database load and no new race.
+  - Fencing first means that, once a request is confirmed, the local fence ends at the grace period even if notification goes wrong.
+- **RUNNER-UP:**
+  - A separate, more frequent cancellation poll: it would notice sooner, but adds database load and a second timing contract.
+  - Giving the handler the event itself: rejected in Slice 1B-A, since the handler could forge an observed cancellation.
+- **TRADE-OFF:**
+  - **Notice comes only with a heartbeat that reaches the database.** There are three cases:
+    - **Confirmed:** a heartbeat reads the committed request. The local fence moves to the end of the grace period, less `fence_margin`, and the handler is told.
+    - **Grace ends first:** the next heartbeat finds the lease ended (`LeaseExpiredError`). The worker is fenced at once, with no notice, and recovery cancels the task.
+    - **Unobserved, during an outage:** if the database is unreachable, the worker cannot learn of the request or its grace deadline. It keeps the existing local ownership fence: the end of the lease it last confirmed, less `fence_margin` (DEC-045). That can be later than the end of the grace period. The database's own fencing still rejects the worker's writes once the lease has ended, and recovery cancels the task.
+  - **Any timing bound is conditional.**
+    - **Responsive database:** if every heartbeat is answered within `db_operation_timeout`, the handler is fenced by roughly `max(request + grace - fence_margin, request + heartbeat_interval + db_operation_timeout)`. Otherwise the bound is the end of the last confirmed lease.
+    - **What the fence itself assumes:** the watchdog thread is scheduled (no handler holding the GIL, no long scheduling stall), and the clocks run at the same rate (DEC-045). Exiting adds its own time.
+    - **What the tests show:** the order of fencing and notice, the fence deadline, and the cases above. They do not measure an end-to-end bound.
+  - **Cooperation is the handler's choice.** One that ignores the signal is ended only by the fence; one holding the GIL can delay even that (DEC-045).
+  - **A spontaneous `HandlerCancelled` can still become cancelled.** If one is raised just as the supervisor sets the event, `run_handler` maps it to `AttemptCancelled`. The database accepts that, because the request had committed.
+- **VERIFICATION:**
+  - **`tests/unit/test_worker_runtime.py`:**
+    - each attempt's event is fresh and unset, and a later attempt is unaffected by an earlier request;
+    - the handler's view reads the worker's event and cannot set it;
+    - a confirmed request restricts the fence, stops renewals and sets the event;
+    - the fence is restricted even if setting the event fails;
+    - unconfirmed heartbeats (connection lost, deadlock, statement timeout, refused connect) and lost ownership (grace expired, revoked, stale) never set it;
+    - a request seen after the handler finished changes nothing recorded;
+    - an unobserved `HandlerCancelled` is an unclassified failure;
+    - a cooperative handler ends `AttemptCancelled`.
+  - **`tests/integration/test_worker_runtime.py`** (in-process, real PostgreSQL):
+    - a handler told of a committed request ends by the existing policy: cancelled; success stands; a transient failure cancels; a permanent failure fails. The attempt is never revoked and the worker carries on;
+    - a request after the completion committed changes nothing (`already_finished`);
+    - a success after a committed request still stands;
+    - a 1 µs grace fences the worker with no notice, and recovery cancels the task;
+    - a repeated request does not extend the lease or run the handler again;
+    - a cancelled outcome whose answer was lost is reconciled (DEC-047).
+  - **`tests/integration/test_worker_process.py`** (real subprocess):
+    - a cooperative handler is cancelled and the process carries on;
+    - refused connections fence the process (exit 3) with no cancellation event, request or recorded outcome;
+    - the existing grace test still fences a handler that ignores the signal, and recovery cancels the task.
+  - **Commit-order races** between cancellation and completion at the lock level stay covered by `test_cancellation_and_completion_in_either_order` and the race tests in `test_attempt_lifecycle.py`.
+  - **Mutation checks:** locally, each of these failed tests:
+    - never telling the handler;
+    - telling it before restricting the fence;
+    - telling it on an unconfirmed heartbeat;
+    - telling it on lost ownership;
+    - one event shared by every attempt.

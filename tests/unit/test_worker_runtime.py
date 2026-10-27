@@ -1,5 +1,6 @@
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -11,7 +12,13 @@ from psycopg import errors
 from psycopg.conninfo import conninfo_to_dict
 
 from orqestra.domain.errors import TransientError
-from orqestra.domain.jobs import Attempt, AttemptFailed, AttemptSucceeded, JsonValue
+from orqestra.domain.jobs import (
+    Attempt,
+    AttemptCancelled,
+    AttemptFailed,
+    AttemptSucceeded,
+    JsonValue,
+)
 from orqestra.domain.leases import RevocationReason
 from orqestra.domain.policy import FailureKind
 from orqestra.domain.states import AttemptState
@@ -26,7 +33,12 @@ from orqestra.persistence.lifecycle import (
 )
 from orqestra.worker import runtime
 from orqestra.worker.fence import ExitCode, Expiry, Guard, Watchdog
-from orqestra.worker.handlers import ControlPlaneSignal, HandlerRegistry, TaskContext
+from orqestra.worker.handlers import (
+    ControlPlaneSignal,
+    HandlerCancelled,
+    HandlerRegistry,
+    TaskContext,
+)
 from orqestra.worker.runtime import (
     CompletionError,
     ConnectionUnavailable,
@@ -277,8 +289,10 @@ class Harness:
         self.conn = FakeConn()
         self.connects = 0
         self.monkeypatch = monkeypatch
+        self.contexts: list[TaskContext] = []  # what each started handler was given
 
         def handler(ctx: TaskContext, payload: JsonValue) -> JsonValue:
+            self.contexts.append(ctx)
             assert self.gate.wait(10)
             return {"ok": True}
 
@@ -883,3 +897,162 @@ def test_without_a_lost_answer_a_retryable_error_ends_as_unrecorded(harness: Har
     with pytest.raises(Terminated) as info:
         harness.worker._complete(running)
     assert info.value.code is ExitCode.UNRECORDED
+
+
+# --- cooperative cancellation (DEC-048) ------------------------------------------------
+
+
+def started(harness: Harness, count: int) -> TaskContext:
+    """The context the ``count``-th started handler was given (it records it first)."""
+    deadline = time.monotonic() + 10
+    while len(harness.contexts) < count and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert len(harness.contexts) >= count
+    return harness.contexts[count - 1]
+
+
+def request(lease_seconds: float = 12.0) -> CancellationRequestedError:
+    return CancellationRequestedError(uuid.UUID(int=1), T0, T0 + timedelta(seconds=lease_seconds))
+
+
+def test_a_handler_starts_with_an_unset_signal_over_its_attempts_own_event(
+    harness: Harness,
+) -> None:
+    running = harness.start()
+    ctx = started(harness, 1)
+    assert not ctx.cancellation.is_set()
+    assert not running.cancel.is_set()
+    running.cancel.set()  # the worker's event is the one the handler's view reads
+    assert ctx.cancellation.is_set()
+    assert not hasattr(ctx.cancellation, "set")  # the handler can only read it
+
+
+def test_a_confirmed_request_fences_first_then_tells_the_handler(harness: Harness) -> None:
+    running = harness.start()
+    ctx = started(harness, 1)
+    harness.renew(raising(request()))
+    harness.worker._heartbeat(running)
+    assert ctx.cancellation.is_set()
+    assert running.heartbeat_due is None  # no more renewals, so no repeated notice
+    assert harness.deadline() == 100.0 + 12.0 - 3.0  # the grace end, less the margin
+
+
+def test_the_fence_is_restricted_even_if_telling_the_handler_fails(harness: Harness) -> None:
+    running = harness.start()
+
+    class Broken:
+        def set(self) -> None:
+            raise RuntimeError("cannot set")
+
+    running.cancel = Broken()  # type: ignore[assignment]
+    harness.renew(raising(request()))
+    with pytest.raises(RuntimeError, match="cannot set"):
+        harness.worker._heartbeat(running)
+    assert harness.deadline() == 100.0 + 12.0 - 3.0  # fencing already holds
+    assert running.heartbeat_due is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        psycopg.OperationalError("lost"),
+        errors.DeadlockDetected(),
+        errors.QueryCanceled(),
+        ConnectionUnavailable("refused"),
+    ],
+    ids=["connection-lost", "deadlock", "statement-timeout", "connect-refused"],
+)
+def test_an_unconfirmed_heartbeat_never_signals_cancellation(
+    harness: Harness, failure: Exception
+) -> None:
+    running = harness.start()
+    ctx = started(harness, 1)
+    harness.renew(raising(failure))
+    harness.worker._heartbeat(running)
+    assert not ctx.cancellation.is_set()
+    assert running.heartbeat_due is not None  # still renewing
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [
+        LeaseExpiredError(uuid.UUID(int=1), RevocationReason.CANCELLATION_GRACE_EXPIRED, T0, T0),
+        AttemptRevokedError(uuid.UUID(int=1), RevocationReason.CANCELLATION_GRACE_EXPIRED),
+        StaleAttemptError(uuid.UUID(int=1), 1, 2),
+    ],
+    ids=["grace-expired", "revoked", "stale"],
+)
+def test_lost_ownership_never_signals_cancellation(harness: Harness, lost: Exception) -> None:
+    running = harness.start()
+    ctx = started(harness, 1)
+    harness.renew(raising(lost))
+    with pytest.raises(Terminated) as info:
+        harness.worker._heartbeat(running)
+    assert info.value.code is ExitCode.FENCED
+    assert not ctx.cancellation.is_set()
+
+
+def test_every_attempt_gets_a_fresh_unset_event(harness: Harness) -> None:
+    first = harness.start()
+    first_ctx = started(harness, 1)
+    harness.renew(raising(request()))
+    harness.worker._heartbeat(first)
+    harness.finish_handler(first)
+    assert first_ctx.cancellation.is_set()
+    harness.worker._schedule.running = None  # settled
+    harness.gate.clear()
+    second = harness.start()
+    second_ctx = started(harness, 2)
+    assert second.cancel is not first.cancel
+    assert not second_ctx.cancellation.is_set()  # the earlier request does not carry over
+    assert not second.cancel.is_set()
+    harness.gate.set()
+
+
+def test_a_request_seen_after_the_handler_finished_changes_nothing_recorded(
+    harness: Harness,
+) -> None:
+    running = harness.start()
+    harness.finish_handler(running)
+    assert running.outcome == [AttemptSucceeded({"ok": True})]
+    harness.renew(raising(request()))
+    harness.worker._heartbeat(running)  # a late heartbeat answer
+    assert running.outcome == [AttemptSucceeded({"ok": True})]  # not converted afterwards
+
+
+def test_an_unobserved_handler_cancelled_is_a_failure_not_a_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = Harness(monkeypatch)
+
+    def gives_up(ctx: TaskContext, payload: JsonValue) -> JsonValue:
+        raise HandlerCancelled
+
+    harness.worker._registry = HandlerRegistry({"k": gives_up})
+    harness.worker._start(attempt(), 100.0, {}, {}, "k")
+    running = running_of(harness.worker)
+    assert running.done.wait(10)
+    (outcome,) = running.outcome
+    assert isinstance(outcome, AttemptFailed)
+    assert (outcome.kind, outcome.error_type) == (
+        FailureKind.UNCLASSIFIED,
+        "orqestra.worker.handlers.HandlerCancelled",
+    )
+
+
+def test_a_cooperative_handler_that_saw_the_request_ends_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = Harness(monkeypatch)
+
+    def cooperative(ctx: TaskContext, payload: JsonValue) -> JsonValue:
+        assert ctx.cancellation.wait(10)
+        raise HandlerCancelled
+
+    harness.worker._registry = HandlerRegistry({"k": cooperative})
+    harness.worker._start(attempt(), 100.0, {}, {}, "k")
+    running = running_of(harness.worker)
+    harness.renew(raising(request()))
+    harness.worker._heartbeat(running)
+    assert running.done.wait(10)
+    assert running.outcome == [AttemptCancelled()]
