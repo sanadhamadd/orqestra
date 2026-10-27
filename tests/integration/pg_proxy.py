@@ -5,18 +5,27 @@ and a test can make it:
 
 - ``stall()``: hold every byte, keeping both sockets open. The client cannot
   tell this from a frozen server: TCP stays up, so neither keepalives nor
-  ``statement_timeout`` end its call.
-- ``refuse()``: close every connection and every new one at once.
+  ``statement_timeout`` end its call. ``resume()`` lets traffic flow again.
+- ``refuse()``: close every connection and every new one at once, until
+  ``accept()``.
 - ``drop_completion(committed=...)``: on the next completion (the transaction
   whose ``UPDATE`` sets ``failure_kind``), cut the connection either after the
   server has answered its ``COMMIT`` (the commit happened, the client never
   hears of it) or before forwarding the ``COMMIT`` (the server rolls back).
+  Drops queue up: each completion takes the next one. With ``then_refuse``,
+  new connections are refused from the drop on, until ``accept()``.
+- ``cut_on(marker)``: close the next connection whose client sends ``marker``,
+  without forwarding it.
+- ``hold_on(marker)``: stall all traffic as soon as a client sends ``marker``,
+  before forwarding it, until ``resume()``.
 """
 
 import contextlib
 import socket
 import threading
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -41,12 +50,18 @@ def upstream_for(database_url: str) -> Callable[[], socket.socket]:
     return lambda: socket.create_connection((address, port))
 
 
+@dataclass
+class _Drop:
+    committed: bool
+    then_refuse: bool
+
+
 class _Pair:
     def __init__(self, client: socket.socket, server: socket.socket) -> None:
         self.client, self.server = client, server
         self.seen = b""  # the tail of what the client sent, to find markers across reads
         self.completion_seen = False
-        self.drop_reply = False
+        self.drop_reply: _Drop | None = None
 
     def close(self) -> None:
         for sock in (self.client, self.server):
@@ -67,8 +82,14 @@ class PgProxy:
         self._forwarding = threading.Event()
         self._forwarding.set()
         self._refusing = False
-        self._drop: bool | None = None  # None: no drop armed; else whether to let the commit happen
-        self.dropped = threading.Event()
+        self._drops: deque[_Drop] = deque()
+        self._cut: bytes | None = None
+        self._hold: bytes | None = None
+        self.dropped = threading.Event()  # set on each drop
+        self.drop_count = 0
+        self.refused = threading.Event()  # set on each refused connection
+        self.cut = threading.Event()
+        self.held = threading.Event()
         self._closed = False
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -91,9 +112,21 @@ class PgProxy:
         for pair in pairs:
             pair.close()
 
-    def drop_completion(self, *, committed: bool) -> None:
+    def accept(self) -> None:
         with self._lock:
-            self._drop = committed
+            self._refusing = False
+
+    def drop_completion(self, *, committed: bool, then_refuse: bool = False) -> None:
+        with self._lock:
+            self._drops.append(_Drop(committed, then_refuse))
+
+    def cut_on(self, marker: bytes) -> None:
+        with self._lock:
+            self._cut = marker
+
+    def hold_on(self, marker: bytes) -> None:
+        with self._lock:
+            self._hold = marker
 
     def close(self) -> None:
         self._closed = True
@@ -117,6 +150,7 @@ class PgProxy:
                 refusing = self._refusing
             if refusing:
                 client.close()
+                self.refused.set()
                 continue
             pair = _Pair(client, self._upstream())
             with self._lock:
@@ -128,12 +162,11 @@ class PgProxy:
         source, target = (pair.client, pair.server) if from_client else (pair.server, pair.client)
         try:
             while data := source.recv(65536):
-                self._forwarding.wait()
-                if not from_client and pair.drop_reply:
-                    pair.close()  # the server answered the COMMIT; the client never hears it
-                    self.dropped.set()
-                    return
                 if from_client and self._intercept(pair, data):
+                    return
+                self._forwarding.wait()
+                if not from_client and pair.drop_reply is not None:
+                    self._dropped(pair, pair.drop_reply)  # the COMMIT was answered: cut
                     return
                 target.sendall(data)
         except OSError:
@@ -141,23 +174,41 @@ class PgProxy:
         finally:
             pair.close()
 
-    def _intercept(self, pair: _Pair, data: bytes) -> bool:
-        """Apply an armed drop to the client's ``data``; True if the pair was cut."""
+    def _dropped(self, pair: _Pair, drop: _Drop) -> None:
         with self._lock:
-            committed = self._drop
-        if committed is None:
-            return False
+            if drop.then_refuse:
+                self._refusing = True
+            self.drop_count += 1
+        pair.close()
+        self.dropped.set()
+
+    def _intercept(self, pair: _Pair, data: bytes) -> bool:
+        """Apply armed controls to the client's ``data``; True if the pair was cut."""
         window = pair.seen + data
-        pair.seen = window[-64:]
+        pair.seen = window[-256:]
+        with self._lock:
+            hold, cut = self._hold, self._cut
+            if hold is not None and hold in window:
+                self._hold = None
+                self._forwarding.clear()  # stall before this is forwarded
+                self.held.set()
+            if cut is not None and cut in window:
+                self._cut = None
+        if cut is not None and cut in window:
+            pair.close()
+            self.cut.set()
+            return True
         if _COMPLETION in window:
             pair.completion_seen = True
         if not (pair.completion_seen and _COMMIT in data):
             return False
+        pair.completion_seen, pair.seen = False, b""  # this COMMIT ends the completion
         with self._lock:
-            self._drop = None
-        if committed:
-            pair.drop_reply = True  # forward the COMMIT; cut when the answer comes back
+            drop = self._drops.popleft() if self._drops else None
+        if drop is None:
             return False
-        pair.close()  # never forward the COMMIT: the server rolls back
-        self.dropped.set()
+        if drop.committed:
+            pair.drop_reply = drop  # forward the COMMIT; cut when the answer comes back
+            return False
+        self._dropped(pair, drop)  # never forward the COMMIT: the server rolls back
         return True

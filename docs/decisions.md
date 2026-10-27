@@ -606,8 +606,10 @@ contracts; the first runtime that uses them is Slice 1B-B1 (DEC-045, DEC-046).
 Entries DEC-045 and DEC-046 record the first single-slot worker runtime and its local
 watchdog, agreed after a read-only probe showed that a stalled database call can hold the
 supervisor indefinitely. They stay **Proposed** until the owner accepts them in a reviewed
-change; "implemented" means verified locally by the tests named, not yet in GitHub CI.
-There is no command or service that runs a worker yet.
+change; "implemented" means verified by the tests named, locally and in GitHub CI: Slice
+1B-B1 was merged in PR #10 (`d498698`), with both CI jobs passing for the pull request
+(run 40487174691) and for `main` (run 40488034469). There is no command or service that
+runs a worker yet.
 
 ### DEC-045 — A single-slot worker: a supervisor, a handler thread and a local watchdog that ends the process
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`orqestra.worker.runtime`, `orqestra.worker.fence`)
@@ -741,3 +743,100 @@ There is no command or service that runs a worker yet.
     - ambiguous completions, committed and not, through a proxy that cuts the connection just after or just before the `COMMIT` reaches the server.
   - **The real-subprocess test:** exit 6, a committed success, the handler run once and the other task unclaimed.
   - **Mutation checks:** locally, not holding an unstarted claim (2 tests) and treating an ambiguous claim as a plain failure (1) each failed tests, as did retrying an ambiguous completion (DEC-045).
+- **Day 3B Slice B2a-1 note:** the ambiguous case is no longer temporary. A completion whose answer was lost is now reconciled from PostgreSQL's evidence (DEC-047); exit 6 now means only that this could not be established before the attempt's deadline. The rest of this policy is unchanged: database errors are never handler failures, retryable errors are retried until the deadline, other rejections of a valid outcome are defects, and claims are handled as described. The B1 tests of ending the process on a lost answer (listed here and under DEC-045) were replaced by the DEC-047 tests.
+
+## Day 3B — Slice B2a-1: reconciling a completion whose answer was lost
+
+Entry DEC-047 records the C4 reconciliation agreed in the Day 3B Slice 1B-B2 design audit.
+It stays **Proposed** until the owner accepts it in a reviewed change; "implemented" means
+verified locally by the tests named, not yet in GitHub CI. Cooperative cancellation
+(Slice B2a-2) and graceful shutdown (Slice B2b) are not part of it.
+
+### DEC-047 — A lost completion answer is reconciled from one consistent PostgreSQL read; the handler never runs again
+- **Status:** Proposed · owner-approved direction (2026-10-27) · implemented locally (`read_completion_evidence`, `Worker`)
+- **WHAT:**
+  - **Evidence read.** `read_completion_evidence(conn, attempt_id, *, generation, outcome)` is read-only: one `SELECT` joins the attempt to its task, so both come from one statement snapshot. It returns a `CompletionEvidence`:
+    - `RUNNING`: the attempt runs, and its task runs at this generation;
+    - `REVOKED`: recovery ended it, and its task is queued, cancelled or failed at this generation (`next_task_state`, DEC-038) or has moved on to a later one;
+    - `MATCHES`: it ended with exactly this outcome;
+    - `CONFLICTS`: it ended otherwise;
+    - `INCONSISTENT`: no such attempt, another generation, or a task that contradicts its attempt.
+  - **What `MATCHES` needs:**
+    - **success:** the attempt succeeded with no failure details, and the task succeeded at this generation with `result = expected::jsonb` evaluated by PostgreSQL. A JSON `null` result is sent as the `jsonb` value `null`, never SQL `NULL`.
+    - **cancelled:** the attempt and the task cancelled at this generation.
+    - **permanent or unclassified failure:** exactly this failure kind, error type and message, and the task failed at this generation.
+    - **transient failure:** the attempt's failure details, and a task queued, cancelled or failed at this generation or moved on to a later one. It may since have been requeued, claimed again, cancelled or failed.
+  - **Contradictions are `INCONSISTENT`.** A revoked or transient-failed attempt beside a task still running or succeeded at its generation is `INCONSISTENT`, never `REVOKED` or `MATCHES`. The schema allows it only through corruption: its constraints are single-row, and the fencing trigger stops a task re-entering `running` at the same generation, but not an attempt row ending while its task never left `running`.
+  - **The worker's loop.** When `complete_attempt`'s answer is lost (`classify_completion_error` returns `AMBIGUOUS`), the supervisor:
+    1. keeps the handler's outcome object and closes the broken connection;
+    2. reads the evidence at once on a fresh connection (through `_call`, under the operation guard);
+    3. acts on it:
+       - `MATCHES`: settles, and the worker carries on;
+       - `REVOKED`: discards the outcome;
+       - `RUNNING`: writes the identical outcome again;
+       - `CONFLICTS` or `INCONSISTENT`: ends the process (exit 7).
+  - **Re-read, never infer.** While uncertain, any rejection of a rewrite (`AttemptRevokedError`, `StaleAttemptError`, `AttemptFinishedError`, `NotFoundError`) is decided by reading the evidence again.
+  - **Bounded.** Failed reads, a second lost answer and retryable errors are spaced by `db_operation_timeout`. The first read after a lost answer always happens. Past the attempt's execution deadline on the local clock, an unresolved outcome ends the process (exit 6, `reconciliation_unresolved`); an outcome that certainly was not recorded still ends it as exit 8.
+- **WHY:**
+  - Only `complete_attempt` and `revoke_next_expired` end a running attempt, each in one transaction that also writes its task, and the attempt ID is private to its worker. So the attempt row says what happened, as long as the worker can recognise its own outcome.
+  - Recognising it exactly needs `jsonb` equality. A read-only probe showed Python equality after a round trip calls `1e308` unequal to the 309-digit number `jsonb` stores for it, and calls `true` equal to `1`; DEC-025 already compares in SQL for the same reason.
+  - A rejected rewrite cannot settle the question, because `complete_attempt` checks the generation before the finished state (DEC-029).
+  - Rerunning the handler would repeat its side effects; keeping its outcome in memory never does.
+- **RUNNER-UP:**
+  - The B1 policy: end the process on any lost answer (DEC-046). That costs a revocation and a rerun of a handler whose outcome may have committed.
+  - Comparing in Python after a JSON round trip: refuted by the probe.
+  - Reading the attempt and the task in two statements: a concurrent change between them could mislead.
+  - A fixed number of retries instead of the deadline: an invented value, with no relation to when recovery can act.
+- **TRADE-OFF:**
+  - **One new read function** in `lifecycle.py`, with no schema change.
+  - **No renewals while reconciling:** a database outage longer than the remaining lease can let recovery revoke the attempt first, and the finished outcome is then discarded. Renewing while completing is a possible later optimisation.
+  - **Bounded by the attempt's deadline,** so a long outage near it ends the process with the outcome unresolved; recovery or the committed completion then decides.
+- **VERIFICATION:**
+  - **`tests/integration/test_completion_evidence.py`** (real PostgreSQL, real completions and revocations):
+    - a running attempt for every outcome;
+    - success results matched only by `jsonb` equality: key order, JSON `null`, `1e308`, `1.0` vs `1`, `-0.0` vs `0` match; `true` vs `1`, `0` vs `false`, `null` vs `{}`, `"1"` vs `1` and different values conflict;
+    - permanent and unclassified failures match only their exact kind, type and message;
+    - cancellation;
+    - a transient failure still matches after its task was claimed again and succeeded, was cancelled, or ran out of attempts;
+    - revoked attempts, also after the task was claimed again;
+    - after a revocation or a transient failure, every legitimate aftermath keeps its evidence: requeued, cancelled while queued, claimed again (running at generation 2), claimed again and succeeded, exhausted (failed), and cancelled by a pending request (including a grace expiry);
+    - a revoked or transient-failed attempt beside a task still running at its generation (the attempt row ended behind the operations' back) or succeeded at it (the task row changed) is `INCONSISTENT`;
+    - the fencing trigger refuses a task re-entering `running` at the same generation;
+    - missing records, other generations and corrupted records are inconsistent;
+    - the read writes nothing.
+  - **`tests/unit/test_worker_runtime.py`** (injected clock and scripted answers):
+    - a lost answer keeps the outcome, closes the connection and reads at once;
+    - each evidence value leads to its action;
+    - the rewrite is the identical outcome object and the handler thread is never restarted;
+    - a rejected rewrite (revoked, stale, finished, not found) is decided by a second read;
+    - failed reads are spaced and end at the deadline with exit 6;
+    - the first read happens even past the deadline;
+    - a second lost answer is spaced;
+    - a retryable rewrite reads again before writing;
+    - without a lost answer, a retryable error still ends as exit 8.
+  - **`tests/integration/test_worker_runtime.py`** (in-process, through `PgProxy`):
+    - a committed completion whose answer was lost is reconciled for an object, JSON `null`, `1e308`, a permanent and a transient failure, and the worker then runs the next task;
+    - an uncommitted one is written again;
+    - when a cancellation request commits while the worker is reconciling, the rewritten success still stands (DEC-020);
+    - two lost answers in a row (rolled back, then committed) are reconciled;
+    - recovery that revoked first wins and the outcome is discarded;
+    - recovery that wins between the evidence and the rewrite is respected, also when another worker has claimed the task again;
+    - a connection cut during the evidence read is retried;
+    - a stored `true` changed to `1` behind the worker's back is a defect;
+    - an unreachable database ends the worker at the deadline with exit 6.
+
+    In every case the handler ran once for the attempt.
+  - **`tests/integration/test_worker_process.py`** (real subprocess):
+    - a committed completion whose answer was lost is reconciled, and the process carries on to the next task without exiting;
+    - an unreachable database ends the process with exit 6 at a 4 s deadline, with nothing recorded as a failure.
+  - **Mutation checks:** locally, each of these failed tests:
+    - not comparing the result;
+    - comparing it as text;
+    - requiring a transient failure's original task state;
+    - accepting `RUNNING` whatever the task;
+    - returning `REVOKED`, or a transient `MATCHES`, whatever the task's state at that generation (found in review; the original code did this, and the four contradiction cases fail against it);
+    - rejecting a task that moved on to a later generation;
+    - rewriting blind after a lost answer;
+    - inferring from a rejection instead of re-reading;
+    - never ending an unresolved reconciliation;
+    - writing again when the evidence matches.

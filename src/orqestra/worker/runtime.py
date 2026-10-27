@@ -9,13 +9,16 @@ It never claims again until the previous task is settled.
 Every supervisor database call is bounded by ``statement_timeout`` and, on the
 client side, by the watchdog's operation guard; a running handler is bounded
 by the ownership guard (``fence``). When the supervisor cannot establish that
-it still owns a running task, or cannot tell what happened to a completion,
-it ends the process: Day 3A recovery, or the completion that already
-committed, then decides the outcome.
+it still owns a running task, it ends the process and Day 3A recovery decides.
+
+When a completion's answer is lost, the supervisor keeps the handler's outcome
+and reconciles it from PostgreSQL's evidence (DEC-047): the completion
+committed, the attempt still runs and the same outcome is written again, or
+recovery revoked it. The handler never runs again for it. If that cannot be
+established before the attempt's deadline, the process ends.
 
 Not in this slice (Day 3B, later): telling the handler about a cancellation
-request, reconciling an ambiguous completion (C4), graceful shutdown with
-draining, and a command to run a worker.
+request, graceful shutdown with draining, and a command to run a worker.
 """
 
 import logging
@@ -40,12 +43,14 @@ from orqestra.persistence.lifecycle import (
     AttemptFinishedError,
     AttemptRevokedError,
     CancellationRequestedError,
+    CompletionEvidence,
     LeaseExpiredError,
     NotFoundError,
     StaleAttemptError,
     WorkerMismatchError,
     claim_next_attempt,
     complete_attempt,
+    read_completion_evidence,
     renew_lease,
     revoke_next_expired,
 )
@@ -225,6 +230,9 @@ class _Running:
     outcome: list[HandlerOutcome]
     heartbeat_due: float | None
     completion_due: float = 0.0
+    # An earlier write of this outcome may have committed: read the evidence
+    # before writing again (DEC-047).
+    uncertain: bool = False
 
     def local(self, instant: datetime) -> float:
         """A database instant of this attempt on the local clock, never later than it."""
@@ -525,6 +533,29 @@ class Worker:
         self._record(running, outcome)
 
     def _record(self, running: _Running, outcome: AttemptOutcome) -> None:
+        """Record the outcome; after a lost answer, reconcile it from the evidence first."""
+        if running.uncertain:
+            evidence = self._read_evidence(running, outcome)
+            if evidence is None:
+                return  # the read failed; tried again later, within the deadline
+            if evidence is CompletionEvidence.MATCHES:
+                self._event(
+                    logging.INFO, "completion_reconciled", "it had committed", running.context
+                )
+                self._settled()
+                return
+            if evidence is CompletionEvidence.REVOKED:
+                self._event(logging.WARNING, "outcome_discarded", "revoked", running.context)
+                self._settled()
+                return
+            if evidence is not CompletionEvidence.RUNNING:
+                self._terminate(
+                    ExitCode.DEFECT,
+                    "completion_conflicts",
+                    f"the recorded completion is {evidence.value}",
+                    running.context,
+                )
+            # Still running: nothing committed, so write the same outcome again.
         attempt = running.attempt
         try:
             completion = self._call(
@@ -534,12 +565,26 @@ class Worker:
                 ),
                 running.context,
             )
-        except (AttemptRevokedError, StaleAttemptError) as exc:
-            # Ownership ended before this completion: its outcome does not count.
-            self._event(logging.WARNING, "outcome_discarded", type(exc).__name__, running.context)
-            self._settled()
-            return
-        except (AttemptFinishedError, NotFoundError, ValueError, RuntimeError) as exc:
+        except (AttemptRevokedError, StaleAttemptError, AttemptFinishedError, NotFoundError) as exc:
+            if running.uncertain:
+                # A rejection cannot tell an earlier write that committed from one
+                # that did not (the generation is checked first): ask the evidence.
+                running.completion_due = self._clock()
+                return
+            if isinstance(exc, AttemptRevokedError | StaleAttemptError):
+                # Ownership ended before this completion: its outcome does not count.
+                self._event(
+                    logging.WARNING, "outcome_discarded", type(exc).__name__, running.context
+                )
+                self._settled()
+                return
+            self._terminate(
+                ExitCode.DEFECT,
+                "completion_refused",
+                f"the completion was refused: {type(exc).__name__}",
+                running.context,
+            )
+        except (ValueError, RuntimeError) as exc:
             self._terminate(
                 ExitCode.DEFECT,
                 "completion_refused",
@@ -557,19 +602,27 @@ class Worker:
         )
         self._settled()
 
+    def _read_evidence(
+        self, running: _Running, outcome: AttemptOutcome
+    ) -> CompletionEvidence | None:
+        """The completion evidence, or None after a failed read (retried later)."""
+        attempt = running.attempt
+        try:
+            return self._call(
+                "read_completion_evidence",
+                lambda conn: read_completion_evidence(
+                    conn, attempt.id, generation=attempt.attempt_number, outcome=outcome
+                ),
+                running.context,
+            )
+        except (psycopg.Error, ConnectionUnavailable) as exc:
+            self._retry_later(running, "evidence_unread", type(exc).__name__)
+            return None
+
     def _completion_failed(
         self, running: _Running, exc: psycopg.Error | ConnectionUnavailable
     ) -> None:
         kind = classify_completion_error(exc, connection_closed=self._conn is None)
-        if kind is CompletionError.AMBIGUOUS:
-            # Slice 1B-B1 policy: no reconciliation, no rerun, no further claim.
-            # Either the completion committed, or recovery decides.
-            self._terminate(
-                ExitCode.AMBIGUOUS,
-                "completion_ambiguous",
-                "the completion's acknowledgement was lost; its outcome is unknown here",
-                running.context,
-            )
         if kind is CompletionError.REJECTED:
             sqlstate = exc.sqlstate if isinstance(exc, psycopg.Error) else None
             self._terminate(
@@ -578,8 +631,38 @@ class Worker:
                 f"the database rejected a valid outcome ({sqlstate})",
                 running.context,
             )
+        if kind is CompletionError.AMBIGUOUS:
+            # The answer was lost: the write may have committed. Keep the outcome,
+            # never rerun the handler, and reconcile from the evidence on a fresh
+            # connection (DEC-047).
+            first = not running.uncertain
+            running.uncertain = True
+            self._close()
+            if first:  # always read the evidence once, at once, whatever the deadline
+                running.completion_due = self._clock()
+                self._event(logging.WARNING, "completion_ambiguous", "reconciling", running.context)
+                return
+            self._retry_later(running, "completion_ambiguous", "again")
+            return
+        self._retry_later(running, "completion_retry", type(exc).__name__)
+
+    def _retry_later(self, running: _Running, event: str, detail: str) -> None:
+        """Schedule the next completion step, or end the process once the deadline has passed.
+
+        The bound is the attempt's execution deadline on the local clock. An
+        outcome that may already have been recorded ends the process as
+        ambiguous; one that certainly was not, as unrecorded.
+        """
         _, deadline_at = _lease(running.attempt)
         if self._clock() >= running.local(deadline_at):
+            if running.uncertain:
+                self._terminate(
+                    ExitCode.AMBIGUOUS,
+                    "reconciliation_unresolved",
+                    "whether the completion committed could not be established before the "
+                    "attempt's deadline",
+                    running.context,
+                )
             self._terminate(
                 ExitCode.UNRECORDED,
                 "completion_unrecorded",
@@ -587,7 +670,7 @@ class Worker:
                 running.context,
             )
         running.completion_due = self._clock() + self._bound()
-        self._event(logging.WARNING, "completion_retry", type(exc).__name__, running.context)
+        self._event(logging.WARNING, event, detail, running.context)
 
     def _settled(self) -> None:
         self._schedule.running = None

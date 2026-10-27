@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-046
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-047
 
 ## Context
 
@@ -76,16 +76,19 @@ detect this: after `running → queued → running`, the state matches again.
   registry, the pure mapping from what a handler did to an attempt outcome (a checked copy
   of a valid result; control-plane signals are never recorded), and validated worker
   timing settings with no defaults (DEC-042 … DEC-044).
-- Implemented and verified locally only (Day 3B Slice 1B-B1): a first single-slot worker
+- Implemented and verified locally and in GitHub CI (PR #10): a first single-slot worker
   runtime. It claims supported kinds, runs one handler thread, renews the lease, sweeps for
   expired attempts while idle or busy, and records outcomes through the Day 3A operations.
   A local watchdog ends the process when the worker cannot establish that it still owns a
-  running task, or when a database call stalls; an ambiguous completion also ends it
-  (DEC-045, DEC-046).
+  running task, or when a database call stalls (DEC-045, DEC-046).
+- Implemented and verified locally only (Day 3B Slice B2a-1): a completion whose answer was
+  lost is reconciled from one consistent PostgreSQL read of the attempt and its task, with
+  results compared by `jsonb` equality: it committed, the same outcome is written again, or
+  recovery revoked it. The handler never runs again; an outcome unresolved by the attempt's
+  deadline ends the process (DEC-047).
 - Not yet implemented, and not proven by the current tests:
   - a command or service that runs workers;
   - telling handlers about cancellation;
-  - reconciling ambiguous completions (C4);
   - graceful shutdown;
   - stopping handlers that hold the GIL or detach processes;
   - bounded worker slots;

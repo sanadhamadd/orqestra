@@ -30,8 +30,11 @@ Day 3B Slice 1B-A (worker contracts: the handler protocol and registry, handler-
 mapping and validated worker settings) was merged in PR #9 (merge commit `823530a`), with
 both CI lanes passing for the pull request (run 40408021385) and for `main` (run
 40408731149). Day 3B Slice 1B-B1 (the first single-slot worker runtime, with a local
-watchdog) is implemented and verified locally only; it has not yet run in GitHub CI, and
-there is no command or service that runs a worker yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+watchdog) was merged in PR #10 (merge commit `d498698`), with both CI lanes passing for the
+pull request (run 40487174691) and for `main` (run 40488034469). Day 3B Slice B2a-1
+(reconciling a completion whose answer was lost) is implemented and verified locally only;
+it has not yet run in GitHub CI. There is no command or service that runs a worker yet. No
+benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
@@ -41,7 +44,7 @@ claim about shipped behaviour.
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046) | a worker command and service; telling handlers about cancellation; reconciling ambiguous completions; graceful shutdown; bounded worker slots; retry backoff (Days 3B–4) |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047) | a worker command and service; telling handlers about cancellation; graceful shutdown; bounded worker slots; retry backoff (Days 3B–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -325,9 +328,27 @@ worker.run(threading.Event())  # returns once the event is set while the worker 
   - Database errors are never handler failures. A rolled-back retryable error
     (`40001`, `40P01`, `55P03`, `57014`) or a failed connect is retried until the
     attempt's deadline. Any other rejection of a valid outcome ends the process.
-  - **A completion whose acknowledgement is lost** (the connection broke) **ends the
-    process** without rerunning the handler or claiming again: either the completion
-    committed, or recovery decides. Reconciling it instead is a later slice.
+  - **A completion whose answer is lost** (the connection broke, so it may or may not
+    have committed) is **reconciled** (DEC-047). The worker keeps the handler's outcome,
+    reconnects, and reads the attempt and its task in one statement
+    (`read_completion_evidence`):
+
+    | Evidence | Meaning | Action |
+    | --- | --- | --- |
+    | it ended with exactly this outcome | the completion committed | settle |
+    | it is still running | nothing committed | write the same outcome again |
+    | it was revoked | recovery won | discard the outcome |
+    | anything else | an invariant broke | end the process (exit 7) |
+
+    - **Exact matching:** results are compared with PostgreSQL's `jsonb` equality, so
+      `1e308` matches the number `jsonb` stores and `true` does not match `1`. Failures
+      must have exactly the same kind, type and message.
+    - **Re-read on rejection:** a rewrite that is rejected is decided by reading the
+      evidence again, never by the error alone.
+    - **The handler never runs again** for that attempt, and the worker then carries on.
+    - **Bounded:** reads and rewrites that fail are retried, spaced by
+      `db_operation_timeout`, until the attempt's execution deadline. If it is still
+      unresolved then, the process ends (exit 6).
 - **Exit codes:**
 
   | Code | Meaning |
@@ -335,7 +356,7 @@ worker.run(threading.Event())  # returns once the event is set while the worker 
   | 3 | Fenced: ownership could not be established |
   | 4 | Stalled: a database call outlived its bound |
   | 5 | Handler aborted: a control-plane signal, nothing recorded |
-  | 6 | Ambiguous completion |
+  | 6 | Whether a completion committed could not be established by the attempt's deadline |
   | 7 | Defect |
   | 8 | Outcome unrecorded before the deadline |
 
@@ -379,7 +400,11 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   - **Cancellation:** handlers are not told about a cancellation request. The worker
     stops renewing and fences at the end of the grace period, so a handler that would
     have stopped cooperatively is ended instead.
-  - **Ambiguous completions:** they end the process without reconciliation.
+  - **Unresolved completions:** a completion whose answer was lost, and which cannot be
+    reconciled before the attempt's deadline (for example, the database stays
+    unreachable), ends the process; recovery or the committed completion then decides.
+    The worker does not renew the lease while reconciling, so a long outage can let
+    recovery revoke the attempt first, discarding a finished outcome.
   - **Lost claims:** a claim whose answer was lost, or whose task could not then be
     read, is never started and is recovered when its lease expires, using one attempt
     of its budget. The worker claims nothing else until that lease has certainly ended

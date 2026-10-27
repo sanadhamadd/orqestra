@@ -25,7 +25,11 @@ from orqestra.domain.errors import PermanentError, TransientError
 from orqestra.domain.jobs import JobSubmission, JsonValue, Task, TaskSpec
 from orqestra.domain.leases import LeasePolicy
 from orqestra.persistence.jobs import list_tasks, submit_job
-from orqestra.persistence.lifecycle import start_attempt
+from orqestra.persistence.lifecycle import (
+    request_cancellation,
+    revoke_next_expired,
+    start_attempt,
+)
 from orqestra.worker.fence import ExitCode, Expiry, Guard, Watchdog
 from orqestra.worker.handlers import HandlerCancelled, HandlerRegistry, TaskContext
 from orqestra.worker.runtime import Worker, connect_supervisor
@@ -104,7 +108,9 @@ class Probe:
 
 @contextmanager
 def running_worker(
-    url: str, handlers: dict[str, Callable[[TaskContext, JsonValue], JsonValue]]
+    url: str,
+    handlers: dict[str, Callable[[TaskContext, JsonValue], JsonValue]],
+    settings: WorkerSettings = SETTINGS,
 ) -> Iterator[Probe]:
     expiries: list[Expiry] = []
     terminations: list[tuple[ExitCode, str]] = []
@@ -115,8 +121,8 @@ def running_worker(
 
     worker = Worker(
         registry=HandlerRegistry(handlers),
-        settings=SETTINGS,
-        connect=functools.partial(connect_supervisor, url, SETTINGS),
+        settings=settings,
+        connect=functools.partial(connect_supervisor, url, settings),
         watchdog=Watchdog(terminate=expiries.append),
         terminate=terminate,
     )
@@ -509,24 +515,275 @@ def test_a_stalled_supervisor_call_is_ended_by_the_operation_guard(
             gate.release.set()
 
 
-@pytest.mark.parametrize("committed", [True, False], ids=["committed", "not-committed"])
-def test_an_ambiguous_completion_ends_the_worker_with_no_rerun_or_claim(
-    schema_url: str, checked: Conn, committed: bool
+# --- reconciling a lost completion answer (DEC-047) ------------------------------------------
+
+# Only the completion evidence read joins the attempt to its task like this.
+EVIDENCE_READ = b"JOIN tasks t ON t.id = a.task_id"
+
+
+@dataclass
+class Returning:
+    """A gated handler that returns ``value`` and records each attempt it ran for."""
+
+    value: JsonValue
+    gate: Gate = field(default_factory=Gate)
+
+    def handler(self, ctx: TaskContext, payload: JsonValue) -> JsonValue:
+        self.gate.handler(ctx, payload)
+        if isinstance(self.value, Exception):
+            raise self.value
+        return self.value
+
+
+def events(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [str(getattr(r, "event", "")) for r in caplog.records if r.name == "orqestra.worker"]
+
+
+def attempt_rows(db: Conn, task: Task) -> list[tuple[Any, ...]]:
+    return rows(
+        db,
+        "SELECT attempt_number, state, failure_kind, revoked_reason FROM attempts "
+        "WHERE task_id = %s ORDER BY attempt_number",
+        task.id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "task_state", "attempt_state", "failure_kind"),
+    [
+        ({"total": 3}, "succeeded", "succeeded", None),
+        (None, "succeeded", "succeeded", None),  # JSON null is a result
+        (1e308, "succeeded", "succeeded", None),  # jsonb stores 309 digits
+        (PermanentError("bad invoice"), "failed", "failed", "permanent"),
+        (TransientError("later"), "failed", "failed", "transient"),  # max_attempts=1
+    ],
+    ids=["object", "json-null", "1e308", "permanent", "transient"],
+)
+def test_a_committed_completion_whose_answer_was_lost_is_reconciled(
+    schema_url: str,
+    checked: Conn,
+    caplog: pytest.LogCaptureFixture,
+    value: Any,
+    task_state: str,
+    attempt_state: str,
+    failure_kind: str | None,
 ) -> None:
-    gate = Gate()
-    first, second = submit(checked, "gated", {"i": 1}, {"i": 2})
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning(value)
+    first, second = submit(checked, "returning", {"i": 1}, {"i": 2}, max_attempts=1)
     with (
         PgProxy(schema_url) as proxy,
-        running_worker(proxy.url(schema_url), {"gated": gate.handler}) as probe,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
     ):
-        eventually(lambda: len(gate.runs) == 1, "the first handler")
-        proxy.drop_completion(committed=committed)
-        gate.release.set()
+        eventually(lambda: len(returning.gate.runs) == 1, "the first handler")
+        proxy.drop_completion(committed=True)
+        returning.gate.release.set()
+        # Reconciled, the worker carries on and runs the next task: no exit.
+        eventually(
+            lambda: sorted(task_states(checked, [first, second])) == [(task_state, 1)] * 2,
+            "both tasks",
+        )
+    assert probe.terminations == []
+    assert proxy.drop_count == 1
+    assert len(returning.gate.runs) == 2  # once per task, never again for the first
+    assert attempt_rows(checked, first) == [(1, attempt_state, failure_kind, None)]
+    assert "completion_reconciled" in events(caplog)
+
+
+def test_an_uncommitted_completion_whose_answer_was_lost_is_written_again(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning({"ok": True})
+    (task,) = submit(checked, "returning", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=False)
+        returning.gate.release.set()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    assert probe.terminations == []
+    assert len(returning.gate.runs) == 1
+    assert rows(checked, "SELECT result FROM tasks WHERE id = %s", task.id) == [({"ok": True},)]
+    recorded = events(caplog)
+    assert recorded.index("completion_ambiguous") < recorded.index("attempt_completed")
+    assert "completion_reconciled" not in recorded  # it had not committed: written again
+
+
+def test_repeated_lost_answers_are_reconciled_without_rerunning(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning({"ok": True})
+    (task,) = submit(checked, "returning", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=False)  # the first write rolls back
+        proxy.drop_completion(committed=True)  # the second commits, its answer lost too
+        returning.gate.release.set()
+        eventually(lambda: "completion_reconciled" in events(caplog), "reconciliation")
+    assert proxy.drop_count == 2
+    assert probe.terminations == []
+    assert len(returning.gate.runs) == 1
+    assert task_states(checked, [task]) == [("succeeded", 1)]
+    assert attempt_rows(checked, task) == [(1, "succeeded", None, None)]
+
+
+def test_recovery_that_revoked_first_wins_and_the_outcome_is_discarded(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning({"ok": True})
+    (task,) = submit(checked, "returning", {}, max_attempts=1)
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=False, then_refuse=True)  # no reconnection yet
+        returning.gate.release.set()
         assert proxy.dropped.wait(WAIT)
+        # No heartbeats while completing: the lease runs out and recovery revokes it.
+        eventually(lambda: revoke_next_expired(checked), "the lease to expire and be revoked")
+        proxy.accept()
+        eventually(lambda: "outcome_discarded" in events(caplog), "the outcome to be discarded")
+    assert probe.terminations == []
+    assert len(returning.gate.runs) == 1  # never rerun
+    assert attempt_rows(checked, task) == [(1, "revoked", None, "lease_expired")]
+    assert task_states(checked, [task]) == [("failed", 1)]  # its only attempt was revoked
+
+
+@pytest.mark.parametrize(
+    "claimed_again", [False, True], ids=["revoked", "revoked-and-claimed-again"]
+)
+def test_recovery_that_wins_between_the_evidence_and_the_rewrite_is_respected(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture, claimed_again: bool
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning({"ok": True})
+    # With no attempt left after the revocation, this worker cannot claim the task
+    # again; with one left, another worker claims it first.
+    (task,) = submit(checked, "returning", {}, max_attempts=2 if claimed_again else 1)
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=False, then_refuse=True)
+        returning.gate.release.set()
+        assert proxy.dropped.wait(WAIT)
+        # Let the worker reconnect and read "still running", then hold its rewrite.
+        proxy.hold_on(b"BEGIN")
+        proxy.accept()
+        assert proxy.held.wait(WAIT)
+        eventually(lambda: revoke_next_expired(checked), "the lease to expire and be revoked")
+        if claimed_again:
+            start_attempt(
+                checked,
+                task.id,
+                "another-worker",
+                policy=LeasePolicy(timedelta(minutes=5), timedelta(minutes=5)),
+            )
+        proxy.resume()  # the rewrite is now refused; the evidence decides
+        eventually(lambda: "outcome_discarded" in events(caplog), "the outcome to be discarded")
+    assert probe.terminations == []
+    assert len(returning.gate.runs) == 1  # the first attempt's handler, once
+    first = attempt_rows(checked, task)[0]
+    assert first == (1, "revoked", None, "lease_expired")
+    expected = [("running", 2)] if claimed_again else [("failed", 1)]
+    assert task_states(checked, [task]) == expected
+
+
+def test_a_success_reconciled_after_a_cancellation_request_still_stands(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning({"ok": True})
+    (task,) = submit(checked, "returning", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=False, then_refuse=True)
+        returning.gate.release.set()
+        assert proxy.dropped.wait(WAIT)
+        # A request commits while the worker cannot reach the database.
+        request_cancellation(checked, task.id, grace=timedelta(minutes=5))
+        proxy.accept()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    # The evidence showed it still running; the rewrite of the success won (DEC-020).
+    assert probe.terminations == []
+    assert len(returning.gate.runs) == 1
+    assert rows(
+        checked, "SELECT cancel_requested_at IS NOT NULL FROM tasks WHERE id = %s", task.id
+    ) == [(True,)]
+
+
+def test_a_lost_connection_while_reading_the_evidence_is_retried(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    returning = Returning({"ok": True})
+    (task,) = submit(checked, "returning", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=True)
+        proxy.cut_on(EVIDENCE_READ)  # the first evidence read loses its connection
+        returning.gate.release.set()
+        eventually(lambda: "completion_reconciled" in events(caplog), "reconciliation")
+    assert proxy.cut.is_set()
+    assert "evidence_unread" in events(caplog)
+    assert probe.terminations == []
+    assert len(returning.gate.runs) == 1
+    assert task_states(checked, [task]) == [("succeeded", 1)]
+
+
+def test_a_conflicting_recorded_result_is_a_defect(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    returning = Returning(True)
+    (task,) = submit(checked, "returning", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=True, then_refuse=True)
+        returning.gate.release.set()
+        assert proxy.dropped.wait(WAIT)
+        # The stored true becomes 1 behind the worker's back: equal in Python, not in jsonb.
+        checked.execute("UPDATE tasks SET result = '1'::jsonb WHERE id = %s", (task.id,))
+        proxy.accept()
         eventually(lambda: probe.terminations, "the worker to end")
-    assert probe.terminations == [(ExitCode.AMBIGUOUS, "completion_ambiguous")]
-    assert len(gate.runs) == 1  # the handler never ran again
-    states = task_states(checked, [first, second])
-    held = states[0] if states[0][0] != "queued" else states[1]
-    assert held == (("succeeded", 1) if committed else ("running", 1))
-    assert ("queued", 0) in states  # no further claim
+    assert probe.terminations == [(ExitCode.DEFECT, "completion_conflicts")]
+    assert len(returning.gate.runs) == 1
+
+
+def test_an_unresolved_reconciliation_ends_at_the_attempts_deadline(
+    schema_url: str, checked: Conn
+) -> None:
+    short = WorkerSettings(
+        _env_file=None, **{**SETTINGS.model_dump(), "execution_timeout": SETTINGS.lease}
+    )
+    returning = Returning({"ok": True})
+    first, second = submit(checked, "returning", {"i": 1}, {"i": 2})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"returning": returning.handler}, short) as probe,
+    ):
+        eventually(lambda: len(returning.gate.runs) == 1, "the handler")
+        proxy.drop_completion(committed=False, then_refuse=True)  # never reachable again
+        returning.gate.release.set()
+        eventually(lambda: probe.terminations, "the worker to end", timeout=WAIT + 10)
+    assert probe.terminations == [(ExitCode.AMBIGUOUS, "reconciliation_unresolved")]
+    assert len(returning.gate.runs) == 1  # never rerun
+    assert sorted(task_states(checked, [first, second])) == [("queued", 0), ("running", 1)]

@@ -87,8 +87,11 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 - Network failure is simulated with `tests/integration/pg_proxy.py`. It can:
   - stall a connection (TCP stays up, so neither keepalives nor `statement_timeout` end
     the call);
-  - refuse connections;
-  - cut a completion either just after or just before its `COMMIT` reaches the server.
+  - refuse connections, and accept them again;
+  - cut a completion either just after or just before its `COMMIT` reaches the server, for
+    several completions in a row, optionally refusing new connections from then on;
+  - cut a connection, or stall all traffic, when the client sends a given statement, to
+    place a race (such as recovery between a reconciliation read and the rewrite) exactly.
 - "Ended before its lease" is checked against PostgreSQL's own clock and the stored
   `lease_expires_at`, with a margin of at least the fencing margin. Worker test timings
   are test values only, not recommendations (DEC-034).

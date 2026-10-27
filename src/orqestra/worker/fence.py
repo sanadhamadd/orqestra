@@ -44,7 +44,7 @@ class ExitCode(IntEnum):
     FENCED = 3  # it could not establish that it still owns its running task
     STALLED = 4  # a database call outlived its bound
     HANDLER_ABORTED = 5  # the handler raised a control-plane signal; nothing was recorded
-    AMBIGUOUS = 6  # a completion's acknowledgement was lost; its outcome is unknown here
+    AMBIGUOUS = 6  # whether a completion committed could not be established in time
     DEFECT = 7  # an invariant broke, or a valid outcome was rejected by the database
     UNRECORDED = 8  # the outcome could not be recorded before the attempt's deadline
 

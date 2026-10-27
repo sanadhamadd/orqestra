@@ -37,9 +37,14 @@ expired. From that commit on, heartbeats are refused with
 (as cancelled, or with its real result) until recovery revokes it, and
 recovery then cancels the task whatever retry budget is left.
 
-These operations are building blocks for at-least-once execution but do not
-provide it: nothing runs them automatically. There is no worker loop, nothing
-schedules recovery, and revoking an attempt does not stop its worker.
+Reconciliation (DEC-047): when a completion's answer is lost,
+``read_completion_evidence`` reads the attempt and its task in one statement
+and says whether that completion committed, the attempt is still running, or
+recovery revoked it, comparing a result with PostgreSQL's ``jsonb`` equality.
+
+These operations are building blocks for at-least-once execution. The worker
+runtime (``orqestra.worker.runtime``) runs them; revoking an attempt in the
+database does not by itself stop its worker.
 """
 
 import logging
@@ -70,7 +75,7 @@ from orqestra.domain.leases import (
     renewed_lease,
     revocation_reason,
 )
-from orqestra.domain.policy import next_task_state, state_after_cancel_request
+from orqestra.domain.policy import FailureKind, next_task_state, state_after_cancel_request
 from orqestra.domain.states import (
     TERMINAL_TASK_STATES,
     AttemptState,
@@ -716,6 +721,105 @@ def list_attempts(conn: Conn, task_id: uuid.UUID) -> tuple[Attempt, ...]:
             (task_id,),
         ).fetchall()
     return tuple(attempt_from_row(row) for row in rows)
+
+
+class CompletionEvidence(StrEnum):
+    """What PostgreSQL shows about an attempt whose completion may or may not have committed."""
+
+    RUNNING = "running"  # still running: no completion of it has committed
+    REVOKED = "revoked"  # recovery ended it: no completion of it counts
+    MATCHES = "matches"  # it ended with exactly the given outcome
+    CONFLICTS = "conflicts"  # it ended, but not with the given outcome
+    INCONSISTENT = "inconsistent"  # no such attempt, or its records contradict each other
+
+
+# One statement, so the attempt and its task come from one snapshot. The result
+# is compared by PostgreSQL's jsonb equality: Python's would call True equal to
+# 1, and 1e308 unequal to the 309-digit number jsonb stores for it.
+_COMPLETION_EVIDENCE = (
+    "SELECT a.attempt_number, a.state, a.failure_kind, a.error_type, a.error_message, "
+    "t.state, t.attempt_count, t.result = %s::jsonb "
+    "FROM attempts a JOIN tasks t ON t.id = a.task_id WHERE a.id = %s"
+)
+
+# A revocation or a transient failure at generation N leaves the task queued,
+# cancelled or failed at N (next_task_state, DEC-038); only a later claim moves
+# it on, to a higher generation. Running or succeeded at N contradicts it.
+_AFTER_A_RETRYABLE_END = frozenset({TaskState.QUEUED, TaskState.CANCELLED, TaskState.FAILED})
+
+# The task state a completion leaves behind, when it is final whatever came after.
+_FINAL_TASK_STATE = {
+    AttemptState.SUCCEEDED: TaskState.SUCCEEDED,
+    AttemptState.CANCELLED: TaskState.CANCELLED,
+    AttemptState.FAILED: TaskState.FAILED,  # permanent or unclassified only
+}
+
+
+def read_completion_evidence(
+    conn: Conn, attempt_id: uuid.UUID, *, generation: int, outcome: AttemptOutcome
+) -> CompletionEvidence:
+    """Whether ``complete_attempt(attempt_id, generation=..., outcome=...)`` committed.
+
+    Read-only: one ``SELECT`` of the attempt and its task. ``MATCHES`` needs
+    every recorded detail to be the one this outcome writes:
+
+    - success: the attempt succeeded with no failure details, and the task
+      succeeded at this generation with a result equal, as ``jsonb``, to
+      ``outcome.result`` (JSON ``null`` is a result, never SQL ``NULL``);
+    - cancelled: the attempt and the task cancelled at this generation;
+    - permanent or unclassified failure: the attempt failed with exactly this
+      failure kind, error type and message, and the task failed at this
+      generation;
+    - transient failure: the attempt's failure details, and a task that is
+      queued, cancelled or failed at this generation or has moved on to a
+      later one (it may since have been requeued, claimed again, cancelled or
+      failed).
+
+    An attempt still running whose task is running at this generation is
+    ``RUNNING``. A revoked attempt is ``REVOKED`` when its task is queued,
+    cancelled or failed at this generation or has moved on to a later one.
+    Any other finished state or detail is ``CONFLICTS``. A missing attempt, a
+    different generation, or a task that contradicts its attempt (for a
+    revoked or transient-failed attempt, a task still running or succeeded at
+    its generation) is ``INCONSISTENT``. On a connection that
+    is not in autocommit mode, the read opens a transaction the caller must end.
+    """
+    expected_result = Jsonb(outcome.result) if isinstance(outcome, AttemptSucceeded) else None
+    with tuple_cursor(conn) as cur:
+        row = cur.execute(_COMPLETION_EVIDENCE, (expected_result, attempt_id)).fetchone()
+    if row is None:
+        return CompletionEvidence.INCONSISTENT
+    number, state, failure_kind, error_type, error_message, task_state, task_generation, same = row
+    attempt_state, task_state = AttemptState(state), TaskState(task_state)
+    if number != generation or task_generation < generation:
+        return CompletionEvidence.INCONSISTENT
+    if attempt_state is AttemptState.RUNNING:
+        if task_state is TaskState.RUNNING and task_generation == generation:
+            return CompletionEvidence.RUNNING
+        return CompletionEvidence.INCONSISTENT
+    retryable_end_consistent = task_generation > generation or task_state in _AFTER_A_RETRYABLE_END
+    if attempt_state is AttemptState.REVOKED:
+        if retryable_end_consistent:
+            return CompletionEvidence.REVOKED
+        return CompletionEvidence.INCONSISTENT
+    failure = outcome if isinstance(outcome, AttemptFailed) else None
+    expected = (
+        (None, None, None)
+        if failure is None
+        else (failure.kind.value, failure.error_type, failure.error_message)
+    )
+    if attempt_state is not outcome.state or (failure_kind, error_type, error_message) != expected:
+        return CompletionEvidence.CONFLICTS
+    if failure is not None and failure.kind is FailureKind.TRANSIENT:
+        # The task may have been requeued, cancelled, failed or claimed again since.
+        if retryable_end_consistent:
+            return CompletionEvidence.MATCHES
+        return CompletionEvidence.INCONSISTENT
+    if task_state is not _FINAL_TASK_STATE[attempt_state] or task_generation != generation:
+        return CompletionEvidence.INCONSISTENT  # one transaction writes both rows
+    if isinstance(outcome, AttemptSucceeded) and same is not True:
+        return CompletionEvidence.CONFLICTS
+    return CompletionEvidence.MATCHES
 
 
 def _finished(attempt: Attempt) -> AttemptFinishedError:
