@@ -1,0 +1,532 @@
+"""The single-slot worker runtime against PostgreSQL, run in this process (DEC-045).
+
+Each worker runs on a thread with a recording watchdog and a ``terminate`` that
+raises instead of ending the process; the process-level tests in
+``test_worker_process.py`` show the real exits. Handlers wait on events the
+test sets, and the test waits for PostgreSQL to show each state (bounded), so
+no assertion depends on timing luck.
+"""
+
+import functools
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, NoReturn
+
+import psycopg
+import pytest
+from psycopg.rows import TupleRow
+
+from orqestra.domain.errors import PermanentError, TransientError
+from orqestra.domain.jobs import JobSubmission, JsonValue, Task, TaskSpec
+from orqestra.domain.leases import LeasePolicy
+from orqestra.persistence.jobs import list_tasks, submit_job
+from orqestra.persistence.lifecycle import start_attempt
+from orqestra.worker.fence import ExitCode, Expiry, Guard, Watchdog
+from orqestra.worker.handlers import HandlerCancelled, HandlerRegistry, TaskContext
+from orqestra.worker.runtime import Worker, connect_supervisor
+from orqestra.worker.settings import WorkerSettings
+from tests.integration.pg_proxy import PgProxy
+from tests.integration.test_attempt_lifecycle import assert_invariants
+
+pytestmark = pytest.mark.integration
+
+Conn = psycopg.Connection[TupleRow]
+
+# Test values only (DEC-034). Generous database bounds keep a slow CI runner
+# from tripping the recording watchdog; the process tests use tighter ones.
+SETTINGS = WorkerSettings(
+    _env_file=None,
+    lease=timedelta(seconds=5),
+    execution_timeout=timedelta(minutes=5),
+    heartbeat_interval=timedelta(seconds=1),
+    db_operation_timeout=timedelta(milliseconds=900),
+    fence_margin=timedelta(seconds=1),
+    poll_interval=timedelta(milliseconds=100),
+    recovery_interval=timedelta(milliseconds=300),
+    recovery_batch_limit=5,
+    shutdown_timeout=timedelta(seconds=5),
+)
+WAIT = 20.0  # the bound on every wait for a state to appear
+
+
+@pytest.fixture
+def checked(db: Conn) -> Iterator[Conn]:
+    """The migrated test connection; the lifecycle invariants must hold when the test ends."""
+    yield db
+    assert_invariants(db)
+
+
+def eventually[T](check: Callable[[], T | None], what: str, timeout: float = WAIT) -> T:
+    """Poll ``check`` until it returns something truthy; fail after ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(0.02)
+    pytest.fail(f"timed out waiting for {what}")
+
+
+class Terminated(Exception):  # noqa: N818
+    pass
+
+
+@dataclass
+class Gate:
+    """Handlers wait on ``release``; ``runs`` records the attempts that ran."""
+
+    release: threading.Event = field(default_factory=threading.Event)
+    runs: list[uuid.UUID] = field(default_factory=list)
+
+    def handler(self, ctx: TaskContext, payload: JsonValue) -> JsonValue:
+        self.runs.append(ctx.attempt_id)
+        assert self.release.wait(60)
+        return {"ran": str(ctx.attempt_id)}
+
+
+@dataclass
+class Probe:
+    worker: Worker
+    expiries: list[Expiry]
+    terminations: list[tuple[ExitCode, str]]
+    stop: threading.Event
+    thread: threading.Thread
+    failures: list[BaseException]
+
+    def ownership_deadline(self) -> float | None:
+        return self.worker._watchdog.deadline(Guard.OWNERSHIP)
+
+
+@contextmanager
+def running_worker(
+    url: str, handlers: dict[str, Callable[[TaskContext, JsonValue], JsonValue]]
+) -> Iterator[Probe]:
+    expiries: list[Expiry] = []
+    terminations: list[tuple[ExitCode, str]] = []
+
+    def terminate(code: ExitCode, event: str, message: str, context: Any) -> NoReturn:
+        terminations.append((code, event))
+        raise Terminated(event)
+
+    worker = Worker(
+        registry=HandlerRegistry(handlers),
+        settings=SETTINGS,
+        connect=functools.partial(connect_supervisor, url, SETTINGS),
+        watchdog=Watchdog(terminate=expiries.append),
+        terminate=terminate,
+    )
+    stop = threading.Event()
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            worker.run(stop)
+        except Terminated:
+            pass
+        except BaseException as exc:  # reported by the test
+            failures.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    probe = Probe(worker, expiries, terminations, stop, thread, failures)
+    try:
+        yield probe
+    finally:
+        stop.set()
+        thread.join(WAIT)
+        assert not thread.is_alive(), "the worker did not stop"
+        assert failures == []
+
+
+def submit(db: Conn, kind: str, *payloads: JsonValue, max_attempts: int = 3) -> list[Task]:
+    specs = tuple(TaskSpec(f"t{i}", payload, max_attempts) for i, payload in enumerate(payloads))
+    job = submit_job(db, JobSubmission(kind, specs)).job
+    return sorted(list_tasks(db, job.id), key=lambda task: task.task_key)
+
+
+def rows(db: Conn, query: str, *params: object) -> list[tuple[Any, ...]]:
+    return db.execute(query, params).fetchall()
+
+
+def task_states(db: Conn, tasks: list[Task]) -> list[tuple[str, int]]:
+    return rows(
+        db,
+        "SELECT state, attempt_count FROM tasks WHERE id = ANY(%s) ORDER BY task_key",
+        [t.id for t in tasks],
+    )
+
+
+def attempts_of(db: Conn, task: Task) -> list[tuple[Any, ...]]:
+    return rows(
+        db,
+        "SELECT attempt_number, state, failure_kind, error_type, worker_id, revoked_reason "
+        "FROM attempts WHERE task_id = %s ORDER BY attempt_number",
+        task.id,
+    )
+
+
+def running_attempt(db: Conn, task: Task) -> tuple[Any, ...] | None:
+    found = rows(
+        db,
+        "SELECT id, lease_expires_at, started_at FROM attempts "
+        "WHERE task_id = %s AND state = 'running'",
+        task.id,
+    )
+    return found[0] if found else None
+
+
+def echo(ctx: TaskContext, payload: JsonValue) -> JsonValue:
+    return payload
+
+
+# --- claiming and completing ------------------------------------------------------
+
+
+def test_supported_tasks_are_completed_and_others_stay_queued(
+    schema_url: str, checked: Conn
+) -> None:
+    supported = submit(checked, "echo", {"n": 1}, None, [1, 2])
+    unsupported = submit(checked, "other", {"n": 2}, {"n": 3})
+    with running_worker(schema_url, {"echo": echo}) as probe:
+        eventually(
+            lambda: task_states(checked, supported) == [("succeeded", 1)] * 3, "the supported tasks"
+        )
+    results = rows(
+        checked,
+        "SELECT result FROM tasks WHERE id = ANY(%s) ORDER BY task_key",
+        [t.id for t in supported],
+    )
+    assert [r[0] for r in results] == [{"n": 1}, None, [1, 2]]  # None is JSON null (DEC-030)
+    assert task_states(checked, unsupported) == [("queued", 0)] * 2
+    assert rows(
+        checked,
+        "SELECT count(*) FROM attempts WHERE task_id = ANY(%s)",
+        [t.id for t in unsupported],
+    ) == [(0,)]
+    assert {a[4] for t in supported for a in attempts_of(checked, t)} == {probe.worker.worker_id}
+    assert probe.expiries == []
+    assert probe.terminations == []
+
+
+def test_concurrent_workers_never_share_a_generation_or_hold_two_tasks(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    payloads: list[JsonValue] = [{"i": i} for i in range(6)]
+    tasks = submit(checked, "gated", *payloads)
+    with (
+        running_worker(schema_url, {"gated": gate.handler}) as first,
+        running_worker(schema_url, {"gated": gate.handler}) as second,
+        running_worker(schema_url, {"gated": gate.handler}) as third,
+    ):
+        per_worker = eventually(
+            lambda: (
+                rows(
+                    checked,
+                    "SELECT worker_id, count(*) FROM attempts "
+                    "WHERE state = 'running' GROUP BY worker_id",
+                )
+                if len(gate.runs) == 3
+                else None
+            ),
+            "three handlers to run",
+        )
+        # Each worker holds exactly one task; the other three are untouched.
+        assert sorted(per_worker) == sorted((w.worker.worker_id, 1) for w in (first, second, third))
+        assert sorted(task_states(checked, tasks)) == [("queued", 0)] * 3 + [("running", 1)] * 3
+        gate.release.set()
+        eventually(lambda: task_states(checked, tasks) == [("succeeded", 1)] * 6, "every task")
+    assert len(gate.runs) == len(set(gate.runs)) == 6
+    for task in tasks:
+        ((number, state, *_),) = attempts_of(checked, task)  # exactly one attempt each
+        assert (number, state) == (1, "succeeded")
+    assert all(not w.expiries and not w.terminations for w in (first, second, third))
+
+
+def test_no_second_task_is_claimed_while_a_handler_runs(schema_url: str, checked: Conn) -> None:
+    gate = Gate()
+    first, second = submit(checked, "gated", {"i": 1}, {"i": 2})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        leases: set[object] = set()
+
+        def renewed_twice() -> bool:
+            found = running_attempt(checked, first) or running_attempt(checked, second)
+            if found is not None:
+                leases.add(found[1])
+            return len(leases) >= 3
+
+        eventually(renewed_twice, "two renewals of the first task")
+        assert sorted(task_states(checked, [first, second])) == [("queued", 0), ("running", 1)]
+        gate.release.set()
+        eventually(
+            lambda: task_states(checked, [first, second]) == [("succeeded", 1)] * 2, "both tasks"
+        )
+    (earlier_end, later_start) = rows(
+        checked,
+        "SELECT min(finished_at), max(started_at) FROM attempts WHERE task_id = ANY(%s)",
+        [first.id, second.id],
+    )[0]
+    assert later_start >= earlier_end  # one at a time
+    assert probe.expiries == []
+
+
+# --- heartbeats and recovery ---------------------------------------------------------
+
+
+def test_heartbeats_keep_a_slow_handler_alive(schema_url: str, checked: Conn) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        leases: list[datetime] = []
+
+        def renewals() -> bool:
+            found = running_attempt(checked, task)
+            if found is not None and (not leases or found[1] != leases[-1]):
+                leases.append(found[1])
+            return len(leases) >= 4
+
+        eventually(renewals, "three renewals")
+        assert leases == sorted(leases)  # the lease only ever moves later
+        deadline = probe.ownership_deadline()
+        assert deadline is not None
+        assert deadline > time.monotonic()  # confirmed renewals moved it
+        gate.release.set()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    ((number, state, _, _, _, revoked),) = attempts_of(checked, task)
+    assert (number, state, revoked) == (1, "succeeded", None)
+    assert probe.expiries == []
+
+
+def test_a_busy_worker_recovers_another_workers_expired_attempt(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    (own,) = submit(checked, "gated", {})
+    (orphan,) = submit(checked, "orphaned", {})  # a kind this worker does not run
+    dead = start_attempt(
+        checked,
+        orphan.id,
+        "dead-worker",
+        policy=LeasePolicy(
+            lease=timedelta(milliseconds=300), execution_timeout=timedelta(minutes=1)
+        ),
+    )
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        both = eventually(
+            lambda: rows(
+                checked,
+                "SELECT d.state, d.revoked_reason, o.state FROM attempts d, attempts o "
+                "WHERE d.id = %s AND o.task_id = %s AND d.state = 'revoked'",
+                dead.id,
+                own.id,
+            ),
+            "the expired attempt to be revoked",
+        )
+        # Revoked by this worker while its own handler was still running.
+        assert both == [("revoked", "lease_expired", "running")]
+        assert len(gate.runs) == 1
+        assert task_states(checked, [orphan]) == [("queued", 1)]
+        gate.release.set()
+        eventually(lambda: task_states(checked, [own]) == [("succeeded", 1)], "the own task")
+    assert probe.expiries == []
+
+
+# --- handler outcomes and database errors ---------------------------------------------
+
+
+def failing(ctx: TaskContext, payload: JsonValue) -> JsonValue:
+    assert isinstance(payload, dict)
+    match payload["mode"]:
+        case "transient":
+            raise TransientError("later")
+        case "permanent":
+            raise PermanentError("never")
+        case "bug":
+            raise KeyError("missing")
+        case "cancelled":
+            raise HandlerCancelled  # without a request
+        case _:
+            return float("nan")
+
+
+def test_handler_failures_follow_the_existing_classification(
+    schema_url: str, checked: Conn
+) -> None:
+    modes = ["transient", "permanent", "bug", "cancelled", "invalid"]
+    payloads: list[JsonValue] = [{"mode": m} for m in modes]
+    tasks = submit(checked, "failing", *payloads, max_attempts=1)
+    with running_worker(schema_url, {"failing": failing}) as probe:
+        eventually(lambda: task_states(checked, tasks) == [("failed", 1)] * 5, "every failure")
+    recorded = [attempts_of(checked, t)[0][2:4] for t in tasks]
+    assert recorded == [
+        ("transient", "orqestra.domain.errors.TransientError"),
+        ("permanent", "orqestra.domain.errors.PermanentError"),
+        ("unclassified", "builtins.KeyError"),
+        ("unclassified", "orqestra.worker.handlers.HandlerCancelled"),
+        ("unclassified", "orqestra.worker.handlers.InvalidHandlerResult"),
+    ]
+    assert probe.terminations == []
+    assert_invariants(checked)
+
+
+def test_a_lost_supervisor_connection_is_not_a_handler_failure(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        first = eventually(lambda: running_attempt(checked, task), "the task to run")
+        conn = probe.worker._conn
+        assert conn is not None
+        killed = conn.info.backend_pid
+        assert rows(checked, "SELECT pg_terminate_backend(%s)", killed) == [(True,)]
+        # The next heartbeat fails unconfirmed; the worker reconnects and renews again.
+        eventually(
+            lambda: (
+                (found := running_attempt(checked, task)) is not None
+                and found[1] > first[1]
+                and probe.worker._conn is not None
+                and probe.worker._conn.info.backend_pid != killed
+            ),
+            "a renewal on a new connection",
+        )
+        gate.release.set()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    ((_, state, failure_kind, *_),) = attempts_of(checked, task)
+    assert (state, failure_kind) == ("succeeded", None)
+    assert probe.expiries == []
+    assert probe.terminations == []
+
+
+def test_a_rejected_valid_outcome_ends_the_worker_without_a_failure(
+    schema_url: str, checked: Conn
+) -> None:
+    checked.execute("""
+        CREATE FUNCTION reject_success() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'rejected for the test' USING ERRCODE = 'check_violation'; END $$;
+        CREATE TRIGGER reject_success BEFORE UPDATE ON attempts FOR EACH ROW
+            WHEN (NEW.state = 'succeeded') EXECUTE FUNCTION reject_success();
+    """)
+    (task,) = submit(checked, "echo", {"x": 1})
+    with running_worker(schema_url, {"echo": echo}) as probe:
+        eventually(lambda: probe.terminations, "the worker to end")
+    assert probe.terminations == [(ExitCode.DEFECT, "completion_rejected")]
+    ((_, state, failure_kind, *_),) = attempts_of(checked, task)
+    assert (state, failure_kind) == ("running", None)  # nothing recorded as a handler failure
+    checked.execute("DROP TRIGGER reject_success ON attempts")
+
+
+def test_a_retryable_completion_error_is_retried_without_rerunning_the_handler(
+    schema_url: str, checked: Conn
+) -> None:
+    # A sequence survives the rollback of the transaction it fails, so only the
+    # first completion is rejected.
+    checked.execute("""
+        CREATE SEQUENCE completions;
+        CREATE FUNCTION deadlock_once() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF nextval('completions') = 1 THEN
+                RAISE EXCEPTION 'deadlock for the test' USING ERRCODE = 'deadlock_detected';
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER deadlock_once BEFORE UPDATE ON attempts FOR EACH ROW
+            WHEN (NEW.state = 'succeeded') EXECUTE FUNCTION deadlock_once();
+    """)
+    gate = Gate()
+    gate.release.set()
+    (task,) = submit(checked, "gated", {})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    assert len(gate.runs) == 1
+    assert rows(checked, "SELECT last_value FROM completions") == [(2,)]  # rejected once
+    assert probe.terminations == []
+    assert probe.expiries == []
+    checked.execute("DROP TRIGGER deadlock_once ON attempts")
+
+
+def test_unconfirmed_heartbeats_never_extend_the_fence(schema_url: str, checked: Conn) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        eventually(lambda: running_attempt(checked, task), "the task to run")
+        armed = eventually(probe.ownership_deadline, "the fence")
+        # From now on every renewal is rejected by the server: no heartbeat is confirmed.
+        checked.execute("""
+            CREATE FUNCTION refuse_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'renewal refused for the test'; END $$;
+            CREATE TRIGGER refuse_renewal BEFORE UPDATE ON attempts FOR EACH ROW
+                WHEN (NEW.lease_expires_at > OLD.lease_expires_at)
+                EXECUTE FUNCTION refuse_renewal();
+        """)
+        frozen = eventually(probe.ownership_deadline, "the fence")
+        assert frozen >= armed
+        expiry = eventually(
+            lambda: probe.expiries,
+            "the fence to expire",
+            timeout=SETTINGS.lease.total_seconds() + WAIT,
+        )
+        ((_, lease_end, _),) = [running_attempt(checked, task) or (None, None, None)]
+        # It expired at the last confirmed deadline, never moved by the refused heartbeats.
+        assert expiry[0].guard is Guard.OWNERSHIP
+        assert expiry[0].deadline == frozen
+        assert lease_end is not None
+        assert rows(checked, "SELECT clock_timestamp() < %s", lease_end) == [(True,)]
+        checked.execute("DROP TRIGGER refuse_renewal ON attempts")
+        gate.release.set()
+
+
+# --- stalls and ambiguous completions (through a proxy) -------------------------------------
+
+
+# The supervisor calls a busy worker makes; which one meets the stall depends on the schedule.
+BUSY_CALLS = {"renew_lease", "revoke_next_expired"}
+
+
+def test_a_stalled_supervisor_call_is_ended_by_the_operation_guard(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    submit(checked, "gated", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"gated": gate.handler}) as probe,
+    ):
+        try:
+            eventually(lambda: len(gate.runs) == 1, "the handler to start")
+            proxy.stall()
+            (expiry,) = eventually(lambda: probe.expiries, "the operation guard")
+            assert expiry.guard is Guard.OPERATION
+            assert expiry.context["operation"] in BUSY_CALLS
+            assert expiry.context["worker_id"] == probe.worker.worker_id
+        finally:
+            proxy.resume()  # never leave the worker stuck, whatever the assertions found
+            gate.release.set()
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "not-committed"])
+def test_an_ambiguous_completion_ends_the_worker_with_no_rerun_or_claim(
+    schema_url: str, checked: Conn, committed: bool
+) -> None:
+    gate = Gate()
+    first, second = submit(checked, "gated", {"i": 1}, {"i": 2})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"gated": gate.handler}) as probe,
+    ):
+        eventually(lambda: len(gate.runs) == 1, "the first handler")
+        proxy.drop_completion(committed=committed)
+        gate.release.set()
+        assert proxy.dropped.wait(WAIT)
+        eventually(lambda: probe.terminations, "the worker to end")
+    assert probe.terminations == [(ExitCode.AMBIGUOUS, "completion_ambiguous")]
+    assert len(gate.runs) == 1  # the handler never ran again
+    states = task_states(checked, [first, second])
+    held = states[0] if states[0][0] != "queued" else states[1]
+    assert held == (("succeeded", 1) if committed else ("running", 1))
+    assert ("queued", 0) in states  # no further claim

@@ -2,7 +2,8 @@
 
 One JSON object per line so logs can be parsed, filtered and correlated by
 ``job_id`` / ``task_id`` / ``attempt_id``. Those fields are emitted only when
-a log call supplies them via ``extra=``.
+a log call supplies them via ``extra=``; worker events also name themselves
+in ``event``.
 """
 
 import json
@@ -11,7 +12,7 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-CONTEXT_FIELDS = ("job_id", "task_id", "attempt_id", "worker_id")
+CONTEXT_FIELDS = ("job_id", "task_id", "attempt_id", "worker_id", "event")
 
 
 class JsonFormatter(logging.Formatter):

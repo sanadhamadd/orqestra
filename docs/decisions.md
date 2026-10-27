@@ -522,9 +522,10 @@ interruption and scheduled recovery remain Day 3B.
 Entries DEC-042 to DEC-044 record the worker contracts agreed after the Day 3B design
 reconciliation (single-slot process, main-thread supervisor, handler thread, and the
 C1–C5 reliability contracts). They stay **Proposed** until the owner accepts them in a
-reviewed change; "implemented" means verified locally by the tests named, not yet in
-GitHub CI. These are contracts only: there is no worker process, supervisor, fencing
-watchdog, recovery scheduler or `worker` command yet.
+reviewed change; "implemented" means verified by the tests named, locally and in GitHub
+CI: Slice 1B-A was merged in PR #9 (`823530a`), with both CI jobs passing for the pull
+request (run 40408021385) and for `main` (run 40408731149). These entries are the
+contracts; the first runtime that uses them is Slice 1B-B1 (DEC-045, DEC-046).
 
 ### DEC-042 — Handlers are synchronous functions; one pure boundary maps what they did to an outcome
 - **Status:** Proposed · owner-approved direction · implemented locally (`orqestra.worker.handlers`)
@@ -599,3 +600,144 @@ watchdog, recovery scheduler or `worker` command yet.
   - `ORQESTRA_WORKER_CONCURRENCY` shares the worker prefix but belongs to `Settings`; `WorkerSettings` ignores it.
   - Whether to require several heartbeats per lease, and how the cancellation grace relates to the heartbeat interval (DEC-040), are operator rules the settings cannot check.
 - **VERIFICATION:** `tests/unit/test_worker_settings.py`: valid settings and their lease policy; frozen; nothing has a default; each field required on its own; environment parsing in ISO 8601 and `HH:MM:SS`; four unit-less values refused; `worker_concurrency` neither read nor affected; zero, negative and unrepresentable durations refused for each field; `shutdown_timeout` zero allowed and negative refused; batch limit 1 allowed, 0 and -1 refused, non-integers refused; `db_operation_timeout` exactly 1 ms allowed and 1 µs less refused; lease equal to the execution timeout allowed and 1 µs shorter refused; database timeout 1 µs under the heartbeat interval allowed and equal refused; the fencing relationship 1 µs over allowed and at or under refused; a relationship is not reported while a field is invalid. Locally, mutants dropping or weakening each check (5) each failed tests.
+
+## Day 3B — Slice 1B-B1: the first worker runtime
+
+Entries DEC-045 and DEC-046 record the first single-slot worker runtime and its local
+watchdog, agreed after a read-only probe showed that a stalled database call can hold the
+supervisor indefinitely. They stay **Proposed** until the owner accepts them in a reviewed
+change; "implemented" means verified locally by the tests named, not yet in GitHub CI.
+There is no command or service that runs a worker yet.
+
+### DEC-045 — A single-slot worker: a supervisor, a handler thread and a local watchdog that ends the process
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`orqestra.worker.runtime`, `orqestra.worker.fence`)
+- **WHAT:**
+  - **Supervisor and handler thread.** `Worker.run` is the supervisor, on the calling thread. It alone uses one autocommit connection (`connect_supervisor`: `statement_timeout` from `db_operation_timeout`, existing `options` kept). It claims with `kinds=registry.kinds`, reads the task and its job, and runs the handler with `run_handler` on one separate thread, which gets no connection. It claims again only after the task is settled.
+  - **Schedule.** `next_step` is a pure function of the local clock:
+    1. a finished handler's completion;
+    2. a running handler's heartbeat every `heartbeat_interval`;
+    3. a recovery sweep step: up to `recovery_batch_limit` calls of `revoke_next_expired` every `recovery_interval`, idle or busy. While a handler runs, a step starts only if it can take its full `db_operation_timeout` and still end before the next heartbeat is due;
+    4. while idle, a stop or a claim every `poll_interval`.
+
+    Every wait is finite.
+  - **Watchdog.** One daemon thread with two guards, each armed with a token so an old arming can never touch a newer one. It ends the process with `end_process` when an armed guard expires. `end_process` writes one diagnostic line to stderr with `os.write`, best effort, and calls `os._exit` in a `finally`, so a failed write (stderr closed, a broken pipe) can never prevent the exit. The guards:
+    - **Ownership** (exit 3), armed while a handler runs.
+      - **Deadline:** the lease end mapped to the local clock from the claim (`local_deadline`: the local time read just before the claim was sent, plus the database's `lease_expires_at − started_at`), so it is never later than the real lease end, minus `fence_margin`.
+      - **Moves later** only after a *confirmed* renewal; an unconfirmed heartbeat (any database error, a failed connect, a lost answer) leaves it unchanged.
+      - **Moves earlier** when a heartbeat reports a cancellation request (the lease now ends with the grace period). Renewals then stop; the handler is not told in this slice.
+      - **Disarmed** by the handler thread itself the moment the handler's work has ended.
+    - **Operation** (exit 4), armed around every supervisor database call, including connecting, with a deadline `db_operation_timeout` ahead. It is a liveness bound, not an ownership claim: a stalled call ends the process instead of hanging it.
+  - **The supervisor ends the process itself:**
+    - when a heartbeat shows the attempt can no longer be renewed (`LeaseExpiredError`, `AttemptRevokedError`, `StaleAttemptError`, `WorkerMismatchError`, `AttemptFinishedError`, `NotFoundError`) while the handler still runs (exit 3);
+    - when the supervisor loop fails while a handler runs (exit 3);
+    - when the handler raised a control-plane signal (exit 5, nothing recorded, DEC-009).
+- **WHY:**
+  - A Python thread cannot be stopped, so ending the process is the only way to stop a handler that may no longer own its task.
+  - A read-only probe showed the supervisor cannot do it alone. With `statement_timeout = 500 ms`, `connect_timeout = 2` and keepalives every second, a psycopg call through a stalled TCP proxy was still blocked after 8 s. A separate thread calling `os._exit` ended that process at 1.00 s, and a `SIGALRM` timer at 1.11 s.
+  - Mapping from the claim keeps the local deadline conservative without a database clock read. Moving it only on confirmed renewals keeps a lost answer from extending ownership.
+  - Holding sweeps back for heartbeats lets a busy worker recover others without risking its own lease. The existing rule `db_operation_timeout < heartbeat_interval` leaves room for at least one sweep step per heartbeat interval.
+- **RUNNER-UP:**
+  - A parent supervisor process with a killable child per handler: stronger (it can stop GIL-holding handlers and kill process groups), but more to run and an overhead per task.
+  - A `SIGALRM` timer instead of a thread: it worked in the probe, but it takes the process's single alarm and the main thread's signal handling, which shutdown handling will need.
+  - Fencing from the main thread only, relying on libpq timeouts: rejected by the probe.
+- **TRADE-OFF:**
+  - **What the fence cannot stop:** a handler holding the GIL in native code starves the watchdog too, and processes a handler detached survive it.
+  - **Clock assumptions:** the local and database clocks are assumed to run at the same rate, with `fence_margin` absorbing small differences. A step forward in the database clock can end the real lease before the local fence (fencing in the database still holds).
+  - **Conservative exits:** any database call longer than `db_operation_timeout`, or a watchdog expiry racing a handler that has just finished, ends the process. The outcome is then lost and recovery decides, using one attempt of the budget.
+  - **Single connection:** the supervisor is single-threaded, so a slow claim, read or completion delays the next heartbeat. The ownership guard bounds the consequence.
+  - **Cancellation:** handlers are not yet told about a cancellation request; they are fenced at the end of the grace period instead.
+  - **Recovery delay:** there is no guaranteed bound, only that any live, responsive worker sweeps.
+- **VERIFICATION:**
+  - **`tests/unit/test_worker_fence.py`** (injected clock and `terminate`):
+    - the deadline mapping;
+    - expiry exactly at the deadline, once;
+    - `extend` only later and `restrict` only earlier;
+    - obsolete tokens touch nothing and an old deadline never fires;
+    - a disarmed guard never fires;
+    - the earliest of two guards fires;
+    - a real watchdog thread fires while another thread is blocked, and honours an extension;
+    - `end_process` writes one JSON line and exits with the code, and still exits with the code when the write raises `OSError` or `BrokenPipeError`;
+    - in a real subprocess whose main thread is blocked, the production watchdog exits with code 3 with stderr writable, closed, or a broken pipe;
+    - a confirmed renewal applied after the old deadline but before the watchdog checks does not expire the worker, both on the watchdog and through `Worker._heartbeat`;
+    - exit codes are stable.
+  - **`tests/unit/test_worker_runtime.py`:**
+    - the `next_step` decision table;
+    - a 1,000-second simulation with an endless expired backlog and every call taking its full bound: every heartbeat runs exactly on time, with at least one revocation between consecutive heartbeats;
+    - completion-error classification;
+    - connection options;
+    - against injected lifecycle functions:
+      - unconfirmed heartbeats (connection loss, deadlock, timeout, failed connect) never move the fence and a confirmed one does;
+      - the handler thread's disarm makes later renewals harmless;
+      - each lost-ownership error ends the process while the handler runs and not after it ended;
+      - a cancellation request shortens the fence;
+      - every completion path;
+      - a failing supervisor ends the process while a handler runs.
+  - **`tests/integration/test_worker_runtime.py`** (in-process, real PostgreSQL):
+    - supported tasks complete while others stay queued at generation 0;
+    - three concurrent workers each hold exactly one task and never share a generation;
+    - no second claim while a handler runs;
+    - heartbeats keep a slow handler alive;
+    - a busy worker revokes another worker's expired attempt while its own handler runs;
+    - five handler failures keep the existing classification;
+    - a killed supervisor connection is reconnected, with no handler failure;
+    - a server rejection of a valid outcome ends the worker without recording a failure;
+    - a deadlock on completion is retried without rerunning the handler;
+    - refused renewals leave the fence at its last confirmed deadline, which expires before the database lease;
+    - a stalled supervisor call while a handler runs (a heartbeat or a sweep step, whichever meets the stall) trips the operation guard;
+    - ambiguous completions, committed or not, end the worker with no rerun and no further claim.
+  - **`tests/integration/test_worker_process.py`** (a real subprocess; exits measured against PostgreSQL's clock):
+    - a stalled supervisor call exits 4 before the lease ends;
+    - refused connections exit 3 before the lease ends;
+    - a lease ended by the database exits 3 at the next heartbeat;
+    - a cancellation request exits 3 at the end of the grace period, and recovery then cancels the task;
+    - a `SystemExit` handler exits 5 with nothing recorded;
+    - an ambiguous completion exits 6 with the handler run once and the other task unclaimed.
+  - **Stability:** both integration files passed 8 of 8, then 5 of 5, consecutive local runs. The first full `make verify` showed that the stall tests had assumed which call would stall; they now accept either call a busy worker makes, and always resume the proxy.
+  - **Adversarial audit correction:** before review, `end_process` called `os._exit` only after a successful `os.write`. With stderr closed or a broken pipe, the write raised: the watchdog thread died and the process kept running, so the handler went on unfenced (shown by a probe; the same raise could escape a supervisor exit). With the old `end_process` restored, the four new stderr tests fail and the writable control passes.
+  - **Mutation checks:** locally, each of these mutants failed tests:
+    - an unconfirmed heartbeat extending the fence;
+    - no disarm by the handler thread;
+    - tokens ignored when moving a deadline;
+    - sweeps not held back for heartbeats;
+    - no operation guard;
+    - claims while a handler runs;
+    - lost ownership ignored;
+    - an ambiguous completion retried;
+    - a cancellation not shortening the fence.
+
+### DEC-046 — Slice 1B-B1 outcome policy: database errors are never handler failures; an ambiguous completion ends the process
+- **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); temporary for the ambiguous case until C4 reconciliation
+- **WHAT:**
+  - **The handler's outcome** is recorded with `complete_attempt`, the authoritative Day 3A operation. Lease expiry is never checked locally before completing, so a completion still counts until recovery commits.
+  - **Ownership already ended** (`AttemptRevokedError`, `StaleAttemptError`): the outcome is discarded.
+  - **A database error is never turned into a handler failure:**
+    - **Retried:** a failed connect (nothing was sent), or a server error that certainly rolled back and may be retried (`40001`, `40P01`, `55P03`, `57014`). The retry comes after `db_operation_timeout` and continues until the attempt's local deadline (exit 8 then).
+    - **Defect (exit 7):** a server rejection of a valid outcome with any other code, or a lifecycle invariant failure (`AttemptFinishedError`, `NotFoundError`, `ValueError`, `RuntimeError`).
+    - **Ambiguous (exit 6):** a broken connection or an error without a server code. The worker does not classify the event as a handler failure, does not report the outcome as recorded, does not rerun the handler and does not claim again. Either the completion committed, or recovery decides.
+  - **Claims and reads:**
+    - **A claim error that certainly rolled back, or a failed connect,** is retried after `poll_interval`.
+    - **A claim whose answer was lost** (it may have committed) holds further claims for a full `lease`.
+    - **A claimed attempt that cannot be started** (its task cannot be read, or too little lease is left) holds further claims until its lease has certainly ended: the local time after the claim returned, plus the lease. It is then recovered.
+
+      In both of these cases the worker runs at most one handler at a time and never holds two attempts whose leases are both valid. The abandoned attempt can still read `running` in the database, beside the worker's next one, until recovery revokes it.
+    - **A missing task, job or handler** is a defect (exit 7).
+- **WHY:**
+  - DEC-009 and DEC-029 already say that database and infrastructure errors are not handler failures.
+  - Ending the process on ambiguity is the smallest correct policy without reconciliation. A retry could raise `StaleAttemptError` even though the earlier completion committed, and rerunning the handler would repeat its side effects.
+- **RUNNER-UP:**
+  - The C4 reconciliation now: re-read the attempt and task, and compare every stored detail. This is deferred to Slice 1B-B2 so that it gets its own review and tests.
+  - Treating an ambiguous completion like a retryable one: rejected, because a committed outcome would then be reported as stale or finished, or retried after recovery claimed the task again.
+- **TRADE-OFF:**
+  - An ambiguous completion that did not commit costs a revocation: one attempt of the budget, and a rerun by another worker after the lease expires.
+  - A claim whose answer was lost costs the same, and keeps this worker from claiming for up to one lease.
+- **VERIFICATION:**
+  - **`classify_completion_error`** decision table (`tests/unit/test_worker_runtime.py`).
+  - **Completion paths against injected failures:** discarded, ambiguous, rejected, refused, retried until the deadline, failed connect, control-plane signal never recorded, missing outcome.
+  - **Claim paths:** a failed claim retried after the poll interval; an ambiguous claim held for a full lease; a failed read, and a lease too short to start, each held until the lease ends; a missing job.
+  - **In-process PostgreSQL tests:**
+    - a killed connection is not a handler failure;
+    - a check-violation trigger on the completion ends the worker with the attempt still running and no failure kind;
+    - a one-time deadlock is retried, with the handler run once;
+    - ambiguous completions, committed and not, through a proxy that cuts the connection just after or just before the `COMMIT` reaches the server.
+  - **The real-subprocess test:** exit 6, a committed success, the handler run once and the other task unclaimed.
+  - **Mutation checks:** locally, not holding an unstarted claim (2 tests) and treating an ambiguous claim as a plain failure (1) each failed tests, as did retrying an ambiguous completion (DEC-045).

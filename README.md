@@ -27,8 +27,11 @@ request (run 40271111779) and for `main` after the merge (run 40271850302). Day 
 1A (job-kind-filtered claims) was merged in PR #8 (merge commit `46acdd9`), with both CI
 lanes passing for the pull request (run 40397331066) and for `main` (run 40397973812).
 Day 3B Slice 1B-A (worker contracts: the handler protocol and registry, handler-outcome
-mapping and validated worker settings) is implemented and verified locally only; it has
-not yet run in GitHub CI. There is no worker process yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+mapping and validated worker settings) was merged in PR #9 (merge commit `823530a`), with
+both CI lanes passing for the pull request (run 40408021385) and for `main` (run
+40408731149). Day 3B Slice 1B-B1 (the first single-slot worker runtime, with a local
+watchdog) is implemented and verified locally only; it has not yet run in GitHub CI, and
+there is no command or service that runs a worker yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
@@ -38,7 +41,7 @@ claim about shipped behaviour.
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts only: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044) | the worker process: claim loop, heartbeats, self-fencing, the response to cancellation, completion and recovery sweeps; bounded worker slots; retry backoff (Days 3B–4) |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046) | a worker command and service; telling handlers about cancellation; reconciling ambiguous completions; graceful shutdown; bounded worker slots; retry backoff (Days 3B–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -215,10 +218,9 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   `succeeded` (every task succeeded), `failed` (all finished, at least one failed) or
   `cancelled` (all finished, none failed, at least one cancelled).
 
-### Task handlers (contracts only)
+### Task handlers
 
-These contracts exist for the worker process, which is not built yet: nothing runs
-handlers on its own.
+A worker runs these handlers (see "Worker runtime" below).
 
 ```python
 from orqestra.domain.jobs import JsonValue
@@ -272,6 +274,75 @@ registry = HandlerRegistry({"invoice_verification": verify_invoice})
   heartbeat is due, and that `heartbeat_interval + db_operation_timeout + fence_margin` is
   shorter than the lease. The worker will use the existing `ORQESTRA_DATABASE_URL`.
 
+### Worker runtime (first slice)
+
+`Worker` runs one task at a time in one process. There is no command or service that
+starts it yet; tests start it directly:
+
+```python
+import functools
+import threading
+
+from orqestra.worker.runtime import Worker, connect_supervisor
+from orqestra.worker.settings import WorkerSettings
+
+settings = WorkerSettings()  # every ORQESTRA_WORKER_* value is required
+worker = Worker(
+    registry=registry,  # a HandlerRegistry, as above
+    settings=settings,
+    connect=functools.partial(connect_supervisor, database_url, settings),
+)
+worker.run(threading.Event())  # returns once the event is set while the worker is idle
+```
+
+- **Supervisor and handler thread.** The calling thread is the supervisor. It alone
+  uses one autocommit connection, with `statement_timeout` set from
+  `db_operation_timeout`. It claims a task of a supported kind
+  (`kinds=registry.kinds`), reads its payload, and runs its handler on a separate thread
+  with no database connection. It never claims again until that task is settled.
+- **Schedule.** While a handler runs, the supervisor renews the lease every
+  `heartbeat_interval` and runs recovery sweeps (at most `recovery_batch_limit`
+  revocations every `recovery_interval`), idle or busy. A sweep step starts only if it
+  can take its full `db_operation_timeout` and still end before the next heartbeat is
+  due, so sweeps never delay a heartbeat. Idle, it claims every `poll_interval`.
+- **Local fence.** A watchdog thread ends the process (`os._exit`) when either guard
+  expires:
+  - **ownership:** the attempt's lease, mapped to the local clock from the claim so it
+    is never later than the real lease end, minus `fence_margin`. It moves later only
+    after a *confirmed* renewal, earlier when a cancellation request shortens the lease,
+    and is disarmed by the handler thread when the handler's work ends.
+  - **operation:** each supervisor database call must end within
+    `db_operation_timeout`. A stalled call (a frozen server or network still answers
+    TCP, so `statement_timeout` never fires) ends the process instead of hanging it.
+
+  The supervisor also ends the process itself when a heartbeat shows the lease can no
+  longer be renewed (`LeaseExpiredError`, `AttemptRevokedError`, `StaleAttemptError`,
+  `WorkerMismatchError`, `AttemptFinishedError`) while the handler still runs.
+- **Recording outcomes.** The handler's outcome is recorded with `complete_attempt`. A
+  completion still counts after the lease expired, until recovery commits.
+  - An outcome rejected because ownership ended (`AttemptRevokedError`,
+    `StaleAttemptError`) is discarded.
+  - Database errors are never handler failures. A rolled-back retryable error
+    (`40001`, `40P01`, `55P03`, `57014`) or a failed connect is retried until the
+    attempt's deadline. Any other rejection of a valid outcome ends the process.
+  - **A completion whose acknowledgement is lost** (the connection broke) **ends the
+    process** without rerunning the handler or claiming again: either the completion
+    committed, or recovery decides. Reconciling it instead is a later slice.
+- **Exit codes:**
+
+  | Code | Meaning |
+  | --- | --- |
+  | 3 | Fenced: ownership could not be established |
+  | 4 | Stalled: a database call outlived its bound |
+  | 5 | Handler aborted: a control-plane signal, nothing recorded |
+  | 6 | Ambiguous completion |
+  | 7 | Defect |
+  | 8 | Outcome unrecorded before the deadline |
+
+  Each exit writes one JSON line with its `event`, best effort: if stderr is closed or a
+  broken pipe, the process still exits with its code. Worker events are logged as JSON
+  with `worker_id`, `task_id`, `attempt_id` and `event`.
+
 ### Verification
 
 ```sh
@@ -288,20 +359,41 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
 
 ### Known limitations
 
-- Leases, renewal and recovery exist as operations only. Nothing renews leases or runs
-  `revoke_next_expired` on a schedule, so a task whose worker dies stays `running` until
-  some caller recovers it; there is no worker loop yet (Day 3B).
-- Revoking an attempt ends its database ownership only. It does not stop the worker or its
-  handler, and does not cancel or un-bill an external AI call already made; usage must be
-  attributed to the revoked attempt when cost tracking exists. Worker self-fencing after
-  a lost lease is Day 3B.
+- There is no command or service that runs a worker yet. A task whose worker dies is
+  recovered only while some worker is running: any live worker sweeps, idle or busy.
+  There is no guaranteed recovery delay: it depends on live workers, their sweep
+  interval and batch limit, and the backlog of expired attempts.
+- Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
+  external AI call already made. Usage must be attributed to the revoked attempt when cost
+  tracking exists.
+- **The worker's local fence is limited.**
+  - It cannot stop a handler that holds the GIL in native code: the watchdog thread then
+    cannot run either.
+  - It cannot stop processes a handler started and detached.
+  - It assumes the local and database clocks run at the same rate, with `fence_margin`
+    absorbing small differences. A step forward in the database clock can end the real
+    lease before the local fence.
+  - It has been shown under the tested conditions only: a stalled proxy, refused
+    connections, a cancellation request, and a lease ended by the database.
+- **The worker runtime is a first slice.**
+  - **Cancellation:** handlers are not told about a cancellation request. The worker
+    stops renewing and fences at the end of the grace period, so a handler that would
+    have stopped cooperatively is ended instead.
+  - **Ambiguous completions:** they end the process without reconciliation.
+  - **Lost claims:** a claim whose answer was lost, or whose task could not then be
+    read, is never started and is recovered when its lease expires, using one attempt
+    of its budget. The worker claims nothing else until that lease has certainly ended
+    (a full `lease` after a lost answer). So a worker process runs at most one handler at
+    a time and never holds two attempts whose leases are both valid; but the abandoned
+    attempt can still read `running` in the database, beside the worker's next one, until
+    recovery revokes it.
+  - **Shutdown:** there is no graceful shutdown or draining. `run` returns only when
+    asked while idle, and a signal ends the process as usual.
 - There are no default or maximum lease values: callers choose them. Operational bounds
   and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing
   value and has no defaults.
-- The worker contracts (Day 3B Slice 1B-A) are not a worker: nothing claims tasks, runs
-  handlers, renews leases, fences a worker or sweeps for expired attempts on its own.
-  `run_handler` cannot interrupt a handler. The existing `Settings.worker_concurrency`
-  (default 4) is validated but not read by anything; the worker will be single-slot.
+- `run_handler` cannot interrupt a handler. The existing `Settings.worker_concurrency`
+  (default 4) is validated but not read by anything; the worker is single-slot.
 - Handler results are checked more strictly than `jsonb` requires: only exact built-in
   types are accepted (a `tuple`, a `str` enum or a `dict` subclass is refused rather than
   converted), and nesting deeper than about 1,000 levels is refused. Results and failure
