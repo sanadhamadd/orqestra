@@ -19,6 +19,7 @@ from orqestra.persistence.lifecycle import (
     AttemptFinishedError,
     AttemptRevokedError,
     CancellationRequestedError,
+    CompletionEvidence,
     LeaseExpiredError,
     NotFoundError,
     StaleAttemptError,
@@ -495,7 +496,6 @@ def test_an_outcome_after_lost_ownership_is_discarded(harness: Harness, exc: Exc
 @pytest.mark.parametrize(
     ("exc", "closed", "code", "event"),
     [
-        (psycopg.OperationalError("lost"), True, ExitCode.AMBIGUOUS, "completion_ambiguous"),
         (errors.CheckViolation(), False, ExitCode.DEFECT, "completion_rejected"),
         (
             AttemptFinishedError(uuid.UUID(int=1), AttemptState.SUCCEEDED),
@@ -506,7 +506,7 @@ def test_an_outcome_after_lost_ownership_is_discarded(harness: Harness, exc: Exc
         (NotFoundError("attempt", uuid.UUID(int=1)), False, ExitCode.DEFECT, "completion_refused"),
         (ValueError("policy"), False, ExitCode.DEFECT, "completion_refused"),
     ],
-    ids=["ambiguous", "rejected", "finished", "not-found", "policy"],
+    ids=["rejected", "finished", "not-found", "policy"],
 )
 def test_completion_failures_end_the_process_without_a_handler_failure(
     harness: Harness, exc: Exception, closed: bool, code: ExitCode, event: str
@@ -697,3 +697,189 @@ def test_a_supervisor_failing_while_idle_just_raises(harness: Harness) -> None:
     harness.monkeypatch.setattr(runtime, "revoke_next_expired", raising(KeyError("unexpected")))
     with pytest.raises(KeyError):
         harness.worker.run(threading.Event())
+
+
+# --- reconciling a lost completion answer (DEC-047) ------------------------------------------
+
+
+def current(worker: Worker) -> runtime._Running | None:
+    """The worker's task, read without letting the type checker narrow it."""
+    return worker._schedule.running
+
+
+class Script:
+    """Fake ``complete_attempt`` and ``read_completion_evidence`` that play scripted answers."""
+
+    def __init__(self, harness: Harness, completions: list[Any], evidence: list[Any]) -> None:
+        self.harness = harness
+        self.completions, self.evidence = list(completions), list(evidence)
+        self.completed: list[Any] = []
+        self.read: list[Any] = []
+        harness.monkeypatch.setattr(runtime, "complete_attempt", self.complete)
+        harness.monkeypatch.setattr(runtime, "read_completion_evidence", self.read_evidence)
+
+    def complete(self, conn: Any, attempt_id: uuid.UUID, *, generation: int, outcome: Any) -> Any:
+        self.completed.append(outcome)
+        return self._play(self.completions.pop(0))
+
+    def read_evidence(
+        self, conn: Any, attempt_id: uuid.UUID, *, generation: int, outcome: Any
+    ) -> Any:
+        self.read.append(outcome)
+        return self._play(self.evidence.pop(0))
+
+    def _play(self, answer: Any) -> Any:
+        if answer == "lost":  # the connection broke mid-call: the answer is lost
+            self.harness.conn.closed = True
+            raise psycopg.OperationalError("server closed the connection")
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer == "done":
+            return completed(self.harness)(None, uuid.UUID(int=1), generation=1, outcome=None)
+        return answer
+
+
+def finished(harness: Harness) -> runtime._Running:
+    running = harness.start()
+    harness.finish_handler(running)
+    harness.clock.now = 120.0
+    return running
+
+
+def steps(harness: Harness, running: runtime._Running, count: int) -> None:
+    for _ in range(count):
+        if current(harness.worker) is None:
+            return
+        harness.clock.now = max(harness.clock.now, running.completion_due)
+        harness.worker._complete(running)
+
+
+def test_a_lost_answer_keeps_the_outcome_and_reads_the_evidence_at_once(harness: Harness) -> None:
+    running = finished(harness)
+    script = Script(harness, ["lost"], [CompletionEvidence.MATCHES])
+    harness.worker._complete(running)
+    assert running.uncertain
+    assert harness.worker._conn is None  # a fresh connection for the evidence
+    assert running.completion_due == 120.0  # read at once
+    assert current(harness.worker) is running  # not settled, and nothing ended
+    steps(harness, running, 1)
+    assert script.read == [AttemptSucceeded({"ok": True})]
+    assert current(harness.worker) is None  # settled: it had committed
+    assert script.completed == [AttemptSucceeded({"ok": True})]  # written once, never again
+
+
+def test_still_running_evidence_writes_the_identical_outcome_again(harness: Harness) -> None:
+    running = finished(harness)
+    script = Script(harness, ["lost", "done"], [CompletionEvidence.RUNNING])
+    steps(harness, running, 2)
+    assert current(harness.worker) is None
+    first, second = script.completed
+    assert first is second is running.outcome[0]  # the very outcome the handler produced
+    assert not running.thread.is_alive()  # the handler was never started again
+
+
+def test_revoked_evidence_discards_the_outcome(harness: Harness) -> None:
+    running = finished(harness)
+    script = Script(harness, ["lost"], [CompletionEvidence.REVOKED])
+    steps(harness, running, 2)
+    assert current(harness.worker) is None
+    assert len(script.completed) == 1
+
+
+@pytest.mark.parametrize(
+    "evidence", [CompletionEvidence.CONFLICTS, CompletionEvidence.INCONSISTENT]
+)
+def test_contradicting_evidence_is_a_defect(harness: Harness, evidence: CompletionEvidence) -> None:
+    running = finished(harness)
+    Script(harness, ["lost"], [evidence])
+    harness.worker._complete(running)
+    with pytest.raises(Terminated) as info:
+        harness.worker._complete(running)
+    assert (info.value.code, info.value.event) == (ExitCode.DEFECT, "completion_conflicts")
+
+
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        AttemptRevokedError(uuid.UUID(int=1), RevocationReason.LEASE_EXPIRED),
+        StaleAttemptError(uuid.UUID(int=1), 1, 2),
+        AttemptFinishedError(uuid.UUID(int=1), AttemptState.SUCCEEDED),
+        NotFoundError("attempt", uuid.UUID(int=1)),
+    ],
+    ids=["revoked", "stale", "finished", "not-found"],
+)
+def test_a_rejected_rewrite_is_decided_by_the_evidence_not_the_error(
+    harness: Harness, rejection: Exception
+) -> None:
+    running = finished(harness)
+    # Lost, still running, the rewrite is refused, and the evidence then shows
+    # the first write had committed after all (or anything else): it decides.
+    script = Script(
+        harness,
+        ["lost", rejection],
+        [CompletionEvidence.RUNNING, CompletionEvidence.MATCHES],
+    )
+    steps(harness, running, 3)
+    assert current(harness.worker) is None
+    assert len(script.read) == 2
+    assert len(script.completed) == 2
+
+
+def test_failed_evidence_reads_are_spaced_and_end_at_the_deadline(harness: Harness) -> None:
+    running = finished(harness)
+    script = Script(harness, ["lost"], ["lost", "lost", "lost"])
+    harness.worker._complete(running)  # lost: read at once
+    harness.worker._complete(running)  # the read fails: retried after the database bound
+    assert running.completion_due == 122.0
+    harness.clock.now = 100.0 + 600.0  # the attempt's deadline on the local clock
+    with pytest.raises(Terminated) as info:
+        harness.worker._complete(running)
+    assert (info.value.code, info.value.event) == (ExitCode.AMBIGUOUS, "reconciliation_unresolved")
+    assert len(script.completed) == 1  # never written again blind
+
+
+def test_the_first_evidence_read_happens_even_past_the_deadline(harness: Harness) -> None:
+    running = finished(harness)
+    harness.clock.now = 100.0 + 700.0
+    script = Script(harness, ["lost"], [CompletionEvidence.MATCHES])
+    harness.worker._complete(running)
+    harness.worker._complete(running)
+    assert script.read == [AttemptSucceeded({"ok": True})]
+    assert current(harness.worker) is None
+
+
+def test_a_second_lost_answer_is_retried_after_the_database_bound(harness: Harness) -> None:
+    running = finished(harness)
+    Script(
+        harness, ["lost", "lost", "done"], [CompletionEvidence.RUNNING, CompletionEvidence.RUNNING]
+    )
+    harness.worker._complete(running)  # lost: read at once
+    harness.worker._complete(running)  # running; the rewrite's answer is lost again
+    assert running.completion_due == 122.0  # spaced, not a tight reconnect loop
+    steps(harness, running, 2)
+    assert current(harness.worker) is None
+
+
+def test_a_retryable_rewrite_reads_the_evidence_before_writing_again(harness: Harness) -> None:
+    running = finished(harness)
+    script = Script(
+        harness,
+        ["lost", errors.DeadlockDetected(), "done"],
+        [CompletionEvidence.RUNNING, CompletionEvidence.RUNNING],
+    )
+    steps(harness, running, 4)
+    assert current(harness.worker) is None
+    assert len(script.read) == 2  # read again before the third write
+    assert len(script.completed) == 3
+
+
+def test_without_a_lost_answer_a_retryable_error_ends_as_unrecorded(harness: Harness) -> None:
+    running = finished(harness)
+    Script(harness, [errors.DeadlockDetected()], [])
+    harness.worker._complete(running)
+    assert not running.uncertain
+    harness.clock.now = 100.0 + 600.0
+    harness.monkeypatch.setattr(runtime, "complete_attempt", raising(errors.DeadlockDetected()))
+    with pytest.raises(Terminated) as info:
+        harness.worker._complete(running)
+    assert info.value.code is ExitCode.UNRECORDED

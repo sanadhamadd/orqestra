@@ -51,12 +51,18 @@ ENVIRONMENT = {
 
 
 class WorkerProcess:
-    def __init__(self, worker_url: str, handler_url: str) -> None:
+    def __init__(
+        self, worker_url: str, handler_url: str, overrides: dict[str, str] | None = None
+    ) -> None:
         env = {k: v for k, v in os.environ.items() if not k.startswith("ORQESTRA_WORKER_")}
-        env |= ENVIRONMENT | {
-            "ORQESTRA_TEST_WORKER_URL": worker_url,
-            "ORQESTRA_TEST_HANDLER_URL": handler_url,
-        }
+        env |= (
+            ENVIRONMENT
+            | (overrides or {})
+            | {
+                "ORQESTRA_TEST_WORKER_URL": worker_url,
+                "ORQESTRA_TEST_HANDLER_URL": handler_url,
+            }
+        )
         self.process = subprocess.Popen(
             [sys.executable, "-m", "tests.integration.worker_process"],
             cwd=ROOT,
@@ -88,8 +94,10 @@ def handler_db(db: Conn) -> Conn:
 def start(schema_url: str) -> Iterator[Any]:
     started: list[WorkerProcess] = []
 
-    def launch(worker_url: str | None = None) -> WorkerProcess:
-        process = WorkerProcess(worker_url or schema_url, schema_url)
+    def launch(
+        worker_url: str | None = None, overrides: dict[str, str] | None = None
+    ) -> WorkerProcess:
+        process = WorkerProcess(worker_url or schema_url, schema_url, overrides)
         started.append(process)
         return process
 
@@ -228,7 +236,7 @@ def test_a_control_plane_signal_ends_the_process_without_recording_anything(
     assert runs(handler_db) == 1
 
 
-def test_an_ambiguous_completion_ends_the_process_with_no_rerun_or_claim(
+def test_a_lost_completion_answer_is_reconciled_and_the_process_carries_on(
     schema_url: str, handler_db: Conn, start: Any, gate: Gate
 ) -> None:
     first, second = submit(handler_db, "gated", {"gate": gate.key}, {"gate": gate.key})
@@ -236,11 +244,32 @@ def test_an_ambiguous_completion_ends_the_process_with_no_rerun_or_claim(
         worker = start(proxy.url(schema_url))
         eventually(lambda: runs(handler_db) == 1, "the first handler")
         proxy.drop_completion(committed=True)
-        gate.release()  # the handler finishes; its completion commits, the answer is lost
+        gate.release()  # the completion commits; its answer is lost
+        eventually(
+            lambda: task_states(handler_db, [first, second]) == [("succeeded", 1)] * 2,
+            "both tasks",
+        )
+        assert worker.process.poll() is None  # reconciled: the process did not exit
+    assert proxy.drop_count == 1
+    assert runs(handler_db) == 2  # once per task, never again for the first
+
+
+def test_an_unresolved_reconciliation_ends_the_process_at_the_deadline(
+    schema_url: str, handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})
+    with PgProxy(schema_url) as proxy:
+        # The execution deadline, which bounds reconciliation, equals the 4 s lease.
+        worker = start(proxy.url(schema_url), {"ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT4S"})
+        eventually(lambda: runs(handler_db) == 1, "the handler")
+        proxy.drop_completion(committed=False, then_refuse=True)  # never reachable again
+        gate.release()
         code, lines = worker.exit()
     assert code == ExitCode.AMBIGUOUS
-    assert lines[-1]["event"] == "completion_ambiguous"
-    assert proxy.dropped.is_set()
-    states = sorted(task_states(handler_db, [first, second]))
-    assert states == [("queued", 0), ("succeeded", 1)]  # committed, and nothing else claimed
-    assert runs(handler_db) == 1  # the handler never ran again
+    assert lines[-1]["event"] == "reconciliation_unresolved"
+    assert any(line.get("event") == "completion_ambiguous" for line in lines)
+    assert task_states(handler_db, [task]) == [
+        ("running", 1)
+    ]  # nothing committed; recovery decides
+    assert no_failure_recorded(handler_db, task)
+    assert runs(handler_db) == 1
