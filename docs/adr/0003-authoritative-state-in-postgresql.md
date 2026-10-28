@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-050
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-051
 
 ## Context
 
@@ -96,14 +96,18 @@ detect this: after `running → queued → running`, the state matches again.
   guard ends the process (exit 9) and recovery takes the attempt after its lease, using
   one attempt of its budget. Shutdown writes nothing and never cancels or fails a task
   (DEC-049).
-- Implemented and verified locally only (recovery correction, DEC-050): worker supervisor
+- Implemented and verified locally and in GitHub CI (PR #14): worker supervisor
   sessions carry a `lock_timeout` shorter than `db_operation_timeout` and an
   `idle_in_transaction_session_timeout` equal to it. A worker frozen inside a transaction
   no longer holds its attempt's row lock indefinitely, and a recovering worker that meets
   a held lock retries instead of being ended by its watchdog. Other clients' sessions are
   not bounded by this.
+- Implemented and verified locally only (Day 3B Slice B3): `orqestra worker run` starts
+  a worker for explicitly named built-in kinds after a read-only check that the schema's
+  migration history equals the packaged one exactly; it never migrates and refuses to
+  start against any other history (DEC-051).
 - Not yet implemented, and not proven by the current tests:
-  - a command or service that runs workers;
+  - a service or deployment that runs workers, and any production workload handler;
   - stopping handlers that hold the GIL or detach processes;
   - bounded worker slots;
   - retry backoff.

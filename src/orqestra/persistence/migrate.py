@@ -19,6 +19,10 @@ Safety properties, each covered by integration tests:
   run in a transaction (``CREATE INDEX CONCURRENTLY``, ``VACUUM``). A migration
   therefore cannot end the runner's transaction, and no SQL is parsed here.
 - A failed migration rolls back completely, together with its history row.
+
+``verify_current`` is the read-only counterpart a worker runs before it starts
+(DEC-051): it requires the database's history to equal the packaged
+migrations exactly, and changes nothing.
 """
 
 import hashlib
@@ -159,6 +163,46 @@ def migrate(conninfo: str, migrations: Sequence[Migration] | None = None) -> tup
             applied.append(migration)
             logger.info("applied migration %s", migration.label)
     return tuple(applied)
+
+
+_HISTORY_EXISTS = (
+    "SELECT EXISTS (SELECT FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = %s AND c.relname = 'schema_migrations' AND c.relkind IN ('r', 'p'))"
+)
+
+
+def verify_current(
+    conn: psycopg.Connection[TupleRow], migrations: Sequence[Migration] | None = None
+) -> None:
+    """Raise ``MigrationError`` unless the current schema has exactly the packaged history.
+
+    Read-only: one ``READ ONLY`` transaction of catalog and history reads. It
+    never creates the history table, applies a migration or takes the
+    migration lock. Missing, extra, renamed and edited migrations are refused,
+    and so is a history that is only a prefix of the packaged one: a schema
+    that is behind must be migrated first (``orqestra migrate``).
+    """
+    migrations = load_migrations() if migrations is None else tuple(migrations)
+    _check_sequence(migrations)
+    with conn.transaction():
+        conn.execute("SET TRANSACTION READ ONLY")
+        schema = _current_schema(conn)
+        row = conn.execute(_HISTORY_EXISTS, (schema,)).fetchone()
+        if row is None or not row[0]:
+            msg = f"schema {schema!r} has no migration history; run `orqestra migrate`"
+            raise MigrationError(msg)
+        rows = conn.execute(
+            sql.SQL("SELECT version, name, checksum FROM {} ORDER BY version").format(
+                sql.Identifier(schema, "schema_migrations")
+            )
+        ).fetchall()
+    recorded = [(int(version), str(name), str(digest)) for version, name, digest in rows]
+    _verify_history(recorded, migrations)
+    if len(recorded) < len(migrations):
+        pending = ", ".join(migration.label for migration in migrations[len(recorded) :])
+        msg = f"schema {schema!r} is behind; pending migrations: {pending}; run `orqestra migrate`"
+        raise MigrationError(msg)
 
 
 def _check_sequence(migrations: Sequence[Migration]) -> None:

@@ -85,6 +85,11 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   real subprocess (`tests/integration/test_worker_process.py`, which starts
   `python -m tests.integration.worker_process`), not only with a mocked `os._exit`.
   In-process worker tests inject a recording watchdog and a `terminate` that raises.
+- `tests/integration/test_worker_cli.py` runs the installed `orqestra worker run` console
+  script itself, against an isolated schema, with the built-in diagnostic handlers only;
+  `test_worker_process.py` uses the test-only worker module and its test handlers. Only
+  the first is evidence that the real entrypoint launches. Neither is a production
+  deployment.
 - Network failure is simulated with `tests/integration/pg_proxy.py`. It can:
   - stall a connection (TCP stays up, so neither keepalives nor `statement_timeout` end
     the call);

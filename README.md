@@ -39,9 +39,11 @@ pull request (run 40487174691) and for `main` (run 40488034469). Day 3B Slice B2
 40598713849) and for `main` (run 40599609791). Day 3B Slice B2b (graceful, bounded
 shutdown) was merged in PR #13 (merge commit `155d319`), with both CI lanes passing for
 the pull request (run 40669564020) and for `main` (run 40671619033). A recovery
-correction for workers frozen inside a database transaction (DEC-050) is implemented and
-verified locally only; it has not yet run in GitHub CI. There
-is no command or service that runs a worker yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+correction for workers frozen inside a database transaction (DEC-050) was merged in PR #14
+(merge commit `0eab699`), with both CI lanes passing for `main` (run 40713618712). Day 3B
+Slice B3 (`orqestra worker run`, DEC-051) is implemented and verified locally only; it has
+not yet run in GitHub CI. There is a command that runs a worker, but no service,
+deployment or production workload handler. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
@@ -49,9 +51,9 @@ claim about shipped behaviour.
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
 | Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
-| CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
+| CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049) | a worker command and service; bounded worker slots; retry backoff (Days 3B–4) |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049) | a production worker service; bounded worker slots; retry backoff (Days 3B–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -289,8 +291,8 @@ registry = HandlerRegistry({"invoice_verification": verify_invoice})
 
 ### Worker runtime (first slice)
 
-`Worker` runs one task at a time in one process. There is no command or service that
-starts it yet; tests start it directly:
+`Worker` runs one task at a time in one process. `orqestra worker run` starts one (see
+[Running a worker](#running-a-worker)); from Python:
 
 ```python
 import functools
@@ -434,7 +436,8 @@ any thread.
   | Code | Meaning |
   | --- | --- |
   | 0 | Controlled stop: every started handler ended as PostgreSQL confirmed (see above) |
-  | 1 | An unexpected exception in the supervisor (Python's own exit, with a traceback) |
+  | 1 | `orqestra worker run` refused to start (one JSON line on stdout), or an unexpected exception in the supervisor (Python's own exit, with a traceback) |
+  | 2 | `orqestra worker run` was called without `--kind` (argparse's usage error) |
   | 3 | Fenced: ownership could not be established |
   | 4 | Stalled: a database call outlived its bound |
   | 5 | Handler aborted: a control-plane signal, nothing recorded |
@@ -446,6 +449,64 @@ any thread.
   Each exit writes one JSON line with its `event`, best effort: if stderr is closed or a
   broken pipe, the process still exits with its code. Worker events are logged as JSON
   with `worker_id`, `task_id`, `attempt_id` and `event`.
+
+### Running a worker
+
+`orqestra worker run` starts one single-slot worker on the main thread and runs it until
+SIGTERM or SIGINT (DEC-051):
+
+```sh
+uv run orqestra worker run --kind diagnostic.echo --kind diagnostic.wait
+```
+
+- **Kinds.** `--kind` is required and may be repeated. Each one must name a handler in
+  the fixed, code-reviewed registry, matched exactly; nothing is imported dynamically.
+  There is no production workload yet, so the only handlers are two diagnostics for
+  development and tests:
+  - `diagnostic.echo` returns its payload unchanged;
+  - `diagnostic.wait` takes exactly `{"seconds": n}`, where `n` is a finite,
+    non-negative number (not a boolean) no longer than `execution_timeout`. It waits on
+    its cancellation signal, returns `{"waited_seconds": n}`, or ends cancelled if told
+    of a committed request. Any other payload is a permanent failure.
+- **Configuration.** The `ORQESTRA_*` settings, including `ORQESTRA_DATABASE_URL`, and
+  all ten required `ORQESTRA_WORKER_*` settings, with no defaults. The values below are
+  test examples only, not recommendations (DEC-034):
+
+  ```sh
+  ORQESTRA_WORKER_LEASE=PT4S
+  ORQESTRA_WORKER_EXECUTION_TIMEOUT=PT5M
+  ORQESTRA_WORKER_HEARTBEAT_INTERVAL=PT1S
+  ORQESTRA_WORKER_DB_OPERATION_TIMEOUT=PT0.8S
+  ORQESTRA_WORKER_LOCK_TIMEOUT=PT0.3S
+  ORQESTRA_WORKER_FENCE_MARGIN=PT1S
+  ORQESTRA_WORKER_POLL_INTERVAL=PT0.1S
+  ORQESTRA_WORKER_RECOVERY_INTERVAL=PT1S
+  ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT=5
+  ORQESTRA_WORKER_SHUTDOWN_TIMEOUT=PT1S
+  ```
+- **Startup checks, in order.** Each refusal prints one JSON line on stdout and exits 1,
+  before any worker exists, so nothing is claimed:
+  1. the settings validate (errors list each field's location and message, never its
+     input);
+  2. every `--kind` is a built-in handler, and none is `diagnostic.*` when
+     `ORQESTRA_ENVIRONMENT=production`;
+  3. `ORQESTRA_DATABASE_URL` is set and parses (a malformed one is reported
+     generically);
+  4. the database is reachable, and its schema is current. The check is read-only (one
+     `READ ONLY` transaction of `SELECT`s, no migration lock) and requires the database's
+     migration history to equal the packaged migrations exactly: an uninitialized, older,
+     newer, renamed or edited history is refused. Database errors are reported by type
+     and SQLSTATE only.
+
+  There is no retry at startup: a database that is down is a refused start. Once
+  running, the worker keeps its normal behaviour during outages.
+- **Running.** After the checks it runs exactly as `run_until_signalled` does: exit 0
+  after a controlled stop, the worker's exit codes otherwise (see above).
+- **Submitting work** is the Python `submit_job` interface; there is no submission
+  command.
+- **Production restriction.** `diagnostic.*` kinds are refused only when
+  `ORQESTRA_ENVIRONMENT` is `production`. An unset `ORQESTRA_ENVIRONMENT` defaults to
+  `development`, so a production deployment must set it.
 
 ### Verification
 
@@ -463,7 +524,8 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
 
 ### Known limitations
 
-- There is no command or service that runs a worker yet. A task whose worker dies is
+- `orqestra worker run` is a command, not a service: nothing restarts, supervises or
+  deploys it, and it can run only the built-in diagnostic handlers. A task whose worker dies is
   recovered only while some worker is running: any live worker sweeps, idle or busy.
   There is no guaranteed recovery delay: it depends on live workers, their sweep
   interval and batch limit, and the backlog of expired attempts.

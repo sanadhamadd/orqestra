@@ -1015,10 +1015,12 @@ command or service that runs a worker.
 Entry DEC-050 records a correction found while testing Slice B3: a worker frozen inside a
 database transaction blocked recovery of its attempt, and ended the workers that tried.
 It stays **Proposed** until the owner accepts it in a reviewed change; "implemented" means
-verified locally by the tests named, not yet in GitHub CI.
+verified by the tests named, locally and in GitHub CI: it was merged in PR #14 (`0eab699`),
+with both CI jobs passing for the pull request (run 40711775654) and for `main` (run
+40713618712).
 
 ### DEC-050 — Worker sessions bound their lock waits and their idle transactions
-- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`WorkerSettings.lock_timeout`, `supervisor_conninfo`)
+- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented (`WorkerSettings.lock_timeout`, `supervisor_conninfo`)
 - **WHAT:**
   - **A required setting**, `lock_timeout`: at least 1 ms and, in the whole milliseconds PostgreSQL uses (rounded up, by exact `timedelta` arithmetic), strictly shorter than `db_operation_timeout`. There is no default.
   - **Session options** on every worker supervisor connection, keeping existing `options` such as a `search_path`:
@@ -1071,3 +1073,80 @@ verified locally by the tests named, not yet in GitHub CI.
     - without the idle bound, the process test and the idle test fail;
     - without `lock_timeout`, or with it equal to the statement bound, the lock-held recovery test fails;
     - without the relationship check, or with floating-point rounding, the settings tests fail.
+
+## Day 3B — Slice B3: a command that runs a worker
+
+Entry DEC-051 records `orqestra worker run`, agreed in the Day 3B Slice B3 design audit
+(owner decisions 01–08). It stays **Proposed** until the owner accepts it in a reviewed
+change; "implemented" means verified locally by the tests named, not yet in GitHub CI.
+
+### DEC-051 — `orqestra worker run`: explicit built-in kinds, fail-fast checks, then the existing runtime
+- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`orqestra.cli`, `orqestra.worker.builtin`, `persistence.migrate.verify_current`)
+- **WHAT:**
+  - **The command.** `orqestra worker run --kind KIND [--kind KIND …]`, a subcommand of the existing argparse CLI. `--kind` is required (argparse exits 2 without it) and repeatable; duplicates collapse.
+  - **A fixed registry.** `orqestra.worker.builtin` holds the only handlers, two diagnostics for development and tests. Kinds are checked by `check_job_kinds` and matched exactly; nothing is imported dynamically.
+    - `diagnostic.echo` returns its payload.
+    - `diagnostic.wait` takes exactly `{"seconds": n}`: a finite, non-negative `int` or `float`, not a `bool`, at most `execution_timeout`. It waits on its read-only cancellation signal (an event wait, no polling) and returns `{"waited_seconds": n}`, or raises `HandlerCancelled` once told. Any other payload raises `PermanentError` before waiting.
+  - **Startup, in order.** Each refusal is one JSON line on stdout and exit 1, before any worker exists:
+    1. `Settings` and `WorkerSettings` validate. Errors carry each field's location, message and type, never its input.
+    2. Every kind is built in.
+    3. No `diagnostic.*` kind is named when `ORQESTRA_ENVIRONMENT=production`.
+    4. `ORQESTRA_DATABASE_URL` is set and parses; a malformed one is reported generically.
+    5. One bounded `connect_supervisor` connection runs `verify_current`.
+  - **`verify_current`.** One `SET TRANSACTION READ ONLY` transaction of catalog and history `SELECT`s, with no migration lock. It requires the history to equal the packaged migrations exactly, refusing:
+    - an uninitialized schema, or an empty history;
+    - a history that is behind (a prefix), ahead, renamed, edited or has a gap;
+    - no current schema.
+
+    It never calls `migrate`.
+  - **Database errors at startup** are reported by type and SQLSTATE only. There is no startup retry.
+  - **Then the existing runtime.** `Worker` with `connect=functools.partial(connect_supervisor, …)`, so its sessions carry DEC-050's bounds, then `run_until_signalled`, then exit 0. The worker's exits 3 to 9 and its nonzero ends are unchanged.
+- **WHY:**
+  - It makes the verified runtime runnable without new infrastructure.
+  - Explicit kinds mean a worker never runs work nobody asked for.
+  - A diagnostic `wait` handler lets the real entrypoint show busy shutdown, crash recovery and cancellation.
+  - Before the preflight, a worker against an unmigrated or older schema retried `claim_failed` forever.
+  - Fail-fast startup surfaces misconfiguration rather than hiding it.
+  - A history that is only a prefix is refused, unlike in `migrate`, because the code needs every migration applied.
+- **RUNNER-UP:**
+  - `python -m orqestra.worker` as a second entrypoint convention.
+  - Dynamic `module:attr` handler registries: arbitrary code from configuration.
+  - Retrying the database at startup.
+  - Waiting for the first real handler before any command exists.
+  - An `orqestra submit` command: deferred; submission stays the Python `submit_job` interface.
+- **TRADE-OFF:**
+  - **Diagnostic kinds ship in the package.** They run only when named, and are refused in production. An unset `ORQESTRA_ENVIRONMENT` defaults to `development`, so a production deployment must set it.
+  - **Exit 1 has two meanings,** a refused start or an unexpected exception; the JSON line or the traceback tells them apart.
+  - **The preflight connection is not under the watchdog.** It is bounded by `connect_timeout` and `statement_timeout` only. No task is held then, and signals are not yet installed, so SIGTERM ends it at once.
+  - **The startup check is not a lock against change.** A migration applied after it is not detected until the worker's own calls meet it.
+  - **Unsupported kinds stay queued** with no warning.
+  - **There is no service, supervision or deployment.**
+- **VERIFICATION:**
+  - **`tests/unit/test_worker_builtin.py`** (27):
+    - `echo` returns its payload unchanged;
+    - `wait` returns what it waited, and accepts exactly its bound;
+    - 16 malformed or unbounded payloads are permanent failures, refused at once: over the bound, `True`, `False`, a string, `None`, a list, negative, infinite, NaN, missing, extra or misspelt keys, non-objects;
+    - a cancelled wait ends early as `AttemptCancelled`;
+    - the registry is valid and bounded by the settings.
+  - **`tests/unit/test_cli.py`:**
+    - `--kind` is required (exit 2);
+    - every missing worker setting is listed, `lock_timeout` included, without its input;
+    - an invalid value is not echoed, a broken relationship is refused, and a lock wait not shorter than the database bound is refused (three values);
+    - unsupported, wrongly cased and blank kinds are refused, and diagnostics are refused in production;
+    - a missing, malformed or unreachable DSN is refused without the password or any part of the DSN;
+    - a schema that is not current is refused;
+    - no worker is created or run after any refusal;
+    - a successful start runs the preflight first, registers exactly the deduplicated kinds, and connects as the preflight did, with the runtime's `connect_supervisor`.
+  - **`tests/integration/test_migrations.py`:**
+    - a current schema passes with nothing changed, on a connection whose transactions are all read-only;
+    - the check sends exactly `SET TRANSACTION READ ONLY` and then only `SELECT`s;
+    - it does not wait for a held migration lock;
+    - seven bad histories (uninitialized, empty, behind, ahead, renamed, tampered, gap) and a missing schema are each refused with the schema left exactly as it was.
+  - **`tests/integration/test_worker_cli.py`** (the installed `orqestra` script, real processes):
+    - **refused starts:** a schema that is behind, an unreachable database with a password, and production with a diagnostic kind each exit 1 with a JSON error, never log `worker_started`, never print the password, and leave the task queued;
+    - **two workers and ten tasks:** while one holds a 10 s wait, the other completes all nine echoes. Every task has exactly one attempt and its payload as its result, and an unsupported kind stays queued with no attempt;
+    - **crash recovery:** a SIGKILLed worker's attempt is revoked (`lease_expired`) and run to success by another;
+    - **a stale worker:** one stopped with SIGSTOP past its lease, then resumed, ends or has its write refused, and never changes the newer result;
+    - **cancellation:** a committed request cancels a running wait, and the worker carries on;
+    - **signals:** SIGTERM or SIGINT while idle exits 0; a busy worker that settles within the drain exits 0, and one that cannot exits 9;
+    - **a lost database while busy** exits 3.
