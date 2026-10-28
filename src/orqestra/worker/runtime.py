@@ -33,7 +33,8 @@ settled within ``shutdown_timeout`` of the latch. Shutdown never cancels or
 fails a task and writes nothing; an abandoned attempt is left to recovery.
 ``shutdown.py`` turns SIGTERM and SIGINT into stop requests.
 
-Not in this slice (Day 3B, later): a command to run a worker.
+``orqestra worker run`` starts a worker from the command line (DEC-051);
+there is no production service or workload handler yet.
 """
 
 import contextlib
