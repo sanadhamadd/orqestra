@@ -18,6 +18,7 @@ VALID: dict[str, Any] = {
     "execution_timeout": timedelta(minutes=10),
     "heartbeat_interval": timedelta(seconds=5),
     "db_operation_timeout": timedelta(seconds=2),
+    "lock_timeout": timedelta(seconds=1),
     "fence_margin": timedelta(seconds=3),
     "poll_interval": timedelta(seconds=1),
     "recovery_interval": timedelta(seconds=10),
@@ -79,6 +80,7 @@ def test_settings_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch)
         "EXECUTION_TIMEOUT": "PT10M",
         "HEARTBEAT_INTERVAL": "PT5S",
         "DB_OPERATION_TIMEOUT": "PT2S",
+        "LOCK_TIMEOUT": "PT0.25S",
         "FENCE_MARGIN": "00:00:03",  # or HH:MM:SS
         "POLL_INTERVAL": "PT0.5S",
         "RECOVERY_INTERVAL": "PT10S",
@@ -90,6 +92,7 @@ def test_settings_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch)
     assert worker.lease == timedelta(seconds=30)
     assert worker.execution_timeout == timedelta(minutes=10)
     assert worker.poll_interval == timedelta(milliseconds=500)
+    assert worker.lock_timeout == timedelta(milliseconds=250)
     assert worker.recovery_batch_limit == 10
     assert worker.shutdown_timeout == timedelta(0)
 
@@ -146,9 +149,49 @@ def test_recovery_batch_limit_must_be_an_integer() -> None:
 
 def test_the_database_timeout_is_at_least_one_millisecond() -> None:
     one_ms = timedelta(milliseconds=1)
-    assert settings(db_operation_timeout=one_ms).db_operation_timeout == one_ms
-    with pytest.raises(ValidationError, match="at least 1 ms"):
+    with pytest.raises(ValidationError, match="db_operation_timeout must be at least 1 ms"):
         settings(db_operation_timeout=one_ms - US)
+    # With a lock wait of at least 1 ms that must be shorter (DEC-050), 2 ms is the least.
+    two_ms = 2 * one_ms
+    assert settings(db_operation_timeout=two_ms, lock_timeout=one_ms).db_operation_timeout == two_ms
+    with pytest.raises(ValidationError, match="must be shorter than db_operation_timeout"):
+        settings(db_operation_timeout=one_ms, lock_timeout=one_ms)
+
+
+def test_the_lock_timeout_is_at_least_one_millisecond() -> None:
+    one_ms = timedelta(milliseconds=1)
+    assert settings(lock_timeout=one_ms).lock_timeout == one_ms
+    with pytest.raises(ValidationError, match="lock_timeout must be at least 1 ms"):
+        settings(lock_timeout=one_ms - US)
+
+
+@pytest.mark.parametrize(
+    ("lock", "valid"),
+    [
+        (timedelta(milliseconds=1_999), True),  # 1999 ms < 2000 ms
+        (timedelta(microseconds=1_999_001), False),  # rounds up to 2000 ms: not shorter
+        (timedelta(seconds=2), False),
+        (timedelta(seconds=3), False),
+    ],
+    ids=["shorter", "equal-after-rounding", "equal", "longer"],
+)
+def test_a_lock_wait_must_end_before_the_database_call_does(lock: timedelta, valid: bool) -> None:
+    if valid:
+        assert settings(lock_timeout=lock).lock_timeout == lock
+    else:
+        with pytest.raises(ValidationError, match="must be shorter than db_operation_timeout"):
+            settings(lock_timeout=lock)
+
+
+def test_the_lock_relationship_uses_postgresqls_exact_milliseconds() -> None:
+    # 2007 ms, which floating point would round to 2008, against a 2006.5 ms lock wait.
+    database = timedelta(milliseconds=2_007)
+    with pytest.raises(ValidationError, match=r"\(2007 ms in PostgreSQL\)"):
+        settings(
+            db_operation_timeout=database,
+            heartbeat_interval=timedelta(seconds=3),
+            lock_timeout=timedelta(microseconds=2_006_500),
+        )
 
 
 def test_the_lease_cannot_outlast_the_execution_timeout() -> None:

@@ -107,6 +107,12 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   supervisor (systemd, Kubernetes) must allow more than `db_operation_timeout +
   shutdown_timeout`, plus exit time, before it kills the process; no production values are
   approved yet.
+- Worker supervisor sessions carry `statement_timeout`, `lock_timeout` and
+  `idle_in_transaction_session_timeout` (DEC-050). A test that needs a lock held, or a
+  transaction left open, does it from its own connection (an ordinary session), or holds
+  a worker's traffic at `PgProxy` and freezes the process with SIGSTOP. It must prove the
+  state it relies on (the session `idle in transaction`, a `FOR UPDATE NOWAIT` probe
+  failing) before it goes on, so a run that misses the window fails instead of passing.
 
 ## Invoice and AI workloads
 

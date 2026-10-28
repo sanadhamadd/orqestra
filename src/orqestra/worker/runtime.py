@@ -81,7 +81,7 @@ from orqestra.worker.handlers import (
     TaskContext,
     run_handler,
 )
-from orqestra.worker.settings import WorkerSettings
+from orqestra.worker.settings import WorkerSettings, server_milliseconds
 
 logger = logging.getLogger("orqestra.worker")
 
@@ -225,16 +225,36 @@ def classify_completion_error(
 def supervisor_conninfo(database_url: str, settings: WorkerSettings) -> str:
     """``database_url`` with the supervisor's server-side bounds added.
 
-    ``statement_timeout`` is ``db_operation_timeout`` in whole milliseconds,
-    rounded up; ``connect_timeout`` is whole seconds, rounded up, and libpq
-    treats anything under 2 as 2. Existing ``options``, such as a
-    ``search_path``, are kept. These bound ordinary slow calls only: a stalled
-    call is ended by the watchdog's operation guard.
+    In whole milliseconds, rounded up (``server_milliseconds``):
+
+    - ``statement_timeout`` is ``db_operation_timeout``;
+    - ``lock_timeout`` is ``lock_timeout``, shorter, so that an ordinary lock
+      wait fails with ``55P03``, which every supervisor path treats as
+      unconfirmed and retries, rather than running into the watchdog's operation
+      guard (DEC-050). This protects ordinary lock waits; it is not a timing
+      guarantee: the guard bounds the whole call, so earlier statements of the
+      same transaction, the network and scheduling can use up the difference,
+      and the guard may still end the process first;
+    - ``idle_in_transaction_session_timeout`` is ``db_operation_timeout``. Every
+      supervisor transaction runs inside one guarded call, so a supervisor still
+      running never sits idle in a transaction that long. A frozen, killed or cut
+      off one may: PostgreSQL then ends its session, rolling the transaction
+      back and releasing its locks, so recovery can proceed (DEC-050).
+
+    ``connect_timeout`` is whole seconds, rounded up, and libpq treats anything
+    under 2 as 2. Existing ``options``, such as a ``search_path``, are kept.
+    These bound ordinary slow calls only: a stalled call is ended by the
+    watchdog's operation guard.
     """
     timeout = settings.db_operation_timeout.total_seconds()
+    statement = server_milliseconds(settings.db_operation_timeout)
+    bounds = (
+        f"-c statement_timeout={statement} "
+        f"-c lock_timeout={server_milliseconds(settings.lock_timeout)} "
+        f"-c idle_in_transaction_session_timeout={statement}"
+    )
     existing = conninfo_to_dict(database_url).get("options")
-    statement_timeout = f"-c statement_timeout={math.ceil(timeout * 1000)}"
-    options = f"{existing} {statement_timeout}" if existing else statement_timeout
+    options = f"{existing} {bounds}" if existing else bounds
     return make_conninfo(
         database_url,
         options=options,

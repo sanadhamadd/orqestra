@@ -49,6 +49,7 @@ SETTINGS = WorkerSettings(
     execution_timeout=timedelta(minutes=5),
     heartbeat_interval=timedelta(seconds=1),
     db_operation_timeout=timedelta(milliseconds=900),
+    lock_timeout=timedelta(milliseconds=300),
     fence_margin=timedelta(seconds=1),
     poll_interval=timedelta(milliseconds=100),
     recovery_interval=timedelta(milliseconds=300),
@@ -1185,3 +1186,147 @@ def test_shutdown_never_tells_the_handler_or_records_anything(
     assert probe.terminations[0] == (ExitCode.SHUTDOWN, "drain_deadline_passed")
     assert task_states(checked, [task]) == [("running", 1)]
     assert untouched(checked, task)
+
+
+# --- lock waits and abandoned transactions (DEC-050) --------------------------------------
+
+
+def row_locked(db: Conn, table: str, row_id: uuid.UUID) -> bool:
+    """Whether another session holds ``row_id``'s row lock (a ``NOWAIT`` probe, rolled back)."""
+    query = f"SELECT 1 FROM {table} WHERE id = %s FOR UPDATE NOWAIT"  # fixed table names only
+    try:
+        with db.transaction():
+            db.execute(query, (row_id,))
+    except psycopg.errors.LockNotAvailable:
+        return True
+    return False
+
+
+def backend_alive(db: Conn, pid: int) -> bool:
+    return rows(db, "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", pid) == [(1,)]
+
+
+def failures(caplog: pytest.LogCaptureFixture, event: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if getattr(r, "event", "") == event]
+
+
+def test_an_abandoned_supervisor_transaction_is_ended_and_its_lock_released(
+    schema_url: str, checked: Conn
+) -> None:
+    (task,) = submit(checked, "orphaned", {})
+    policy = LeasePolicy(lease=timedelta(minutes=1), execution_timeout=timedelta(minutes=5))
+    attempt = start_attempt(checked, task.id, "frozen-worker", policy=policy)
+    bound = SETTINGS.db_operation_timeout.total_seconds()  # 0.9 s
+    conn = connect_supervisor(schema_url, SETTINGS)  # exactly a worker's session options
+    try:
+        assert conn.execute("SHOW idle_in_transaction_session_timeout").fetchone() == ("900ms",)
+        assert conn.execute("SHOW lock_timeout").fetchone() == ("300ms",)
+        pid = conn.info.backend_pid
+        conn.execute("BEGIN")
+        conn.execute("SELECT id FROM attempts WHERE id = %s FOR UPDATE", (attempt.id,))
+        time.sleep(bound / 2)  # idle, but well inside the bound: the session survives
+        conn.execute("SELECT 1")
+        assert row_locked(checked, "attempts", attempt.id)
+        idle_from = time.monotonic()  # now abandoned, as a frozen worker would leave it
+        eventually(lambda: not backend_alive(checked, pid), "the session to be ended", 10)
+        ended_after = time.monotonic() - idle_from
+        assert bound * 0.9 <= ended_after < bound + 3.0
+        assert not row_locked(checked, "attempts", attempt.id)  # released by the rollback
+        with pytest.raises(psycopg.Error) as info:
+            conn.execute("SELECT 1")  # what a resumed worker meets
+        assert info.value.sqlstate == "25P03"  # idle_in_transaction_session_timeout
+        # Closed, so the worker treats it as a lost answer, never as a rejection.
+        assert conn.closed
+    finally:
+        conn.close()
+    assert attempts_of(checked, task)[0][1] == "running"  # nothing was committed
+
+
+def test_a_recovery_blocked_by_a_held_lock_retries_instead_of_dying(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    (task,) = submit(checked, "echo", {"n": 1})
+    policy = LeasePolicy(lease=timedelta(milliseconds=300), execution_timeout=timedelta(minutes=1))
+    dead = start_attempt(checked, task.id, "frozen-worker", policy=policy)
+    eventually(
+        lambda: (
+            rows(checked, "SELECT lease_expires_at < now() FROM attempts WHERE id = %s", dead.id)
+            == [(True,)]
+        ),
+        "the lease to end",
+    )
+    holder = psycopg.connect(checked.info.dsn)  # an open transaction holding the attempt row
+    try:
+        holder.execute("SELECT id FROM attempts WHERE id = %s FOR UPDATE", (dead.id,))
+        with running_worker(schema_url, {"echo": echo}) as probe:
+            eventually(lambda: len(failures(caplog, "sweep_failed")) >= 2, "two failed sweeps")
+            assert all("LockNotAvailable" in m for m in failures(caplog, "sweep_failed"))
+            assert probe.expiries == []  # the operation guard never fired
+            assert probe.terminations == []
+            assert probe.thread.is_alive()
+            assert attempts_of(checked, task)[0][1] == "running"  # not revoked, not touched
+            holder.rollback()  # the lock is released
+            eventually(
+                lambda: task_states(checked, [task]) == [("succeeded", 2)], "recovery and a rerun"
+            )
+    finally:
+        holder.close()
+    assert [(a[0], a[1], a[5]) for a in attempts_of(checked, task)] == [
+        (1, "revoked", "lease_expired"),
+        (2, "succeeded", None),
+    ]
+    assert probe.expiries == []
+    assert probe.terminations == []
+
+
+def test_a_heartbeat_that_waits_on_a_held_lock_is_unconfirmed_and_retried(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        found = running_attempt(checked, task)
+        assert found is not None
+        holder = psycopg.connect(checked.info.dsn)
+        try:
+            holder.execute("SELECT id FROM attempts WHERE id = %s FOR UPDATE", (found[0],))
+            eventually(lambda: failures(caplog, "heartbeat_unconfirmed"), "a lock-timed heartbeat")
+            assert all("LockNotAvailable" in m for m in failures(caplog, "heartbeat_unconfirmed"))
+            lease = lease_of(checked, task)
+            holder.rollback()
+        finally:
+            holder.close()
+        eventually(lambda: lease_of(checked, task) > lease, "a renewal after the release")
+        gate.release.set()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    assert probe.expiries == []
+    assert probe.terminations == []
+    assert len(gate.runs) == 1
+
+
+def test_a_completion_that_waits_on_a_held_lock_is_retried_and_recorded_once(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        holder = psycopg.connect(checked.info.dsn)
+        try:
+            holder.execute("SELECT id FROM tasks WHERE id = %s FOR UPDATE", (task.id,))
+            gate.release.set()  # the completion now waits on the task's lock
+            eventually(lambda: failures(caplog, "completion_retry"), "a lock-timed completion")
+            assert all("LockNotAvailable" in m for m in failures(caplog, "completion_retry"))
+            assert task_states(checked, [task]) == [("running", 1)]  # nothing partial
+            holder.rollback()
+        finally:
+            holder.close()
+        eventually(lambda: task_states(checked, [task]) == [("succeeded", 1)], "the task")
+    assert [(a[0], a[1]) for a in attempts_of(checked, task)] == [(1, "succeeded")]
+    assert probe.expiries == []
+    assert probe.terminations == []
+    assert len(gate.runs) == 1

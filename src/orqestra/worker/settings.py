@@ -11,8 +11,10 @@ The worker is single-slot: one task at a time per process. The existing
 
 Checked here are the relationships a healthy worker needs: the lease rules of
 ``LeasePolicy``; a database call that ends before the next heartbeat is due;
-and a heartbeat that, sent on time and taking its full database time, is
-confirmed before the local fencing margin is reached. Nothing here bounds how
+a heartbeat that, sent on time and taking its full database time, is
+confirmed before the local fencing margin is reached; and a lock wait that
+PostgreSQL ends before the database call's own bound, compared in the whole
+milliseconds PostgreSQL uses (DEC-050). Nothing here bounds how
 quickly expired attempts are recovered. The database connection itself is the
 existing ``ORQESTRA_DATABASE_URL`` (``Settings.database_url``).
 """
@@ -25,8 +27,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from orqestra.domain.leases import LeasePolicy, check_duration
 
-# PostgreSQL's statement_timeout counts whole milliseconds, and 0 disables it.
+# PostgreSQL's statement_timeout and lock_timeout count whole milliseconds, and 0
+# disables them.
 _SHORTEST_DATABASE_TIMEOUT = timedelta(milliseconds=1)
+_MILLISECOND = timedelta(milliseconds=1)
+
+
+def server_milliseconds(value: timedelta) -> int:
+    """``value`` in the whole milliseconds a PostgreSQL timeout setting takes, rounded up.
+
+    Exact: ``timedelta`` arithmetic, not floating point, which rounds some
+    whole-millisecond values (2007 ms, for one) up a millisecond too far.
+    """
+    return -(-value // _MILLISECOND)
 
 
 class WorkerSettings(BaseSettings):
@@ -44,6 +57,8 @@ class WorkerSettings(BaseSettings):
     heartbeat_interval: timedelta
     # The longest a single database call may take before it is abandoned.
     db_operation_timeout: timedelta
+    # The longest a supervisor statement waits for a row or table lock (DEC-050).
+    lock_timeout: timedelta
     # How long before its lease may end the worker stops a handler it cannot vouch for.
     fence_margin: timedelta
     # How long an idle worker waits before trying to claim again.
@@ -61,6 +76,7 @@ class WorkerSettings(BaseSettings):
         "execution_timeout",
         "heartbeat_interval",
         "db_operation_timeout",
+        "lock_timeout",
         "fence_margin",
         "poll_interval",
         "recovery_interval",
@@ -80,11 +96,11 @@ class WorkerSettings(BaseSettings):
             check_duration("shutdown_timeout", value)
         return value
 
-    @field_validator("db_operation_timeout")
+    @field_validator("db_operation_timeout", "lock_timeout")
     @classmethod
-    def _database_resolution(cls, value: timedelta) -> timedelta:
+    def _database_resolution(cls, value: timedelta, info: ValidationInfo) -> timedelta:
         if value < _SHORTEST_DATABASE_TIMEOUT:
-            msg = f"db_operation_timeout must be at least 1 ms, got {value}"
+            msg = f"{info.field_name} must be at least 1 ms, got {value}"
             raise ValueError(msg)
         return value
 
@@ -104,6 +120,17 @@ class WorkerSettings(BaseSettings):
                 f"heartbeat_interval + db_operation_timeout + fence_margin ({needed}) must be "
                 f"shorter than lease {self.lease}: a heartbeat sent on time must be confirmed "
                 "before the worker's fencing margin is reached"
+            )
+            raise ValueError(msg)
+        lock, statement = (
+            server_milliseconds(self.lock_timeout),
+            server_milliseconds(self.db_operation_timeout),
+        )
+        if lock >= statement:
+            msg = (
+                f"lock_timeout {self.lock_timeout} ({lock} ms in PostgreSQL) must be shorter than "
+                f"db_operation_timeout {self.db_operation_timeout} ({statement} ms): a lock wait "
+                "must end, and be retried, before the call's own bound ends the process"
             )
             raise ValueError(msg)
         return self

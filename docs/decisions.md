@@ -399,6 +399,7 @@ is not stopped (Day 3B).
   - A poisoned write, and a terminated connection, each roll back both rows.
   - An invariant that every revoked attempt's lease had expired when it was revoked.
   - Locally, mutants that skip the re-check, drop `SKIP LOCKED`, stop locking the task, or report a revoked completion as a plain finished one each fail tests.
+- **Recovery correction note (DEC-050):** a recovery that waits for the attempt's row lock now waits at most `lock_timeout` and then fails with `55P03`; the sweep ends and is retried at the next interval. The lock order is unchanged.
 
 ### DEC-038 — Revoked attempts: a distinct state; the task follows the transient-failure rule
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented
@@ -601,6 +602,7 @@ contracts; the first runtime that uses them is Slice 1B-B1 (DEC-045, DEC-046).
   - Whether to require several heartbeats per lease, and how the cancellation grace relates to the heartbeat interval (DEC-040), are operator rules the settings cannot check.
 - **VERIFICATION:** `tests/unit/test_worker_settings.py`: valid settings and their lease policy; frozen; nothing has a default; each field required on its own; environment parsing in ISO 8601 and `HH:MM:SS`; four unit-less values refused; `worker_concurrency` neither read nor affected; zero, negative and unrepresentable durations refused for each field; `shutdown_timeout` zero allowed and negative refused; batch limit 1 allowed, 0 and -1 refused, non-integers refused; `db_operation_timeout` exactly 1 ms allowed and 1 µs less refused; lease equal to the execution timeout allowed and 1 µs shorter refused; database timeout 1 µs under the heartbeat interval allowed and equal refused; the fencing relationship 1 µs over allowed and at or under refused; a relationship is not reported while a field is invalid. Locally, mutants dropping or weakening each check (5) each failed tests.
 - **Day 3B Slice B2b note:** `shutdown_timeout` is now read. It is the time a stopping worker gives the task it holds to settle (handler, completion and reconciliation), counted from the latch; `0` abandons a running task at once and stops an idle worker at once (DEC-049).
+- **Recovery correction note (DEC-050):** a tenth required setting, `lock_timeout`, at least 1 ms and, in whole milliseconds rounded up, strictly shorter than `db_operation_timeout`, which is therefore at least 2 ms. Millisecond rounding is now exact for every supervisor bound (floating point had made some, such as 2007 ms, 1 ms too long).
 
 ## Day 3B — Slice 1B-B1: the first worker runtime
 
@@ -709,6 +711,7 @@ runs a worker yet.
     - a cancellation not shortening the fence.
 - **Day 3B Slice B2a-2 note:** "the handler is not told in this slice", and the trade-off that handlers are not yet told, no longer hold. When a heartbeat confirms a committed request, the supervisor still stops renewing and restricts the fence to the end of the grace period first, then sets the attempt's cancellation event for the handler (DEC-048). A handler that ignores it is still fenced at the end of the grace period.
 - **Day 3B Slice B2b note:** `run(stop)` is replaced by `run()` and `request_stop()`. The supervisor now waits on a self-pipe that the handler's end, `request_stop` and signals write to, rather than on the handler's `done` or the `stop` event; this also ended a busy wait while an outcome waited for a retry. A stop is latched and, while a task is held, drained rather than ignored; a third guard, drain, ends the process with exit 9. Signal handling, which the `SIGALRM` runner-up left to shutdown, is owned by `shutdown.run_until_signalled` on the main thread (DEC-049).
+- **Recovery correction note (DEC-050):** the supervisor's session also carries `lock_timeout` and `idle_in_transaction_session_timeout`. Neither changes what the watchdog guards; together they keep a frozen worker's open transaction from blocking recovery, and keep a recovering worker from being ended by its own operation guard while it waits for that lock.
 
 ### DEC-046 — Slice 1B-B1 outcome policy: database errors are never handler failures; an ambiguous completion ends the process
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); temporary for the ambiguous case until C4 reconciliation
@@ -920,8 +923,10 @@ not part of it.
 
 Entry DEC-049 records graceful, bounded shutdown, agreed in the Day 3B Slice B2b design
 audit and its clarification (owner decisions O1–O10). It stays **Proposed** until the owner
-accepts it in a reviewed change; "implemented" means verified locally by the tests named,
-not yet in GitHub CI. There is still no command or service that runs a worker.
+accepts it in a reviewed change; "implemented" means verified by the tests named, locally
+and in GitHub CI: Slice B2b was merged in PR #13 (`155d319`), with both CI jobs passing for
+the pull request (run 40669564020) and for `main` (run 40671619033). There is still no
+command or service that runs a worker.
 
 ### DEC-049 — Graceful shutdown: a latched stop, a drain bounded by a watchdog guard, and lock-free signal handling
 - **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`Worker.request_stop`, `orqestra.worker.shutdown`, `Guard.DRAIN`)
@@ -1004,3 +1009,65 @@ not yet in GitHub CI. There is still no command or service that runs a worker.
     - `SystemExit(0)` passing through; the busy wait restored; no unstarted-claim warning;
     - no wakeup fd; a handler that takes a lock; check-then-set instead of numbered runs; handlers or the wakeup fd not restored; another wakeup fd accepted;
     - **review correction F1:** before it, a stop that arrived during a claim was latched only in the pre-start check, after the task and job reads (up to three database calls), and one during an evidence read only after the rewrite. Removing the look after the claim, after the task read, or before the rewrite, or the pre-start check, each failed its own latency test.
+
+## Day 3B — Recovery correction: workers frozen inside a transaction
+
+Entry DEC-050 records a correction found while testing Slice B3: a worker frozen inside a
+database transaction blocked recovery of its attempt, and ended the workers that tried.
+It stays **Proposed** until the owner accepts it in a reviewed change; "implemented" means
+verified locally by the tests named, not yet in GitHub CI.
+
+### DEC-050 — Worker sessions bound their lock waits and their idle transactions
+- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`WorkerSettings.lock_timeout`, `supervisor_conninfo`)
+- **WHAT:**
+  - **A required setting**, `lock_timeout`: at least 1 ms and, in the whole milliseconds PostgreSQL uses (rounded up, by exact `timedelta` arithmetic), strictly shorter than `db_operation_timeout`. There is no default.
+  - **Session options** on every worker supervisor connection, keeping existing `options` such as a `search_path`:
+    - `statement_timeout` = `db_operation_timeout`, as before;
+    - `lock_timeout` = `lock_timeout`;
+    - `idle_in_transaction_session_timeout` = `db_operation_timeout`.
+  - **No new behaviour in the worker.** A lock wait that times out raises `LockNotAvailable` (`55P03`), already a retryable code: an unconfirmed heartbeat, a completion retried, a failed sweep, or a failed claim. A session the server ended raises `IdleInTransactionSessionTimeout` (`25P03`) on its next use, with the connection closed, which the worker treats as a lost answer: unconfirmed, or reconciled for a completion (DEC-047).
+- **WHY:**
+  - **The defect, reproduced deterministically:**
+    1. A worker frozen inside `renew_lease`, after it locks the attempt row, left its session `idle in transaction` holding the lock.
+    2. Once the lease ended, a healthy worker's sweep locked the task (`SKIP LOCKED`), then waited for the attempt.
+    3. Its operation guard, armed before its `statement_timeout`, ended it with exit 4.
+    4. Nothing ended the frozen transaction.
+  - **Neither bound suffices alone.**
+    - The idle bound releases the lock, but up to `2 × db_operation_timeout` after the frozen heartbeat began. The lease may end before that whenever `db_operation_timeout > fence_margin`, and a recovering worker would then still wait and die.
+    - The lock bound keeps a recovering worker that meets an ordinary lock wait alive, but the lock is never released.
+  - **The idle bound can derive from `db_operation_timeout`.** Every supervisor transaction runs inside one call under the operation guard, so a running supervisor never sits idle in a transaction that long.
+  - **The lock bound needs its own value.** Deriving it from `db_operation_timeout` would invent a ratio, and operational values need the owner's approval (DEC-034).
+- **RUNNER-UP:**
+  - **Recovery taking the attempt lock with `NOWAIT` or `SKIP LOCKED`** (with the idle bound): precise, but it changes `lifecycle.py` and DEC-037, and does not protect heartbeats or completions that wait for a lock other clients hold.
+  - **Deriving `lock_timeout` as a fraction of `db_operation_timeout`:** one fewer variable, but an invented ratio.
+  - **A server-wide `idle_in_transaction_session_timeout`:** it would cover every client, but it is a database-administration decision, not the worker's.
+- **TRADE-OFF:**
+  - **Operators set a tenth variable,** and `db_operation_timeout` can no longer be 1 ms.
+  - **A paused but healthy worker loses its session.** A SIGSTOP, a suspended VM or a debugger paused between two statements of a transaction for `db_operation_timeout` has its transaction rolled back. That is safe, because the transaction is atomic, but it is not limited to defective workers.
+  - **A long but legitimate lock wait is retried,** which costs liveness under contention, not correctness.
+  - **Only worker supervisor sessions are bounded.** Other clients can still hold locks; workers then retry, and one whose heartbeat cannot lock its attempt for longer than its lease fences itself.
+  - **No timing guarantee.** These are bounds, not a recovery-time SLA. `lock_timeout < db_operation_timeout` does not guarantee that a lock wait ends before the watchdog: the operation guard bounds the whole call, so earlier statements of the same transaction, the network and scheduling can use up the difference.
+- **VERIFICATION:**
+  - **`tests/unit/test_worker_settings.py`:**
+    - `lock_timeout` is required, read from the environment in ISO 8601, at least 1 ms;
+    - it must be strictly shorter than `db_operation_timeout` after rounding (1999 ms passes; 1999.001 ms, 2 s and 3 s are refused);
+    - the exact-rounding case (2007 ms);
+    - `db_operation_timeout` 2 ms with a 1 ms lock passes, and 1 ms is refused.
+  - **`tests/unit/test_worker_runtime.py`:** both options appear in whole milliseconds, rounded up, after an existing `search_path`, including 2007 ms exactly.
+  - **`tests/integration/test_worker_runtime.py`** (real PostgreSQL):
+    - **idle bound:** a session opened with the worker's exact options shows both settings. It survives an idle half of the bound, then is ended about the bound after it was abandoned; its row lock is released, nothing committed, the next use raises `25P03`, and the connection reads closed.
+    - **lock held during recovery:** with another session holding an expired attempt's row lock, a worker's sweeps fail with `LockNotAvailable` while no watchdog guard fires, the worker stays alive and the attempt is untouched. Once the lock is released, it revokes the attempt (`lease_expired`) and runs the task to success on attempt 2.
+    - **lock held during a heartbeat:** the heartbeat is unconfirmed (`LockNotAvailable`), then renewed after the lock is released, with no guard firing.
+    - **lock held during a completion:** the completion is retried (`LockNotAvailable`) with nothing partial, then recorded once.
+  - **`tests/integration/test_worker_process.py`** (real processes, the deterministic reproduction turned around):
+    1. Worker A's heartbeat is held at the proxy after its row lock, A is frozen with SIGSTOP, and the write is let through.
+    2. The test proves the window was hit: the session is `idle in transaction` and a `NOWAIT` probe fails.
+    3. PostgreSQL ends A's session, releasing the lock and rolling the renewal back (the lease is unchanged).
+    4. Worker B, which never dies and never hits its operation guard, revokes attempt 1 (`lease_expired`) and runs attempt 2 to success, the only success recorded.
+    5. Resumed, A ends through its watchdog (exit 4 or 3) or has its late write refused. The attempt rows and result are unchanged.
+
+    It passed in 10 of 10 consecutive runs, each proving the window was hit.
+  - **Mutation checks:** locally, each of these failed tests, with the files restored by hash:
+    - without the idle bound, the process test and the idle test fail;
+    - without `lock_timeout`, or with it equal to the statement bound, the lock-held recovery test fails;
+    - without the relationship check, or with floating-point rounding, the settings tests fail.
