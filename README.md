@@ -34,9 +34,11 @@ watchdog) was merged in PR #10 (merge commit `d498698`), with both CI lanes pass
 pull request (run 40487174691) and for `main` (run 40488034469). Day 3B Slice B2a-1
 (reconciling a completion whose answer was lost) was merged in PR #11 (merge commit
 `278cb74`), with both CI lanes passing for the pull request (run 40520647309) and for `main`
-(run 40524368913). Day 3B Slice B2a-2 (cooperative cancellation) is implemented and
-verified locally only; it has not yet run in GitHub CI. There is no command or service that
-runs a worker yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+(run 40524368913). Day 3B Slice B2a-2 (cooperative cancellation) was merged in PR #12
+(merge commit `308bb0a`), with both CI lanes passing for the pull request (run
+40598713849) and for `main` (run 40599609791). Day 3B Slice B2b (graceful, bounded
+shutdown) is implemented and verified locally only; it has not yet run in GitHub CI. There
+is no command or service that runs a worker yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
@@ -46,7 +48,7 @@ claim about shipped behaviour.
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate` | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048) | a worker command and service; graceful shutdown; bounded worker slots; retry backoff (Days 3B–4) |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049) | a worker command and service; bounded worker slots; retry backoff (Days 3B–4) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -286,10 +288,10 @@ starts it yet; tests start it directly:
 
 ```python
 import functools
-import threading
 
 from orqestra.worker.runtime import Worker, connect_supervisor
 from orqestra.worker.settings import WorkerSettings
+from orqestra.worker.shutdown import run_until_signalled
 
 settings = WorkerSettings()  # every ORQESTRA_WORKER_* value is required
 worker = Worker(
@@ -297,8 +299,11 @@ worker = Worker(
     settings=settings,
     connect=functools.partial(connect_supervisor, database_url, settings),
 )
-worker.run(threading.Event())  # returns once the event is set while the worker is idle
+run_until_signalled(worker)  # on the main thread; returns after SIGTERM or SIGINT
 ```
+
+Without signals, `worker.run()` works until `worker.request_stop()` is called from
+any thread.
 
 - **Supervisor and handler thread.** The calling thread is the supervisor. It alone
   uses one autocommit connection, with `statement_timeout` set from
@@ -370,16 +375,52 @@ worker.run(threading.Event())  # returns once the event is set while the worker 
     - **Bounded:** reads and rewrites that fail are retried, spaced by
       `db_operation_timeout`, until the attempt's execution deadline. If it is still
       unresolved then, the process ends (exit 6).
+- **Graceful shutdown** (DEC-049).
+  - **Stop requests.** `request_stop()` sets a flag and writes one byte to the
+    worker's wake pipe; it takes no lock. `run_until_signalled` (POSIX, main thread
+    only) turns the first SIGTERM or SIGINT it processes into `request_stop()`; any
+    later one ends the process at once (exit 9, `shutdown_forced`). It refuses to
+    start if another wakeup fd is set or a previous handler cannot be restored, and
+    restores the previous handlers and wakeup fd however `run` ends.
+  - **The latch.** The supervisor latches a request at its next step: the wake pipe
+    ends any wait, and a step that makes several database calls (a claim and its task
+    and job reads; an evidence read and its rewrite) looks for a stop after each one, so
+    the lag is at most the one database call in flight. From the latch on it sends
+    no claim, starts no handler and starts no sweep. The latch, not the request, is the
+    linearization point: a handler that started after a request was made but before
+    the latch was already running, and it is drained like any other.
+  - **Draining.** A task held at the latch keeps its heartbeats, completion and
+    reconciliation. Once it is settled (recorded, reconciled, or discarded because
+    recovery revoked it), `run` returns and the process exits 0. The watchdog's drain
+    guard, armed at `latch + shutdown_timeout`, ends the process with exit 9 otherwise,
+    even if the supervisor is blocked in a database call. With `shutdown_timeout = 0`
+    an idle worker stops at once and a busy one exits 9 at once.
+  - **Nothing is fabricated.** Shutdown never sets the cancellation event, never
+    records a failure or a cancellation, and writes nothing. An abandoned attempt
+    stays `running` until its lease ends; recovery then revokes it (`lease_expired`),
+    using one attempt of its budget, so a task on its last attempt fails.
+  - **A claim that never started.** A claim whose answer arrives after the latch is
+    not started. The worker still exits 0, and logs `stopped_with_unstarted_claim`
+    with the attempt and task IDs and the lease end; a claim whose answer was lost is
+    logged as `stopped_with_uncertain_claim`. **Exit 0 means every handler the worker
+    started has ended as PostgreSQL confirmed; it does not mean no attempt of this
+    worker is still `running`.**
+  - **Never a false success.** `run` returns only through this controlled stop. An
+    exception while a handler runs ends the process (exit 3); `SystemExit` with a
+    success code is raised as `UncontrolledExitError`, so any other end is nonzero.
 - **Exit codes:**
 
   | Code | Meaning |
   | --- | --- |
+  | 0 | Controlled stop: every started handler ended as PostgreSQL confirmed (see above) |
+  | 1 | An unexpected exception in the supervisor (Python's own exit, with a traceback) |
   | 3 | Fenced: ownership could not be established |
   | 4 | Stalled: a database call outlived its bound |
   | 5 | Handler aborted: a control-plane signal, nothing recorded |
   | 6 | Whether a completion committed could not be established by the attempt's deadline |
   | 7 | Defect |
   | 8 | Outcome unrecorded before the deadline |
+  | 9 | Shutdown: the task was not settled by the drain deadline, or a second signal came |
 
   Each exit writes one JSON line with its `event`, best effort: if stderr is closed or a
   broken pipe, the process still exits with its code. Worker events are logged as JSON
@@ -434,8 +475,16 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
     a time and never holds two attempts whose leases are both valid; but the abandoned
     attempt can still read `running` in the database, beside the worker's next one, until
     recovery revokes it.
-  - **Shutdown:** there is no graceful shutdown or draining. `run` returns only when
-    asked while idle, and a signal ends the process as usual.
+  - **Shutdown timing is conditional.** From a signal, the process ends within about
+    `db_operation_timeout + shutdown_timeout`, plus exit time, only while the
+    watchdog and main threads can run: a handler holding the GIL delays the signal
+    handler and the watchdog alike. SIGKILL, and an orchestrator whose kill grace is
+    shorter than this, end the process like a crash. Processes a handler started and
+    detached survive. The worker's wake pipe (`select.poll`) and the signal helper are
+    POSIX only.
+  - **Shutdown costs budget when it abandons work.** An attempt left by exit 9, or a
+    claim that never started, uses one attempt and is recovered only after its lease
+    ends, by a live worker. Handlers are not told about shutdown.
 - There are no default or maximum lease values: callers choose them. Operational bounds
   and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing
   value and has no defaults.

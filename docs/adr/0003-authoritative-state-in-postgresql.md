@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-048
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-049
 
 ## Context
 
@@ -86,13 +86,18 @@ detect this: after `running → queued → running`, the state matches again.
   results compared by `jsonb` equality: it committed, the same outcome is written again, or
   recovery revoked it. The handler never runs again; an outcome unresolved by the attempt's
   deadline ends the process (DEC-047).
-- Implemented and verified locally only (Day 3B Slice B2a-2): cooperative cancellation. A
+- Implemented and verified locally and in GitHub CI (PR #12): cooperative cancellation. A
   heartbeat that confirms a committed request restricts the fence to the end of the grace
   period and then tells the handler through its read-only signal; a handler that
   cooperates ends the attempt cancelled. Notice is only as timely as heartbeats (DEC-048).
+- Implemented and verified locally only (Day 3B Slice B2b): graceful, bounded shutdown. A
+  stop request (SIGTERM or SIGINT) is latched by the supervisor, which then claims and
+  starts nothing; the task it holds is drained and settled through PostgreSQL, or a drain
+  guard ends the process (exit 9) and recovery takes the attempt after its lease, using
+  one attempt of its budget. Shutdown writes nothing and never cancels or fails a task
+  (DEC-049).
 - Not yet implemented, and not proven by the current tests:
   - a command or service that runs workers;
-  - graceful shutdown;
   - stopping handlers that hold the GIL or detach processes;
   - bounded worker slots;
   - retry backoff.

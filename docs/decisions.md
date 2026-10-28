@@ -600,6 +600,7 @@ contracts; the first runtime that uses them is Slice 1B-B1 (DEC-045, DEC-046).
   - `ORQESTRA_WORKER_CONCURRENCY` shares the worker prefix but belongs to `Settings`; `WorkerSettings` ignores it.
   - Whether to require several heartbeats per lease, and how the cancellation grace relates to the heartbeat interval (DEC-040), are operator rules the settings cannot check.
 - **VERIFICATION:** `tests/unit/test_worker_settings.py`: valid settings and their lease policy; frozen; nothing has a default; each field required on its own; environment parsing in ISO 8601 and `HH:MM:SS`; four unit-less values refused; `worker_concurrency` neither read nor affected; zero, negative and unrepresentable durations refused for each field; `shutdown_timeout` zero allowed and negative refused; batch limit 1 allowed, 0 and -1 refused, non-integers refused; `db_operation_timeout` exactly 1 ms allowed and 1 µs less refused; lease equal to the execution timeout allowed and 1 µs shorter refused; database timeout 1 µs under the heartbeat interval allowed and equal refused; the fencing relationship 1 µs over allowed and at or under refused; a relationship is not reported while a field is invalid. Locally, mutants dropping or weakening each check (5) each failed tests.
+- **Day 3B Slice B2b note:** `shutdown_timeout` is now read. It is the time a stopping worker gives the task it holds to settle (handler, completion and reconciliation), counted from the latch; `0` abandons a running task at once and stops an idle worker at once (DEC-049).
 
 ## Day 3B — Slice 1B-B1: the first worker runtime
 
@@ -707,6 +708,7 @@ runs a worker yet.
     - an ambiguous completion retried;
     - a cancellation not shortening the fence.
 - **Day 3B Slice B2a-2 note:** "the handler is not told in this slice", and the trade-off that handlers are not yet told, no longer hold. When a heartbeat confirms a committed request, the supervisor still stops renewing and restricts the fence to the end of the grace period first, then sets the attempt's cancellation event for the handler (DEC-048). A handler that ignores it is still fenced at the end of the grace period.
+- **Day 3B Slice B2b note:** `run(stop)` is replaced by `run()` and `request_stop()`. The supervisor now waits on a self-pipe that the handler's end, `request_stop` and signals write to, rather than on the handler's `done` or the `stop` event; this also ended a busy wait while an outcome waited for a retry. A stop is latched and, while a task is held, drained rather than ignored; a third guard, drain, ends the process with exit 9. Signal handling, which the `SIGALRM` runner-up left to shutdown, is owned by `shutdown.run_until_signalled` on the main thread (DEC-049).
 
 ### DEC-046 — Slice 1B-B1 outcome policy: database errors are never handler failures; an ambiguous completion ends the process
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); temporary for the ambiguous case until C4 reconciliation
@@ -754,6 +756,7 @@ verified by the tests named, locally and in GitHub CI: Slice B2a-1 was merged in
 (`278cb74`), with both CI jobs passing for the pull request (run 40520647309) and for
 `main` (run 40524368913). Cooperative cancellation (Slice B2a-2, DEC-048) and graceful
 shutdown (Slice B2b) are not part of it.
+- **Day 3B Slice B2b note:** exit 9 is added for shutdown. `run` returns only through a controlled stop: an unexpected exception while a handler runs still ends the process (exit 3); `SystemExit` with a success code is raised as `UncontrolledExitError`; any other exception propagates, so the process exits nonzero (DEC-049).
 
 ### DEC-047 — A lost completion answer is reconciled from one consistent PostgreSQL read; the handler never runs again
 - **Status:** Proposed · owner-approved direction (2026-10-27) · implemented locally (`read_completion_evidence`, `Worker`)
@@ -843,13 +846,16 @@ shutdown (Slice B2b) are not part of it.
     - inferring from a rejection instead of re-reading;
     - never ending an unresolved reconciliation;
     - writing again when the evidence matches.
+- **Day 3B Slice B2b note:** while a stopping worker drains, reconciliation is also bounded by the drain deadline; if that comes first, the process ends with exit 9 and PostgreSQL's evidence decides later (DEC-049).
 
 ## Day 3B — Slice B2a-2: cooperative cancellation
 
 Entry DEC-048 records cooperative cancellation, agreed in the Day 3B Slice 1B-B2 design
 audit. It stays **Proposed** until the owner accepts it in a reviewed change;
-"implemented" means verified locally by the tests named, not yet in GitHub CI. Graceful
-shutdown (Slice B2b) is not part of it.
+"implemented" means verified by the tests named, locally and in GitHub CI: Slice B2a-2 was
+merged in PR #12 (`308bb0a`), with both CI jobs passing for the pull request (run
+40598713849) and for `main` (run 40599609791). Graceful shutdown (Slice B2b, DEC-049) is
+not part of it.
 
 ### DEC-048 — A heartbeat that confirms a committed request tells the handler, after fencing at the grace end
 - **Status:** Proposed · owner-approved direction (2026-10-27) · implemented locally (`Worker`)
@@ -909,3 +915,92 @@ shutdown (Slice B2b) is not part of it.
     - telling it on an unconfirmed heartbeat;
     - telling it on lost ownership;
     - one event shared by every attempt.
+
+## Day 3B — Slice B2b: graceful shutdown
+
+Entry DEC-049 records graceful, bounded shutdown, agreed in the Day 3B Slice B2b design
+audit and its clarification (owner decisions O1–O10). It stays **Proposed** until the owner
+accepts it in a reviewed change; "implemented" means verified locally by the tests named,
+not yet in GitHub CI. There is still no command or service that runs a worker.
+
+### DEC-049 — Graceful shutdown: a latched stop, a drain bounded by a watchdog guard, and lock-free signal handling
+- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`Worker.request_stop`, `orqestra.worker.shutdown`, `Guard.DRAIN`)
+- **WHAT:**
+  - **Stop requests.** `Worker.request_stop()` sets a flag and writes one byte to the worker's nonblocking self-pipe. It takes no lock, so a signal handler may call it. The supervisor empties the pipe before it reads any state and then waits on it (`poll`), so the handler's end, a stop request or a signal ends a wait at once and no wake is lost.
+  - **The latch** is the supervisor's first read of the flag that finds it set: at the top of its loop; after each database call of a step that makes several (after the claim and after the task read, so a claimed task is not read further; between an evidence read and its rewrite); or in the pre-start check, the last read before `thread.start()`. So a stop is latched at most one database call, the one in flight, after it was requested. It is the shutdown's linearization point. From the latch on, the supervisor sends no claim, starts no handler and starts no sweep.
+    - A handler that started after the request was stored but before the latch was already running, and it is drained.
+    - A claim answered after the latch is not started (`claimed_task_not_started`). It is left to recovery.
+  - **Draining.** If a task is held at the latch, the watchdog's drain guard is armed at `latch + shutdown_timeout`. Heartbeats, completion and reconciliation continue.
+    - Once the task is settled (recorded, reconciled, or discarded because recovery revoked it), the guard is disarmed, `run` returns, and the process exits 0.
+    - Otherwise the drain guard, or the supervisor's own `ABANDON` step, ends the process with exit 9 (`drain_deadline_passed`). This holds even while the supervisor is blocked in a database call.
+    - `shutdown_timeout = 0` stops an idle worker at once and abandons a running task at once.
+  - **Nothing is fabricated.** Shutdown never sets the cancellation event and writes nothing; an abandoned attempt stays `running` until recovery revokes it after its lease (`lease_expired`).
+  - **Exit 0** means every handler the worker started has ended as PostgreSQL confirmed. It does not mean no attempt of this worker is still `running`. A held claim whose lease may not have ended is logged at the stop: `stopped_with_unstarted_claim`, with the attempt and task IDs, generation and lease end, or `stopped_with_uncertain_claim` after a lost claim answer.
+  - **Signals.** `run_until_signalled(worker)` runs the worker on the main thread.
+    - It refuses, changing nothing, off the main thread or when a previous SIGTERM or SIGINT handler was installed outside Python and so cannot be restored.
+    - It sets the worker's pipe as the process's wakeup fd, and refuses, putting it back, if another wakeup fd was set. Then it installs one handler for SIGTERM and SIGINT.
+    - The handler numbers its runs with `itertools.count`. The first requests a stop; any later one, before `run` has returned, ends the process with exit 9 (`shutdown_forced`).
+    - Everything is restored in `finally`, however `run` ends; a partial installation is rolled back.
+  - **No false success.** `run` returns only through the controlled stop. An exception while a handler runs ends the process (exit 3, as before). `SystemExit` with a success code is raised as `UncontrolledExitError`. Any other exception propagates, so the process exits nonzero (Python's exit 1).
+  - **No busy wait.** The design audit found the supervisor spinning while an outcome waited for a retry (about 881,000 iterations in one second), because it waited on the handler's `done` event, already set. The pipe wait removes it.
+- **WHY:**
+  - `shutdown_timeout` existed but was unused. A stop while busy was ignored until the task settled, bounded only by the attempt's execution deadline. SIGTERM killed the process mid-task, and SIGINT raised `KeyboardInterrupt` wherever the main thread was.
+  - A watchdog guard holds whatever the supervisor is doing, as the ownership and operation guards already do.
+  - Read-only probes (Python 3.12, macOS) decided the signal design:
+    - a handler calling `Event.set()` while the interrupted main thread held that event's lock deadlocked;
+    - a main thread blocked in `join()` was not woken by a signal delivered to another thread: the handler ran 1.8 s late, when `join` returned;
+    - with `set_wakeup_fd`, the same delivery woke a `select` in 10 ms;
+    - handlers do nest, and `itertools.count` gave each run its own number.
+  - Without a lock in signal context, no ordering between a stop request and `thread.start()` can be enforced; the supervisor's own read is the strongest point that can.
+- **RUNNER-UP:**
+  - **The supervisor on its own thread, the main thread joining it, and a handler that sets an `Event`:** the first audit's proposal. Rejected by the probes above.
+  - **`pthread_sigmask` plus a `sigwait` thread:** no Python handler at all. Rejected because children of a thread with SIGTERM blocked inherit the block (a probe's child ignored `terminate()`), and any thread started before the mask would take the default action and kill the process.
+  - **A supervisor-only drain check:** late by up to one database call.
+  - **Starting a claim answered after the latch, and draining it:** may finish the task, but starts work after a stop, which at `shutdown_timeout = 0` is only harm.
+  - **Releasing the lease on abandon:** a write while the handler thread may still run would let another worker start before this process has ended. A release that keeps the budget needs a new revocation reason, so a migration.
+  - **Keeping `run(stop)` with a relay thread:** compatible, but a second way to stop, and a thread that leaks when the event is never set.
+- **TRADE-OFF:**
+  - **Timing is conditional.** From a signal, the process ends within about `db_operation_timeout + shutdown_timeout`, plus exit time, only while the watchdog and main threads can run. A handler holding the GIL delays the signal handler and the watchdog alike; SIGKILL, and an orchestrator kill grace shorter than this, end it like a crash; detached processes survive.
+  - **An abandoned drain, or a claim that never started, uses one attempt** of the task's budget, and is recovered only after its lease ends by a live worker; a task on its last attempt fails.
+  - **Exit 9 can race a completion that committed.** PostgreSQL decides.
+  - **Signals:** two identical signals that arrive before the handler runs count once (POSIX). The worker's wake pipe (`select.poll`) and the helper are POSIX only, and the helper cannot share the process with another wakeup-fd user, such as an asyncio loop.
+  - **Resources:** the pipe's descriptors are closed only when the worker is garbage, so no write can reach a closed or reused descriptor.
+  - **API:** `run(stop)` became `run()` plus `request_stop()`: four test call sites and the README example changed.
+  - **Handlers are not told about shutdown.**
+- **VERIFICATION:**
+  - **`tests/unit/test_worker_shutdown.py`** (fake clock, scripted database calls, threads synchronised by events):
+    - **latch:** a stop before `run` claims nothing; the latch is permanent; a stop ends a 10-minute idle wait at once;
+    - **draining:** a busy worker latches at once, arms the drain guard at the latch plus the timeout, keeps heartbeating, never tells the handler, records the outcome when the handler ends (woken by it, not a timer) and stops;
+    - **drain guard:** fires on its own while the supervisor is uninvolved; settling disarms it at once; a passed deadline abandons a running task and an unrecorded outcome; `shutdown_timeout = 0`, idle and busy;
+    - **latency:** a stop stored during the claim, the task read or the job read is latched before any further database call (none follows), and the attempt is held for recovery; one stored during an evidence read is latched, and the drain guard armed, before the rewrite;
+    - **stop/start race:** a stop during a claim, or while the claimed task is read, leaves it unstarted with a warning naming the attempt and task; a stop stored after the pre-start check finds the handler running and drains it, with no further claim; a lost claim answer is reported; a hold whose lease has certainly ended is not;
+    - **no busy wait:** at most 5 steps over a 0.5 s retry wait;
+    - **no false success:** `SystemExit(0)`, `SystemExit(None)` and `SystemExit(False)` while idle raise `UncontrolledExitError`; `SystemExit(3)` passes through; `SystemExit(0)` while a handler runs exits 3; `SystemExit(0)`, `KeyboardInterrupt` and `KeyError` while completing or reconciling are never a success, and leave the task unsettled; a real process whose supervisor calls `sys.exit(0)` exits 1;
+    - **signal handler:** the first signal requests a stop and a later one forces exit 9; a nested one still counts as the second; one after a controlled stop forces nothing; the handler returns while the watchdog's lock and the logging lock are held and the pipe is full;
+    - **installation:** handlers and the wakeup fd are installed for the run and restored after; a signal after the helper returned reaches the previous handler, not the worker; a signal delivered to another thread ends a 30-second wait at once; refusal off the main thread, with an unrestorable handler, or with another wakeup fd changes nothing; a partial installation is rolled back; an exception from `run` restores everything and propagates.
+  - **`tests/unit/test_worker_runtime.py`:** `next_step` while draining (heartbeat and completion go on, no sweep, wait for the drain deadline, abandon first), and every wait finite and positive across 120 combinations.
+  - **`tests/unit/test_worker_fence.py`:** exit 9 is stable; the drain guard ends the process with `drain_deadline_passed`; with three guards armed, the earliest fires.
+  - **`tests/integration/test_worker_runtime.py`** (real PostgreSQL, in process):
+    - a draining worker renews, records, and leaves the second task queued;
+    - a drain that runs out leaves the attempt `running`, untouched, then revoked `lease_expired`, requeued with budget left and failed on its last attempt;
+    - a lost completion answer while draining is reconciled;
+    - an outage while draining ends at the drain deadline, not the attempt's;
+    - a supervisor blocked in a stalled call while draining is ended by the drain guard first;
+    - a cooperative cancellation while draining ends cancelled;
+    - a cancellation grace shorter than the drain fences first (ownership), and recovery cancels;
+    - a stop during an in-flight claim (held by the proxy before its `INSERT` commits) leaves the attempt unstarted, warned about, and revoked `lease_expired` later;
+    - `shutdown_timeout = 0` abandons a running task at once;
+    - shutdown never tells the handler or records anything.
+  - **`tests/integration/test_worker_process.py`** (a real subprocess, signals sent after `worker_started` is logged):
+    - SIGTERM or SIGINT while idle exits 0, with a 1 s or a zero timeout;
+    - a task settled within the drain exits 0, with the second task still queued;
+    - a task not settled in time exits 9 two seconds after `shutdown_requested` by the worker's own log timestamps, untouched, then recovered (queued, or failed on its last attempt);
+    - a second signal exits 9 at once (`shutdown_forced`);
+    - `shutdown_timeout = 0` exits 9 at once.
+  - **Mutation checks:** locally, 23 deliberate faults each failed tests, with the files restored by hash:
+    - a latch that is not permanent; `request_stop`, or the handler's end, not waking the supervisor;
+    - the drain guard never armed, or not disarmed on settling (caught only after a test was added for it);
+    - shutdown telling the handler; no pre-start check; sweeps while draining; a stop before settling; no abandon at the drain deadline;
+    - `SystemExit(0)` passing through; the busy wait restored; no unstarted-claim warning;
+    - no wakeup fd; a handler that takes a lock; check-then-set instead of numbered runs; handlers or the wakeup fd not restored; another wakeup fd accepted;
+    - **review correction F1:** before it, a stop that arrived during a claim was latched only in the pre-start check, after the task and job reads (up to three database calls), and one during an evidence read only after the rewrite. Removing the look after the claim, after the task read, or before the rewrite, or the pre-start check, each failed its own latency test.

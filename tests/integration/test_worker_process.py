@@ -6,16 +6,22 @@ exit code, the event it logged last, and what PostgreSQL recorded. A handler
 waits on an advisory lock the test holds; the process may reach the database
 through a ``PgProxy`` the test can stall or cut. "Before its lease ended" is
 checked against PostgreSQL's own clock and the stored ``lease_expires_at``.
+Graceful shutdown (DEC-049) is driven with real SIGTERM and SIGINT, sent only
+once the worker has logged that its handlers are installed, and timed from
+the worker's own log timestamps.
 """
 
 import json
 import os
 import secrets
+import select
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -71,11 +77,30 @@ class WorkerProcess:
             stderr=subprocess.PIPE,
             text=True,
         )
+        self._read = ""  # log text read before the process ended
+
+    def wait_for(self, event: str) -> dict[str, Any]:
+        """Read the log (bounded) until a line with ``event`` appears; return that line."""
+        assert self.process.stderr is not None
+        fd = self.process.stderr.fileno()  # read raw, so no text buffer hides a line
+        deadline = time.monotonic() + WAIT
+        while (left := deadline - time.monotonic()) > 0:
+            *complete, _ = self._read.split("\n")
+            for line in complete:
+                if line.startswith("{") and json.loads(line).get("event") == event:
+                    return dict(json.loads(line))
+            if select.select([fd], [], [], left)[0]:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                self._read += chunk.decode()
+        pytest.fail(f"the worker did not log {event}")
 
     def exit(self) -> tuple[int, list[dict[str, Any]]]:
         """Wait (bounded) for the process to end; its exit code and its JSON log lines."""
         _, stderr = self.process.communicate(timeout=WAIT)
-        lines = [json.loads(line) for line in stderr.splitlines() if line.startswith("{")]
+        text = self._read + stderr
+        lines = [json.loads(line) for line in text.splitlines() if line.startswith("{")]
         return self.process.returncode, lines
 
     def kill(self) -> None:
@@ -307,4 +332,100 @@ def test_a_lost_connection_is_never_mistaken_for_a_cancellation(
         (None,)
     ]
     assert task_states(handler_db, [task]) == [("running", 1)]  # the handler never ended it
+    assert no_failure_recorded(handler_db, task)
+
+
+# --- graceful shutdown (DEC-049) ---------------------------------------------------------
+
+
+def logged_at(line: dict[str, Any]) -> datetime:
+    return datetime.fromisoformat(line["ts"])
+
+
+@pytest.mark.parametrize("timeout", ["PT1S", "PT0S"])
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["sigterm", "sigint"])
+def test_a_signal_while_idle_stops_the_process_cleanly(
+    handler_db: Conn, start: Any, sig: signal.Signals, timeout: str
+) -> None:
+    worker = start(overrides={"ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": timeout})
+    worker.wait_for("worker_started")  # the handlers are installed before this
+    worker.process.send_signal(sig)
+    code, lines = worker.exit()
+    assert code == 0
+    assert [line["event"] for line in lines][-2:] == ["shutdown_requested", "worker_stopped"]
+
+
+def test_a_task_settled_within_the_drain_ends_the_process_cleanly(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    first, second = submit(handler_db, "gated", {"gate": gate.key}, {"gate": gate.key})
+    worker = start(overrides={"ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT30S"})
+    eventually(lambda: runs(handler_db) == 1, "the first handler")
+    worker.process.send_signal(signal.SIGTERM)
+    worker.wait_for("shutdown_requested")
+    gate.release()
+    code, lines = worker.exit()
+    assert code == 0
+    assert lines[-1]["event"] == "worker_stopped"
+    # Which of the two is claimed first depends on its random id; the other is untouched.
+    assert sorted(task_states(handler_db, [first, second])) == [("queued", 0), ("succeeded", 1)]
+    assert runs(handler_db) == 1
+
+
+@pytest.mark.parametrize(("max_attempts", "after"), [(3, ("queued", 1)), (1, ("failed", 1))])
+def test_a_task_not_settled_in_time_ends_the_process_with_exit_9(
+    handler_db: Conn, start: Any, gate: Gate, max_attempts: int, after: tuple[str, int]
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key}, max_attempts=max_attempts)
+    worker = start(overrides={"ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT2S"})
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    worker.process.send_signal(signal.SIGTERM)
+    requested = worker.wait_for("shutdown_requested")
+    code, lines = worker.exit()
+    assert code == ExitCode.SHUTDOWN
+    assert lines[-1]["event"] == "drain_deadline_passed"
+    # Timed by the worker's own clock: the drain deadline, plus scheduling.
+    drained = (logged_at(lines[-1]) - logged_at(requested)).total_seconds()
+    assert 1.9 <= drained < 2.0 + 0.8
+    assert task_states(handler_db, [task]) == [("running", 1)]
+    assert no_failure_recorded(handler_db, task)
+    assert rows(handler_db, "SELECT cancel_requested_at FROM tasks WHERE id = %s", task.id) == [
+        (None,)
+    ]
+    # Recovery revokes it once its lease ends, using one attempt of its budget.
+    revocation = eventually(lambda: revoke_next_expired(handler_db), "the lease to end")
+    assert revocation.attempt.revoked_reason is not None
+    assert revocation.attempt.revoked_reason.value == "lease_expired"
+    assert task_states(handler_db, [task]) == [after]
+    assert runs(handler_db) == 1
+
+
+def test_a_second_signal_ends_a_draining_process_at_once(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})
+    worker = start(overrides={"ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT30S"})
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    worker.process.send_signal(signal.SIGTERM)
+    requested = worker.wait_for("shutdown_requested")
+    worker.process.send_signal(signal.SIGINT)
+    code, lines = worker.exit()
+    assert code == ExitCode.SHUTDOWN
+    assert lines[-1]["event"] == "shutdown_forced"
+    assert (logged_at(lines[-1]) - logged_at(requested)).total_seconds() < 5.0  # not 30 s
+    assert task_states(handler_db, [task]) == [("running", 1)]
+    assert no_failure_recorded(handler_db, task)
+
+
+def test_a_zero_shutdown_timeout_ends_a_busy_process_at_once(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})
+    worker = start(overrides={"ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT0S"})
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    worker.process.send_signal(signal.SIGTERM)
+    code, lines = worker.exit()
+    assert code == ExitCode.SHUTDOWN
+    assert lines[-1]["event"] == "drain_deadline_passed"
+    assert task_states(handler_db, [task]) == [("running", 1)]
     assert no_failure_recorded(handler_db, task)

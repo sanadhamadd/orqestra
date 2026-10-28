@@ -8,7 +8,7 @@ or a stalled network still acknowledges TCP, so neither ``statement_timeout``
 nor keepalives end the call). The watchdog is a separate thread that ends the
 process when an armed deadline passes, whatever the main thread is doing.
 
-It holds at most one deadline per ``Guard``:
+It holds at most one deadline per ``Guard``; the earliest expiry ends the process:
 
 - ``OWNERSHIP``: armed while a handler runs. Its deadline is the attempt's
   lease, mapped to the local clock so that it is never later than the lease
@@ -18,6 +18,9 @@ It holds at most one deadline per ``Guard``:
   thread the moment the handler's work has ended.
 - ``OPERATION``: armed around each supervisor database call, so a stalled call
   ends the process instead of hanging it. It says nothing about ownership.
+- ``DRAIN``: armed once, when a stopping worker still holds a task: the end of
+  the time ``shutdown_timeout`` gives it to settle that task (DEC-049). It can
+  only end the process sooner, never extend a lease or another guard.
 
 Each arming returns a token; only the current token can extend, restrict or
 disarm its guard, so an old arming can never touch a newer one, and the
@@ -47,6 +50,7 @@ class ExitCode(IntEnum):
     AMBIGUOUS = 6  # whether a completion committed could not be established in time
     DEFECT = 7  # an invariant broke, or a valid outcome was rejected by the database
     UNRECORDED = 8  # the outcome could not be recorded before the attempt's deadline
+    SHUTDOWN = 9  # a stopping worker's task was not settled in time, or a second signal came
 
 
 class Guard(StrEnum):
@@ -54,9 +58,14 @@ class Guard(StrEnum):
 
     OWNERSHIP = "ownership"
     OPERATION = "operation"
+    DRAIN = "drain"
 
 
-_EXIT_FOR = {Guard.OWNERSHIP: ExitCode.FENCED, Guard.OPERATION: ExitCode.STALLED}
+_EXIT_FOR = {
+    Guard.OWNERSHIP: ExitCode.FENCED,
+    Guard.OPERATION: ExitCode.STALLED,
+    Guard.DRAIN: ExitCode.SHUTDOWN,
+}
 
 
 @dataclass(frozen=True, slots=True)

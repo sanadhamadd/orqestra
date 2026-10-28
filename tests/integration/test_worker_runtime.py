@@ -98,7 +98,6 @@ class Probe:
     worker: Worker
     expiries: list[Expiry]
     terminations: list[tuple[ExitCode, str]]
-    stop: threading.Event
     thread: threading.Thread
     failures: list[BaseException]
 
@@ -126,12 +125,11 @@ def running_worker(
         watchdog=Watchdog(terminate=expiries.append),
         terminate=terminate,
     )
-    stop = threading.Event()
     failures: list[BaseException] = []
 
     def run() -> None:
         try:
-            worker.run(stop)
+            worker.run()
         except Terminated:
             pass
         except BaseException as exc:  # reported by the test
@@ -139,11 +137,11 @@ def running_worker(
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    probe = Probe(worker, expiries, terminations, stop, thread, failures)
+    probe = Probe(worker, expiries, terminations, thread, failures)
     try:
         yield probe
     finally:
-        stop.set()
+        worker.request_stop()
         thread.join(WAIT)
         assert not thread.is_alive(), "the worker did not stop"
         assert failures == []
@@ -950,3 +948,240 @@ def test_a_cancelled_outcome_whose_answer_was_lost_is_reconciled(
     assert attempt_rows(checked, task) == [(1, "cancelled", None, None)]
     assert len(cooperative.runs) == 1
     assert probe.terminations == []
+
+
+# --- graceful shutdown (DEC-049) ---------------------------------------------------------
+
+
+def stopped(probe: Probe) -> bool:
+    return not probe.thread.is_alive()
+
+
+def draining(probe: Probe) -> bool:
+    return probe.worker._watchdog.deadline(Guard.DRAIN) is not None
+
+
+def untouched(db: Conn, task: Task) -> bool:
+    """Shutdown fabricated nothing: no cancellation request and no recorded failure."""
+    return rows(
+        db,
+        "SELECT t.cancel_requested_at IS NULL AND bool_and(a.failure_kind IS NULL) "
+        "FROM tasks t JOIN attempts a ON a.task_id = t.id WHERE t.id = %s "
+        "GROUP BY t.cancel_requested_at",
+        task.id,
+    ) == [(True,)]
+
+
+def test_a_draining_worker_renews_records_and_claims_nothing_more(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    first, second = submit(checked, "gated", {"i": 1}, {"i": 2})
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(seconds=30)})
+    with running_worker(schema_url, {"gated": gate.handler}, settings) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the first handler")
+        probe.worker.request_stop()
+        eventually(lambda: draining(probe), "the drain")
+        # Same job, same created_at: which task is claimed first depends on its random id.
+        (claimed,) = [t for t in (first, second) if running_attempt(checked, t)]
+        lease = lease_of(checked, claimed)
+        eventually(lambda: lease_of(checked, claimed) > lease, "a renewal while draining")
+        gate.release.set()
+        eventually(lambda: stopped(probe), "the worker to stop")
+    assert probe.worker.finished
+    assert sorted(task_states(checked, [first, second])) == [("queued", 0), ("succeeded", 1)]
+    assert len(gate.runs) == 1
+    assert probe.expiries == []
+    assert probe.terminations == []
+
+
+@pytest.mark.parametrize(("max_attempts", "after"), [(3, ("queued", 1)), (1, ("failed", 1))])
+def test_a_drain_that_runs_out_leaves_the_attempt_to_recovery(
+    schema_url: str, checked: Conn, max_attempts: int, after: tuple[str, int]
+) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {}, max_attempts=max_attempts)
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(seconds=1)})
+    with running_worker(schema_url, {"gated": gate.handler}, settings) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: stopped(probe), "the drain to run out")
+        assert probe.terminations[0] == (ExitCode.SHUTDOWN, "drain_deadline_passed")
+        assert all(expiry.guard is Guard.DRAIN for expiry in probe.expiries)
+        assert task_states(checked, [task]) == [("running", 1)]
+        assert untouched(checked, task)
+        gate.release.set()  # too late: nothing supervises it any more
+    # Recovery revokes it once its lease ends; it used one attempt (DEC-038).
+    revocation = eventually(lambda: revoke_next_expired(checked), "the lease to end")
+    assert revocation.attempt.revoked_reason is not None
+    assert revocation.attempt.revoked_reason.value == "lease_expired"
+    assert task_states(checked, [task]) == [after]
+    assert untouched(checked, task)
+    assert len(gate.runs) == 1
+
+
+def test_a_lost_completion_answer_while_draining_is_reconciled(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"gated": gate.handler}) as probe,
+    ):
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: draining(probe), "the drain")
+        proxy.drop_completion(committed=True)
+        gate.release.set()
+        eventually(lambda: stopped(probe), "the worker to stop")
+    assert probe.worker.finished
+    assert proxy.drop_count == 1
+    assert task_states(checked, [task]) == [("succeeded", 1)]
+    assert len(gate.runs) == 1
+    assert probe.terminations == []
+
+
+def test_an_outage_while_draining_ends_at_the_drain_deadline(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(seconds=2)})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"gated": gate.handler}, settings) as probe,
+    ):
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: draining(probe), "the drain")
+        proxy.drop_completion(committed=False, then_refuse=True)  # unreachable from now on
+        gate.release.set()
+        eventually(lambda: stopped(probe), "the drain to run out")
+    # Long before the attempt's 5-minute deadline would have ended reconciliation.
+    assert probe.terminations[0] == (ExitCode.SHUTDOWN, "drain_deadline_passed")
+    assert task_states(checked, [task]) == [("running", 1)]  # nothing committed
+    assert untouched(checked, task)
+
+
+def test_a_supervisor_blocked_while_draining_is_ended_by_the_drain_guard(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    submit(checked, "gated", {})
+    # The drain ends 0.5 s after the latch; any call started after it, 0.9 s after its start.
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(milliseconds=500)})
+    with (
+        PgProxy(schema_url) as proxy,
+        running_worker(proxy.url(schema_url), {"gated": gate.handler}, settings) as probe,
+    ):
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: draining(probe), "the drain")
+        proxy.stall()  # the next supervisor call never gets an answer
+        gate.release.set()
+        eventually(lambda: probe.expiries, "the watchdog")
+        assert probe.expiries[0].guard is Guard.DRAIN
+        proxy.resume()
+        eventually(lambda: stopped(probe), "the worker to end")
+
+
+def test_a_cooperative_cancellation_while_draining_ends_cancelled(
+    schema_url: str, checked: Conn
+) -> None:
+    cooperative = Cooperative()
+    (task,) = submit(checked, "cooperative", {})
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(seconds=30)})
+    with running_worker(schema_url, {"cooperative": cooperative.handler}, settings) as probe:
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: draining(probe), "the drain")
+        assert not cooperative.observed.is_set()  # shutdown alone never tells it
+        request_cancellation(checked, task.id, grace=GRACE)
+        eventually(lambda: stopped(probe), "the worker to stop")
+    assert cooperative.observed.is_set()
+    assert task_states(checked, [task]) == [("cancelled", 1)]
+    assert attempt_rows(checked, task) == [(1, "cancelled", None, None)]
+    assert probe.terminations == []
+
+
+def test_a_cancellation_grace_shorter_than_the_drain_fences_first(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()  # ignores the request
+    (task,) = submit(checked, "gated", {})
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(seconds=30)})
+    with running_worker(schema_url, {"gated": gate.handler}, settings) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: draining(probe), "the drain")
+        request_cancellation(checked, task.id, grace=timedelta(seconds=2))
+        eventually(lambda: probe.expiries, "the fence")
+        assert probe.expiries[0].guard is Guard.OWNERSHIP  # the grace, not the drain
+        revocation = eventually(lambda: revoke_next_expired(checked), "the grace to run out")
+        assert revocation.attempt.revoked_reason is not None
+        assert revocation.attempt.revoked_reason.value == "cancellation_grace_expired"
+        gate.release.set()  # its outcome is discarded: recovery already decided
+        eventually(lambda: stopped(probe), "the worker to stop")
+    assert task_states(checked, [task]) == [("cancelled", 1)]
+
+
+def test_a_stop_during_an_in_flight_claim_leaves_the_attempt_to_recovery(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    with PgProxy(schema_url) as proxy:
+        proxy.hold_on(b"INSERT INTO attempts")  # the claim, before it commits
+        with running_worker(proxy.url(schema_url), {"gated": gate.handler}) as probe:
+            assert proxy.held.wait(WAIT)
+            probe.worker.request_stop()
+            proxy.resume()  # the claim commits
+            eventually(lambda: stopped(probe), "the worker to stop")
+    assert probe.worker.finished
+    assert gate.runs == []  # the claimed task's handler never started
+    assert probe.terminations == []
+    unstarted = running_attempt(checked, task)  # still running, never started
+    assert unstarted is not None
+    attempt_id = unstarted[0]
+    warnings = [
+        r for r in caplog.records if getattr(r, "event", "") == "stopped_with_unstarted_claim"
+    ]
+    assert [getattr(r, "attempt_id", None) for r in warnings] == [str(attempt_id)]
+    revocation = eventually(lambda: revoke_next_expired(checked), "the lease to end")
+    assert revocation.attempt.revoked_reason is not None
+    assert revocation.attempt.revoked_reason.value == "lease_expired"
+    assert task_states(checked, [task]) == [("queued", 1)]
+
+
+def test_a_zero_shutdown_timeout_abandons_a_running_task_at_once(
+    schema_url: str, checked: Conn
+) -> None:
+    gate = Gate()
+    (task,) = submit(checked, "gated", {})
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(0)})
+    with running_worker(schema_url, {"gated": gate.handler}, settings) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: stopped(probe), "the worker to end")
+        assert probe.terminations[0] == (ExitCode.SHUTDOWN, "drain_deadline_passed")
+        gate.release.set()
+    assert task_states(checked, [task]) == [("running", 1)]
+    assert untouched(checked, task)
+
+
+def test_shutdown_never_tells_the_handler_or_records_anything(
+    schema_url: str, checked: Conn
+) -> None:
+    cooperative = Cooperative()
+    (task,) = submit(checked, "cooperative", {})
+    settings = SETTINGS.model_copy(update={"shutdown_timeout": timedelta(seconds=1)})
+    with running_worker(schema_url, {"cooperative": cooperative.handler}, settings) as probe:
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        probe.worker.request_stop()
+        eventually(lambda: stopped(probe), "the drain to run out")
+    assert not cooperative.observed.is_set()
+    assert probe.terminations[0] == (ExitCode.SHUTDOWN, "drain_deadline_passed")
+    assert task_states(checked, [task]) == [("running", 1)]
+    assert untouched(checked, task)

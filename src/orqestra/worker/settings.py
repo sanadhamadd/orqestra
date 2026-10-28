@@ -52,7 +52,8 @@ class WorkerSettings(BaseSettings):
     recovery_interval: timedelta
     # The most attempts one sweep revokes.
     recovery_batch_limit: int = Field(ge=1)
-    # How long a stopping worker waits for its running handler; 0 means not at all.
+    # How long a stopping worker gives the task it holds to settle (its handler, the
+    # completion and any reconciliation), from the latch; 0 means not at all (DEC-049).
     shutdown_timeout: timedelta
 
     @field_validator(

@@ -78,7 +78,8 @@ def timing(**changes: Any) -> Timing:
         "now": 100.0,
         "running": False,
         "completing": False,
-        "stop_requested": False,
+        "stopping": False,
+        "drain_due": None,
         "heartbeat_due": None,
         "completion_due": 0.0,
         "sweep_due": 200.0,
@@ -96,10 +97,10 @@ def timing(**changes: Any) -> Timing:
         ({"claim_due": 100.0}, (Step.CLAIM, 0.0)),
         ({"claim_due": 150.0}, (Step.WAIT, 50.0)),
         ({"sweep_due": 100.0, "claim_due": 100.0}, (Step.SWEEP, 0.0)),  # a sweep comes first
-        ({"stop_requested": True, "claim_due": 0.0, "sweep_due": 0.0}, (Step.STOP, 0.0)),
+        ({"stopping": True, "claim_due": 0.0, "sweep_due": 0.0}, (Step.STOP, 0.0)),
         # running: never a claim, never a stop
         (
-            {"running": True, "heartbeat_due": 105.0, "claim_due": 0.0, "stop_requested": True},
+            {"running": True, "heartbeat_due": 105.0, "claim_due": 0.0, "stopping": True},
             (Step.WAIT, 5.0),
         ),
         ({"running": True, "heartbeat_due": 100.0, "sweep_due": 0.0}, (Step.HEARTBEAT, 0.0)),
@@ -113,11 +114,79 @@ def timing(**changes: Any) -> Timing:
         # completing: the outcome first, retries spaced
         ({"completing": True, "completion_due": 100.0, "sweep_due": 0.0}, (Step.COMPLETE, 0.0)),
         ({"completing": True, "completion_due": 101.5}, (Step.WAIT, 1.5)),
+        # draining (DEC-049): heartbeats and the completion go on, sweeps do not
+        (
+            {"running": True, "stopping": True, "drain_due": 130.0, "heartbeat_due": 100.0},
+            (Step.HEARTBEAT, 0.0),
+        ),
+        (
+            {
+                "running": True,
+                "stopping": True,
+                "drain_due": 130.0,
+                "heartbeat_due": 105.0,
+                "sweep_due": 100.0,
+            },
+            (Step.WAIT, 5.0),
+        ),
+        (  # no more renewals: wait for the handler, or the drain deadline at the latest
+            {
+                "running": True,
+                "stopping": True,
+                "drain_due": 130.0,
+                "heartbeat_due": None,
+                "sweep_due": 100.0,
+            },
+            (Step.WAIT, 30.0),
+        ),
+        (
+            {"completing": True, "stopping": True, "drain_due": 130.0, "completion_due": 100.0},
+            (Step.COMPLETE, 0.0),
+        ),
+        (
+            {"completing": True, "stopping": True, "drain_due": 101.0, "completion_due": 105.0},
+            (Step.WAIT, 1.0),
+        ),
+        # the drain deadline passed: abandon, before anything else
+        (
+            {"running": True, "stopping": True, "drain_due": 100.0, "heartbeat_due": 100.0},
+            (Step.ABANDON, 0.0),
+        ),
+        (
+            {"completing": True, "stopping": True, "drain_due": 99.0, "completion_due": 90.0},
+            (Step.ABANDON, 0.0),
+        ),
     ],
 )
 def test_next_step(changes: dict[str, Any], expected: tuple[Step, float]) -> None:
     step, seconds = next_step(timing(**changes))
     assert (step, seconds) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("stopping", [False, True])
+@pytest.mark.parametrize("state", ["idle", "running", "completing"])
+@pytest.mark.parametrize("heartbeat_due", [None, 99.0, 100.0, 101.0, 150.0])
+@pytest.mark.parametrize("sweep_due", [50.0, 100.0, 101.0, 300.0])
+def test_every_wait_is_finite_and_positive(
+    stopping: bool, state: str, heartbeat_due: float | None, sweep_due: float
+) -> None:
+    busy = state != "idle"
+    step, seconds = next_step(
+        timing(
+            running=state == "running",
+            completing=state == "completing",
+            stopping=stopping,
+            # A stopping worker holds a task only with a drain deadline (DEC-049).
+            drain_due=160.0 if stopping and busy else None,
+            heartbeat_due=heartbeat_due if busy else None,
+            completion_due=120.0,
+            sweep_due=sweep_due,
+        )
+    )
+    if step is Step.WAIT:
+        assert 0.0 < seconds < float("inf")
+    if stopping:
+        assert step not in {Step.SWEEP, Step.CLAIM}
 
 
 def test_sweeps_never_delay_a_heartbeat_and_always_progress() -> None:
@@ -701,7 +770,7 @@ def test_a_supervisor_failing_while_a_handler_runs_ends_the_process(harness: Har
     harness.clock.now = 106.0  # the first heartbeat is due
     harness.monkeypatch.setattr(runtime, "renew_lease", raising(KeyError("unexpected")))
     with pytest.raises(Terminated) as info:
-        harness.worker.run(threading.Event())
+        harness.worker.run()
     assert (info.value.code, info.value.event) == (ExitCode.FENCED, "supervisor_failed")
     assert isinstance(info.value.__context__, KeyError)
     assert harness.deadline() is None  # the watchdog was stopped on the way out
@@ -710,7 +779,7 @@ def test_a_supervisor_failing_while_a_handler_runs_ends_the_process(harness: Har
 def test_a_supervisor_failing_while_idle_just_raises(harness: Harness) -> None:
     harness.monkeypatch.setattr(runtime, "revoke_next_expired", raising(KeyError("unexpected")))
     with pytest.raises(KeyError):
-        harness.worker.run(threading.Event())
+        harness.worker.run()
 
 
 # --- reconciling a lost completion answer (DEC-047) ------------------------------------------
