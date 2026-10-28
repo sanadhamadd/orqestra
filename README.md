@@ -41,15 +41,17 @@ shutdown) was merged in PR #13 (merge commit `155d319`), with both CI lanes pass
 the pull request (run 40669564020) and for `main` (run 40671619033). A recovery
 correction for workers frozen inside a database transaction (DEC-050) was merged in PR #14
 (merge commit `0eab699`), with both CI lanes passing for `main` (run 40713618712). Day 3B
-Slice B3 (`orqestra worker run`, DEC-051) is implemented and verified locally only; it has
-not yet run in GitHub CI. There is a command that runs a worker, but no service,
-deployment or production workload handler. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
+Slice B3 (`orqestra worker run`, DEC-051) was merged in PR #15 (merge commit `71fab72`),
+with both CI lanes passing for the pull request (run 40760433076) and for `main` (run
+40761239383). Day 3C deterministic task partitioning (DEC-052) is implemented and tested
+locally only; it has not yet run in GitHub CI. There is a command that runs a worker, but
+no service, deployment or production workload handler. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
 | --- | --- | --- |
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
-| Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules | — |
+| Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules; deterministic partitioning of an ordered item list into fixed-size batch tasks (DEC-052, local only) | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
@@ -129,12 +131,46 @@ raises `RuntimeError` if the caller has a transaction open. On a connection that
 autocommit mode, reads leave an implicit transaction open; commit or roll back before
 submitting again.
 
+### Partitioning items into tasks
+
+`partition` (DEC-052, local only) turns an ordered list of JSON items into the tasks of
+one job, in contiguous batches of `batch_size`:
+
+```python
+from orqestra.domain.jobs import JobSubmission
+from orqestra.domain.partitioning import partition
+
+tasks = partition(items, batch_size=100, max_attempts=3)  # 100 is an example, not advice
+result = submit_job(conn, JobSubmission("invoice_verification", tasks, idempotency_key="run-42"))
+```
+
+- **Order and repeats.** Batches are contiguous slices in input order; the last may be
+  shorter. Repeated items are kept, never deduplicated.
+- **Keys.** `"<key_prefix>-<index>"` (prefix `"batch"` by default), with the index
+  zero-padded to the width of the last one (`batch-00` … `batch-10`), so `list_tasks`
+  returns the batches in order. The prefix must not be blank or contain NUL.
+- **Payloads.** `{"offset": <index of the batch's first item>, "items": [...]}`. Items are
+  not copied: treat them as read-only, like any payload.
+- **Determinism.** The same items and settings always give equal tasks, so a resubmission
+  with the same idempotency key replays. PostgreSQL compares the resulting tasks, not the
+  settings: a different `batch_size` that yields the same tasks is still a replay, and
+  one that yields different tasks raises `IdempotencyConflictError`.
+- **Refusals.** No items, a `str` or `bytes` instead of a list, or a `batch_size` that is
+  not an integer of at least 1 (`True` and `2.0` included) raise `ValueError` or
+  `TypeError`. `max_attempts` is passed through; the database enforces 1–100.
+- **Not decided yet.** There is no production batch size, and no limit on the number of
+  items, the batch size or a payload's size; these wait for measurement (BS-05). A job's
+  batches are claimed in no particular order (DEC-033).
+
 ### Running attempts
 
 A worker claims the next queued task (or starts a task whose ID it already knows) with a
 lease policy, does the work outside any database transaction while renewing the lease, and
-reports the outcome with the attempt's generation. The operations exist; the worker loop
-that runs them, renews leases on a schedule and sweeps for expired attempts does not yet.
+reports the outcome with the attempt's generation. The single-slot worker runtime runs
+these operations in a loop: it claims, renews leases on a schedule and sweeps for expired
+attempts (see [Worker runtime](#worker-runtime-first-slice) and
+[Running a worker](#running-a-worker)). There is no production worker service yet. The
+example below shows the operations themselves.
 
 ```python
 from datetime import timedelta
@@ -568,6 +604,9 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   - **Shutdown costs budget when it abandons work.** An attempt left by exit 9, or a
     claim that never started, uses one attempt and is recovered only after its lease
     ends, by a live worker. Handlers are not told about shutdown.
+- Partitioning (DEC-052) has no production batch size and no size limits: a whole job,
+  however many batches, is still one submission transaction, and replaying it compares
+  every task. Bounds wait for the large-scale benchmark (BS-05).
 - There are no default or maximum lease values: callers choose them. Operational bounds
   and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing
   value and has no defaults.
@@ -603,17 +642,24 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   how PostgreSQL plans that, and what unsupported backlogs cost, has not been measured.
 - The claim reads a job's kind without locking the job, which relies on kinds never
   changing. No code path updates a job's kind, but the database does not forbid it.
-- Cancellation is bounded by the grace period only at the database: nothing tells a
-  worker except a refused heartbeat, nothing interrupts its handler, and nothing revokes
-  the attempt until some caller runs recovery (Day 3B). There are no default or maximum
-  grace values, and the heartbeat interval must be shorter than any grace used for a
-  worker to hear in time. There is no job-level cancellation.
+- Cancellation is cooperative and bounded by the grace period. A worker learns of a
+  committed request only when a heartbeat reports it; it then tells its handler through
+  the read-only cancellation signal (DEC-048). Notice is not guaranteed before the grace
+  period ends, for example during a database outage or when the grace is shorter than the
+  time to the next heartbeat. Nothing can forcibly interrupt a handler that ignores the
+  signal: the worker is fenced at the end of the grace period, and the attempt is revoked
+  only when a live worker's recovery sweep runs. There are no default or maximum grace
+  values, and the heartbeat interval must be shorter than any grace used for a worker to
+  hear in time. There is no job-level cancellation.
 - A request resets a valid lease to one grace period, so if the worker is already dead,
   recovery waits for the grace period instead of the lease it had left; a grace longer
   than that lease delays recovery.
-- At-least-once execution is not provided yet. A task may run in several attempts, and
-  generation fencing records only the current generation's result, but nothing delivers
-  tasks or recovers them automatically.
+- Execution is at-least-once only where workers are running. Running workers claim the
+  kinds they support and recover expired attempts, and generation fencing records only
+  the current generation's result. A task makes no progress while no running worker
+  supports its kind or no worker is running at all, so eventual completion is not
+  guaranteed. Neither execution nor external effects are exactly-once: a handler may run
+  again after recovery.
 - Migration 0002 needs a quiescent database: stop workers and claimers, let running
   attempts finish, migrate, then deploy. It refuses while any task or attempt is running
   or any session is using those tables. Code from before 0002 cannot run against the new

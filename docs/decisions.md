@@ -1078,10 +1078,12 @@ with both CI jobs passing for the pull request (run 40711775654) and for `main` 
 
 Entry DEC-051 records `orqestra worker run`, agreed in the Day 3B Slice B3 design audit
 (owner decisions 01–08). It stays **Proposed** until the owner accepts it in a reviewed
-change; "implemented" means verified locally by the tests named, not yet in GitHub CI.
+change; "implemented" means verified by the tests named, locally and in GitHub CI: it was
+merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (run
+40760433076) and for `main` (run 40761239383).
 
 ### DEC-051 — `orqestra worker run`: explicit built-in kinds, fail-fast checks, then the existing runtime
-- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`orqestra.cli`, `orqestra.worker.builtin`, `persistence.migrate.verify_current`)
+- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented (`orqestra.cli`, `orqestra.worker.builtin`, `persistence.migrate.verify_current`)
 - **WHAT:**
   - **The command.** `orqestra worker run --kind KIND [--kind KIND …]`, a subcommand of the existing argparse CLI. `--kind` is required (argparse exits 2 without it) and repeatable; duplicates collapse.
   - **A fixed registry.** `orqestra.worker.builtin` holds the only handlers, two diagnostics for development and tests. Kinds are checked by `check_job_kinds` and matched exactly; nothing is imported dynamically.
@@ -1150,3 +1152,59 @@ change; "implemented" means verified locally by the tests named, not yet in GitH
     - **cancellation:** a committed request cancels a running wait, and the worker carries on;
     - **signals:** SIGTERM or SIGINT while idle exits 0; a busy worker that settles within the drain exits 0, and one that cannot exits 9;
     - **a lost database while busy** exits 3.
+
+## Day 3C — Deterministic task partitioning
+
+Entry DEC-052 records the partitioner, agreed in the Day 3C read-only assessment. It stays
+**Proposed** until the owner accepts it in a reviewed change; "implemented" means verified
+locally by the tests named, not yet in GitHub CI.
+
+### DEC-052 — An ordered item list is partitioned into contiguous, fixed-size batch tasks with index-derived keys
+- **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`orqestra.domain.partitioning.partition`)
+- **WHAT:**
+  - **The function.** `partition(items, *, batch_size, max_attempts, key_prefix="batch") -> tuple[TaskSpec, ...]` is pure, standard library only, and has no database, worker or invoice knowledge.
+  - **Batches.** Contiguous slices of `batch_size` in input order; the last may be shorter. Repeated items are kept.
+  - **Keys.** `"<key_prefix>-<index>"`, with the index zero-padded to the width of the last index, so code-point order (DEC-027) is batch order.
+  - **Payloads.** `{"offset": <index of the batch's first item>, "items": [...]}`.
+  - **Retries.** `max_attempts` is passed through; the database enforces its range (DEC-026).
+  - **Refusals.**
+    - **`ValueError`:** no items, a `batch_size` below 1, or a blank or NUL-containing `key_prefix` (the rules of `tasks_task_key_not_blank` and of PostgreSQL `text`).
+    - **`TypeError`:** a `str` or `bytes` in place of a list, a non-`int` `batch_size` (`bool` and `float` included), or a non-`str` prefix.
+  - **The caller's sequence is read once and never changed.** Items are not copied, following the read-only payload convention (DEC-026).
+  - **No limits:** there is no default batch size and no maximum item count, batch size or payload size.
+- **WHY:**
+  - **Determinism is what idempotent replay needs.** Positional slicing is deterministic for any JSON item, and DEC-025 accepts a replay only when the resulting tasks are equal.
+  - **Index-derived, zero-padded keys** need no item identity, never collide, and list in batch order.
+  - **The offset** lets later aggregation map results back to input positions, whatever order the batches are claimed in (DEC-033).
+  - **Mechanism now, policy later.** It is independent of any workload. Choosing batch sizes and limits needs the Day 5 synthetic workload and its measurements.
+- **RUNNER-UP:** keys derived from item identity: a caller-supplied id per item, with each batch keyed by its first item's id or by a hash of its content.
+- **WHY NOT:**
+  - it needs an item-identity contract the engine does not have;
+  - hashed keys do not list in input order;
+  - identical batches would collide;
+  - it is harder to keep deterministic.
+- **TRADE-OFF:**
+  - **Positional keys tie a task to its place in the input.** Inserting an item shifts every later batch, so a changed input under the same idempotency key is a conflict, not a partial reuse. That is correct for an immutable job.
+  - **Key width depends on the batch count,** which is stable for a given input.
+  - **PostgreSQL compares tasks, not settings.** A different `batch_size` replays when it yields the same tasks (for example, any size at least the item count) and conflicts when it does not.
+  - **Large jobs are easy to build before any size bounds are measured** (BS-05). A job is still one transaction, and a replay compares every task (DEC-024, DEC-025).
+  - **Items within a batch are one handler call's work.**
+- **VERIFICATION:**
+  - **`tests/unit/test_partitioning.py`:**
+    - **exhaustively, for every length from 1 to 200 and every batch size from 1 to n+2:** the batches reproduce the input in order with repeats; the count is ⌈n / size⌉; every batch but the last is full; the offsets are index × size; the keys are unique and already sorted; `max_attempts` is constant;
+    - **key padding:** one, ten, eleven and 101 batches;
+    - **exact values:** an exact multiple, a shorter last batch, a batch larger than the input, and exact `TaskSpec` values with repeats;
+    - **determinism:** equal output for equal input, from a list or a tuple, with the caller's list unchanged; different batch sizes that make the same tasks give equal tasks;
+    - **pass-through and validity:** `max_attempts` 1, 3 and 100 pass through, and the tasks form a valid `JobSubmission`;
+    - **refusals:** empty input (list and tuple); seven non-sequences (`str`, `bytes`, `bytearray`, a set, a generator, a dict, an int); eight bad batch sizes (0, −1, `True`, `False`, 1.5, 2.0, `"2"`, `None`); five bad prefixes.
+  - **`tests/integration/test_job_submission.py`** (real PostgreSQL):
+    - 23 items in batches of 2 are stored as 12 tasks, which `list_tasks` returns as `batch-00` … `batch-11`, with the right offsets, every item in order and `max_attempts` stored;
+    - under one idempotency key, batch sizes 6 and 100 replay a size-5 submission of five items (`created=False`, the same job), while size 2 raises `IdempotencyConflictError` and stores nothing.
+  - **Mutation checks:** locally, each of these failed tests, with the file restored by hash:
+    - no zero-padding;
+    - per-batch instead of per-item offsets;
+    - a dropped last batch;
+    - reordered items;
+    - accepting a `bool` batch size;
+    - accepting empty input;
+    - accepting a NUL prefix.

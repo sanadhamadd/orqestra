@@ -102,7 +102,7 @@ detect this: after `running → queued → running`, the state matches again.
   no longer holds its attempt's row lock indefinitely, and a recovering worker that meets
   a held lock retries instead of being ended by its watchdog. Other clients' sessions are
   not bounded by this.
-- Implemented and verified locally only (Day 3B Slice B3): `orqestra worker run` starts
+- Implemented and verified locally and in GitHub CI (PR #15): `orqestra worker run` starts
   a worker for explicitly named built-in kinds after a read-only check that the schema's
   migration history equals the packaged one exactly; it never migrates and refuses to
   start against any other history (DEC-051).

@@ -21,7 +21,8 @@ from psycopg import IsolationLevel, errors, sql
 from psycopg.pq import TransactionStatus
 from psycopg.rows import TupleRow, dict_row
 
-from orqestra.domain.jobs import JobSubmission, TaskSpec
+from orqestra.domain.jobs import JobSubmission, JsonValue, TaskSpec
+from orqestra.domain.partitioning import partition
 from orqestra.domain.states import TaskState
 from orqestra.persistence.jobs import (
     IdempotencyConflictError,
@@ -767,3 +768,49 @@ def test_a_connection_lost_mid_submission_stores_nothing(
 
     assert counts(db) == (0, 0)
     assert submit_job(db, submission("c", key="k")).created  # the key was never taken
+
+
+# --- partitioned submissions (DEC-052) --------------------------------------------------------
+
+
+def stored_batches(db: Conn, job_id: uuid.UUID) -> list[tuple[str, int, list[Any]]]:
+    """Each stored task's key, offset and items, as ``list_tasks`` orders them."""
+    found = []
+    for task in list_tasks(db, job_id):
+        assert isinstance(task.payload, dict)
+        offset, items = task.payload["offset"], task.payload["items"]
+        assert isinstance(offset, int)
+        assert isinstance(items, list)
+        found.append((task.task_key, offset, items))
+    return found
+
+
+def test_a_partitioned_job_stores_its_batches_in_order(db: Conn) -> None:
+    items: list[JsonValue] = [i % 4 for i in range(23)]  # repeats kept
+    result = submit_job(db, JobSubmission(KIND, partition(items, batch_size=2, max_attempts=3)))
+    batches = stored_batches(db, result.job.id)
+    assert len(batches) == 12  # ceil(23 / 2)
+    assert [key for key, _, _ in batches] == [f"batch-{i:02d}" for i in range(12)]
+    assert [offset for _, offset, _ in batches] == list(range(0, 23, 2))
+    assert [x for _, _, chunk in batches for x in chunk] == items  # in order, as given
+    assert {task.max_attempts for task in list_tasks(db, result.job.id)} == {3}
+
+
+def test_a_partitioned_submission_replays_by_its_tasks_not_its_settings(db: Conn) -> None:
+    items: list[JsonValue] = [{"id": i} for i in range(5)]
+    key = f"partitioned-{secrets.token_hex(4)}"
+
+    def submit(batch_size: int) -> SubmissionResult:
+        tasks = partition(items, batch_size=batch_size, max_attempts=3)
+        return submit_job(db, JobSubmission(KIND, tasks, idempotency_key=key))
+
+    first = submit(5)  # one batch of all five items
+    assert first.created
+    before = counts(db)
+    for same_tasks in (5, 6, 100):  # every batch size of 5 or more makes the same one task
+        replay = submit(same_tasks)
+        assert (replay.created, replay.job.id) == (False, first.job.id)
+    with pytest.raises(IdempotencyConflictError):
+        submit(2)  # different tasks under the same key
+    assert counts(db) == before  # nothing was added or changed
+    assert stored_batches(db, first.job.id) == [("batch-0", 0, items)]
