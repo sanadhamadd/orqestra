@@ -33,7 +33,15 @@ from orqestra.domain.jobs import Task
 from orqestra.persistence.lifecycle import request_cancellation, revoke_next_expired
 from orqestra.worker.fence import ExitCode
 from tests.integration.pg_proxy import PgProxy
-from tests.integration.test_worker_runtime import WAIT, eventually, rows, submit, task_states
+from tests.integration.test_worker_runtime import (
+    WAIT,
+    backend_alive,
+    eventually,
+    row_locked,
+    rows,
+    submit,
+    task_states,
+)
 from tests.integration.worker_process import HANDLER_RUNS
 
 pytestmark = pytest.mark.integration
@@ -48,6 +56,7 @@ ENVIRONMENT = {
     "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT5M",
     "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT1S",
     "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT0.8S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.3S",
     "ORQESTRA_WORKER_FENCE_MARGIN": "PT1S",
     "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.1S",
     "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT1S",
@@ -79,22 +88,22 @@ class WorkerProcess:
         )
         self._read = ""  # log text read before the process ended
 
-    def wait_for(self, event: str) -> dict[str, Any]:
-        """Read the log (bounded) until a line with ``event`` appears; return that line."""
+    def wait_for(self, *events: str) -> dict[str, Any]:
+        """Read the log (bounded) until a line with one of ``events`` appears; return it."""
         assert self.process.stderr is not None
         fd = self.process.stderr.fileno()  # read raw, so no text buffer hides a line
         deadline = time.monotonic() + WAIT
         while (left := deadline - time.monotonic()) > 0:
             *complete, _ = self._read.split("\n")
             for line in complete:
-                if line.startswith("{") and json.loads(line).get("event") == event:
+                if line.startswith("{") and json.loads(line).get("event") in events:
                     return dict(json.loads(line))
             if select.select([fd], [], [], left)[0]:
                 chunk = os.read(fd, 65536)
                 if not chunk:
                     break
                 self._read += chunk.decode()
-        pytest.fail(f"the worker did not log {event}")
+        pytest.fail(f"the worker logged none of {events}")
 
     def exit(self) -> tuple[int, list[dict[str, Any]]]:
         """Wait (bounded) for the process to end; its exit code and its JSON log lines."""
@@ -429,3 +438,91 @@ def test_a_zero_shutdown_timeout_ends_a_busy_process_at_once(
     assert lines[-1]["event"] == "drain_deadline_passed"
     assert task_states(handler_db, [task]) == [("running", 1)]
     assert no_failure_recorded(handler_db, task)
+
+
+# --- a worker frozen inside a transaction (DEC-050) ---------------------------------------
+
+# Test values only (DEC-034): a 2 s database bound leaves time to prove the frozen
+# transaction holds its lock before PostgreSQL ends it; 3 + 2 + 1 < 8 and 0.5 < 2.
+FROZEN = {
+    "ORQESTRA_WORKER_LEASE": "PT8S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT3S",
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT2S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT1S",
+}
+RENEWAL = b"UPDATE attempts SET lease_expires_at"  # the heartbeat's write, after its row lock
+
+
+def test_a_worker_frozen_mid_heartbeat_is_recovered_and_cannot_overwrite(
+    schema_url: str, handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key}, max_attempts=3)
+    with PgProxy(schema_url) as proxy:
+        frozen = start(proxy.url(schema_url), FROZEN)
+        eventually(lambda: runs(handler_db) == 1, "the handler")
+        ((attempt_id, lease_before),) = rows(
+            handler_db, "SELECT id, lease_expires_at FROM attempts WHERE task_id = %s", task.id
+        )
+        proxy.hold_on(RENEWAL)
+        assert proxy.held.wait(WAIT)  # the heartbeat holds the row lock, its write is in hand
+        os.kill(frozen.process.pid, signal.SIGSTOP)  # frozen: no watchdog, no COMMIT
+        proxy.resume()  # the write reaches PostgreSQL; nothing after it ever will
+        # The vulnerable window was hit: an idle transaction holds the attempt's row.
+        ((pid,),) = eventually(
+            lambda: rows(
+                handler_db,
+                "SELECT pid FROM pg_stat_activity WHERE application_name = 'orqestra-worker' "
+                "AND state = 'idle in transaction' AND query LIKE %s",
+                RENEWAL.decode() + "%",
+            ),
+            "the frozen transaction",
+        )
+        assert row_locked(handler_db, "attempts", attempt_id)
+        healthy = start(schema_url, FROZEN)  # straight to the database
+        # PostgreSQL ends the abandoned session; its uncommitted renewal rolls back.
+        eventually(lambda: not backend_alive(handler_db, pid), "the frozen session to end")
+        assert not row_locked(handler_db, "attempts", attempt_id)
+        assert rows(
+            handler_db, "SELECT lease_expires_at FROM attempts WHERE id = %s", attempt_id
+        ) == [(lease_before,)]
+        # The healthy worker recovers it once the lease ends, and runs the next generation.
+        eventually(lambda: runs(handler_db) == 2, "recovery and a rerun")
+        gate.release()
+        eventually(lambda: task_states(handler_db, [task]) == [("succeeded", 2)], "the task")
+        assert healthy.process.poll() is None  # it never died
+        settled = rows(
+            handler_db,
+            "SELECT attempt_number, state, revoked_reason, finished_at FROM attempts "
+            "WHERE task_id = %s ORDER BY attempt_number",
+            task.id,
+        )
+        result = rows(handler_db, "SELECT result FROM tasks WHERE id = %s", task.id)
+        assert [row[:3] for row in settled] == [
+            (1, "revoked", "lease_expired"),
+            (2, "succeeded", None),
+        ]
+        # Resumed, it never counts. Its watchdog ends it at once (its frozen call's operation
+        # deadline, exit 4, or, if the supervisor first meets the closed session, its
+        # ownership deadline, exit 3); or, if its handler ends first, its write is refused.
+        os.kill(frozen.process.pid, signal.SIGCONT)
+        ended = {"operation_deadline_passed": ExitCode.STALLED}
+        ended["ownership_deadline_passed"] = ExitCode.FENCED
+        line = frozen.wait_for(*ended, "outcome_discarded")
+        if line["event"] in ended:
+            assert frozen.exit()[0] == ended[line["event"]]
+    assert (
+        rows(
+            handler_db,
+            "SELECT attempt_number, state, revoked_reason, finished_at FROM attempts "
+            "WHERE task_id = %s ORDER BY attempt_number",
+            task.id,
+        )
+        == settled
+    )
+    assert rows(handler_db, "SELECT result FROM tasks WHERE id = %s", task.id) == result
+    assert rows(handler_db, "SELECT count(*) FROM attempts WHERE state = 'succeeded'") == [(1,)]
+    healthy.process.send_signal(signal.SIGTERM)
+    code, lines = healthy.exit()
+    assert code == 0
+    assert not any(line.get("event") == "operation_deadline_passed" for line in lines)

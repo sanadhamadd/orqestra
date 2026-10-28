@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-049
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-050
 
 ## Context
 
@@ -90,12 +90,18 @@ detect this: after `running → queued → running`, the state matches again.
   heartbeat that confirms a committed request restricts the fence to the end of the grace
   period and then tells the handler through its read-only signal; a handler that
   cooperates ends the attempt cancelled. Notice is only as timely as heartbeats (DEC-048).
-- Implemented and verified locally only (Day 3B Slice B2b): graceful, bounded shutdown. A
+- Implemented and verified locally and in GitHub CI (PR #13): graceful, bounded shutdown. A
   stop request (SIGTERM or SIGINT) is latched by the supervisor, which then claims and
   starts nothing; the task it holds is drained and settled through PostgreSQL, or a drain
   guard ends the process (exit 9) and recovery takes the attempt after its lease, using
   one attempt of its budget. Shutdown writes nothing and never cancels or fails a task
   (DEC-049).
+- Implemented and verified locally only (recovery correction, DEC-050): worker supervisor
+  sessions carry a `lock_timeout` shorter than `db_operation_timeout` and an
+  `idle_in_transaction_session_timeout` equal to it. A worker frozen inside a transaction
+  no longer holds its attempt's row lock indefinitely, and a recovering worker that meets
+  a held lock retries instead of being ended by its watchdog. Other clients' sessions are
+  not bounded by this.
 - Not yet implemented, and not proven by the current tests:
   - a command or service that runs workers;
   - stopping handlers that hold the GIL or detach processes;

@@ -61,6 +61,7 @@ SETTINGS = WorkerSettings(
     execution_timeout=timedelta(minutes=10),
     heartbeat_interval=timedelta(seconds=5),
     db_operation_timeout=timedelta(seconds=2),
+    lock_timeout=timedelta(seconds=1),
     fence_margin=timedelta(seconds=3),
     poll_interval=timedelta(seconds=1),
     recovery_interval=timedelta(seconds=10),
@@ -266,31 +267,43 @@ def settings_with(db_timeout: timedelta) -> WorkerSettings:
 def test_the_supervisor_connection_keeps_options_and_adds_its_bounds() -> None:
     url = "postgresql://localhost/orqestra_test?options=-c%20search_path%3Dmy_schema"
     params = conninfo_to_dict(supervisor_conninfo(url, SETTINGS))
-    assert params["options"] == "-c search_path=my_schema -c statement_timeout=2000"
+    assert params["options"] == (
+        "-c search_path=my_schema -c statement_timeout=2000 -c lock_timeout=1000 "
+        "-c idle_in_transaction_session_timeout=2000"
+    )
     assert params["connect_timeout"] == "2"
     assert params["application_name"] == "orqestra-worker"
     assert params["dbname"] == "orqestra_test"
 
 
 @pytest.mark.parametrize(
-    ("db_timeout", "statement", "connect"),
+    ("db_timeout", "lock_timeout", "statement", "lock", "connect"),
     [
-        (timedelta(microseconds=1_500), "2", "2"),  # rounded up to whole milliseconds
-        (timedelta(milliseconds=500), "500", "2"),  # libpq's minimum is 2 s
-        (timedelta(seconds=2.5), "2500", "3"),
+        # rounded up to whole milliseconds
+        (timedelta(microseconds=1_500), timedelta(milliseconds=1), "2", "1", "2"),
+        (timedelta(milliseconds=500), timedelta(microseconds=1_001), "500", "2", "2"),  # libpq: 2 s
+        (timedelta(seconds=2.5), timedelta(seconds=1), "2500", "1000", "3"),
+        # exact: floating point would make 2007 ms 2008
+        (timedelta(milliseconds=2_007), timedelta(milliseconds=2_006), "2007", "2006", "3"),
     ],
 )
-def test_bounds_are_rounded_up(db_timeout: timedelta, statement: str, connect: str) -> None:
+def test_bounds_are_rounded_up(
+    db_timeout: timedelta, lock_timeout: timedelta, statement: str, lock: str, connect: str
+) -> None:
     settings = WorkerSettings(
         _env_file=None,
         **{
             **SETTINGS.model_dump(),
             "db_operation_timeout": db_timeout,
+            "lock_timeout": lock_timeout,
             "heartbeat_interval": timedelta(seconds=5),
         },
     )
     params = conninfo_to_dict(supervisor_conninfo("postgresql:///orqestra_test", settings))
-    assert params["options"] == f"-c statement_timeout={statement}"
+    assert params["options"] == (
+        f"-c statement_timeout={statement} -c lock_timeout={lock} "
+        f"-c idle_in_transaction_session_timeout={statement}"
+    )
     assert params["connect_timeout"] == connect
 
 

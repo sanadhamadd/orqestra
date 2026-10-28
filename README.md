@@ -37,7 +37,10 @@ pull request (run 40487174691) and for `main` (run 40488034469). Day 3B Slice B2
 (run 40524368913). Day 3B Slice B2a-2 (cooperative cancellation) was merged in PR #12
 (merge commit `308bb0a`), with both CI lanes passing for the pull request (run
 40598713849) and for `main` (run 40599609791). Day 3B Slice B2b (graceful, bounded
-shutdown) is implemented and verified locally only; it has not yet run in GitHub CI. There
+shutdown) was merged in PR #13 (merge commit `155d319`), with both CI lanes passing for
+the pull request (run 40669564020) and for `main` (run 40671619033). A recovery
+correction for workers frozen inside a database transaction (DEC-050) is implemented and
+verified locally only; it has not yet run in GitHub CI. There
 is no command or service that runs a worker yet. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
 claim about shipped behaviour.
 
@@ -278,8 +281,11 @@ registry = HandlerRegistry({"invoice_verification": verify_invoice})
 - `WorkerSettings` reads the worker's timing settings from `ORQESTRA_WORKER_*` variables
   (durations as ISO 8601, such as `PT30S`). Every value is required; there are no
   defaults. It checks the lease rules, that a database call ends before the next
-  heartbeat is due, and that `heartbeat_interval + db_operation_timeout + fence_margin` is
-  shorter than the lease. The worker will use the existing `ORQESTRA_DATABASE_URL`.
+  heartbeat is due, that `heartbeat_interval + db_operation_timeout + fence_margin` is
+  shorter than the lease, and that `lock_timeout` is at least 1 ms and, in the whole
+  milliseconds PostgreSQL uses (rounded up), strictly shorter than
+  `db_operation_timeout`; so `db_operation_timeout` is at least 2 ms. The worker will use
+  the existing `ORQESTRA_DATABASE_URL`.
 
 ### Worker runtime (first slice)
 
@@ -306,10 +312,25 @@ Without signals, `worker.run()` works until `worker.request_stop()` is called fr
 any thread.
 
 - **Supervisor and handler thread.** The calling thread is the supervisor. It alone
-  uses one autocommit connection, with `statement_timeout` set from
-  `db_operation_timeout`. It claims a task of a supported kind
+  uses one autocommit connection. It claims a task of a supported kind
   (`kinds=registry.kinds`), reads its payload, and runs its handler on a separate thread
   with no database connection. It never claims again until that task is settled.
+- **The supervisor's server-side bounds** (DEC-050), in whole milliseconds rounded up:
+  - `statement_timeout` = `db_operation_timeout`;
+  - `lock_timeout` = `lock_timeout`, shorter: a supervisor statement waiting for a row
+    lock ordinarily gets `LockNotAvailable` (`55P03`) and the existing path retries it
+    (an unconfirmed heartbeat, a completion retried, a failed sweep or claim) instead of
+    being ended by the watchdog with exit 4. This is not a timing guarantee: the
+    watchdog bounds the whole call, so earlier statements, the network and scheduling can
+    use up the difference, and the watchdog may still end the process first;
+  - `idle_in_transaction_session_timeout` = `db_operation_timeout`: if the worker is
+    frozen, killed or cut off between two statements of a transaction, PostgreSQL ends
+    its session, rolls the transaction back and releases its locks, so recovery can
+    revoke its attempt.
+
+  Both are needed. Before them, a worker frozen inside its heartbeat transaction kept
+  its attempt's row lock indefinitely, and every worker that tried to recover that
+  attempt waited for the lock until its own watchdog ended it (exit 4).
 - **Schedule.** While a handler runs, the supervisor renews the lease every
   `heartbeat_interval` and runs recovery sweeps (at most `recovery_batch_limit`
   revocations every `recovery_interval`), idle or busy. A sweep step starts only if it
@@ -494,6 +515,18 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   types are accepted (a `tuple`, a `str` enum or a `dict` subclass is refused rather than
   converted), and nesting deeper than about 1,000 levels is refused. Results and failure
   messages have no size limit yet.
+- **Lock and idle-transaction bounds (DEC-050) are bounds, not a recovery-time promise.**
+  - They protect worker supervisor sessions only. Other clients (a cancellation request
+    in progress, a migration, a person in `psql`) can still hold task or attempt locks
+    for as long as their sessions allow; workers then retry, and a worker whose heartbeat
+    cannot get its lock for longer than its lease fences itself.
+  - `idle_in_transaction_session_timeout` ends any supervisor session paused between two
+    statements of a transaction for `db_operation_timeout`, whatever the cause. A
+    supervisor that is running cannot pause that long inside its transaction without its
+    operation guard ending the process first; a paused process (SIGSTOP, a suspended VM
+    or container, a debugger) loses its session and its transaction rolls back.
+  - Timing still depends on scheduling and the network: the settings relationships do not
+    guarantee that a delay cannot outlast the watchdog's deadline.
 - A heartbeat proves the worker is alive, not that its work progresses: a stuck handler
   keeps renewing its lease until the deadline, and only then is revoked.
 - A database outage longer than the lease makes every live attempt revocable once the
