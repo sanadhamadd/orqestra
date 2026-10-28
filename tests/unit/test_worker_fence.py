@@ -137,6 +137,20 @@ def test_the_earliest_of_two_guards_fires_and_both_are_disarmed() -> None:
     assert len(recorder.expiries) == 1
 
 
+@pytest.mark.parametrize("first", list(Guard))
+def test_with_three_guards_armed_the_earliest_deadline_fires(first: Guard) -> None:
+    clock = FakeClock()
+    dog, recorder = watchdog(clock)
+    for guard in Guard:
+        dog.arm(guard, 110.0 if guard is first else 120.0, {**CONTEXT, "guard": guard.value})
+    clock.now = 130.0
+    expiry = dog.check()
+    assert expiry is not None
+    assert (expiry.guard, expiry.deadline, expiry.context["guard"]) == (first, 110.0, first.value)
+    assert all(dog.deadline(guard) is None for guard in Guard)
+    assert len(recorder.expiries) == 1
+
+
 # --- the thread ------------------------------------------------------------------------------
 
 
@@ -232,6 +246,7 @@ def test_end_process_writes_one_json_line_then_exits_with_the_code(
     [
         (Guard.OWNERSHIP, ExitCode.FENCED, "ownership_deadline_passed"),
         (Guard.OPERATION, ExitCode.STALLED, "operation_deadline_passed"),
+        (Guard.DRAIN, ExitCode.SHUTDOWN, "drain_deadline_passed"),
     ],
 )
 def test_the_default_terminate_ends_the_process_for_each_guard(
@@ -344,4 +359,5 @@ def test_exit_codes_are_stable() -> None:
         "AMBIGUOUS": 6,
         "DEFECT": 7,
         "UNRECORDED": 8,
+        "SHUTDOWN": 9,
     }

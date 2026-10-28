@@ -67,7 +67,8 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   versions are the constraint the database cannot enforce: stop all application processes,
   run `orqestra migrate`, then start only code from Slice 3 or later, because older code
   cannot read the `cancellation_grace_expired` reason and does not stop heartbeats after
-  a cancellation request. Stopping claims and draining work first is preferable.
+  a cancellation request. Stopping claims and draining work first is preferable: SIGTERM
+  drains a worker (DEC-049).
 
 ## Distributed correctness
 
@@ -95,6 +96,17 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 - "Ended before its lease" is checked against PostgreSQL's own clock and the stored
   `lease_expires_at`, with a margin of at least the fencing margin. Worker test timings
   are test values only, not recommendations (DEC-034).
+- Signals in process tests are sent only after the worker has logged `worker_started`
+  (its handlers are installed by then), never on a timer, and shutdown timings are read
+  from the worker's own log timestamps rather than the database clock. Unit tests that
+  send a signal to the test process first install a recording handler for it, so a stray
+  signal can never end the test run.
+- Stopping a worker (DEC-049): send SIGTERM or SIGINT once. It finishes the task it holds
+  within `shutdown_timeout`, then exits 0; otherwise, or on a second signal, it exits 9 and
+  recovery takes the attempt after its lease ends, using one attempt of its budget. A
+  supervisor (systemd, Kubernetes) must allow more than `db_operation_timeout +
+  shutdown_timeout`, plus exit time, before it kills the process; no production values are
+  approved yet.
 
 ## Invoice and AI workloads
 

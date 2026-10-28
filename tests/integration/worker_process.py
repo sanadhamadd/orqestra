@@ -1,7 +1,8 @@
 """A worker process for the process-level tests: ``python -m tests.integration.worker_process``.
 
-Test-only. It runs a real ``Worker``, whose default ``terminate`` and watchdog
-end the process with ``os._exit``, against the URL in
+Test-only. It runs a real ``Worker`` under ``run_until_signalled``, so SIGTERM
+and SIGINT stop it gracefully (DEC-049); its default ``terminate`` and watchdog
+end the process with ``os._exit``. It works against the URL in
 ``ORQESTRA_TEST_WORKER_URL`` (possibly through a ``PgProxy``), with timing
 from the ``ORQESTRA_WORKER_*`` variables. Its handlers coordinate with the
 test through their own connection to ``ORQESTRA_TEST_HANDLER_URL``:
@@ -16,7 +17,6 @@ test through their own connection to ``ORQESTRA_TEST_HANDLER_URL``:
 
 import functools
 import os
-import threading
 
 import psycopg
 
@@ -25,6 +25,7 @@ from orqestra.logging import configure_logging
 from orqestra.worker.handlers import HandlerCancelled, HandlerRegistry, TaskContext
 from orqestra.worker.runtime import Worker, connect_supervisor
 from orqestra.worker.settings import WorkerSettings
+from orqestra.worker.shutdown import run_until_signalled
 
 HANDLER_RUNS = (
     "CREATE TABLE handler_runs "
@@ -67,7 +68,7 @@ def main() -> None:
         settings=settings,
         connect=functools.partial(connect_supervisor, url, settings),
     )
-    worker.run(threading.Event())  # runs until the process ends or is killed
+    run_until_signalled(worker)  # until a signal stops it, or the process ends
 
 
 if __name__ == "__main__":

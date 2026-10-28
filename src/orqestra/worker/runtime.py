@@ -24,17 +24,28 @@ event, which the handler sees through its read-only ``CancellationSignal``.
 Notice arrives only with a heartbeat, so it is not guaranteed before the
 grace period ends.
 
-Not in this slice (Day 3B, later): graceful shutdown with draining, and a
-command to run a worker.
+Shutdown is graceful and bounded (DEC-049). ``request_stop`` only sets a flag
+and wakes the supervisor; the supervisor latches the request at its next step,
+and from then on sends no claim, starts no handler and starts no sweep. A task
+it already holds is drained: heartbeats, completion and reconciliation go on,
+and the watchdog's drain guard ends the process (exit 9) if the task is not
+settled within ``shutdown_timeout`` of the latch. Shutdown never cancels or
+fails a task and writes nothing; an abandoned attempt is left to recovery.
+``shutdown.py`` turns SIGTERM and SIGINT into stop requests.
+
+Not in this slice (Day 3B, later): a command to run a worker.
 """
 
+import contextlib
 import logging
 import math
 import os
+import select
 import socket
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -97,6 +108,14 @@ class ConnectionUnavailable(Exception):  # noqa: N818 - it names a state, not an
     """The supervisor could not connect; nothing was sent to the database."""
 
 
+class UncontrolledExitError(RuntimeError):
+    """``SystemExit`` with a success code escaped the supervisor without a controlled stop.
+
+    ``run`` raises this instead, so an unexpected exit can never end the
+    process with status 0 (DEC-049).
+    """
+
+
 class Step(StrEnum):
     """What the supervisor does next."""
 
@@ -105,6 +124,7 @@ class Step(StrEnum):
     SWEEP = "sweep"
     CLAIM = "claim"
     STOP = "stop"
+    ABANDON = "abandon"  # a stopping worker's drain deadline passed with its task unsettled
     WAIT = "wait"
 
 
@@ -115,7 +135,8 @@ class Timing:
     now: float
     running: bool  # a handler thread is executing
     completing: bool  # a handler has finished and its outcome is not yet settled
-    stop_requested: bool
+    stopping: bool  # a stop request has been latched (DEC-049)
+    drain_due: float | None  # while a stopping worker holds a task: its drain deadline
     heartbeat_due: float | None  # None: the lease is no longer renewed
     completion_due: float
     sweep_due: float  # a sweep in progress is due at once
@@ -126,35 +147,53 @@ class Timing:
 def next_step(timing: Timing) -> tuple[Step, float]:
     """The supervisor's next step, and for ``WAIT`` how many seconds to wait.
 
-    In order: a finished handler's completion; a running handler's heartbeat;
-    a recovery sweep step, which while a handler runs starts only if it can
-    take its full ``sweep_reserve`` and still end before the next heartbeat is
-    due, so sweeps never delay a heartbeat; then, only when idle, a stop or a
-    claim. Every wait is finite.
+    A drain deadline that has passed comes first: the task is abandoned.
+    Then, in order: a finished handler's completion; a running handler's
+    heartbeat; a recovery sweep step, which while a handler runs starts only
+    if it can take its full ``sweep_reserve`` and still end before the next
+    heartbeat is due, so sweeps never delay a heartbeat; then, only when idle,
+    a stop or a claim. A stopping worker starts no sweep and no claim
+    (DEC-049). Every wait is finite and positive, and the supervisor's wake
+    pipe can end it sooner.
     """
     t = timing
+    if t.drain_due is not None and t.now >= t.drain_due:
+        return Step.ABANDON, 0.0
     if t.completing:
         if t.now >= t.completion_due:
             return Step.COMPLETE, 0.0
-        return Step.WAIT, t.completion_due - t.now
+        return Step.WAIT, _until(t, t.completion_due)
     if t.running:
         heartbeat = t.heartbeat_due
         if heartbeat is not None and t.now >= heartbeat:
             return Step.HEARTBEAT, 0.0
-        if t.now >= t.sweep_due and (heartbeat is None or heartbeat - t.now >= t.sweep_reserve):
+        sweeping = not t.stopping
+        if (
+            sweeping
+            and t.now >= t.sweep_due
+            and (heartbeat is None or heartbeat - t.now >= t.sweep_reserve)
+        ):
             return Step.SWEEP, 0.0
         # A sweep held back for the heartbeat waits for it; otherwise wake for either.
         wakes = [] if heartbeat is None else [heartbeat]
-        if t.sweep_due > t.now:
+        if sweeping and t.sweep_due > t.now:
             wakes.append(t.sweep_due)
-        return Step.WAIT, min(wakes) - t.now
-    if t.stop_requested:
+        return Step.WAIT, _until(t, *wakes)
+    if t.stopping:
         return Step.STOP, 0.0
     if t.now >= t.sweep_due:
         return Step.SWEEP, 0.0
     if t.now >= t.claim_due:
         return Step.CLAIM, 0.0
     return Step.WAIT, min(t.sweep_due, t.claim_due) - t.now
+
+
+def _until(t: Timing, *wakes: float) -> float:
+    """Seconds until the earliest of ``wakes`` and the drain deadline, if any."""
+    due = [*wakes] if t.drain_due is None else [*wakes, t.drain_due]
+    if not due:  # pragma: no cover - a stopping worker that holds a task has a drain deadline
+        return t.sweep_reserve
+    return min(due) - t.now
 
 
 class CompletionError(StrEnum):
@@ -251,6 +290,58 @@ class _Running:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Held:
+    """A claim that may hold an attempt whose handler never started (DEC-049)."""
+
+    attempt: Attempt | None  # None: the claim's answer was lost
+    until: float  # the local clock by which its lease has certainly ended
+
+
+def _close_pipe(*fds: int) -> None:
+    for fd in fds:
+        os.close(fd)
+
+
+class _Wake:
+    """A nonblocking self-pipe that ends the supervisor's waits early (DEC-049).
+
+    The handler thread when it ends, ``request_stop`` and, through
+    ``signal.set_wakeup_fd``, the C-level signal handler of whichever thread
+    receives a signal each write one byte. Writing takes no Python lock, so a
+    signal handler may do it. The supervisor empties the pipe before it reads
+    any state and then waits on it, so a wake that comes after the read ends
+    the wait at once, and none is lost.
+
+    The descriptors are closed only once this object is garbage. While
+    anything can still write to them (the worker, its handler thread, a signal
+    handler holding the worker), they stay open, so no write can ever reach a
+    closed or reused descriptor.
+    """
+
+    def __init__(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        os.set_blocking(write_fd, False)
+        self.read_fd, self.write_fd = read_fd, write_fd
+        self._poll = select.poll()
+        self._poll.register(read_fd, select.POLLIN)
+        weakref.finalize(self, _close_pipe, read_fd, write_fd)
+
+    def notify(self) -> None:
+        with contextlib.suppress(BlockingIOError):  # full: a wake is already pending
+            os.write(self.write_fd, b"\0")
+
+    def drain(self) -> None:
+        with contextlib.suppress(BlockingIOError):  # empty
+            while os.read(self.read_fd, 4096):
+                pass
+
+    def wait(self, seconds: float) -> None:
+        """Wait up to ``seconds`` (rounded up to whole milliseconds), or until woken."""
+        self._poll.poll(math.ceil(seconds * 1000))
+
+
 @dataclass(slots=True)
 class _Sweep:
     due: float
@@ -270,7 +361,8 @@ class Worker:
 
     ``connect`` opens a new supervisor connection in autocommit mode (see
     ``connect_supervisor``). ``clock``, ``watchdog`` and ``terminate`` are
-    injectable for tests; by default ``terminate`` ends the process.
+    injectable for tests; by default ``terminate`` ends the process. ``run``
+    works until ``request_stop`` is latched; a worker runs once.
     """
 
     def __init__(
@@ -295,20 +387,62 @@ class Worker:
         self._conn: Conn | None = None
         now = clock()
         self._schedule = _Schedule(sweep=_Sweep(due=now), claim_due=now)
+        self._wake = _Wake()
+        self._stop_requested = False  # set by request_stop; read by the supervisor only
+        self._stopping_at: float | None = None  # the latch (DEC-049)
+        self._drain_due: float | None = None
+        self._drain_token: int | None = None
+        self._held: _Held | None = None
+        self._finished = False
 
-    def run(self, stop: threading.Event) -> None:
-        """Work until ``stop`` is set while idle; a task already claimed is settled first."""
+    def request_stop(self) -> None:
+        """Ask the worker to stop; the supervisor latches the request at its next step.
+
+        Safe from a signal handler and from any thread: it sets a flag and
+        writes one byte to the wake pipe, and takes no lock. It never cancels
+        or fails the task the worker holds (DEC-049).
+        """
+        self._stop_requested = True
+        self._wake.notify()
+
+    @property
+    def finished(self) -> bool:
+        """Whether ``run`` has returned through a controlled stop."""
+        return self._finished
+
+    @property
+    def wakeup_fd(self) -> int:
+        """The wake pipe's write end, for ``signal.set_wakeup_fd`` (``shutdown.py``)."""
+        return self._wake.write_fd
+
+    def run(self) -> None:
+        """Work until a stop request is latched; a task already started is drained first.
+
+        It returns only through a controlled stop: no handler is running, and
+        each one this worker started has ended as PostgreSQL confirmed. A claim
+        whose handler never started may still hold an attempt; that is logged
+        (``stopped_with_unstarted_claim``) and left to recovery. Anything else
+        ends the process or raises (DEC-049).
+        """
         self._watchdog.start()
         self._event(logging.INFO, "worker_started", f"kinds={list(self._registry.kinds)}")
         try:
             while True:
-                step, seconds = next_step(self._timing(stop))
+                self._wake.drain()  # before any state is read, so no wake is lost
+                self._observe_stop()
+                step, seconds = next_step(self._timing())
                 if step is Step.STOP:
-                    self._event(logging.INFO, "worker_stopped")
+                    self._stopped()
                     return
                 if step is Step.WAIT:
-                    running = self._schedule.running
-                    (running.done if running is not None else stop).wait(seconds)
+                    self._wake.wait(seconds)
+                elif step is Step.ABANDON:
+                    self._terminate(
+                        ExitCode.SHUTDOWN,
+                        "drain_deadline_passed",
+                        "the drain deadline passed before the task was settled; recovery decides",
+                        self._require_running().context,
+                    )
                 elif step is Step.HEARTBEAT:
                     self._heartbeat(self._require_running())
                 elif step is Step.COMPLETE:
@@ -317,7 +451,7 @@ class Worker:
                     self._sweep()
                 else:
                     self._claim()
-        except BaseException:
+        except BaseException as exc:
             running = self._schedule.running
             if running is not None and not running.done.is_set():
                 # Nothing would supervise the handler any more: end the process.
@@ -327,21 +461,80 @@ class Worker:
                     "the supervisor stopped while a handler ran",
                     running.context,
                 )
+            if isinstance(exc, SystemExit) and exc.code in (None, 0):
+                # Never a silent success: only a controlled stop returns.
+                msg = "SystemExit with a success code ended the supervisor without a stop"
+                raise UncontrolledExitError(msg) from exc
             raise
         finally:
             self._close()
             self._watchdog.stop(self._bound())
 
+    # --- stopping -------------------------------------------------------------
+
+    def _observe_stop(self) -> bool:
+        """Latch a stop request, the shutdown's linearization point; True once latched.
+
+        From the latch on, the supervisor sends no claim and starts no handler
+        or sweep. A task it already holds, including one whose handler started
+        after the request but before this read, is drained: the drain guard
+        ends the process unless it is settled within ``shutdown_timeout``.
+        """
+        if self._stopping_at is None and self._stop_requested:
+            self._stopping_at = now = self._clock()
+            running = self._schedule.running
+            if running is None:
+                self._event(logging.INFO, "shutdown_requested", "idle")
+            else:
+                timeout = self._settings.shutdown_timeout.total_seconds()
+                self._drain_due = now + timeout
+                self._drain_token = self._watchdog.arm(
+                    Guard.DRAIN, self._drain_due, running.context
+                )
+                self._event(
+                    logging.INFO,
+                    "shutdown_requested",
+                    f"draining: the task has {timeout}s to settle",
+                    running.context,
+                )
+        return self._stopping_at is not None
+
+    def _stopped(self) -> None:
+        held = self._held
+        if held is not None and self._clock() < held.until:
+            # Exit 0 does not mean every claim is settled: say which one is not.
+            if held.attempt is None:
+                self._event(
+                    logging.WARNING,
+                    "stopped_with_uncertain_claim",
+                    "a claim's answer was lost; if it committed, recovery revokes that attempt "
+                    "once its lease ends, using one attempt of its task's budget",
+                )
+            else:
+                lease_expires_at, _ = _lease(held.attempt)
+                self._event(
+                    logging.WARNING,
+                    "stopped_with_unstarted_claim",
+                    f"generation={held.attempt.attempt_number} "
+                    f"lease_expires_at={lease_expires_at.isoformat()}: its handler never "
+                    "started; recovery revokes it once its lease ends, using one attempt of its "
+                    "task's budget",
+                    self._context(held.attempt),
+                )
+        self._finished = True
+        self._event(logging.INFO, "worker_stopped")
+
     # --- scheduling -----------------------------------------------------------
 
-    def _timing(self, stop: threading.Event) -> Timing:
+    def _timing(self) -> Timing:
         running = self._schedule.running
         busy = running is not None and not running.done.is_set()
         return Timing(
             now=self._clock(),
             running=busy,
             completing=running is not None and not busy,
-            stop_requested=stop.is_set(),
+            stopping=self._stopping_at is not None,
+            drain_due=self._drain_due,
             heartbeat_due=running.heartbeat_due if running is not None else None,
             completion_due=running.completion_due if running is not None else 0.0,
             sweep_due=self._schedule.sweep.due,
@@ -369,7 +562,9 @@ class Worker:
                 # The claim may have committed. Claim nothing else until any such
                 # attempt's lease has certainly ended; recovery then takes it back.
                 self._event(logging.WARNING, "claim_uncertain", type(exc).__name__)
-                self._schedule.claim_due = self._clock() + self._policy.lease.total_seconds()
+                until = self._clock() + self._policy.lease.total_seconds()
+                self._held = _Held(None, until)
+                self._schedule.claim_due = until
             else:
                 self._event(logging.WARNING, "claim_failed", type(exc).__name__)
                 self._schedule.claim_due = self._clock() + poll
@@ -382,8 +577,14 @@ class Worker:
         self._event(
             logging.INFO, "attempt_claimed", f"generation={attempt.attempt_number}", context
         )
+        # A stop is looked for after each database call of this step, so it is
+        # latched no more than one call after it was requested (DEC-049).
+        if self._stopping_before_start(attempt, returned, context):
+            return
         try:
             task = self._call("read_task", lambda conn: get_task(conn, attempt.task_id), context)
+            if task is not None and self._stopping_before_start(attempt, returned, context):
+                return
             job = (
                 None
                 if task is None
@@ -404,6 +605,16 @@ class Worker:
         if not self._start(attempt, anchor, context, task.payload, job.kind):
             self._hold(attempt, returned)
 
+    def _stopping_before_start(
+        self, attempt: Attempt, returned: float, context: Mapping[str, str]
+    ) -> bool:
+        """True, holding ``attempt`` unstarted, if a stop is latched before its handler starts."""
+        if not self._observe_stop():
+            return False
+        self._event(logging.WARNING, "claimed_task_not_started", "stopping", context)
+        self._hold(attempt, returned)
+        return True
+
     def _hold(self, attempt: Attempt, returned: float) -> None:
         """Claim nothing else until ``attempt``'s lease has certainly ended.
 
@@ -413,8 +624,9 @@ class Worker:
         this waits at least until the real end of the lease.
         """
         lease_expires_at, _ = _lease(attempt)
-        held = (lease_expires_at - attempt.started_at).total_seconds()
-        self._schedule.claim_due = returned + held
+        until = returned + (lease_expires_at - attempt.started_at).total_seconds()
+        self._held = _Held(attempt, until)
+        self._schedule.claim_due = until
 
     def _start(
         self,
@@ -424,7 +636,14 @@ class Worker:
         payload: JsonValue,
         kind: str,
     ) -> bool:
-        """Start the handler under the ownership guard; False if too little lease is left."""
+        """Start the handler under the ownership guard; False if it must not start.
+
+        It must not start once a stop is latched (this is the last read before
+        ``thread.start``), or if too little of the lease is left.
+        """
+        if self._observe_stop():
+            self._event(logging.WARNING, "claimed_task_not_started", "stopping", context)
+            return False
         lease_expires_at, _ = _lease(attempt)
         deadline = (
             local_deadline(anchor=anchor, started_at=attempt.started_at, instant=lease_expires_at)
@@ -446,6 +665,7 @@ class Worker:
         )
         done = threading.Event()
         outcome: list[HandlerOutcome] = []
+        wake = self._wake
 
         def execute() -> None:
             try:
@@ -453,6 +673,7 @@ class Worker:
             finally:
                 self._watchdog.disarm(token)  # the protected execution has ended
                 done.set()
+                wake.notify()  # the supervisor records the outcome at once
 
         thread = threading.Thread(
             target=execute, name=f"orqestra-handler-{attempt.id}", daemon=True
@@ -574,7 +795,9 @@ class Worker:
                     f"the recorded completion is {evidence.value}",
                     running.context,
                 )
-            # Still running: nothing committed, so write the same outcome again.
+            # Still running: nothing committed, so write the same outcome again. A
+            # stop requested during the read is latched before that write (DEC-049).
+            self._observe_stop()
         attempt = running.attempt
         try:
             completion = self._call(
@@ -694,6 +917,10 @@ class Worker:
     def _settled(self) -> None:
         self._schedule.running = None
         self._schedule.claim_due = self._clock()
+        if self._drain_token is not None:
+            # Settled while stopping: the drain guard has done its job (DEC-049).
+            self._watchdog.disarm(self._drain_token)
+            self._drain_token = self._drain_due = None
 
     # --- recovery -------------------------------------------------------------------------
 
