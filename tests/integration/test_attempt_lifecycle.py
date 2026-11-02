@@ -41,7 +41,7 @@ from orqestra.domain.jobs import (
 )
 from orqestra.domain.leases import LeasePolicy, RevocationReason
 from orqestra.domain.policy import FailureKind
-from orqestra.domain.retry import RetryPolicy, retry_delay
+from orqestra.domain.retry import RetryPolicy, retry_at, retry_delay
 from orqestra.domain.states import AttemptState, TaskState
 from orqestra.persistence import lifecycle
 from orqestra.persistence.jobs import get_job_progress, get_task, list_tasks, submit_job
@@ -3326,7 +3326,7 @@ def retry_instant_at_the_end_of_time() -> Iterator[None]:
 
     Only the instant changes: the guard, the locks and the writes all still run.
     """
-    real = lifecycle.retry_at
+    real = retry_at  # the function the lifecycle module imported by this name
 
     def at_far(
         policy: RetryPolicy, task_id: uuid.UUID, attempt_number: int, now: datetime
@@ -3351,11 +3351,11 @@ def test_an_unrepresentable_retry_time_refuses_a_completion_and_changes_nothing(
     attempt = start_attempt(checked, task.id, "w", policy=POLICY)
     assert_delay_overflows_far(task.id, 1)
     before = snapshot(checked)
-    with retry_instant_at_the_end_of_time():
-        with pytest.raises(ValueError, match="not representable"):
-            complete_attempt(
-                checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=HOUR
-            )
+    with (
+        retry_instant_at_the_end_of_time(),
+        pytest.raises(ValueError, match="not representable"),
+    ):
+        complete_attempt(checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=HOUR)
     assert snapshot(checked) == before
     assert task_now(checked, task.id).state is TaskState.RUNNING
     running = get_attempt(checked, attempt.id)
@@ -3373,9 +3373,11 @@ def test_an_unrepresentable_retry_time_refuses_a_revocation_and_changes_nothing(
     until_expired(checked, attempt)
     assert_delay_overflows_far(task.id, 1)
     before = snapshot(checked)
-    with retry_instant_at_the_end_of_time():
-        with pytest.raises(ValueError, match="not representable"):
-            revoke_next_expired(checked, retry_policy=HOUR)
+    with (
+        retry_instant_at_the_end_of_time(),
+        pytest.raises(ValueError, match="not representable"),
+    ):
+        revoke_next_expired(checked, retry_policy=HOUR)
     assert snapshot(checked) == before
     assert task_now(checked, task.id).state is TaskState.RUNNING
     running = get_attempt(checked, attempt.id)
