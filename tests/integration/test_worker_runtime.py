@@ -718,7 +718,7 @@ def test_recovery_that_wins_between_the_evidence_and_the_rewrite_is_respected(
         proxy.accept()
         assert proxy.held.wait(WAIT)
         eventually(
-            # No retry delay here: another worker claims the next generation at once.
+            # A 1 µs retry delay here: another worker claims the next generation at once.
             lambda: revoke_next_expired(checked, retry_policy=RETRY),
             "the lease to expire and be revoked",
         )

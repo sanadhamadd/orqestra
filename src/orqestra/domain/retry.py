@@ -50,15 +50,19 @@ class RetryPolicy:
 def retry_delay(policy: RetryPolicy, task_id: uuid.UUID, attempt_number: int) -> timedelta:
     """The wait before ``task_id`` may run again after its attempt ``attempt_number`` ended.
 
-    ``attempt_number`` is the ended attempt's generation, from 1. The result
-    lies in ``[ceil(capped / 2), capped]``, where ``capped`` is the capped
-    exponential delay.
+    ``attempt_number`` is the ended attempt's generation, from 1 and below
+    2**64 (stored generations are far smaller; the bound is the width of the
+    jitter input). The result lies in ``[ceil(capped / 2), capped]``, where
+    ``capped`` is the capped exponential delay.
     """
     if isinstance(attempt_number, bool) or not isinstance(attempt_number, int):
         msg = f"attempt_number must be an integer, got {type(attempt_number).__name__}"
         raise TypeError(msg)
     if attempt_number < 1:
         msg = f"attempt_number must be at least 1, got {attempt_number}"
+        raise ValueError(msg)
+    if attempt_number >= 1 << 64:
+        msg = f"attempt_number must be below 2**64, got {attempt_number}"
         raise ValueError(msg)
     base = policy.base_delay // _MICROSECOND
     cap = policy.max_delay // _MICROSECOND

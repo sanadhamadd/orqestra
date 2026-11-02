@@ -16,7 +16,8 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any, cast
 
@@ -1326,7 +1327,7 @@ def test_claims_prefer_older_tasks(checked: Conn) -> None:
 
 def test_a_requeued_task_keeps_its_place(checked: Conn) -> None:
     # A requeued task keeps its created_at, so without contention it is claimed
-    # again before newer tasks: there is no backoff in this slice.
+    # again before newer tasks: this test's retry delay is only 1 µs (RETRY).
     first = new_task(checked)
     later = new_task(checked)
     attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
@@ -3224,3 +3225,162 @@ def test_a_stale_worker_cannot_write_while_the_task_waits_or_after_the_next_gene
         complete_attempt(checked, first.id, generation=1, outcome=SUCCESS, retry_policy=BACKOFF)
     done = complete_attempt(checked, second.id, generation=2, outcome=SUCCESS, retry_policy=BACKOFF)
     assert done.task.state is TaskState.SUCCEEDED
+
+
+UNCLASSIFIED = AttemptFailed(FailureKind.UNCLASSIFIED, "builtins.KeyError", "'total'")
+
+# name: (lease policy, outcome or None for a revocation, cancellation requested first,
+#        max_attempts, expected task state, expected revocation reason)
+NOT_SCHEDULED: dict[
+    str, tuple[LeasePolicy, AttemptOutcome | None, bool, int, TaskState, str | None]
+] = {
+    "unclassified": (POLICY, UNCLASSIFIED, False, 3, TaskState.FAILED, None),
+    "transient-with-cancellation-pending": (
+        POLICY,
+        TRANSIENT,
+        True,
+        3,
+        TaskState.CANCELLED,
+        None,
+    ),
+    "acknowledged-cancellation": (
+        POLICY,
+        AttemptCancelled(),
+        True,
+        3,
+        TaskState.CANCELLED,
+        None,
+    ),
+    "lease-expired-with-cancellation-pending": (
+        EXPIRING,
+        None,
+        True,
+        3,
+        TaskState.CANCELLED,
+        "lease_expired",
+    ),
+    "deadline-exceeded-with-cancellation-pending": (
+        DEADLINE_EXPIRING,
+        None,
+        True,
+        3,
+        TaskState.CANCELLED,
+        "deadline_exceeded",
+    ),
+    "revoked-on-the-last-attempt": (EXPIRING, None, False, 1, TaskState.FAILED, "lease_expired"),
+}
+
+
+@pytest.mark.parametrize("case", list(NOT_SCHEDULED))
+def test_endings_that_do_not_requeue_leave_available_at_alone(checked: Conn, case: str) -> None:
+    lease, outcome, cancel, max_attempts, expected, reason = NOT_SCHEDULED[case]
+    task = new_task(checked, max_attempts=max_attempts)
+    original = available_at(checked, task.id)
+    attempt = start_attempt(checked, task.id, "w", policy=lease)
+    if outcome is None:  # recovery; a request made after the lease expired does not extend it
+        until_expired(checked, attempt)
+        if cancel:
+            request_cancellation(checked, task.id, grace=GRACE)
+        revocation = revoke_next_expired(checked, retry_policy=BACKOFF)
+        assert revocation is not None
+        assert revocation.attempt.revoked_reason is not None
+        assert revocation.attempt.revoked_reason.value == reason
+        state = revocation.task.state
+    else:
+        if cancel:
+            request_cancellation(checked, task.id, grace=GRACE)
+        done = complete_attempt(
+            checked, attempt.id, generation=1, outcome=outcome, retry_policy=BACKOFF
+        )
+        state = done.task.state
+    assert state is expected
+    assert available_at(checked, task.id) == original  # no retry was scheduled
+
+
+def test_claims_follow_created_at_not_available_at(checked: Conn) -> None:
+    (older,) = new_tasks(checked, "older")
+    first = start_attempt(checked, older.id, "w", policy=POLICY)
+    done = complete_attempt(
+        checked, first.id, generation=1, outcome=TRANSIENT, retry_policy=BACKOFF
+    )
+    assert done.task.state is TaskState.QUEUED
+    (newer,) = new_tasks(checked, "newer")  # submitted after the older task was requeued
+    delay(checked, older.id, -US)  # the older task's retry time has come, just now
+    assert available_at(checked, older.id) > available_at(checked, newer.id)
+    again = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
+    assert again is not None
+    assert (again.task_id, again.attempt_number) == (older.id, 2)  # created_at, not available_at
+    other = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
+    assert other is not None
+    assert other.task_id == newer.id
+
+
+# The latest minute the calendar has: any retry delay of 30 minutes or more overflows it.
+FAR = datetime(9999, 12, 31, 23, 59, tzinfo=UTC)
+HOUR = RetryPolicy(base_delay=timedelta(hours=1), max_delay=timedelta(hours=1))
+
+
+@contextmanager
+def retry_instant_at_the_end_of_time() -> Iterator[None]:
+    """Feed the real ``retry_at`` a fixed instant instead of the database's clock.
+
+    Only the instant changes: the guard, the locks and the writes all still run.
+    """
+    real = lifecycle.retry_at
+
+    def at_far(
+        policy: RetryPolicy, task_id: uuid.UUID, attempt_number: int, now: datetime
+    ) -> datetime:
+        return real(policy, task_id, attempt_number, FAR)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lifecycle, "retry_at", at_far)
+        yield
+
+
+def assert_delay_overflows_far(task_id: uuid.UUID, generation: int) -> None:
+    """Whatever the task, a one-hour policy waits at least 30 minutes, past the end of time."""
+    left = datetime.max.replace(tzinfo=UTC) - FAR
+    assert retry_delay(HOUR, task_id, generation) > left
+
+
+def test_an_unrepresentable_retry_time_refuses_a_completion_and_changes_nothing(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    assert_delay_overflows_far(task.id, 1)
+    before = snapshot(checked)
+    with retry_instant_at_the_end_of_time():
+        with pytest.raises(ValueError, match="not representable"):
+            complete_attempt(
+                checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=HOUR
+            )
+    assert snapshot(checked) == before
+    assert task_now(checked, task.id).state is TaskState.RUNNING
+    running = get_attempt(checked, attempt.id)
+    assert running is not None
+    assert running.state is AttemptState.RUNNING
+    done = complete_attempt(checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=HOUR)
+    assert done.task.state is TaskState.QUEUED  # the same completion succeeds with a real clock
+
+
+def test_an_unrepresentable_retry_time_refuses_a_revocation_and_changes_nothing(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "dead-worker", policy=EXPIRING)
+    until_expired(checked, attempt)
+    assert_delay_overflows_far(task.id, 1)
+    before = snapshot(checked)
+    with retry_instant_at_the_end_of_time():
+        with pytest.raises(ValueError, match="not representable"):
+            revoke_next_expired(checked, retry_policy=HOUR)
+    assert snapshot(checked) == before
+    assert task_now(checked, task.id).state is TaskState.RUNNING
+    running = get_attempt(checked, attempt.id)
+    assert running is not None
+    assert running.state is AttemptState.RUNNING
+    revocation = revoke_next_expired(checked, retry_policy=HOUR)
+    assert revocation is not None
+    assert revocation.task.state is TaskState.QUEUED

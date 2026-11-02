@@ -491,7 +491,8 @@ def complete_attempt(
     ``AttemptFinishedError`` when the attempt already ended otherwise (a
     duplicate completion); ``NotFoundError`` for an unknown attempt;
     ``ValueError`` from the policy for a cancelled outcome without a
-    cancellation request.
+    cancellation request, or when the retry time of a requeued task is not a
+    representable timestamp.
     """
     with owned_transaction(conn, "complete_attempt") as cur:
         task = _lock_task(cur, _LOCK_TASK_OF_ATTEMPT, attempt_id, "attempt")
@@ -628,7 +629,9 @@ def revoke_next_expired(conn: Conn, *, retry_policy: RetryPolicy) -> AttemptRevo
     decides for that reason (DEC-038, DEC-040). Ownership ends when this
     commits. A task requeued by a ``lease_expired`` or ``deadline_exceeded``
     revocation becomes eligible again after ``retry_policy``'s delay from that
-    database time (DEC-053); a cancelled or failed one is not delayed.
+    database time (DEC-053); a cancelled or failed one is not delayed. If that
+    retry time is not a representable timestamp, ``ValueError`` is raised and
+    the transaction rolls back, so nothing is revoked.
 
     Returns the revoked attempt and its task, or ``None`` when this call
     revoked nothing: no expired attempt was unlocked, or the one found was

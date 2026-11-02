@@ -124,11 +124,25 @@ def test_the_jitter_spreads_across_tasks_and_generations() -> None:
 
 @pytest.mark.parametrize(
     ("attempt_number", "error"),
-    [(0, ValueError), (-1, ValueError), (True, TypeError), (1.0, TypeError), ("1", TypeError)],
+    [
+        (0, ValueError),
+        (-1, ValueError),
+        (2**64, ValueError),  # wider than the jitter input
+        (True, TypeError),
+        (1.0, TypeError),
+        ("1", TypeError),
+    ],
 )
 def test_the_attempt_number_is_a_generation_from_one(attempt_number: Any, error: type) -> None:
     with pytest.raises(error, match="attempt_number"):
         retry_delay(POLICY, TASKS[0], attempt_number)
+
+
+def test_the_largest_generation_the_jitter_can_hold_is_accepted() -> None:
+    limit = POLICY.max_delay  # 2**64 - 1 shifts far past the cap, so the cap applies
+    for task in TASKS[:5]:
+        delay = retry_delay(POLICY, task, 2**64 - 1)
+        assert -(-limit // 2) <= delay <= limit
 
 
 def test_the_first_ended_attempt_uses_the_base_delay() -> None:

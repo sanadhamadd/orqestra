@@ -35,7 +35,9 @@ pytestmark = pytest.mark.integration
 
 Conn = psycopg.Connection[TupleRow]
 
-*UP_TO_0003, AVAILABILITY = load_migrations()
+INITIAL, LEASES, GRACE_REASON, AVAILABILITY, *_ = load_migrations()
+UP_TO_0003 = [INITIAL, LEASES, GRACE_REASON]
+UP_TO_0004 = [*UP_TO_0003, AVAILABILITY]  # never a later migration: it has its own tests
 KINDS = ("availability",)
 EXPIRING = LeasePolicy(lease=timedelta(microseconds=1), execution_timeout=timedelta(hours=1))
 
@@ -102,7 +104,7 @@ def upgrade_refused(url: str) -> MigrationError:
 
     def run() -> None:
         try:
-            outcome.append(migrate(url))
+            outcome.append(migrate(url, UP_TO_0004))
         except Exception as exc:  # returned to the test thread, which inspects it
             outcome.append(exc)
 
@@ -141,7 +143,7 @@ def test_upgrades_a_populated_0003_schema_keeping_rows_and_making_tasks_eligible
     before = snapshot(conn)
     upgrade_started = clock(conn)
 
-    assert [m.label for m in migrate(schema_url)] == [AVAILABILITY.label]  # to the latest
+    assert [m.label for m in migrate(schema_url, UP_TO_0004)] == [AVAILABILITY.label]
 
     upgrade_ended = clock(conn)
     assert versions(conn) == [1, 2, 3, 4]
@@ -168,11 +170,11 @@ def test_a_repeated_upgrade_changes_nothing_and_the_history_verifies(
 ) -> None:
     conn = at_0003()
     populate(conn)
-    assert [m.label for m in migrate(schema_url)] == [AVAILABILITY.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0004)] == [AVAILABILITY.label]
     after = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
-    assert migrate(schema_url) == ()
+    assert migrate(schema_url, UP_TO_0004) == ()
     assert conn.execute("SELECT * FROM tasks ORDER BY id").fetchall() == after
-    verify_current(conn)  # the exact, read-only history check a worker runs (DEC-051)
+    verify_current(conn, UP_TO_0004)  # the exact, read-only history check a worker runs (DEC-051)
 
 
 def test_fails_at_once_while_a_reader_holds_tasks_and_rolls_back(
@@ -190,7 +192,7 @@ def test_fails_at_once_while_a_reader_holds_tasks_and_rolls_back(
         assert not has_available_at(conn)  # and no column
         assert snapshot(conn) == before
         reader.rollback()
-    assert [m.label for m in migrate(schema_url)] == [AVAILABILITY.label]  # the retry
+    assert [m.label for m in migrate(schema_url, UP_TO_0004)] == [AVAILABILITY.label]  # the retry
 
 
 def test_fails_at_once_while_a_lifecycle_write_holds_a_task(
@@ -204,7 +206,7 @@ def test_fails_at_once_while_a_lifecycle_write_holds_a_task(
     assert versions(conn) == [1, 2, 3]
     assert not has_available_at(conn)
     holder.execute("ROLLBACK")
-    assert [m.label for m in migrate(schema_url)] == [AVAILABILITY.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0004)] == [AVAILABILITY.label]
 
 
 def test_does_not_lock_the_attempts_table(schema_url: str, at_0003: Callable[[], Conn]) -> None:
@@ -216,6 +218,26 @@ def test_does_not_lock_the_attempts_table(schema_url: str, at_0003: Callable[[],
     holder.execute("BEGIN")
     holder.execute("SELECT id FROM attempts WHERE id = %s FOR UPDATE", (attempt.id,))
     started = time.monotonic()
-    assert [m.label for m in migrate(schema_url)] == [AVAILABILITY.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0004)] == [AVAILABILITY.label]
     assert time.monotonic() - started < 5
     holder.execute("ROLLBACK")
+
+
+def test_adds_a_not_null_timestamptz_column_and_no_index(
+    schema_url: str, at_0003: Callable[[], Conn]
+) -> None:
+    conn = at_0003()
+    indexes = "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() "
+    indexes += "AND tablename = 'tasks' ORDER BY indexname"
+    before = conn.execute(indexes).fetchall()
+    assert [m.label for m in migrate(schema_url, UP_TO_0004)] == [AVAILABILITY.label]
+    assert conn.execute(indexes).fetchall() == before  # claim order is unchanged: no new index
+    column = conn.execute(
+        "SELECT data_type, is_nullable, column_default FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = 'tasks' "
+        "AND column_name = 'available_at'"
+    ).fetchone()
+    assert column is not None
+    data_type, nullable, default = column
+    assert (data_type, nullable) == ("timestamp with time zone", "NO")
+    assert "now()" in str(default)
