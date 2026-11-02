@@ -11,6 +11,7 @@ once the worker has logged that its handlers are installed, and timed from
 the worker's own log timestamps.
 """
 
+import itertools
 import json
 import os
 import secrets
@@ -30,6 +31,7 @@ import pytest
 from psycopg.rows import TupleRow
 
 from orqestra.domain.jobs import Task
+from orqestra.domain.retry import RetryPolicy, retry_delay
 from orqestra.persistence.lifecycle import request_cancellation, revoke_next_expired
 from orqestra.worker.fence import ExitCode
 from tests.integration.pg_proxy import PgProxy
@@ -51,6 +53,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Test values only (DEC-034): heartbeat 1 s + database bound 0.8 s + margin 1 s < lease 4 s.
 LEASE = timedelta(seconds=4)
+RETRY = RetryPolicy(timedelta(milliseconds=100), timedelta(milliseconds=500))  # as ENVIRONMENT
 ENVIRONMENT = {
     "ORQESTRA_WORKER_LEASE": "PT4S",
     "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT5M",
@@ -62,6 +65,8 @@ ENVIRONMENT = {
     "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT1S",
     "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "5",
     "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.1S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT0.5S",
 }
 
 
@@ -250,7 +255,9 @@ def test_a_cancellation_request_fences_the_process_at_the_end_of_its_grace(
     assert lines[-1]["event"] == "ownership_deadline_passed"
     assert any(line.get("event") == "cancellation_requested" for line in lines)
     # Recovery then cancels the task (DEC-040).
-    revocation = eventually(lambda: revoke_next_expired(handler_db), "the grace to run out")
+    revocation = eventually(
+        lambda: revoke_next_expired(handler_db, retry_policy=RETRY), "the grace to run out"
+    )
     assert revocation.attempt.revoked_reason is not None
     assert revocation.attempt.revoked_reason.value == "cancellation_grace_expired"
     assert task_states(handler_db, [task]) == [("cancelled", 1)]
@@ -402,7 +409,9 @@ def test_a_task_not_settled_in_time_ends_the_process_with_exit_9(
         (None,)
     ]
     # Recovery revokes it once its lease ends, using one attempt of its budget.
-    revocation = eventually(lambda: revoke_next_expired(handler_db), "the lease to end")
+    revocation = eventually(
+        lambda: revoke_next_expired(handler_db, retry_policy=RETRY), "the lease to end"
+    )
     assert revocation.attempt.revoked_reason is not None
     assert revocation.attempt.revoked_reason.value == "lease_expired"
     assert task_states(handler_db, [task]) == [after]
@@ -526,3 +535,97 @@ def test_a_worker_frozen_mid_heartbeat_is_recovered_and_cannot_overwrite(
     code, lines = healthy.exit()
     assert code == 0
     assert not any(line.get("event") == "operation_deadline_passed" for line in lines)
+
+
+# --- retry scheduling (DEC-053) -----------------------------------------------------------
+
+# Test values only (DEC-034): delays of 0.5 to 2 s, many poll intervals long.
+RETRYING = {"ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT1S", "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT2S"}
+RETRYING_POLICY = RetryPolicy(timedelta(seconds=1), timedelta(seconds=2))
+
+
+def attempt_history(db: Conn, task: Task) -> list[tuple[Any, ...]]:
+    return rows(
+        db,
+        "SELECT attempt_number, started_at, finished_at, revoked_reason FROM attempts "
+        "WHERE task_id = %s ORDER BY attempt_number",
+        task.id,
+    )
+
+
+def available_at(db: Conn, task: Task) -> Any:
+    ((available,),) = rows(db, "SELECT available_at FROM tasks WHERE id = %s", task.id)
+    return available
+
+
+def assert_spaced(db: Conn, task: Task, policy: RetryPolicy) -> None:
+    """No attempt started before its predecessor's end plus that generation's delay."""
+    for (n, _, finished, _), (_, started, _, _) in itertools.pairwise(attempt_history(db, task)):
+        assert started >= finished + retry_delay(policy, task.id, n)
+
+
+def stop(worker: WorkerProcess) -> list[dict[str, Any]]:
+    worker.process.send_signal(signal.SIGTERM)
+    code, lines = worker.exit()
+    assert code == 0
+    return lines
+
+
+def test_a_transient_failure_is_retried_no_earlier_than_its_stored_time(
+    handler_db: Conn, start: Any
+) -> None:
+    (task,) = submit(handler_db, "flaky", None, max_attempts=3)
+    worker = start(overrides=RETRYING)
+    eventually(lambda: task_states(handler_db, [task]) == [("failed", 3)], "every attempt")
+    assert_spaced(handler_db, task, RETRYING_POLICY)
+    assert runs(handler_db) == 3
+    stop(worker)
+
+
+def test_a_killed_workers_task_is_recovered_and_retried_no_earlier_than_its_stored_time(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})
+    first = start(overrides=RETRYING)
+    eventually(lambda: runs(handler_db) == 1, "the first handler")
+    first.kill()  # SIGKILL: nothing is recorded, and the lease runs out
+    assert task_states(handler_db, [task]) == [("running", 1)]
+    second = start(overrides=RETRYING)  # recovers the attempt, then waits out the delay
+    eventually(lambda: runs(handler_db) == 2, "the retry")
+    (_, _, revoked_at, reason), (_, started, _, _) = attempt_history(handler_db, task)
+    assert reason == "lease_expired"
+    # Exactly the recovery's database time plus the first generation's delay.
+    assert available_at(handler_db, task) == revoked_at + retry_delay(RETRYING_POLICY, task.id, 1)
+    assert started >= available_at(handler_db, task)
+    gate.release()
+    eventually(lambda: task_states(handler_db, [task]) == [("succeeded", 2)], "the success")
+    stop(second)
+
+
+def test_a_signal_during_a_retry_delay_stops_the_process_and_leaves_the_task_waiting(
+    handler_db: Conn, start: Any
+) -> None:
+    (task,) = submit(handler_db, "flaky", None, max_attempts=3)
+    minute = {"ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT1M", "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT1M"}
+    worker = start(overrides=minute)
+    eventually(lambda: task_states(handler_db, [task]) == [("queued", 1)], "the first failure")
+    waiting = rows(handler_db, "SELECT * FROM tasks WHERE id = %s", task.id)
+    attempts = rows(handler_db, "SELECT * FROM attempts WHERE task_id = %s", task.id)
+    assert rows(handler_db, "SELECT available_at > clock_timestamp() FROM tasks") == [(True,)]
+    lines = stop(worker)
+    events = [line["event"] for line in lines if "event" in line]  # not the handler's own logs
+    assert events[-2:] == ["shutdown_requested", "worker_stopped"]
+    # Nothing fabricated: still queued for the same time, one attempt, one run.
+    assert rows(handler_db, "SELECT * FROM tasks WHERE id = %s", task.id) == waiting
+    assert rows(handler_db, "SELECT * FROM attempts WHERE task_id = %s", task.id) == attempts
+    assert runs(handler_db) == 1
+
+
+def test_two_workers_both_wait_for_the_stored_time(handler_db: Conn, start: Any) -> None:
+    (task,) = submit(handler_db, "flaky", None, max_attempts=3)
+    workers = [start(overrides=RETRYING) for _ in range(2)]
+    eventually(lambda: task_states(handler_db, [task]) == [("failed", 3)], "every attempt")
+    assert_spaced(handler_db, task, RETRYING_POLICY)
+    assert runs(handler_db) == 3  # each generation ran once, by one of the two
+    for worker in workers:
+        stop(worker)

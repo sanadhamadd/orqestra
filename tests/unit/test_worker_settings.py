@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from orqestra.config import Settings
 from orqestra.domain.leases import LeasePolicy
+from orqestra.domain.retry import RetryPolicy
 from orqestra.worker.settings import WorkerSettings
 
 pytestmark = pytest.mark.unit
@@ -24,6 +25,8 @@ VALID: dict[str, Any] = {
     "recovery_interval": timedelta(seconds=10),
     "recovery_batch_limit": 10,
     "shutdown_timeout": timedelta(seconds=30),
+    "retry_base_delay": timedelta(seconds=1),
+    "retry_max_delay": timedelta(minutes=5),
 }
 FIELDS = tuple(VALID)
 DURATIONS = tuple(name for name in FIELDS if name != "recovery_batch_limit")
@@ -86,6 +89,8 @@ def test_settings_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch)
         "RECOVERY_INTERVAL": "PT10S",
         "RECOVERY_BATCH_LIMIT": "10",
         "SHUTDOWN_TIMEOUT": "PT0S",
+        "RETRY_BASE_DELAY": "PT2S",
+        "RETRY_MAX_DELAY": "PT10M",
     }.items():
         monkeypatch.setenv(f"ORQESTRA_WORKER_{name}", value)
     worker = WorkerSettings(_env_file=None)
@@ -93,6 +98,7 @@ def test_settings_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch)
     assert worker.execution_timeout == timedelta(minutes=10)
     assert worker.poll_interval == timedelta(milliseconds=500)
     assert worker.lock_timeout == timedelta(milliseconds=250)
+    assert worker.retry_policy == RetryPolicy(timedelta(seconds=2), timedelta(minutes=10))
     assert worker.recovery_batch_limit == 10
     assert worker.shutdown_timeout == timedelta(0)
 
@@ -224,3 +230,14 @@ def test_a_relationship_is_reported_once_its_fields_are_valid() -> None:
     with pytest.raises(ValidationError) as info:
         settings(lease=timedelta(0), heartbeat_interval=timedelta(hours=1))
     assert [loc for loc, _ in errors(info)] == [("lease",)]
+
+
+def test_the_retry_base_delay_cannot_exceed_its_maximum() -> None:
+    equal = settings(retry_base_delay=timedelta(minutes=5), retry_max_delay=timedelta(minutes=5))
+    assert equal.retry_policy == RetryPolicy(timedelta(minutes=5), timedelta(minutes=5))
+    with pytest.raises(ValidationError, match=r"base_delay .* must not exceed max_delay"):
+        settings(retry_base_delay=timedelta(minutes=5) + US, retry_max_delay=timedelta(minutes=5))
+
+
+def test_the_retry_policy_is_built_from_the_two_settings() -> None:
+    assert settings().retry_policy == RetryPolicy(timedelta(seconds=1), timedelta(minutes=5))

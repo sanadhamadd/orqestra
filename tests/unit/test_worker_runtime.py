@@ -67,6 +67,8 @@ SETTINGS = WorkerSettings(
     recovery_interval=timedelta(seconds=10),
     recovery_batch_limit=3,
     shutdown_timeout=timedelta(seconds=30),
+    retry_base_delay=timedelta(seconds=1),
+    retry_max_delay=timedelta(seconds=60),
 )
 T0 = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
@@ -543,7 +545,10 @@ def completed(
 ) -> Callable[..., Any]:
     calls: list[Any] = []
 
-    def complete(conn: Any, attempt_id: uuid.UUID, *, generation: int, outcome: Any) -> Any:
+    def complete(
+        conn: Any, attempt_id: uuid.UUID, *, generation: int, outcome: Any, retry_policy: Any
+    ) -> Any:
+        assert retry_policy == SETTINGS.retry_policy  # the worker's own policy (DEC-053)
         calls.append(outcome)
         if outcome_check is not None:
             outcome_check(outcome)
@@ -762,13 +767,20 @@ def test_a_sweep_revokes_up_to_its_batch_limit_then_waits_for_the_interval(
     class Revocation:
         attempt = revoked
 
-    harness.monkeypatch.setattr(runtime, "revoke_next_expired", lambda conn: Revocation)
+    policies: list[Any] = []
+
+    def revoke(conn: Any, *, retry_policy: Any) -> Any:
+        policies.append(retry_policy)
+        return Revocation
+
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", revoke)
     sweep = harness.worker._schedule.sweep
     for left in (2, 1):  # the batch limit is 3
         harness.worker._sweep()
         assert (sweep.left, sweep.due) == (left, 100.0)  # continues at once
     harness.worker._sweep()
     assert (sweep.left, sweep.due) == (0, 110.0)  # the next sweep, one interval after this one
+    assert policies == [SETTINGS.retry_policy] * 3  # every recovery requeues by this policy
 
 
 def test_a_failed_sweep_ends_until_the_next_interval(harness: Harness) -> None:
@@ -814,7 +826,15 @@ class Script:
         harness.monkeypatch.setattr(runtime, "complete_attempt", self.complete)
         harness.monkeypatch.setattr(runtime, "read_completion_evidence", self.read_evidence)
 
-    def complete(self, conn: Any, attempt_id: uuid.UUID, *, generation: int, outcome: Any) -> Any:
+    def complete(
+        self,
+        conn: Any,
+        attempt_id: uuid.UUID,
+        *,
+        generation: int,
+        outcome: Any,
+        retry_policy: Any,
+    ) -> Any:
         self.completed.append(outcome)
         return self._play(self.completions.pop(0))
 
@@ -831,7 +851,13 @@ class Script:
         if isinstance(answer, BaseException):
             raise answer
         if answer == "done":
-            return completed(self.harness)(None, uuid.UUID(int=1), generation=1, outcome=None)
+            return completed(self.harness)(
+                None,
+                uuid.UUID(int=1),
+                generation=1,
+                outcome=None,
+                retry_policy=SETTINGS.retry_policy,
+            )
         return answer
 
 

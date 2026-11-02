@@ -8,6 +8,7 @@ no assertion depends on timing luck.
 """
 
 import functools
+import itertools
 import threading
 import time
 import uuid
@@ -24,6 +25,7 @@ from psycopg.rows import TupleRow
 from orqestra.domain.errors import PermanentError, TransientError
 from orqestra.domain.jobs import JobSubmission, JsonValue, Task, TaskSpec
 from orqestra.domain.leases import LeasePolicy
+from orqestra.domain.retry import retry_delay
 from orqestra.persistence.jobs import list_tasks, submit_job
 from orqestra.persistence.lifecycle import (
     request_cancellation,
@@ -35,7 +37,7 @@ from orqestra.worker.handlers import HandlerCancelled, HandlerRegistry, TaskCont
 from orqestra.worker.runtime import Worker, connect_supervisor
 from orqestra.worker.settings import WorkerSettings
 from tests.integration.pg_proxy import PgProxy
-from tests.integration.test_attempt_lifecycle import assert_invariants
+from tests.integration.test_attempt_lifecycle import RETRY, assert_invariants
 
 pytestmark = pytest.mark.integration
 
@@ -55,6 +57,8 @@ SETTINGS = WorkerSettings(
     recovery_interval=timedelta(milliseconds=300),
     recovery_batch_limit=5,
     shutdown_timeout=timedelta(seconds=5),
+    retry_base_delay=timedelta(milliseconds=50),
+    retry_max_delay=timedelta(milliseconds=200),
 )
 WAIT = 20.0  # the bound on every wait for a state to appear
 
@@ -379,6 +383,36 @@ def test_handler_failures_follow_the_existing_classification(
     assert_invariants(checked)
 
 
+def test_a_transient_failure_is_retried_no_earlier_than_its_stored_time(
+    schema_url: str, checked: Conn
+) -> None:
+    # Delays well above the poll interval, so an early claim would be seen (DEC-053).
+    settings = SETTINGS.model_copy(
+        update={
+            "retry_base_delay": timedelta(milliseconds=400),
+            "retry_max_delay": timedelta(milliseconds=800),
+        }
+    )
+    (task,) = submit(checked, "failing", {"mode": "transient"}, max_attempts=3)
+    with running_worker(schema_url, {"failing": failing}, settings) as probe:
+        eventually(lambda: task_states(checked, [task]) == [("failed", 3)], "every attempt")
+    history = rows(
+        checked,
+        "SELECT attempt_number, started_at, finished_at FROM attempts "
+        "WHERE task_id = %s ORDER BY attempt_number",
+        task.id,
+    )
+    for (n, _, finished), (_, started, _) in itertools.pairwise(history):
+        # The requeue's clock is at or after the attempt's end; the claim at or after it.
+        assert started >= finished + retry_delay(settings.retry_policy, task.id, n)
+    # The exhausted third failure scheduled nothing: the stored time is the second retry's.
+    ((available,),) = rows(checked, "SELECT available_at FROM tasks WHERE id = %s", task.id)
+    assert history[1][2] + retry_delay(settings.retry_policy, task.id, 2) <= available
+    assert available <= history[2][1]
+    assert probe.terminations == []
+    assert_invariants(checked)
+
+
 def test_a_lost_supervisor_connection_is_not_a_handler_failure(
     schema_url: str, checked: Conn
 ) -> None:
@@ -648,7 +682,10 @@ def test_recovery_that_revoked_first_wins_and_the_outcome_is_discarded(
         returning.gate.release.set()
         assert proxy.dropped.wait(WAIT)
         # No heartbeats while completing: the lease runs out and recovery revokes it.
-        eventually(lambda: revoke_next_expired(checked), "the lease to expire and be revoked")
+        eventually(
+            lambda: revoke_next_expired(checked, retry_policy=SETTINGS.retry_policy),
+            "the lease to expire and be revoked",
+        )
         proxy.accept()
         eventually(lambda: "outcome_discarded" in events(caplog), "the outcome to be discarded")
     assert probe.terminations == []
@@ -680,7 +717,11 @@ def test_recovery_that_wins_between_the_evidence_and_the_rewrite_is_respected(
         proxy.hold_on(b"BEGIN")
         proxy.accept()
         assert proxy.held.wait(WAIT)
-        eventually(lambda: revoke_next_expired(checked), "the lease to expire and be revoked")
+        eventually(
+            # No retry delay here: another worker claims the next generation at once.
+            lambda: revoke_next_expired(checked, retry_policy=RETRY),
+            "the lease to expire and be revoked",
+        )
         if claimed_again:
             start_attempt(
                 checked,
@@ -906,7 +947,9 @@ def test_a_grace_that_ends_before_the_next_heartbeat_fences_without_notice(
     assert probe.terminations[0] == (ExitCode.FENCED, "ownership_lost")
     assert not cooperative.observed.is_set()  # no notice: it was never guaranteed
     assert attempt_rows(checked, task) == [(1, "running", None, None)]  # nothing recorded
-    revocation = revoke_next_expired(checked)  # recovery then cancels it (DEC-040)
+    revocation = revoke_next_expired(
+        checked, retry_policy=SETTINGS.retry_policy
+    )  # recovery then cancels it (DEC-040)
     assert revocation is not None
     assert task_states(checked, [task]) == [("cancelled", 1)]
 
@@ -1013,7 +1056,9 @@ def test_a_drain_that_runs_out_leaves_the_attempt_to_recovery(
         assert untouched(checked, task)
         gate.release.set()  # too late: nothing supervises it any more
     # Recovery revokes it once its lease ends; it used one attempt (DEC-038).
-    revocation = eventually(lambda: revoke_next_expired(checked), "the lease to end")
+    revocation = eventually(
+        lambda: revoke_next_expired(checked, retry_policy=SETTINGS.retry_policy), "the lease to end"
+    )
     assert revocation.attempt.revoked_reason is not None
     assert revocation.attempt.revoked_reason.value == "lease_expired"
     assert task_states(checked, [task]) == [after]
@@ -1119,7 +1164,10 @@ def test_a_cancellation_grace_shorter_than_the_drain_fences_first(
         request_cancellation(checked, task.id, grace=timedelta(seconds=2))
         eventually(lambda: probe.expiries, "the fence")
         assert probe.expiries[0].guard is Guard.OWNERSHIP  # the grace, not the drain
-        revocation = eventually(lambda: revoke_next_expired(checked), "the grace to run out")
+        revocation = eventually(
+            lambda: revoke_next_expired(checked, retry_policy=SETTINGS.retry_policy),
+            "the grace to run out",
+        )
         assert revocation.attempt.revoked_reason is not None
         assert revocation.attempt.revoked_reason.value == "cancellation_grace_expired"
         gate.release.set()  # its outcome is discarded: recovery already decided
@@ -1150,7 +1198,9 @@ def test_a_stop_during_an_in_flight_claim_leaves_the_attempt_to_recovery(
         r for r in caplog.records if getattr(r, "event", "") == "stopped_with_unstarted_claim"
     ]
     assert [getattr(r, "attempt_id", None) for r in warnings] == [str(attempt_id)]
-    revocation = eventually(lambda: revoke_next_expired(checked), "the lease to end")
+    revocation = eventually(
+        lambda: revoke_next_expired(checked, retry_policy=SETTINGS.retry_policy), "the lease to end"
+    )
     assert revocation.attempt.revoked_reason is not None
     assert revocation.attempt.revoked_reason.value == "lease_expired"
     assert task_states(checked, [task]) == [("queued", 1)]

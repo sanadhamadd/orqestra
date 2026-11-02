@@ -4,7 +4,7 @@
   architecture audit and an independent review; awaiting the owner's acceptance of this
   implementation in a reviewed change.
 - **Date:** 2026-10-24
-- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-051
+- **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-051 and DEC-053
 
 ## Context
 
@@ -106,11 +106,18 @@ detect this: after `running → queued → running`, the state matches again.
   a worker for explicitly named built-in kinds after a read-only check that the schema's
   migration history equals the packaged one exactly; it never migrates and refuses to
   start against any other history (DEC-051).
+- Implemented and verified locally only, not yet in GitHub CI (Day 4A): durable retry
+  eligibility. Every task stores `available_at`, the database time from which it may be
+  claimed (migration 0004). A requeue after a transient failure, or after a
+  `lease_expired` or `deadline_exceeded` revocation, sets it to the database clock at the
+  requeue plus a bounded, deterministically jittered exponential delay from a required
+  `RetryPolicy`; both claim paths refuse a task before then, inside the same atomic claim.
+  Retry timing is therefore part of PostgreSQL's authoritative state and survives worker
+  crashes and restarts. Workers must share one policy; nothing enforces it (DEC-053).
 - Not yet implemented, and not proven by the current tests:
   - a service or deployment that runs workers, and any production workload handler;
   - stopping handlers that hold the GIL or detach processes;
-  - bounded worker slots;
-  - retry backoff.
+  - bounded worker slots.
 
   A task whose worker dies is recovered only while some worker runs. These must be
   verified by their own tests before being described as working.

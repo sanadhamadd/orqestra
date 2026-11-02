@@ -27,6 +27,7 @@ from tests.integration.test_attempt_lifecycle import (
     GRACE,
     PERMANENT,
     POLICY,
+    RETRY,
     SUCCESS,
     TRANSIENT,
     Conn,
@@ -348,7 +349,9 @@ def claim_again_and_succeed(db: Conn, task_id: uuid.UUID) -> None:
     from orqestra.persistence.lifecycle import complete_attempt
 
     attempt = start_attempt(db, task_id, "w2", policy=POLICY)
-    complete_attempt(db, attempt.id, generation=attempt.attempt_number, outcome=SUCCESS)
+    complete_attempt(
+        db, attempt.id, generation=attempt.attempt_number, outcome=SUCCESS, retry_policy=RETRY
+    )
 
 
 @pytest.mark.parametrize(

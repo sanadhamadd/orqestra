@@ -8,7 +8,8 @@ Deliberately **undecided** (do not infer a choice from the code): API framework,
 hosting, AI provider and models, asyncio vs threads for worker slots, operational lease
 and execution-timeout values and any per-job-kind policy (DEC-034). The DB driver,
 migration tool and task queue are no longer open: see DEC-016, DEC-017 and DEC-033.
-Operational cancellation grace periods are undecided too (DEC-040).
+Operational cancellation grace periods are undecided too (DEC-040), and so are
+operational retry delays (DEC-053).
 
 ## Day 1 — repository foundation
 
@@ -321,6 +322,7 @@ lifecycle policy functions and transition tables are unchanged.
   - **VERIFICATION:** `tests/integration/test_attempt_lifecycle.py`, section 22 (13 tests, 47 cases): only supported kinds are claimed; a failed filtered claim rolls back completely; a kind is refused as blank exactly when PostgreSQL's own `btrim` rule refuses it (8 samples: only spaces are refused; tabs, newlines, CRLF and a no-break space are kinds); tabs and newlines match exactly and are never trimmed or confused with spaces; NUL characters are refused before any statement; a claim takes no lock on the job row, in either direction, under `lock_timeout` and `NOWAIT`; an eligible task is claimed past earlier candidates held mid-claim by two other claimants and an unsupported task; an older unsupported task with one attempt left never holds up newer supported work and keeps its state, generation and budget, then is claimed at generation 1 by a claimant supporting it; several kinds keep the age order; exact matching (case, whitespace, wildcard, prefix, literal `%`); 18 invalid inputs refused before any database work, also inside a caller's transaction, leaving every row unchanged; repeated kinds accepted; a gated claim is skipped without waiting by claimants of the same and another kind; 20 rounds of concurrent claimants of disjoint kinds each take only their own kind, and 20 rounds of overlapping kinds never claim a task twice and, as holds for every schedule, claim every task. The existing section 16 and Day 3A tests pass with `kinds` added.
 
     Locally, each of these mutations failed at least one section-22 test: blank checked with `strip()` (8 tests), no NUL check (3), the `EXISTS` taking `FOR SHARE` on `jobs` (1), a `FOR KEY SHARE` lock on the job after discovery (1), a waiting `FOR UPDATE` (3), and no kind filter (28).
+- **Day 4A note (retry eligibility, DEC-053):** discovery and the claim's `UPDATE` now also require `available_at <= statement_timestamp()`, so a requeued task is not claimed again straight away. The ordering (`created_at`, then `id`), `SKIP LOCKED`, the kind filter and the lock order are unchanged, and there is still no claim index: delayed tasks are scanned with the rest.
 
 ## Day 3A — Slice 2: attempt leases, execution deadlines and recovery
 
@@ -415,6 +417,7 @@ is not stopped (Day 3B).
   - The cancellation-grace revocation of Slice 3 is caused by the request and will need its own rule.
 - **VERIFICATION:** `tests/unit/test_policy.py` decision table, plus a check that a revocation moves the task exactly as a transient failure does for every count and request; the integration outcome table (six cases, including a single-attempt task with a pending request); invariant rules on attempt history.
 - **Day 3A Slice 3 note:** the anticipated rule now exists: a `cancellation_grace_expired` revocation cancels the task whatever budget is left, and requires a pending request. `next_task_state` takes the revocation reason for every revoked outcome (DEC-040).
+- **Day 4A note (DEC-053):** a `lease_expired` or `deadline_exceeded` revocation that requeues now also schedules a retry delay, exactly as a transient failure does, so a deterministic hang is no longer retried back to back. `next_task_state` is unchanged.
 
 ### DEC-039 — Migration 0002: additive schema and a quiescent upgrade with `NOWAIT` locks
 - **Status:** Proposed · owner-approved direction (2026-10-26) · implemented (`0002_attempt_leases.sql`)
@@ -602,6 +605,7 @@ contracts; the first runtime that uses them is Slice 1B-B1 (DEC-045, DEC-046).
   - Whether to require several heartbeats per lease, and how the cancellation grace relates to the heartbeat interval (DEC-040), are operator rules the settings cannot check.
 - **VERIFICATION:** `tests/unit/test_worker_settings.py`: valid settings and their lease policy; frozen; nothing has a default; each field required on its own; environment parsing in ISO 8601 and `HH:MM:SS`; four unit-less values refused; `worker_concurrency` neither read nor affected; zero, negative and unrepresentable durations refused for each field; `shutdown_timeout` zero allowed and negative refused; batch limit 1 allowed, 0 and -1 refused, non-integers refused; `db_operation_timeout` exactly 1 ms allowed and 1 µs less refused; lease equal to the execution timeout allowed and 1 µs shorter refused; database timeout 1 µs under the heartbeat interval allowed and equal refused; the fencing relationship 1 µs over allowed and at or under refused; a relationship is not reported while a field is invalid. Locally, mutants dropping or weakening each check (5) each failed tests.
 - **Day 3B Slice B2b note:** `shutdown_timeout` is now read. It is the time a stopping worker gives the task it holds to settle (handler, completion and reconciliation), counted from the latch; `0` abandons a running task at once and stops an idle worker at once (DEC-049).
+- **Day 4A note (DEC-053):** two more required settings, `retry_base_delay` and `retry_max_delay`, with no defaults; both positive and representable, the base no longer than the maximum, together forming `retry_policy`. Every worker must use the same values; nothing checks this.
 - **Recovery correction note (DEC-050):** a tenth required setting, `lock_timeout`, at least 1 ms and, in whole milliseconds rounded up, strictly shorter than `db_operation_timeout`, which is therefore at least 2 ms. Millisecond rounding is now exact for every supervisor bound (floating point had made some, such as 2007 ms, 1 ms too long).
 
 ## Day 3B — Slice 1B-B1: the first worker runtime
@@ -1156,8 +1160,9 @@ merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (ru
 ## Day 3C — Deterministic task partitioning
 
 Entry DEC-052 records the partitioner, agreed in the Day 3C read-only assessment. It stays
-**Proposed** until the owner accepts it in a reviewed change; "implemented" means verified
-locally by the tests named, not yet in GitHub CI.
+**Proposed** until the owner accepts it in a reviewed change. It was merged in PR #16
+(`da5b4b3`), with both CI lanes passing for the pull request (run 40770878527) and for
+`main` (run 40771746389).
 
 ### DEC-052 — An ordered item list is partitioned into contiguous, fixed-size batch tasks with index-derived keys
 - **Status:** Proposed · owner-approved direction (2026-10-28) · implemented locally (`orqestra.domain.partitioning.partition`)
@@ -1208,3 +1213,49 @@ locally by the tests named, not yet in GitHub CI.
     - accepting a `bool` batch size;
     - accepting empty input;
     - accepting a NUL prefix.
+
+## Day 4A — Durable retry scheduling
+
+Entry DEC-053 records retry backoff, agreed in the Day 4A read-only assessment (decisions
+D1–D4). It stays **Proposed** until the owner accepts it in a reviewed change;
+"implemented" means verified locally by the tests named, not yet in GitHub CI.
+
+### DEC-053 — A requeued task waits until a durable `available_at`, from a required policy with deterministic jitter
+- **Status:** Proposed · owner-approved direction (Day 4A decisions D1–D4) · implemented locally (`orqestra.domain.retry`, migration 0004, `orqestra.persistence.lifecycle`)
+- **WHAT:**
+  - **Durable eligibility (D1).** Migration 0004 adds `tasks.available_at timestamptz NOT NULL DEFAULT now()`. A task may be claimed only when `available_at <= statement_timestamp()`. Both claim paths check it inside the atomic claim: discovery's `FOR UPDATE SKIP LOCKED` query and the claim's `UPDATE … WHERE`, so a refused claim updates no row.
+  - **When a retry is scheduled (D2).** Only when the task is requeued: a transient failure with attempts left, or a `lease_expired` or `deadline_exceeded` revocation with attempts left and no cancellation request. Then `available_at` = the database clock read after the locks (DEC-035) + `retry_delay(policy, task_id, n)`, where *n* is the ended attempt's generation. A success, a permanent or unclassified failure, exhausted retries and any cancellation, including `cancellation_grace_expired`, leave it unchanged.
+  - **The delay.** `min(max_delay, base_delay * 2**(n-1))`, scaled by a factor in `[0.5, 1]` from the first 64 bits of SHA-256(task UUID bytes ‖ *n* as 8 big-endian bytes). Integer microseconds throughout, standard library only; never below half the capped value (rounded up), never above `max_delay`, and no huge integers for large *n*. A retry time past the representable range is a `ValueError`.
+  - **The policy.** `RetryPolicy(base_delay, max_delay)` is frozen, with no defaults: both positive and representable (the `LeasePolicy` rule), and `base_delay <= max_delay`. `complete_attempt` and `revoke_next_expired` require it as a keyword. The worker builds it from two required settings, `ORQESTRA_WORKER_RETRY_BASE_DELAY` and `ORQESTRA_WORKER_RETRY_MAX_DELAY` (DEC-044 note).
+  - **An early explicit start (D3).** `start_attempt` on a queued task that is not yet eligible raises `TaskNotEligibleError`, a subclass of `TaskNotStartableError` with `state = queued` and the task's `available_at`, and changes nothing.
+  - **Ordering (D4).** Unchanged: among eligible tasks, `created_at` then `id`. No fairness rule and no index.
+  - **Not exposed on `Task`.** `available_at` is a column only; the `Task` record and `TASK_COLUMNS` are unchanged.
+- **WHY:**
+  - **Durable, because recovery is the database's job.** The retry time must survive the worker that scheduled it: a crash, a restart or another worker claiming next. Anything held in a worker's memory would be lost exactly when retries matter.
+  - **The database clock** is the one every claimant compares against, read after the locks as for leases (DEC-035), so waiting for a lock does not shorten the delay.
+  - **Revocations are retried like transient failures (DEC-038),** so a hang or a dead worker is not retried back to back. A grace expiry ends the task, so there is nothing to delay.
+  - **Deterministic jitter** spreads retries of many tasks failing together (a provider outage) without randomness that tests and replays cannot reproduce; the same task and attempt always get the same delay, whichever process computes it.
+  - **A required policy** follows DEC-034: no production value is invented.
+  - **A distinct subclass** lets callers tell "not yet" from "never" without breaking code that catches `TaskNotStartableError`.
+- **RUNNER-UP:**
+  - Delays held by the worker (sleep before releasing, or skip recently failed tasks in memory): lost on a crash and invisible to other workers.
+  - Random jitter: not reproducible in tests or across processes.
+  - A per-task or per-job-kind policy stored in the database: needs a policy model nobody has decided; deferred.
+  - Ordering by `available_at`, or a claim index: changes fairness and planning without measurements (D4).
+- **WHY NOT:** each runner-up either loses the retry time with its process, cannot be tested deterministically, or decides policy or performance questions that wait for measurements.
+- **TRADE-OFF:**
+  - **Policy consistency is not enforced.** The process that records a requeue decides the delay; workers configured differently schedule differently, and nothing detects it.
+  - **A delay is an earliest time, not a schedule.** A task runs at the first poll of a live, supporting worker after it, behind any backlog.
+  - **Claims scan delayed tasks too.** With no index, a large backlog waiting out its delays is scanned and sorted by every claim; not measured.
+  - **Versions must switch together.** Code from before 0004 ignores `available_at` and would retry at once. `orqestra worker run`'s exact-history check refuses mismatched versions at startup (DEC-051), but does not stop a worker already running, and direct callers of the lifecycle functions are not checked.
+  - **The delay does not depend on the error**, for example a rate limit's `Retry-After`.
+  - **Many attempts revoked together after an outage** are spread by the jitter only.
+- **VERIFICATION:**
+  - **`tests/unit/test_retry.py` (68 cases):** both delays required; zero, negative, unrepresentable and non-`timedelta` values refused for each; base above max refused, equal allowed; immutable; for 41 task IDs and every *n* from 1 to 100, the delay lies between half (rounded up) and all of the capped exponential; doubling to the cap; huge *n* (up to 10⁹) capped without overflow; a 1 µs policy always waits 1 µs; equal delays for an equal task and attempt, also in a fresh interpreter; no two of 41 tasks share a capped delay, and a new factor for every attempt; *n* below 1, `bool`, `float` and `str` refused; the first attempt never waits longer than `base_delay`; `retry_at` adds the delay, and an unrepresentable time is a `ValueError`.
+  - **`tests/unit/test_worker_settings.py`:** both settings required and parsed from ISO 8601; base above max refused; the policy built from the two settings. Unit fakes check the runtime passes the configured policy to `complete_attempt` and to each recovery sweep.
+  - **`tests/integration/test_attempt_lifecycle.py`, section 23 (10 tests, 14 cases, real PostgreSQL):** a new task is eligible at once; a delayed older task is passed over for an eligible newer one, and only delayed tasks give `None`; the predicate both claims use is inclusive at fixed instants (equal is eligible, 1 µs before is not), and an explicit start succeeds 1 µs past it; an early explicit start raises `TaskNotEligibleError` (also a `TaskNotStartableError`) with every row unchanged, and succeeds once eligible; 8 concurrent claimants over 12 tasks, 4 delayed, take each eligible task once and no delayed one; a transient failure is delayed from a clock between the attempt's end and the moment after; `lease_expired` and `deadline_exceeded` revocations set exactly the recovery's time plus that generation's delay, for generations 1 and 2; a permanent failure, exhaustion, a success and a grace expiry leave `available_at` unchanged; a task cancelled during its backoff is cancelled at once and never runs, and its refusal is not the eligibility subclass; a revoked worker's completion during the backoff raises `AttemptRevokedError`, and after the next generation started `StaleAttemptError`, changing nothing.
+  - **`tests/integration/test_worker_runtime.py`:** a worker retries a transient failure three times, each attempt starting no earlier than the previous one's end plus its delay, and the exhausted attempt schedules nothing.
+  - **`tests/integration/test_worker_process.py` (real subprocesses):** retries spaced by the stored delay; a worker killed with SIGKILL is recovered by a second process, which sets exactly the recovery's time plus the delay and claims no earlier; SIGTERM during a one-minute delay exits 0 and leaves the task and its attempt unchanged; two workers polling the same task both wait for its time.
+  - **`tests/integration/test_migration_0004.py` (5 tests):** from an authentic, populated 0003 schema (no synthetic column), the upgrade keeps every task and attempt row, stamps one `available_at` between clock reads before and after, makes queued tasks claimable by current code and leaves the running attempt renewable; a repeated run is a no-op and the history verifies; it fails at once (`55P03`, "could not lock tasks") while a reader or a row lock holds `tasks`, leaving no history row and no column; it does not lock `attempts`.
+  - **Historical upgrade tests.** Migrations 0002 and 0003 are still tested against genuine pre-0004 schemas, pinned to the migrations they exercise. Because current lifecycle code reads `available_at`, those tests reproduce the claim, start, success and revocation of that time in a test-only module (`tests/integration/historical.py`), raw SQL in the same lock order, deciding with the production pure functions. One test now shows the 0002 schema refusing the `cancellation_grace_expired` reason and its transaction leaving nothing changed, rather than current code failing closed on an old schema, which is no longer possible by design.
+  - **Mutation checks:** locally, each of these failed tests, with the file restored and checked by hash: discovery ignoring `available_at` (6 cases); the claim's `UPDATE` ignoring it; an exclusive boundary; completion or recovery scheduling no retry; completion or recovery scheduling on every ending; no jitter; an exponent off by one; no cap.

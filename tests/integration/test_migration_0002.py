@@ -21,8 +21,9 @@ from psycopg import errors
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import TupleRow
 
-from orqestra.persistence.lifecycle import claim_next_attempt, get_attempt, list_attempts
+from orqestra.persistence.lifecycle import get_attempt, list_attempts
 from orqestra.persistence.migrate import MigrationError, load_migrations, migrate
+from tests.integration import historical
 from tests.integration.test_attempt_lifecycle import POLICY, assert_invariants
 
 pytestmark = pytest.mark.integration
@@ -250,18 +251,17 @@ def test_upgrades_a_quiescent_database_and_keeps_its_history(
         ("failed", None),
         ("failed", None),
     ]
-    # The upgraded schema serves the new code: both queued tasks are claimable.
+    # The upgraded schema serves the code of its time (claims since 0004 have their own
+    # tests): both queued tasks are claimable, with leases.
     claimed = {
         a.task_id: a
-        for a in (
-            claim_next_attempt(conn, "w", policy=POLICY, kinds=LEGACY_KINDS) for _ in range(2)
-        )
+        for a in (historical.claim(conn, "w", policy=POLICY, kinds=LEGACY_KINDS) for _ in range(2))
         if a is not None
     }
     assert set(claimed) == {requeued, queued}
     assert claimed[requeued].attempt_number == 2
     assert all(a.lease_expires_at is not None for a in claimed.values())
-    assert claim_next_attempt(conn, "w", policy=POLICY, kinds=LEGACY_KINDS) is None
+    assert historical.claim(conn, "w", policy=POLICY, kinds=LEGACY_KINDS) is None
     assert_invariants(conn)
 
 

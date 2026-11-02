@@ -14,7 +14,8 @@ Checked here are the relationships a healthy worker needs: the lease rules of
 a heartbeat that, sent on time and taking its full database time, is
 confirmed before the local fencing margin is reached; and a lock wait that
 PostgreSQL ends before the database call's own bound, compared in the whole
-milliseconds PostgreSQL uses (DEC-050). Nothing here bounds how
+milliseconds PostgreSQL uses (DEC-050); and a retry policy whose base delay
+does not exceed its maximum (DEC-053). Nothing here bounds how
 quickly expired attempts are recovered. The database connection itself is the
 existing ``ORQESTRA_DATABASE_URL`` (``Settings.database_url``).
 """
@@ -26,6 +27,7 @@ from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from orqestra.domain.leases import LeasePolicy, check_duration
+from orqestra.domain.retry import RetryPolicy
 
 # PostgreSQL's statement_timeout and lock_timeout count whole milliseconds, and 0
 # disables them.
@@ -70,6 +72,11 @@ class WorkerSettings(BaseSettings):
     # How long a stopping worker gives the task it holds to settle (its handler, the
     # completion and any reconciliation), from the latch; 0 means not at all (DEC-049).
     shutdown_timeout: timedelta
+    # How long a requeued task waits after its first ended attempt; doubled after each
+    # later one, up to retry_max_delay, with jitter (RetryPolicy, DEC-053). Every worker
+    # of a deployment must use the same values: nothing enforces that.
+    retry_base_delay: timedelta
+    retry_max_delay: timedelta
 
     @field_validator(
         "lease",
@@ -80,6 +87,8 @@ class WorkerSettings(BaseSettings):
         "fence_margin",
         "poll_interval",
         "recovery_interval",
+        "retry_base_delay",
+        "retry_max_delay",
     )
     @classmethod
     def _positive(cls, value: timedelta, info: ValidationInfo) -> timedelta:
@@ -107,6 +116,7 @@ class WorkerSettings(BaseSettings):
     @model_validator(mode="after")
     def _relationships(self) -> Self:
         self.lease_policy  # noqa: B018 - LeasePolicy checks lease <= execution_timeout
+        self.retry_policy  # noqa: B018 - RetryPolicy checks base <= max
         if self.db_operation_timeout >= self.heartbeat_interval:
             msg = (
                 f"db_operation_timeout {self.db_operation_timeout} must be shorter than "
@@ -139,3 +149,8 @@ class WorkerSettings(BaseSettings):
     def lease_policy(self) -> LeasePolicy:
         """The lease policy every claim and heartbeat of this worker uses."""
         return LeasePolicy(lease=self.lease, execution_timeout=self.execution_timeout)
+
+    @property
+    def retry_policy(self) -> RetryPolicy:
+        """The retry policy every requeue this worker records uses (completion and recovery)."""
+        return RetryPolicy(base_delay=self.retry_base_delay, max_delay=self.retry_max_delay)

@@ -76,6 +76,7 @@ from orqestra.domain.leases import (
     revocation_reason,
 )
 from orqestra.domain.policy import FailureKind, next_task_state, state_after_cancel_request
+from orqestra.domain.retry import RetryPolicy, retry_at
 from orqestra.domain.states import (
     TERMINAL_TASK_STATES,
     AttemptState,
@@ -117,8 +118,12 @@ _LOCK_CURRENT_ATTEMPT = (
 # is read by the subquery, which takes no row lock and is not re-checked. That
 # relies on a job's kind never changing; no code path updates it, but the
 # database does not forbid it.
+# A queued task may be claimed once the database clock reaches its available_at,
+# inclusively (DEC-053). Both claim paths test it at the statement that decides.
+_ELIGIBLE = "available_at <= {now}"
 _LOCK_NEXT_CLAIMABLE_TASK = (
     f"SELECT {TASK_COLUMNS} FROM tasks WHERE state = ANY(%s) "
+    f"AND {_ELIGIBLE.format(now='statement_timestamp()')} "
     "AND EXISTS (SELECT FROM jobs WHERE jobs.id = tasks.job_id AND jobs.kind = ANY(%s)) "
     "ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
 )
@@ -131,10 +136,14 @@ _NOW = "SELECT statement_timestamp()"
 # The claim instant: this statement runs after the task row is locked, so its
 # statement_timestamp() excludes any wait for that lock. The attempt's
 # started_at, lease and deadline are all derived from the same instant.
+# The same instant decides eligibility: an ineligible task updates no row.
 _CLAIM_TASK = (
     "UPDATE tasks SET state = %s, attempt_count = attempt_count + 1, "
-    "updated_at = statement_timestamp() WHERE id = %s RETURNING attempt_count, updated_at"
+    "updated_at = statement_timestamp() "
+    f"WHERE id = %s AND {_ELIGIBLE.format(now='statement_timestamp()')} "
+    "RETURNING attempt_count, updated_at"
 )
+_AVAILABLE_AT = "SELECT available_at FROM tasks WHERE id = %s"
 _INSERT_ATTEMPT = (
     "INSERT INTO attempts "
     "(id, task_id, attempt_number, worker_id, started_at, lease_expires_at, deadline_at) "
@@ -144,9 +153,10 @@ _FINISH_ATTEMPT = (
     "UPDATE attempts SET state = %s, failure_kind = %s, error_type = %s, error_message = %s, "
     f"finished_at = now() WHERE id = %s RETURNING {ATTEMPT_COLUMNS}"
 )
+# available_at changes only when the task is requeued (otherwise NULL keeps it).
 _FINISH_TASK = (
     "UPDATE tasks SET state = %s, result = %s, updated_at = now(), "
-    "finished_at = CASE WHEN %s THEN now() END "
+    "finished_at = CASE WHEN %s THEN now() END, available_at = COALESCE(%s, available_at) "
     f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
 # A request's instant is this statement's timestamp, taken after the task row
@@ -190,7 +200,8 @@ _REVOKE_ATTEMPT = (
     f"WHERE id = %s RETURNING {ATTEMPT_COLUMNS}"
 )
 _RECOVER_TASK = (
-    "UPDATE tasks SET state = %s, updated_at = %s, finished_at = %s "
+    "UPDATE tasks SET state = %s, updated_at = %s, finished_at = %s, "
+    "available_at = COALESCE(%s, available_at) "
     f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
 
@@ -211,6 +222,21 @@ class TaskNotStartableError(OrqestraError):
         super().__init__(f"task {task_id} cannot start an attempt from state {state.value!r}")
         self.task_id = task_id
         self.state = state
+
+
+class TaskNotEligibleError(TaskNotStartableError):
+    """The task is queued, but its retry delay has not passed: no attempt can start yet.
+
+    ``available_at`` is the database time from which it may start (DEC-053).
+    """
+
+    def __init__(self, task_id: uuid.UUID, available_at: datetime) -> None:
+        OrqestraError.__init__(
+            self, f"task {task_id} is queued but not eligible until {available_at.isoformat()}"
+        )
+        self.task_id = task_id
+        self.state = TaskState.QUEUED
+        self.available_at = available_at
 
 
 class StaleAttemptError(OrqestraError):
@@ -345,8 +371,10 @@ def start_attempt(
     In one transaction: lock the task, then claim it (see ``_claim``) with a
     lease and deadline from ``policy``. Competing callers serialise on the
     task's row lock, so exactly one of them starts each generation; the others
-    get ``TaskNotStartableError``. Raises ``NotFoundError`` for an unknown
-    task, and ``ValueError`` if the deadline is not representable.
+    get ``TaskNotStartableError``. A queued task whose retry delay has not
+    passed raises ``TaskNotEligibleError``, a subclass, with nothing changed.
+    Raises ``NotFoundError`` for an unknown task, and ``ValueError`` if the
+    deadline is not representable.
     """
     with owned_transaction(conn, "start_attempt") as cur:
         task = _lock_task(cur, _LOCK_TASK, task_id, "task")
@@ -368,8 +396,9 @@ def claim_next_attempt(
     cannot hold. Kinds match job kinds exactly. They are checked before
     anything is sent to the database.
 
-    In one transaction: lock the first queued task of one of those kinds, by
-    ``created_at`` then ``id``, that no other transaction has locked, then
+    In one transaction: lock the first queued task of one of those kinds whose
+    ``available_at`` has been reached, by ``created_at`` then ``id``, that no
+    other transaction has locked, then
     claim it exactly as ``start_attempt`` does. Tasks of other kinds are never
     locked or claimed, so they keep their place and their retry budget, and
     never hold up supported ones. It never waits for a row lock: tasks being
@@ -396,11 +425,17 @@ def _claim(cur: Cursor, task: Task, worker_id: str, policy: LeasePolicy) -> Atte
     trigger rejects any other change) and inserts the attempt whose number is
     the new generation, started at the claim instant with its lease and
     deadline. tasks_queued_has_attempts_left guarantees a queued task has an
-    attempt left, so this cannot exceed ``max_attempts``.
+    attempt left, so this cannot exceed ``max_attempts``. The claim itself
+    requires ``available_at`` to have been reached at its own instant, so no
+    caller can start a task early (DEC-053); a refused claim changes nothing.
     """
     if not can_transition(task.state, TaskState.RUNNING):
         raise TaskNotStartableError(task.id, task.state)
-    generation, claimed_at = _one(cur.execute(_CLAIM_TASK, (TaskState.RUNNING.value, task.id)))
+    claimed = cur.execute(_CLAIM_TASK, (TaskState.RUNNING.value, task.id)).fetchone()
+    if claimed is None:
+        (not_before,) = _one(cur.execute(_AVAILABLE_AT, (task.id,)))
+        raise TaskNotEligibleError(task.id, not_before)
+    generation, claimed_at = claimed
     lease_expires_at, deadline_at = initial_lease(policy, claimed_at)
     row = _one(
         cur.execute(
@@ -431,7 +466,12 @@ def _log_started(attempt: Attempt) -> None:
 
 
 def complete_attempt(
-    conn: Conn, attempt_id: uuid.UUID, *, generation: int, outcome: AttemptOutcome
+    conn: Conn,
+    attempt_id: uuid.UUID,
+    *,
+    generation: int,
+    outcome: AttemptOutcome,
+    retry_policy: RetryPolicy,
 ) -> AttemptCompletion:
     """Record how an attempt ended and move its task accordingly.
 
@@ -441,6 +481,9 @@ def complete_attempt(
     together, with the task's next state chosen by ``next_task_state``.
     A succeeded attempt's result becomes the task's result. An attempt whose
     lease expired still completes until recovery has committed its revocation.
+    A task requeued by a transient failure becomes eligible again after
+    ``retry_policy``'s delay, from the database's clock read after the locks
+    (DEC-053); no other outcome changes its ``available_at``.
 
     Raises, without changing anything: ``StaleAttemptError`` when the
     generation does not match the attempt or a newer generation exists;
@@ -476,6 +519,11 @@ def complete_attempt(
             ),
         )
         attempt_state = transition_attempt(AttemptState.RUNNING, outcome.state)
+        not_before = (
+            retry_at(retry_policy, task.id, task.attempt_count, _now(cur))
+            if next_state is TaskState.QUEUED
+            else None
+        )
         attempt_row = _one(
             cur.execute(
                 _FINISH_ATTEMPT,
@@ -493,7 +541,13 @@ def complete_attempt(
         task_row = _one(
             cur.execute(
                 _FINISH_TASK,
-                (next_state.value, result, next_state in TERMINAL_TASK_STATES, task.id),
+                (
+                    next_state.value,
+                    result,
+                    next_state in TERMINAL_TASK_STATES,
+                    not_before,
+                    task.id,
+                ),
             )
         )
         completion = AttemptCompletion(attempt_from_row(attempt_row), task_from_row(task_row))
@@ -562,7 +616,7 @@ def renew_lease(
     return attempt
 
 
-def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
+def revoke_next_expired(conn: Conn, *, retry_policy: RetryPolicy) -> AttemptRevocation | None:
     """Revoke one running attempt whose lease has expired, and move its task.
 
     In one transaction: lock the task of the most overdue expired attempt that
@@ -572,7 +626,9 @@ def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
     the attempt as ``REVOKED`` with the reason its stored lease, deadline and
     cancellation request show, and move the task as ``next_task_state``
     decides for that reason (DEC-038, DEC-040). Ownership ends when this
-    commits.
+    commits. A task requeued by a ``lease_expired`` or ``deadline_exceeded``
+    revocation becomes eligible again after ``retry_policy``'s delay from that
+    database time (DEC-053); a cancelled or failed one is not delayed.
 
     Returns the revoked attempt and its task, or ``None`` when this call
     revoked nothing: no expired attempt was unlocked, or the one found was
@@ -622,7 +678,14 @@ def revoke_next_expired(conn: Conn) -> AttemptRevocation | None:
             cur.execute(_REVOKE_ATTEMPT, (attempt_state.value, reason.value, now, current.id))
         )
         finished_at = now if next_state in TERMINAL_TASK_STATES else None
-        task_row = _one(cur.execute(_RECOVER_TASK, (next_state.value, now, finished_at, task.id)))
+        not_before = (
+            retry_at(retry_policy, task.id, task.attempt_count, now)
+            if next_state is TaskState.QUEUED
+            else None
+        )
+        task_row = _one(
+            cur.execute(_RECOVER_TASK, (next_state.value, now, finished_at, not_before, task.id))
+        )
         revocation = AttemptRevocation(attempt_from_row(attempt_row), task_from_row(task_row))
     logger.warning(
         "attempt revoked: %s",

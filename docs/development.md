@@ -69,6 +69,17 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   cannot read the `cancellation_grace_expired` reason and does not stop heartbeats after
   a cancellation request. Stopping claims and draining work first is preferable: SIGTERM
   drains a worker (DEC-049).
+- Upgrading to 0004 is additive at the database: it adds `tasks.available_at` with a
+  default and no table rewrite, takes only `tasks`, with `NOWAIT` (`55P03` while any
+  session uses it), and leaves running attempts and every row as they were; existing
+  tasks become eligible at once. Application versions are again the constraint the
+  database cannot enforce: code from before 0004 ignores `available_at` and would retry a
+  requeued task at once. Stop all application processes (SIGTERM drains a worker), run
+  `orqestra migrate`, then start only code from Day 4A or later, every worker configured
+  with the same retry settings. `orqestra worker run`'s startup check refuses a history
+  that differs from the packaged one, so new code refuses an unmigrated database and old
+  code refuses a migrated one; it does not stop a worker that was already running, and
+  code that calls the lifecycle functions directly is not checked at all.
 
 ## Distributed correctness
 
