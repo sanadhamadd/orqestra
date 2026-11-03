@@ -62,7 +62,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
 | Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed) | a live provider adapter; a usage and cost ledger |
-| Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
+| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed) | a usage and cost ledger; an API (framework undecided) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
 
@@ -671,6 +671,61 @@ handler = invoice_verification_handler(
   guard that makes any connection or name lookup fail. No SDK, credential or network call
   is involved.
 
+### Invoice job summary
+
+A job's status says nothing about its invoices: a job in which every invoice was rejected
+is still `succeeded`. `summarize_invoice_job` reads the stored item results and reports
+what happened to each item (DEC-056, Proposed). It is a Python interface for now, with no
+command, API, table or migration.
+
+```python
+import psycopg
+
+from orqestra.aggregation.invoice import summarize_invoice_job
+
+with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
+    summary = summarize_invoice_job(conn, job_id)  # None if there is no such job
+    if summary is not None and summary.complete:
+        print(summary.verified, summary.rejected, summary.needs_review, summary.malformed)
+    elif summary is not None:
+        print(summary.job_status, summary.unprocessed_items, summary.anomaly_samples)
+```
+
+- **One snapshot.** The job row and all of its tasks are read in a single
+  `REPEATABLE READ, READ ONLY` transaction, so a completion committed meanwhile is not seen
+  and the counts describe one coherent past state. The read takes no row locks and does not
+  block workers. Tasks are streamed through a server-side cursor in chunks (`fetch_size`),
+  and only a bounded description of each payload is fetched, never the payload itself.
+  `observed_at` is approximate: the database time of the read's first query. A long read
+  holds back vacuum for as long as it lasts.
+- **What is counted.** An item is counted as `verified`, `rejected`, `needs_review` or
+  `malformed` only if its task succeeded, the stored result matches the task's payload
+  (same `offset`, one entry per item), and the entry is valid, inside the task's own range
+  and claimed once. Result indices are absolute; the offset is never added.
+- **Where the rest goes.**
+  - `unprocessed_items`: items of tasks that are queued, running, failed or cancelled.
+  - `invalid_items`: items of a batch whose result does not match its payload, and
+    indices claimed by an unusable or duplicated entry.
+  - `missing_items`: indices of a matching result that no entry claims.
+  - `processed + unprocessed + missing + invalid` equals `expected_items`, the sum of the
+    payload lengths; it is `None` if any payload is not a batch.
+- **Anomalies.** Problems in the data (a payload that is not a batch, a gap or overlap
+  between batches, a result that is `null` or the wrong shape, a duplicate, out-of-range or
+  unusable entry) are counted by a closed set of codes, with up to `MAX_SAMPLES` samples
+  of the code, task key and index. They never contain a value from an invoice, and none is
+  raised as an error.
+- **`complete`.** True only for a succeeded job with at least one item, every item
+  processed, and no anomaly. **Counts are per-task tallies, not a final job tally
+  unless `complete` is true.** A complete summary does not change later if the engine's contracts
+  hold; the schema does not enforce that, and a summary that is not complete is a
+  point-in-time observation.
+- **Not a spend figure.** `provider_assisted_items` counts items a provider helped read,
+  not provider calls or cost. A retried batch repeats calls, and no usage is stored.
+- **Errors.** `None` for a missing job; `WrongJobKindError` for another kind of job (no
+  task is read); `ValueError` for a job without tasks; `RuntimeError` if the connection is
+  already inside a transaction. A database error propagates and no partial summary is
+  returned.
+
 ### Verification
 
 ```sh
@@ -699,6 +754,12 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   discarded, and the stored `routing` shows only which route was chosen. A provider error
   repeats the whole batch on retry, so billable calls could repeat; deterministic request
   ids would let a real adapter deduplicate them, and no exactly-once claim is made.
+- The invoice job summary is in process only: no command or API exposes it, and it
+  summarizes one job per call. Its snapshot read grows with the number of tasks and the
+  size of their stored results, and holds back vacuum while it lasts; the cost of the
+  ordering, the effect of the fetch size and the behaviour under concurrent completions
+  are measured by tests that no default lane runs, and no threshold or batch-size limit is
+  decided. Counts are per-task tallies, not a final job tally unless `complete`.
 - **The worker's local fence is limited.**
   - It cannot stop a handler that holds the GIL in native code: the watchdog thread then
     cannot run either.
