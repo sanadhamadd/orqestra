@@ -4,12 +4,12 @@ Material engineering decisions in WHAT / WHY / RUNNER-UP form. A proposal is not
 decision: every entry stays **Proposed** until the owner marks it **Accepted** in a
 reviewed change. Trivial edits are not logged. Cross-cutting choices also get an ADR.
 
-Deliberately **undecided** (do not infer a choice from the code): API framework, worker
-hosting, AI provider and models, asyncio vs threads for worker slots, operational lease
-and execution-timeout values and any per-job-kind policy (DEC-034). The DB driver,
-migration tool and task queue are no longer open: see DEC-016, DEC-017 and DEC-033.
-Operational cancellation grace periods are undecided too (DEC-040), and so are
-operational retry delays (DEC-053).
+Deliberately **undecided** (do not infer a choice from the code): API framework, AI
+provider and models, operational lease and execution-timeout values and any
+per-job-kind policy (DEC-034). The Day 4 worker model and hosting boundary are
+recorded in DEC-054. The DB driver, migration tool and task queue are no longer open:
+see DEC-016, DEC-017 and DEC-033. Operational cancellation grace periods are
+undecided too (DEC-040), and so are operational retry delays (DEC-053).
 
 ## Day 1 — repository foundation
 
@@ -1216,12 +1216,13 @@ Entry DEC-052 records the partitioner, agreed in the Day 3C read-only assessment
 
 ## Day 4A — Durable retry scheduling
 
-Entry DEC-053 records retry backoff, agreed in the Day 4A read-only assessment (decisions
-D1–D4). It stays **Proposed** until the owner accepts it in a reviewed change;
-"implemented" means verified locally by the tests named, not yet in GitHub CI.
+Entry DEC-053 records retry backoff, agreed in the Day 4A assessment (decisions D1–D4).
+It stays **Proposed** until the owner accepts it in a reviewed change. The original
+GitHub Actions run 41538196569 passed both lanes on head `e4aa59b`; later checks are
+recorded on PR #17.
 
 ### DEC-053 — A requeued task waits until a durable `available_at`, from a required policy with deterministic jitter
-- **Status:** Proposed · owner-approved direction (Day 4A decisions D1–D4) · implemented locally (`orqestra.domain.retry`, migration 0004, `orqestra.persistence.lifecycle`)
+- **Status:** Proposed · owner-approved direction (Day 4A decisions D1–D4) · implemented on PR #17 (`orqestra.domain.retry`, migration 0004, `orqestra.persistence.lifecycle`)
 - **WHAT:**
   - **Durable eligibility (D1).** Migration 0004 adds `tasks.available_at timestamptz NOT NULL DEFAULT now()`. A task may be claimed only when `available_at <= statement_timestamp()`. Both claim paths check it inside the atomic claim: discovery's `FOR UPDATE SKIP LOCKED` query and the claim's `UPDATE … WHERE`, so a refused claim updates no row.
   - **When a retry is scheduled (D2).** Only when the task is requeued: a transient failure with attempts left, or a `lease_expired` or `deadline_exceeded` revocation with attempts left and no cancellation request. Then `available_at` = the database clock read after the locks (DEC-035) + `retry_delay(policy, task_id, n)`, where *n* is the ended attempt's generation. A success, a permanent or unclassified failure, exhausted retries and any cancellation, including `cancellation_grace_expired`, leave it unchanged.
@@ -1259,3 +1260,22 @@ D1–D4). It stays **Proposed** until the owner accepts it in a reviewed change;
   - **`tests/integration/test_migration_0004.py`:** pinned to migrations 0001–0004, so a later migration cannot change what it exercises; from an authentic, populated 0003 schema (no synthetic column), the upgrade keeps every task and attempt row, stamps one `available_at` between clock reads before and after, makes queued tasks claimable by current code and leaves the running attempt renewable; a repeated run is a no-op and the history verifies; it fails at once (`55P03`, "could not lock tasks") while a reader or a row lock holds `tasks`, leaving no history row and no column; it does not lock `attempts`; the column is `timestamptz NOT NULL` with a `now()` default, and the set of indexes on `tasks` is the same before and after.
   - **Historical upgrade tests.** Migrations 0002 and 0003 are still tested against genuine pre-0004 schemas, pinned to the migrations they exercise. Because current lifecycle code reads `available_at`, those tests reproduce the claim, start, success and revocation of that time in a test-only module (`tests/integration/historical.py`), raw SQL in the same lock order, deciding with the production pure functions. One test now shows the 0002 schema refusing the `cancellation_grace_expired` reason and its transaction leaving nothing changed, rather than current code failing closed on an old schema, which is no longer possible by design.
   - **Mutation checks (the author's earlier local run, not repeated since):** each of these failed tests, with the file restored and checked by hash: discovery ignoring `available_at` (6 cases); the claim's `UPDATE` ignoring it; an exclusive boundary; completion or recovery scheduling no retry; completion or recovery scheduling on every ending; no jitter; an exponent off by one; no cap.
+
+
+## Day 4 — Worker architecture
+
+### DEC-054 — Day 4 uses independent single-slot workers without an Orqestra-owned service
+- **Status:** Proposed · owner-approved direction (2026-11-03, Day 4 architecture r2 `8d656bd386ecee65e8db5214ca59a2879bed02b2c10c8a2f6effc0387a8c0a46`)
+- **WHAT:**
+  - One `orqestra worker run` process has one handler slot. Scale by running N independent worker processes against PostgreSQL; do not add in-process threads or asyncio slots.
+  - Day 4 adds no Orqestra-owned worker service or restart supervisor. The operator starts workers with identical settings and owns restart policy; deployment is out of scope.
+  - Keep lease, execution-timeout, retry-delay and cancellation-grace settings explicit and required, with no defaults. Numeric operating values and per-kind policies remain undecided pending measurement (BS-05 or the Day 5 workload).
+  - Before closing Day 4, add the worker-level integration test identified in the r2 review: let a handler run beyond `execution_timeout`, then verify the worker is fenced and the attempt is revoked as `deadline_exceeded`.
+- **WHY:**
+  - DEC-044/045 already define the single-slot process model and require process termination when ownership cannot be confirmed. Multiple slots in one process would reopen that design.
+  - Existing worker tests cover multi-process execution and crash recovery, but do not cover a handler that outlives its execution deadline and the resulting `deadline_exceeded` revocation.
+  - No service or default timing values are needed to verify the approved Day 4 behavior; both require separate operational decisions or measurement.
+- **RUNNER-UP:** Multiple worker slots in one process (threads or asyncio), or an Orqestra-owned worker supervisor. These reopen the DEC-045 stop model or the undecided hosting boundary.
+- **WHY NOT:** The existing runtime can end a process when a handler may have lost ownership; it cannot safely isolate sibling slots inside that process. DEC-051 also records that Orqestra owns no service or supervisor.
+- **TRADE-OFF:** The operator must launch enough workers for progress and keep their settings consistent. Orqestra provides no restart or recovery-time guarantee while no compatible worker is live.
+- **VERIFICATION:** The worker-level deadline test is a remaining Day 4 acceptance item and is not implemented by PR #17. Existing tests continue to cover stale-worker fencing, SIGKILL recovery, and one authoritative result.
