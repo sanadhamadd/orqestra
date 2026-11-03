@@ -4,8 +4,10 @@ Material engineering decisions in WHAT / WHY / RUNNER-UP form. A proposal is not
 decision: every entry stays **Proposed** until the owner marks it **Accepted** in a
 reviewed change. Trivial edits are not logged. Cross-cutting choices also get an ADR.
 
-Deliberately **undecided** (do not infer a choice from the code): API framework, AI
-provider and models, operational lease and execution-timeout values and any
+The selected outbound provider is OpenRouter (DEC-057). No inbound API or framework is
+planned; any future inbound service requires a separate decision. Deliberately
+**undecided** (do not infer a choice from the code): which provider models may be used,
+operational lease and execution-timeout values and any
 per-job-kind policy (DEC-034). The Day 4 worker model and hosting boundary are
 recorded in DEC-054. The DB driver, migration tool and task queue are no longer open:
 see DEC-016, DEC-017 and DEC-033. Operational cancellation grace periods are
@@ -1334,3 +1336,35 @@ recorded on PR #17.
   - A `complete` summary is stable only if the engine's contracts hold (`SUCCEEDED` has no outgoing transition and only a completion writes a result). The schema does not enforce that, so a manual edit could change it. A summary that is not complete is a point-in-time observation.
   - A batch with `items: []` is valid but is never `complete`. Batch size and limits stay undecided (BS-05).
 - **VERIFICATION:** Unit tests (`tests/unit/test_invoice_summary.py`) cover absolute-index mapping at offsets 0, 3 and 100 with the offset-added and relative-index regressions, every anomaly code and every batch-rejection condition, the partition rules, a conservation check of `processed + unprocessed + missing + invalid == expected` and order independence over every combination of up to three tasks drawn from twelve shapes, `complete` in each negative case, the deterministic sample bound, frozen and zero-filled output, payload-shape parity with the handler, and that no value from the data reaches a summary. Integration tests (`tests/integration/test_invoice_summary_pg.py`, real PostgreSQL) run the real lifecycle for happy paths and use raw SQL only for corrupt fixtures: payloads `5`, `"x"`, JSON `null`, `[1]`, `{"invoice_id": "INV-1"}`, `{"offset": 1.5, "items": []}` and `{"offset": 0, "items": "x"}` are first shown to fail an unguarded projection and are then reported without a database error; the projection is compared with the Python description of each payload; a completion committed after the job row is read is invisible to the stream, and a companion test asserts that weakening the isolation level to `READ COMMITTED` makes it visible, so the first test is sensitive to the level; partial jobs and nine kinds of corrupt result; a write inside the snapshot fails; table contents are unchanged by a read; the connection ends outside a transaction after success, an error and an abandoned stream, in autocommit and manual-commit mode; a caller-open transaction is refused; and fetch sizes 1, 2 and 1,000 give identical summaries. Three tests marked `performance` (never in a default lane) seed with raw SQL and record time, `tracemalloc` peak and RSS at 50,000 invoices for batch sizes 1, 10, 100 and 1,000, the ordering and fetch-size cost, and reads made while tasks complete, asserting correctness only. The results of the fixed test profile are recorded on the pull request, not here.
+
+## Provider access and usage
+
+### DEC-057 — Provider calls go to OpenRouter through an outbound adapter, and each call is recorded before it is made
+- **Status:** Proposed · owner-resolved direction (2026-11-03); it stays Proposed until the maintainer accepts it in a reviewed change. None of it is implemented yet. DEC-055 and DEC-056 keep their own text and status.
+- **WHAT:**
+  - **Provider.** The selected provider is OpenRouter. A future outbound adapter reaches it using the Python standard library, with no new dependency, from a package outside the packages covered by the offline isolation scan. There is no default model. Credentials, prompts and responses are never logged.
+  - **No inbound API.** No inbound Orqestra API or framework is planned. Any future inbound service requires a separate decision.
+  - **Live calls.** The changes that build this make no live provider call. A live call requires separate, explicit authorization.
+  - **Ledger first.** A provider usage ledger in PostgreSQL exists before any live provider call. Its records are append-only and stay attributed to the attempt that made the call, even after that attempt loses ownership. A retry is a new attempt, so a repeated call appears as a separate record.
+  - **Intent-first capture.** A call's intent is recorded durably before the call can be made. If the intent cannot be recorded, no call is made, and a failure to record the intent is not a handler failure. A call whose outcome is unknown stays explicitly unresolved and is never counted as zero.
+  - **Reported usage.** The ledger keeps the provider-reported numeric amount with the unit label the provider declared. Values are not converted, and no currency or actual charge is implied. Totals are grouped by unit and described as provider-reported usage, not as cost or charges.
+  - **Retention.** v1 adds no deletion or retention mechanism. Usage data stays synthetic until a retention policy is reviewed.
+  - **Call cap.** Any attempt that may call a billable provider needs an explicit per-attempt call cap, with no default. At the cap, verification returns `needs_review` with an explicit reason. The relationships between the cap, the timeout and the fencing margin are validated. This settles the per-attempt call cap that DEC-055 left undecided; DEC-055's text and status are unchanged. A per-job spend gate is advisory only, because workers claim independently.
+  - **Registration.** Invoice verification is registered with `orqestra worker run` only behind durable recording, the explicit per-attempt call cap and the agreed safety gates.
+  - **Claim index.** Claim ordering is measured against the pinned PostgreSQL 16 image and the observations are recorded. The partial index DEC-033 left open is added only if repeatable measurements justify it without unacceptable write overhead.
+- **WHY:**
+  - A real provider call is billable, yet its reported usage is discarded today, and a retried batch repeats calls it already made (DEC-055). Recording before the first live call means no billed call goes unrecorded.
+  - Recording the intent first is the only capture order with no unrecorded call: a worker that is fenced or killed during a call still leaves a record of it.
+  - Keeping the provider's own figure and unit avoids inventing rates or currency.
+  - PostgreSQL is already authoritative (DEC-015), so the ledger needs no second store.
+  - The standard library is enough for one outbound request and adds no supply-chain surface.
+  - DEC-033 records that each claim scans and sorts until a partial index is added; measurement, not assumption, decides whether that cost matters.
+- **RUNNER-UP:** Buffer usage in memory and store it with the attempt's completion.
+- **WHY NOT:** It loses every call of an attempt that is fenced or killed, which is exactly the `deadline_exceeded` retry case where billed calls repeat. A third-party HTTP client was not chosen because it adds a dependency for one request. An inbound API was not chosen because no need for one is recorded.
+- **TRADE-OFF:**
+  - Each call waits for a durable write before it is made, which adds latency per call.
+  - The ledger cannot prove an actual charge, give exactly-once billing, or resolve a call whose response was lost.
+  - Without a deletion path, records accumulate; that is acceptable only while the data is synthetic.
+  - Concurrent workers can exceed an advisory per-job gate; only the per-attempt cap is enforced.
+  - No model can be used until one is chosen explicitly.
+- **VERIFICATION:** This entry changes documentation only; no code, schema or test changes. Each behavior is verified by tests in the change that implements it, and the claim-index choice rests on recorded measurements, not a fixed threshold.
