@@ -632,9 +632,7 @@ def record_call_intent(conn: Conn, intent: CallIntent) -> Recorded[StoredCall]:
     """
     content = _intent_content(intent)
     with owned_transaction(conn, "record_call_intent") as cur:
-        row = cur.execute(
-            _INSERT_INTENT, (intent.call_seq, *content, intent.attempt_id)
-        ).fetchone()
+        row = cur.execute(_INSERT_INTENT, (intent.call_seq, *content, intent.attempt_id)).fetchone()
         created = row is not None
         if row is None:
             row = cur.execute(_SELECT_INTENT, (intent.attempt_id, intent.call_seq)).fetchone()
@@ -667,9 +665,7 @@ def record_call_result(conn: Conn, result: CallResult) -> Recorded[StoredResult]
     """
     content = _result_content(result)
     with owned_transaction(conn, "record_call_result") as cur:
-        row = cur.execute(
-            _INSERT_RESULT, (*content, result.attempt_id, result.call_seq)
-        ).fetchone()
+        row = cur.execute(_INSERT_RESULT, (*content, result.attempt_id, result.call_seq)).fetchone()
         created = row is not None
         if row is None:
             row = cur.execute(_SELECT_RESULT, (result.attempt_id, result.call_seq)).fetchone()

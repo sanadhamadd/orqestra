@@ -334,7 +334,7 @@ def test_an_amount_must_be_a_finite_unsigned_numeric_value(amount: Decimal) -> N
 def test_an_amount_is_kept_exactly(amount: Decimal) -> None:
     kept = with_amount(amount).reported_amount
     assert kept is amount
-    assert AMOUNT_LIMIT == Decimal(10) ** 20
+    assert Decimal(10) ** 20 == AMOUNT_LIMIT
 
 
 def test_an_amounts_identity_is_its_value_and_scale() -> None:

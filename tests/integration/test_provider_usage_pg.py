@@ -795,9 +795,7 @@ def test_reads_and_writes_refuse_a_caller_transaction(schema_url: str, checked: 
 # --- locks ------------------------------------------------------------------------------
 
 
-def test_writes_and_reads_never_wait_for_a_lock_on_the_task(
-    schema_url: str, checked: Conn
-) -> None:
+def test_writes_and_reads_never_wait_for_a_lock_on_the_task(schema_url: str, checked: Conn) -> None:
     task, attempt = running(checked)
     with connect(schema_url) as holder, connect(schema_url) as writer:
         writer.execute("SET lock_timeout = '1s'")  # a wait fails the test instead
