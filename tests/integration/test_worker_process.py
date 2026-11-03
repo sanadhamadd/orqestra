@@ -351,6 +351,56 @@ def test_a_lost_connection_is_never_mistaken_for_a_cancellation(
     assert no_failure_recorded(handler_db, task)
 
 
+# --- a handler that outlives its execution timeout ----------------------------------------
+
+# Test values only (DEC-034): lease 4 s <= execution timeout 6 s, and the lease is capped at
+# the deadline by the heartbeats at about 1 s and 2 s, so the ownership watchdog sits at
+# about deadline minus the 1 s fence margin.
+DEADLINE = timedelta(seconds=6)
+MARGIN = timedelta(seconds=1)
+
+
+def test_a_handler_outliving_the_execution_timeout_is_fenced_and_revoked_as_deadline_exceeded(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key}, max_attempts=3)
+    worker = start(overrides={"ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT6S"})
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    code, lines = worker.exit()
+    events = [line.get("event") for line in lines]
+    # Fenced by the deadline, not by a lost connection, a lost lease or a cancellation.
+    assert code == ExitCode.FENCED
+    assert events[-1] == "ownership_deadline_passed"
+    for other in ("ownership_lost", "heartbeat_unconfirmed", "cancellation_requested"):
+        assert other not in events
+    started = next(line for line in lines if line.get("event") == "handler_started")
+    fenced_after = (logged_at(lines[-1]) - logged_at(started)).total_seconds()
+    assert fenced_after >= (DEADLINE - MARGIN).total_seconds() - 0.5
+    # The handler outlived the deadline (the test still holds its gate) and never ended.
+    assert before_lease_end(handler_db, task)
+    assert task_states(handler_db, [task]) == [("running", 1)]
+    assert no_failure_recorded(handler_db, task)
+    # The lease reached its cap, which is what makes recovery's reason the deadline.
+    ((lease_end, deadline_at, claimed_at),) = rows(
+        handler_db,
+        "SELECT lease_expires_at, deadline_at, started_at FROM attempts WHERE task_id = %s",
+        task.id,
+    )
+    assert lease_end == deadline_at
+    assert deadline_at - claimed_at == DEADLINE
+    # Recovery then revokes the attempt for the deadline, and the task is retried (DEC-053).
+    revocation = eventually(
+        lambda: revoke_next_expired(handler_db, retry_policy=RETRY), "the deadline to pass"
+    )
+    assert revocation.attempt.revoked_reason is not None
+    assert revocation.attempt.revoked_reason.value == "deadline_exceeded"
+    assert task_states(handler_db, [task]) == [("queued", 1)]
+    assert rows(
+        handler_db, "SELECT state, revoked_reason FROM attempts WHERE task_id = %s", task.id
+    ) == [("revoked", "deadline_exceeded")]
+    assert runs(handler_db) == 1  # no worker is left to run it again
+
+
 # --- graceful shutdown (DEC-049) ---------------------------------------------------------
 
 

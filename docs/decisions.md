@@ -1270,16 +1270,15 @@ recorded on PR #17.
   - One `orqestra worker run` process has one handler slot. Scale by running N independent worker processes against PostgreSQL; do not add in-process threads or asyncio slots.
   - Day 4 adds no Orqestra-owned worker service or restart supervisor. The operator starts workers with identical settings and owns restart policy; deployment is out of scope.
   - Keep lease, execution-timeout, retry-delay and cancellation-grace settings explicit and required, with no defaults. Numeric operating values and per-kind policies remain undecided pending measurement (BS-05 or the Day 5 workload).
-  - Before closing Day 4, add the worker-level integration test identified in the r2 review: let a handler run beyond `execution_timeout`, then verify the worker is fenced and the attempt is revoked as `deadline_exceeded`.
+  - Cover the deadline boundary at worker level: let a handler run beyond `execution_timeout`, verify that the worker is fenced, then verify recovery revokes the attempt as `deadline_exceeded` (implemented in PR #18).
 - **WHY:**
   - DEC-044/045 already define the single-slot process model and require process termination when ownership cannot be confirmed. Multiple slots in one process would reopen that design.
-  - Existing worker tests cover multi-process execution and crash recovery, but do not cover a handler that outlives its execution deadline and the resulting `deadline_exceeded` revocation.
+  - Before PR #18, worker tests covered multi-process execution and crash recovery but not a handler that outlives its execution deadline and the resulting `deadline_exceeded` revocation. PR #18 closes that coverage gap without changing production code.
   - No service or default timing values are needed to verify the approved Day 4 behavior; both require separate operational decisions or measurement.
 - **RUNNER-UP:** Multiple worker slots in one process (threads or asyncio), or an Orqestra-owned worker supervisor. These reopen the DEC-045 stop model or the undecided hosting boundary.
 - **WHY NOT:** The existing runtime can end a process when a handler may have lost ownership; it cannot safely isolate sibling slots inside that process. DEC-051 also records that Orqestra owns no service or supervisor.
 - **TRADE-OFF:** The operator must launch enough workers for progress and keep their settings consistent. Orqestra provides no restart or recovery-time guarantee while no compatible worker is live.
-- **VERIFICATION:** The worker-level deadline test is a remaining Day 4 acceptance item and is not implemented by PR #17. Existing tests continue to cover stale-worker fencing, SIGKILL recovery, and one authoritative result.
-
+- **VERIFICATION:** `tests/integration/test_worker_process.py::test_a_handler_outliving_the_execution_timeout_is_fenced_and_revoked_as_deadline_exceeded` (PR #18) holds a handler open past its six-second test deadline, confirms the worker exits with the fenced result before the lease ends, and checks that recovery records `deadline_exceeded` and requeues the task. The test also rules out connection-loss, lease-loss, and cancellation as the reason for fencing. This is integration coverage; it does not add production behavior. Existing tests continue to cover stale-worker fencing, SIGKILL recovery, and one authoritative result.
 
 ## Invoice verification
 
