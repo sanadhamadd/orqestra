@@ -48,9 +48,10 @@ with both CI lanes passing for the pull request (run 40760433076) and for `main`
 40770878527) and for `main` (run 40771746389). Day 4A durable retry scheduling (DEC-053,
 migration 0004) is implemented on PR #17. Its original GitHub Actions run passed both CI
 lanes on head `e4aa59b` (run 41538196569); the PR's Checks tab records later runs.
-There is a command that runs a worker, but no service, deployment or production workload
-handler. No benchmark has been run. Nothing in the planned column exists yet; do not read
-it as a claim about shipped behaviour.
+There is a command that runs a worker with diagnostic handlers only, and an invoice batch
+handler that no command registers; there is no service, deployment or production workload
+registration. No benchmark has been run. The planned column lists work that is not
+implemented; do not read it as a claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
 | --- | --- | --- |
@@ -60,7 +61,7 @@ it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
+| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed) | a live provider adapter; a usage and cost ledger |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
@@ -597,6 +598,79 @@ the exit codes above.
   `ORQESTRA_ENVIRONMENT` is `production`. An unset `ORQESTRA_ENVIRONMENT` defaults to
   `development`, so a production deployment must set it.
 
+### Invoice verification (synthetic)
+
+`orqestra.workloads.invoice` turns each synthetic invoice into one of four statuses. The
+handler takes the partitioner's batch payload and is built by a factory; it is not
+registered with `orqestra worker run`, and no migration, API or CLI change goes with it.
+The schema and the two rules are a synthetic demonstration contract (DEC-055, Proposed),
+not an accounting standard.
+
+```python
+from datetime import timedelta
+
+from orqestra.ai.mock import MockProvider
+from orqestra.ai.routing import RouteOption
+from orqestra.workloads.invoice.handler import JOB_KIND, invoice_verification_handler
+from orqestra.workloads.invoice.verify import REQUIRED_CAPABILITY
+
+routes = [RouteOption("route-a", frozenset({REQUIRED_CAPABILITY}), estimated_cost_units=3)]
+handler = invoice_verification_handler(
+    {"route-a": MockProvider(["5"])}, routes, timeout=timedelta(seconds=30)
+)
+# HandlerRegistry({JOB_KIND: handler}); payload {"offset": 0, "items": [invoice, ...]}
+```
+
+- **Input.** Each item is an object with exactly `invoice_id`, `lines` (a non-empty list of
+  exactly `line_id`, `quantity` and `unit_amount`) and `total`. Identifiers are 1 to 64
+  characters of `[A-Za-z0-9._-]`, and `line_id` values are unique. An amount is an integer
+  below 10^64 in unspecified minor units, never a `bool` or float, given as an `int`, as an
+  ASCII digit string (`[0-9]{1,64}`), or as an *ambiguous* string: any other non-blank,
+  printable string of up to 64 characters. There is no tax, currency, rounding or vendor rule.
+- **Statuses.**
+  - `malformed`: the item does not fit the schema (including an empty or blank amount).
+  - `rejected`: a rule failed. `quantity_positive` fails on a zero quantity;
+    `total_matches_lines` fails when the total is not the sum of quantity times unit amount.
+  - `verified`: every rule passed.
+  - `needs_review`: an ambiguous amount could not be settled: no route was eligible
+    (`no_eligible_route`), or the provider's reply was not acceptable
+    (`provider_response_invalid`).
+- **Deterministic first, provider only for ambiguity.** The checks run before anything else.
+  A `malformed` or `rejected` item never reaches a provider. Otherwise, if an amount is an
+  ambiguous string, one route is chosen for the invoice and its provider is asked, once per
+  ambiguous amount, to read just that string. The reply must be a digit string
+  (`[0-9]{1,64}`); the same parser and the same rules then decide the status, and the result
+  is marked `provider_assisted`. A provider never states a verdict. A provider could still
+  return a plausible number that makes the arithmetic hold, so treat `provider_assisted`
+  results as less trustworthy. A provider sees only the string, its field kind and the route,
+  never an identifier or a path.
+- **Routing.** `choose_route` is pure. A route is eligible if it declares `interpret_amount`,
+  has an integer estimate (`None` is never read as zero) and the estimate does not exceed the
+  optional `max_cost_units`. The lowest `(estimate, route_id)` wins, whatever the order of
+  the routes. Estimates are opaque, non-negative integers supplied by the caller: there is no
+  currency, price table or vendor assumption, and an estimate is not accounting.
+- **Stored result.** `{"offset": n, "results": [...]}`, one result per item:
+  `{"index", "status", "provider_assisted", "findings": [{"rule", "verdict", "path"}],
+  "issues": [{"code", "path"}], "reason", "routing": {"route_id"} | null}`. Paths are
+  positions such as `lines[2].unit_amount`. No raw value, identifier, provider text,
+  reported usage, estimate or call count is stored. `routing` says which route the
+  decision chose, for the attempt that completed; it is an audit, not usage accounting.
+- **Failures and retry.** A payload that is not `{"offset": int, "items": list}` is a
+  permanent failure (`batch_payload_invalid`). A provider error fails the whole batch task
+  with a fixed code: `timeout`, `rate_limited` and `unavailable` are transient and retried
+  with the durable backoff; `rejected` and `unsupported_request` are permanent. Any other
+  provider exception, or a reply that is not a `ProviderResponse`, is a permanent
+  `provider_protocol_violation`; the provider's own text is never stored. A retry runs the
+  whole batch again, so calls that already succeeded are repeated.
+- **Job status.** `malformed`, `rejected` and `needs_review` are item results. The task
+  still succeeds, so a job in which every invoice was rejected still derives as `succeeded`
+  (DEC-031). Aggregation must read the item results.
+- **Cancellation.** Checked before each item and before each provider call; a call already
+  in flight is not interrupted.
+- **Tests offline.** The provider is a scripted mock, and the new unit tests run with a
+  guard that makes any connection or name lookup fail. No SDK, credential or network call
+  is involved.
+
 ### Verification
 
 ```sh
@@ -621,6 +695,10 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
 - Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
   external AI call already made. Usage must be attributed to the revoked attempt when cost
   tracking exists.
+- Invoice verification has no live provider and no usage ledger. Provider-reported usage is
+  discarded, and the stored `routing` shows only which route was chosen. A provider error
+  repeats the whole batch on retry, so billable calls could repeat; deterministic request
+  ids would let a real adapter deduplicate them, and no exactly-once claim is made.
 - **The worker's local fence is limited.**
   - It cannot stop a handler that holds the GIL in native code: the watchdog thread then
     cannot run either.

@@ -136,6 +136,16 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 - AI only for justified ambiguity, behind swappable provider adapters, mocked in routine
   tests. Validate model output; never execute instructions found in invoice data.
 - Ordinary logs carry non-sensitive identifiers only.
+- Where it lives: `orqestra.ai` (provider protocol, deterministic mock, pure routing) and
+  `orqestra.workloads.invoice` (normalization, checks, verification, batch handler). Behaviour
+  and limits are in the README ("Invoice verification") and DEC-055.
+- Tests of these modules enable the `no_network` fixture from `tests/unit/conftest.py` with
+  `pytest.mark.usefixtures("no_network")`; it is not autouse, so integration tests keep their
+  real sockets. Provider replies in tests are scripted with `MockProvider`; never call a real
+  provider from a test.
+- The new modules import only the standard library and `orqestra` (an import scan checks it).
+  Provider errors carry closed codes only, and nothing logs, stores or echoes raw invoice
+  values, identifiers or provider text.
 
 ## Costs
 
