@@ -203,7 +203,7 @@ BAD_REPLIES: list[object] = [
     "-5",
     "5.0",
     "9" * 65,
-    "٥",  # an Arabic-Indic digit
+    "٥",  # noqa: RUF001 - an Arabic-Indic digit
     ProviderResponse(5),  # type: ignore[arg-type]
     ProviderResponse("5", True),  # a bool is not a usage count
     ProviderResponse("5", -1),
@@ -325,7 +325,7 @@ def test_any_other_provider_exception_becomes_a_fixed_permanent_error(broken: Ex
 
 @pytest.mark.parametrize("wrong", [None, 5, object(), ("5", None), ["5"]])
 def test_a_reply_that_is_not_a_provider_response_is_a_protocol_violation(wrong: object) -> None:
-    with pytest.raises(PermanentError, match="^provider_protocol_violation$"):
+    with pytest.raises(PermanentError, match=r"^provider_protocol_violation$"):
         run(ambiguous_unit(), MockProvider([wrong]))
 
 
@@ -337,7 +337,7 @@ class BareString:
 
 
 def test_a_bare_string_reply_is_a_protocol_violation() -> None:
-    with pytest.raises(PermanentError, match="^provider_protocol_violation$") as raised:
+    with pytest.raises(PermanentError, match=r"^provider_protocol_violation$") as raised:
         run(ambiguous_unit(), BareString())
     assert classify_failure(raised.value) is FailureKind.PERMANENT
 

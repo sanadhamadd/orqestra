@@ -208,9 +208,8 @@ def _decided_with_provider(
 def _ask(provider: Provider, request: ProviderRequest) -> ProviderResponse:
     """The provider's reply, or the fixed-text error that replaces whatever it raised."""
     failure: Exception
-    reply: object
     try:
-        reply = provider.interpret(request)
+        reply = _reply_of(provider, request)
     except ProviderTransientError as exc:
         failure = ProviderTransientError(exc.code)
     except ProviderPermanentError as exc:
@@ -222,6 +221,11 @@ def _ask(provider: Provider, request: ProviderRequest) -> ProviderResponse:
             return reply
         failure = PermanentError(PROTOCOL_VIOLATION)
     raise failure from None  # raised outside the handlers above: nothing is chained
+
+
+def _reply_of(provider: Provider, request: ProviderRequest) -> object:
+    """What the provider returned, typed as unchecked: a broken provider may return anything."""
+    return provider.interpret(request)
 
 
 def _valid_value(response: ProviderResponse) -> int | None:
