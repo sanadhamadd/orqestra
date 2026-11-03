@@ -146,6 +146,19 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 - The new modules import only the standard library and `orqestra` (an import scan checks it).
   Provider errors carry closed codes only, and nothing logs, stores or echoes raw invoice
   values, identifiers or provider text.
+- Job outcome summaries live in three layers (README, "Invoice job summary", and DEC-056):
+  `orqestra.workloads.invoice.summary` holds the pure rules (it is import-scanned like the
+  other workload modules), `orqestra.persistence.snapshots` owns the read-only
+  `REPEATABLE READ` snapshot and its server-side cursor, and `orqestra.aggregation` joins
+  them. Persistence must not import a workload, and a workload must not open a connection.
+- Summary and anomaly output carries identifiers and positions only, never a value from
+  the data. Any new projection of a task payload must stay behind `jsonb_typeof` guards and
+  must not cast, because a payload is any JSON value.
+- The PostgreSQL tests of the summary use the real lifecycle for happy paths and raw SQL only
+  for data the engine would never write. The scale tests are marked `performance`, so
+  neither lane runs them; run them by hand with
+  `uv run pytest -m performance -s tests/integration/test_invoice_summary_pg.py` against the
+  test database, and record what they print. They assert correctness, never a threshold.
 
 ## Costs
 
