@@ -43,23 +43,27 @@ correction for workers frozen inside a database transaction (DEC-050) was merged
 (merge commit `0eab699`), with both CI lanes passing for `main` (run 40713618712). Day 3B
 Slice B3 (`orqestra worker run`, DEC-051) was merged in PR #15 (merge commit `71fab72`),
 with both CI lanes passing for the pull request (run 40760433076) and for `main` (run
-40761239383). Day 3C deterministic task partitioning (DEC-052) is implemented and tested
-locally only; it has not yet run in GitHub CI. There is a command that runs a worker, but
-no service, deployment or production workload handler. No benchmark has been run. Nothing in the planned column exists yet; do not read it as a
-claim about shipped behaviour.
+40761239383). Day 3C (deterministic task partitioning, DEC-052) was merged in PR #16
+(merge commit `da5b4b3`), with both CI lanes passing for the pull request (run
+40770878527) and for `main` (run 40771746389). Day 4A durable retry scheduling (DEC-053,
+migration 0004) is implemented on PR #17. Its original GitHub Actions run passed both CI
+lanes on head `e4aa59b` (run 41538196569); the PR's Checks tab records later runs.
+There is a command that runs a worker, but no service, deployment or production workload
+handler. No benchmark has been run. Nothing in the planned column exists yet; do not read
+it as a claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
 | --- | --- | --- |
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
-| Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules; deterministic partitioning of an ordered item list into fixed-size batch tasks (DEC-052, local only) | — |
+| Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules; deterministic partitioning of an ordered item list into fixed-size batch tasks (DEC-052); `RetryPolicy` and a bounded exponential retry delay with deterministic jitter (DEC-053, PR #17) | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
-| Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002 and additive migration 0003; concurrency tests between separate connections | — |
-| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049) | a production worker service; bounded worker slots; retry backoff (Days 3B–4) |
+| Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
+| Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); Day 4 uses independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction) | a worker-level execution-deadline recovery integration test (Day 4 closeout) |
 | Invoice rules and AI adapters | — | deterministic checks, mocked provider adapter, cost-aware routing (Day 5) |
 | Aggregation, cost ledger, API | — | Days 6–7; API framework undecided |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
-| Containers | — | Docker Compose for PostgreSQL and workers |
+| Containers | — | Docker Compose for PostgreSQL (local development only) |
 
 ## Quickstart
 
@@ -86,7 +90,7 @@ creates, drops or resets a database.
 createdb orqestra
 export ORQESTRA_DATABASE_URL=postgresql:///orqestra
 uv run orqestra migrate
-# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace"]}
+# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace", "0004_task_availability"]}
 uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 ```
 
@@ -180,11 +184,13 @@ import psycopg
 
 from orqestra.domain.jobs import AttemptFailed, AttemptOutcome, AttemptSucceeded, JsonValue, Task
 from orqestra.domain.leases import LeasePolicy
+from orqestra.domain.retry import RetryPolicy
 from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.lifecycle import complete_attempt, start_attempt
 
-# Example values only: Orqestra has no default lease policy.
+# Example values only: Orqestra has no default lease or retry policy.
 POLICY = LeasePolicy(lease=timedelta(seconds=30), execution_timeout=timedelta(minutes=10))
+RETRY = RetryPolicy(base_delay=timedelta(seconds=1), max_delay=timedelta(minutes=5))
 
 
 def verify(payload: JsonValue) -> JsonValue:
@@ -198,20 +204,24 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
         outcome = AttemptSucceeded(verify(task.payload))
     except Exception as exc:
         outcome = AttemptFailed.from_exception(exc)
-    done = complete_attempt(conn, attempt.id, generation=attempt.attempt_number, outcome=outcome)
+    done = complete_attempt(
+        conn, attempt.id, generation=attempt.attempt_number, outcome=outcome, retry_policy=RETRY
+    )
     print(done.task.state, get_job_progress(conn, task.job_id))
 ```
 
 - `start_attempt` moves a queued task to `running`, advances its generation
   (`attempt_count`) and creates attempt *N* for generation *N*, in one transaction.
-  Concurrent callers get exactly one attempt; the others get `TaskNotStartableError`.
+  Concurrent callers get exactly one attempt; the others get `TaskNotStartableError`. A
+  queued task whose retry time has not come yet raises `TaskNotEligibleError`, a subclass
+  carrying that `available_at`, and changes nothing (see [Retry backoff](#retry-backoff)).
 - Every claim takes a required `LeasePolicy(lease, execution_timeout)`: positive
   `timedelta`s, with the lease no longer than the timeout. The attempt gets a lease and a
   non-renewable deadline, both measured from one claim instant on the database clock, read
   after the task lock is held, so waiting for that lock does not shorten the lease.
-- `claim_next_attempt(conn, worker_id, kinds=..., policy=...)` finds the next queued task
-  whose job kind is one of `kinds` and claims it the same way, returning its attempt, or
-  `None` when nothing of those kinds is claimable right now. `kinds` is required: a
+- `claim_next_attempt(conn, worker_id, kinds=..., policy=...)` finds the next queued,
+  eligible task whose job kind is one of `kinds` and claims it the same way, returning its
+  attempt, or `None` when nothing of those kinds is claimable right now. `kinds` is required: a
   non-empty collection of strings, matched exactly (no case folding, trimming or
   wildcards). A bare string, an empty collection, a kind of only spaces or a kind with a
   NUL character is refused before anything is sent to the database; there is no
@@ -230,7 +240,8 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
 
   Neither changes any record. The next task state comes from the lifecycle policy:
   - A success is final, and its result becomes the task's result.
-  - A transient failure requeues the task while attempts remain.
+  - A transient failure requeues the task while attempts remain, eligible again only
+    after its retry delay, computed from the required `retry_policy`.
   - A permanent or unclassified failure, or exhausted retries, fail the task.
 - `renew_lease(conn, attempt_id, generation=..., worker_id=..., policy=...)` is the
   heartbeat: it extends the lease by `policy.lease` from now, never past the deadline and
@@ -241,15 +252,16 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   (`CancellationRequestedError`, with the end of the grace period). A worker that sees
   any of these must stop; after a cancellation request it should complete the attempt as
   cancelled before its lease ends.
-- `revoke_next_expired(conn)` revokes at most one running attempt whose lease has expired
-  and records why: `deadline_exceeded` when the lease had reached its deadline;
-  otherwise `cancellation_grace_expired` when cancellation was requested while the lease
-  still held; otherwise `lease_expired`. A grace expiry cancels the task whatever retry
-  budget is left. The other reasons move the task like a transient failure: requeued while
-  attempts remain, cancelled instead if a request is pending, failed once the budget is
-  used up. It returns `None` when it revoked nothing. Ownership ends when the revocation
-  commits: a completion that commits first still counts, and afterwards the old worker's
-  completion raises `AttemptRevokedError` (or `StaleAttemptError` once the task was
+- `revoke_next_expired(conn, retry_policy=...)` revokes at most one running attempt whose
+  lease has expired and records why: `deadline_exceeded` when the lease had reached its
+  deadline; otherwise `cancellation_grace_expired` when cancellation was requested while
+  the lease still held; otherwise `lease_expired`. A grace expiry cancels the task
+  whatever retry budget is left. The other reasons move the task like a transient
+  failure: requeued, with a retry delay, while attempts remain, cancelled instead if a
+  request is pending, failed once the budget is used up. It returns `None` when it
+  revoked nothing. Ownership ends when the revocation commits: a completion that commits
+  first still counts, and afterwards the old worker's completion raises
+  `AttemptRevokedError` (or `StaleAttemptError` once the task was
   claimed again).
 - `request_cancellation(conn, task_id, grace=...)` takes a required, positive grace period
   (a `timedelta`; there is no default). It cancels a queued task at once. On a running
@@ -265,6 +277,37 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
 - Job status is derived from task states: `queued` (every task queued), `running`,
   `succeeded` (every task succeeded), `failed` (all finished, at least one failed) or
   `cancelled` (all finished, none failed, at least one cancelled).
+
+### Retry backoff
+
+A requeued task waits before it may run again (DEC-053). The wait is stored in
+PostgreSQL, so it holds across worker crashes, restarts and every worker:
+
+- Every task has `available_at`, the database time from which it may be claimed. A new
+  task is eligible at once.
+- A requeue sets it: a transient failure with attempts left, or a `lease_expired` or
+  `deadline_exceeded` revocation with attempts left and no cancellation request. The
+  task becomes eligible at the database clock at the requeue (read after the locks) plus
+  `retry_delay(policy, task_id, n)`, where *n* is the ended attempt's generation.
+- The delay is `min(max_delay, base_delay * 2**(n-1))`, scaled by a jitter factor in
+  `[0.5, 1]` taken from a SHA-256 digest of the task's ID and *n*. The same task and
+  attempt always get the same delay, in any process; different tasks spread out. It is
+  never shorter than half the capped value and never longer than `max_delay`.
+- Nothing else moves it: a success, a permanent or unclassified failure, exhausted
+  retries and any cancellation (including a grace expiry) schedule no retry. A
+  cancellation request on a task waiting out its delay cancels it at once, like any
+  queued task.
+- Both claims check `available_at <= statement_timestamp()` inside the atomic claim, so
+  the boundary is inclusive and a refused claim changes nothing. Among eligible tasks the
+  order is unchanged (`created_at`, then `id`), so once its delay has passed a retried
+  task goes ahead of newer ones.
+- `RetryPolicy(base_delay, max_delay)` has no defaults: both are positive, representable
+  `timedelta`s and `base_delay` cannot exceed `max_delay`. `complete_attempt` and
+  `revoke_next_expired` require one; a worker builds it from two required settings.
+  **Every worker must use the same values. Nothing checks this:** the process that
+  records the requeue (the worker completing the attempt, or any worker whose recovery
+  sweep revokes it) decides the delay.
+- `available_at` is not part of the `Task` record; it is a column for diagnostics.
 
 ### Task handlers
 
@@ -322,7 +365,8 @@ registry = HandlerRegistry({"invoice_verification": verify_invoice})
   heartbeat is due, that `heartbeat_interval + db_operation_timeout + fence_margin` is
   shorter than the lease, and that `lock_timeout` is at least 1 ms and, in the whole
   milliseconds PostgreSQL uses (rounded up), strictly shorter than
-  `db_operation_timeout`; so `db_operation_timeout` is at least 2 ms. The worker will use
+  `db_operation_timeout`; so `db_operation_timeout` is at least 2 ms. `retry_base_delay`
+  and `retry_max_delay` form its `retry_policy` (base no longer than max). The worker will use
   the existing `ORQESTRA_DATABASE_URL`.
 
 ### Worker runtime (first slice)
@@ -495,6 +539,11 @@ SIGTERM or SIGINT (DEC-051):
 uv run orqestra worker run --kind diagnostic.echo --kind diagnostic.wait
 ```
 
+Each invocation is one worker process with one handler slot. To run N workers, start N
+separate invocations with the same database and `ORQESTRA_WORKER_*` settings. Orqestra
+does not supervise or restart them; the operator owns restart policy and must account for
+the exit codes above.
+
 - **Kinds.** `--kind` is required and may be repeated. Each one must name a handler in
   the fixed, code-reviewed registry, matched exactly; nothing is imported dynamically.
   There is no production workload yet, so the only handlers are two diagnostics for
@@ -505,7 +554,7 @@ uv run orqestra worker run --kind diagnostic.echo --kind diagnostic.wait
     its cancellation signal, returns `{"waited_seconds": n}`, or ends cancelled if told
     of a committed request. Any other payload is a permanent failure.
 - **Configuration.** The `ORQESTRA_*` settings, including `ORQESTRA_DATABASE_URL`, and
-  all ten required `ORQESTRA_WORKER_*` settings, with no defaults. The values below are
+  all twelve required `ORQESTRA_WORKER_*` settings, with no defaults. The values below are
   test examples only, not recommendations (DEC-034):
 
   ```sh
@@ -519,7 +568,11 @@ uv run orqestra worker run --kind diagnostic.echo --kind diagnostic.wait
   ORQESTRA_WORKER_RECOVERY_INTERVAL=PT1S
   ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT=5
   ORQESTRA_WORKER_SHUTDOWN_TIMEOUT=PT1S
+  ORQESTRA_WORKER_RETRY_BASE_DELAY=PT0.1S
+  ORQESTRA_WORKER_RETRY_MAX_DELAY=PT0.5S
   ```
+
+  Every worker sharing a database must use the same two retry values; nothing checks this.
 - **Startup checks, in order.** Each refusal prints one JSON line on stdout and exits 1,
   before any worker exists, so nothing is claimed:
   1. the settings validate (errors list each field's location and message, never its
@@ -632,11 +685,19 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   keeps renewing its lease until the deadline, and only then is revoked.
 - A database outage longer than the lease makes every live attempt revocable once the
   database returns, and each revocation uses one attempt of its task's budget.
-- Discovery has no retry backoff: a requeued task, including a revoked one, keeps its
-  original `created_at`, so it is claimed again ahead of newer tasks straight away. Each
-  claim scans and sorts the queued tasks; there is no index for it yet (deferred until it
-  is measured). `None` from `claim_next_attempt` or `revoke_next_expired` means only that
-  nothing was claimed or revoked by that call.
+- A retry delay is the earliest time a requeued task may run, not a schedule: it runs
+  when a live worker supporting its kind next polls after that time, and behind any
+  backlog. A retried task keeps its original `created_at`, so once eligible it is claimed
+  ahead of newer tasks. Each claim scans and sorts the queued tasks, including those still
+  waiting out a delay; there is no index for it yet (deferred until it is measured).
+  `None` from `claim_next_attempt` or `revoke_next_expired` means only that nothing was
+  claimed or revoked by that call.
+- Retry policy consistency is not enforced: each process uses its own settings, and a
+  worker configured differently schedules different delays for the tasks it requeues.
+  There are no production retry values (DEC-034), no per-job-kind policy, and the delay
+  does not depend on the error (for example, a rate limit's `Retry-After`). A database
+  outage longer than the lease still revokes every live attempt when it returns; their
+  retries are spread by the jitter only.
 - A task whose job kind no claimant supports stays `queued` indefinitely: nothing reports
   or expires it yet. Each claim now also reads the job of the queued tasks it considers;
   how PostgreSQL plans that, and what unsupported backlogs cost, has not been measured.
@@ -669,6 +730,12 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   can write `cancellation_grace_expired`: it cannot read that reason, and its heartbeats
   ignore cancellation. Stop all application processes, apply 0003, then start only
   Slice 3 code; draining first is preferable. The database does not enforce this order.
+- Migration 0004 is additive and may run while attempts are running, but it fails at once
+  while any session uses `tasks`. Code from before 0004 ignores `available_at` and would
+  retry requeued tasks at once. Stop all application processes, apply 0004, then start
+  only Day 4A code with one shared retry policy. `orqestra worker run` refuses to start
+  against any other migration history, but a worker already running is not stopped, and
+  direct callers of the lifecycle functions are not checked.
 - A job whose started tasks were all requeued reads as `queued`; one failed task makes a
   whole job `failed` (the per-state counts give the detail).
 - Idempotency keys are global (not scoped per job kind or client) and never expire.

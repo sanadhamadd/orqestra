@@ -16,9 +16,10 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
@@ -40,7 +41,9 @@ from orqestra.domain.jobs import (
 )
 from orqestra.domain.leases import LeasePolicy, RevocationReason
 from orqestra.domain.policy import FailureKind
+from orqestra.domain.retry import RetryPolicy, retry_at, retry_delay
 from orqestra.domain.states import AttemptState, TaskState
+from orqestra.persistence import lifecycle
 from orqestra.persistence.jobs import get_job_progress, get_task, list_tasks, submit_job
 from orqestra.persistence.lifecycle import (
     AttemptCompletion,
@@ -52,6 +55,7 @@ from orqestra.persistence.lifecycle import (
     LeaseExpiredError,
     NotFoundError,
     StaleAttemptError,
+    TaskNotEligibleError,
     TaskNotStartableError,
     WorkerMismatchError,
     claim_next_attempt,
@@ -79,6 +83,17 @@ POLICY = LeasePolicy(lease=timedelta(minutes=5), execution_timeout=timedelta(hou
 # Attempts claimed with these expire one microsecond after their claim
 # instant; ``until_expired`` waits for the database clock to pass that.
 EXPIRING = LeasePolicy(lease=timedelta(microseconds=1), execution_timeout=timedelta(hours=1))
+# Test value, not a recommendation: a requeued task is eligible again 1 µs later, so these
+# tests see requeued tasks as they did before backoff existed; the delay itself is
+# tested in section 23 (DEC-053).
+RETRY = RetryPolicy(base_delay=timedelta(microseconds=1), max_delay=timedelta(microseconds=1))
+
+
+def recover(conn: Conn) -> AttemptRevocation | None:
+    """``revoke_next_expired`` with the test retry policy."""
+    return revoke_next_expired(conn, retry_policy=RETRY)
+
+
 DEADLINE_EXPIRING = LeasePolicy(
     lease=timedelta(microseconds=1), execution_timeout=timedelta(microseconds=1)
 )
@@ -111,7 +126,9 @@ def task_now(db: Conn, task_id: uuid.UUID) -> Task:
 
 
 def complete(db: Conn, attempt: Attempt, outcome: AttemptOutcome) -> AttemptCompletion:
-    return complete_attempt(db, attempt.id, generation=attempt.attempt_number, outcome=outcome)
+    return complete_attempt(
+        db, attempt.id, generation=attempt.attempt_number, outcome=outcome, retry_policy=RETRY
+    )
 
 
 def renew(db: Conn, attempt: Attempt, policy: LeasePolicy = POLICY) -> Attempt:
@@ -140,7 +157,7 @@ def until_expired(db: Conn, *attempts: Attempt) -> None:
 
 def revoke(db: Conn) -> AttemptRevocation:
     """Revoke the next expired attempt, which the test knows exists."""
-    revocation = revoke_next_expired(db)
+    revocation = recover(db)
     assert revocation is not None
     return revocation
 
@@ -381,7 +398,7 @@ def test_unknown_records_are_reported_as_not_found(checked: Conn) -> None:
         start_attempt(checked, missing, "w", policy=POLICY)
     assert (info.value.kind, info.value.record_id) == ("task", missing)
     with pytest.raises(NotFoundError, match="attempt"):
-        complete_attempt(checked, missing, generation=1, outcome=SUCCESS)
+        complete_attempt(checked, missing, generation=1, outcome=SUCCESS, retry_policy=RETRY)
     with pytest.raises(NotFoundError, match="task"):
         request_cancellation(checked, missing, grace=GRACE)
     assert get_attempt(checked, missing) is None
@@ -393,11 +410,13 @@ def test_unknown_records_are_reported_as_not_found(checked: Conn) -> None:
     [
         lambda conn, task: start_attempt(conn, task.id, "w", policy=POLICY),
         lambda conn, task: request_cancellation(conn, task.id, grace=GRACE),
-        lambda conn, task: complete_attempt(conn, uuid.uuid4(), generation=1, outcome=SUCCESS),
+        lambda conn, task: complete_attempt(
+            conn, uuid.uuid4(), generation=1, outcome=SUCCESS, retry_policy=RETRY
+        ),
         lambda conn, task: renew_lease(
             conn, uuid.uuid4(), generation=1, worker_id="w", policy=POLICY
         ),
-        lambda conn, task: revoke_next_expired(conn),
+        lambda conn, task: recover(conn),
     ],
     ids=["start", "cancel", "complete", "renew", "revoke"],
 )
@@ -418,7 +437,7 @@ def test_operations_work_on_a_connection_with_any_row_factory(
     with psycopg.connect(schema_url, autocommit=True, row_factory=dict_row) as conn:
         attempt = start_attempt(conn, first.id, "w", policy=POLICY)
         assert attempt == get_attempt(checked, attempt.id)
-        done = complete_attempt(conn, attempt.id, generation=1, outcome=SUCCESS)
+        done = complete_attempt(conn, attempt.id, generation=1, outcome=SUCCESS, retry_policy=RETRY)
         assert done.task == task_now(checked, first.id)
         assert list_attempts(conn, first.id) == (done.attempt,)
         assert request_cancellation(conn, second.id, grace=GRACE).task == task_now(
@@ -701,7 +720,11 @@ def test_competing_workers_never_start_more_than_max_attempts(
                     continue  # another worker holds it; it will be requeued or fail
                 started += 1
                 complete_attempt(
-                    conn, attempt.id, generation=attempt.attempt_number, outcome=TRANSIENT
+                    conn,
+                    attempt.id,
+                    generation=attempt.attempt_number,
+                    outcome=TRANSIENT,
+                    retry_policy=RETRY,
                 )
 
         per_worker = race(schema_url, [work] * workers)
@@ -763,7 +786,9 @@ def test_a_generation_that_does_not_match_the_attempt_is_rejected(
     current = start_attempt(checked, task.id, "w2", policy=POLICY)  # generation 2
     before = snapshot(checked)
     with pytest.raises(StaleAttemptError) as info:
-        complete_attempt(checked, current.id, generation=presented, outcome=SUCCESS)
+        complete_attempt(
+            checked, current.id, generation=presented, outcome=SUCCESS, retry_policy=RETRY
+        )
     assert (info.value.generation, info.value.current_generation) == (presented, 2)
     assert snapshot(checked) == before
 
@@ -786,6 +811,7 @@ def test_a_finished_attempt_with_a_mismatched_generation_is_stale(
             recorded.attempt.id,
             generation=presented,
             outcome=AttemptSucceeded({"verified": False}),
+            retry_policy=RETRY,
         )
     assert (info.value.attempt_id, info.value.generation) == (recorded.attempt.id, presented)
     assert info.value.current_generation == 1
@@ -1301,7 +1327,7 @@ def test_claims_prefer_older_tasks(checked: Conn) -> None:
 
 def test_a_requeued_task_keeps_its_place(checked: Conn) -> None:
     # A requeued task keeps its created_at, so without contention it is claimed
-    # again before newer tasks: there is no backoff in this slice.
+    # again before newer tasks: this test's retry delay is only 1 µs (RETRY).
     first = new_task(checked)
     later = new_task(checked)
     attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
@@ -1538,7 +1564,13 @@ def test_competing_claimants_never_exceed_any_retry_budget(schema_url: str, chec
                     return started
                 continue  # others hold the remaining tasks; they will requeue or fail
             started += 1
-            complete_attempt(conn, attempt.id, generation=attempt.attempt_number, outcome=TRANSIENT)
+            complete_attempt(
+                conn,
+                attempt.id,
+                generation=attempt.attempt_number,
+                outcome=TRANSIENT,
+                retry_policy=RETRY,
+            )
 
     per_worker = race(schema_url, [work] * claimants)
     assert sum(per_worker) == max_attempts * len(tasks)
@@ -1785,12 +1817,12 @@ def test_a_heartbeat_does_not_lock_the_task(checked: Conn, worker: Callable[[], 
 
 
 def test_recovery_without_expired_attempts_changes_nothing(checked: Conn) -> None:
-    assert revoke_next_expired(checked) is None  # empty
+    assert recover(checked) is None  # empty
     task = new_task(checked)
     start_attempt(checked, task.id, "w", policy=POLICY)  # running, lease current
     new_task(checked)  # queued
     before = snapshot(checked)
-    assert revoke_next_expired(checked) is None
+    assert recover(checked) is None
     assert snapshot(checked) == before
 
 
@@ -1824,7 +1856,7 @@ def test_an_expired_lease_is_revoked_and_the_task_requeued(
         None,
     )
     assert requeued.updated_at == revoked.finished_at
-    assert revoke_next_expired(checked) is None  # revoked exactly once
+    assert recover(checked) is None  # revoked exactly once
     again = start_attempt(checked, task.id, "w2", policy=POLICY)
     assert again.attempt_number == 2  # the revoked attempt used one of the budget
     assert_untouched(checked, unrelated)
@@ -1941,7 +1973,7 @@ def test_a_completion_before_revocation_still_counts(checked: Conn) -> None:
         renew(checked, attempt)  # the worker can no longer extend its lease
     done = complete(checked, attempt, SUCCESS)  # but its result is still accepted
     assert (done.task.state, done.task.result) == (TaskState.SUCCEEDED, SUCCESS.result)
-    assert revoke_next_expired(checked) is None
+    assert recover(checked) is None
 
 
 def test_concurrent_recoverers_revoke_each_expired_attempt_exactly_once(
@@ -1952,11 +1984,11 @@ def test_concurrent_recoverers_revoke_each_expired_attempt_exactly_once(
         tasks = new_tasks(checked, *[f"r{n}-{i}" for i in range(expired)])
         attempts = [start_attempt(checked, t.id, "w", policy=EXPIRING) for t in tasks]
         until_expired(checked, *attempts)
-        results = race(schema_url, [revoke_next_expired] * recoverers)
+        results = race(schema_url, [recover] * recoverers)
         revoked = [r for r in results if isinstance(r, AttemptRevocation)]
         assert results.count(None) == recoverers - expired
         assert sorted(r.attempt.id for r in revoked) == sorted(a.id for a in attempts)
-        assert revoke_next_expired(checked) is None
+        assert recover(checked) is None
         assert_invariants(checked)
 
 
@@ -1971,7 +2003,7 @@ def test_recovery_skips_a_task_another_transaction_holds(
     with holder.transaction():
         holder.execute("SELECT id FROM tasks WHERE id = %s FOR UPDATE", (held_task.id,))
         assert revoke(recoverer).attempt.id == free.id  # no wait for the held task
-        assert revoke_next_expired(recoverer) is None  # only the held one is left
+        assert recover(recoverer) is None  # only the held one is left
     assert revoke(recoverer).attempt.id == held.id
 
 
@@ -1989,7 +2021,7 @@ def test_a_failed_revocation_rolls_back_both_records(checked: Conn) -> None:
     until_expired(checked, attempt)
     before = snapshot(checked)
     with pytest.raises(errors.RaiseException, match="poisoned requeue"):
-        revoke_next_expired(checked)
+        recover(checked)
     assert snapshot(checked) == before
     assert checked.info.transaction_status is TransactionStatus.IDLE
     checked.execute("DROP TRIGGER poison ON tasks")
@@ -2006,7 +2038,7 @@ def test_a_connection_lost_mid_recovery_records_nothing(
     release = gate("UPDATE", "tasks")
     conn = worker()
     with ThreadPoolExecutor(1) as pool:
-        recovering = pool.submit(revoke_next_expired, conn)
+        recovering = pool.submit(recover, conn)
         wait_for_lock(checked, conn, "advisory")  # attempt revoked in its transaction, task not yet
         checked.execute("SELECT pg_terminate_backend(%s)", (conn.info.backend_pid,))
         with pytest.raises(psycopg.OperationalError):
@@ -2031,7 +2063,7 @@ def test_recovery_first_then_a_heartbeat_cannot_revive_the_attempt(
     release = gate("UPDATE", "attempts")
     recoverer, beater = worker(), worker()
     with ThreadPoolExecutor(2) as pool:
-        recovering = pool.submit(revoke_next_expired, recoverer)
+        recovering = pool.submit(recover, recoverer)
         wait_for_lock(checked, recoverer, "advisory")  # task and attempt locked, decided
         beating = pool.submit(renew, beater, attempt)
         wait_for_lock(checked, beater, "transactionid")  # waits for the attempt row
@@ -2059,7 +2091,7 @@ def test_a_heartbeat_first_then_recovery_finds_the_lease_renewed(
         beating = pool.submit(renew, beater, attempt)
         wait_for_lock(checked, beater, "advisory")  # attempt locked, renewal decided
         until_expired(checked, attempt)
-        recovering = pool.submit(revoke_next_expired, recoverer)
+        recovering = pool.submit(recover, recoverer)
         wait_for_lock(checked, recoverer, "transactionid")  # task locked, waits for the attempt
         release()
         renewed = beating.result(timeout=20)
@@ -2082,7 +2114,7 @@ def test_completion_and_recovery_in_either_order(
     recoverer, completer = worker(), worker()
     with ThreadPoolExecutor(2) as pool:
         if first == "recover":
-            recovering = pool.submit(revoke_next_expired, recoverer)
+            recovering = pool.submit(recover, recoverer)
             wait_for_lock(checked, recoverer, "advisory")  # attempt revoked, task not yet
             completing = pool.submit(complete, completer, attempt, SUCCESS)
             wait_for_lock(checked, completer, "transactionid")
@@ -2094,10 +2126,10 @@ def test_completion_and_recovery_in_either_order(
         else:
             completing = pool.submit(complete, completer, attempt, SUCCESS)
             wait_for_lock(checked, completer, "advisory")  # attempt finished, task not yet
-            assert revoke_next_expired(no_wait(recoverer)) is None  # skips the locked task
+            assert recover(no_wait(recoverer)) is None  # skips the locked task
             release()
             assert completing.result(timeout=20).task.state is TaskState.SUCCEEDED
-            assert revoke_next_expired(recoverer) is None
+            assert recover(recoverer) is None
     assert_invariants(checked)
 
 
@@ -2137,7 +2169,7 @@ def test_heartbeats_completion_recovery_and_cancellation_never_deadlock(
         participants: dict[str, Callable[[Conn], Any]] = {
             "renew": partial(renew, attempt=attempt),
             "complete": partial(complete, attempt=attempt, outcome=SUCCESS if n % 3 else TRANSIENT),
-            "revoke": revoke_next_expired,
+            "revoke": recover,
             "cancel": partial(request_cancellation, task_id=task.id, grace=GRACE),
         }
         if n % 4 == 2:
@@ -2319,7 +2351,7 @@ def test_an_acknowledged_cancellation_ends_the_attempt_as_cancelled(checked: Con
     request(checked, task)
     done = complete(checked, attempt, AttemptCancelled())
     assert (done.attempt.state, done.task.state) == (AttemptState.CANCELLED, TaskState.CANCELLED)
-    assert revoke_next_expired(checked) is None
+    assert recover(checked) is None
 
 
 @pytest.mark.parametrize("max_attempts", [1, 3])
@@ -2406,7 +2438,7 @@ def test_a_completion_within_the_grace_counts_and_after_revocation_does_not(
     with pytest.raises(AttemptRevokedError):
         renew(checked, after)
     assert snapshot(checked) == before
-    assert revoke_next_expired(checked) is None
+    assert recover(checked) is None
 
 
 # Forced orders, as in section 20: the first transaction is held at a gate
@@ -2470,7 +2502,7 @@ def test_a_request_and_recovery_in_either_order(
     recoverer, requester = worker(), worker()
     with ThreadPoolExecutor(2) as pool:
         if first == "recover":
-            recovering = pool.submit(revoke_next_expired, recoverer)
+            recovering = pool.submit(recover, recoverer)
             wait_for_lock(checked, recoverer, "advisory")  # attempt revoked, task not yet
             requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
             wait_for_lock(checked, requester, "transactionid")
@@ -2481,7 +2513,7 @@ def test_a_request_and_recovery_in_either_order(
         else:
             requesting = pool.submit(request_cancellation, requester, task.id, grace=GRACE)
             wait_for_lock(checked, requester, "advisory")  # task and attempt locked
-            assert revoke_next_expired(no_wait(recoverer)) is None  # skips the locked task
+            assert recover(no_wait(recoverer)) is None  # skips the locked task
             release()
             assert requesting.result(timeout=20).outcome is CancellationOutcome.REQUESTED
             assert revoke(recoverer).task.state is TaskState.CANCELLED
@@ -2524,7 +2556,7 @@ def test_a_failed_grace_revocation_rolls_back_both_records(checked: Conn) -> Non
     until_expired(checked, attempt_now(checked, attempt.id))
     before = snapshot(checked)
     with pytest.raises(errors.RaiseException, match="poisoned cancellation"):
-        revoke_next_expired(checked)
+        recover(checked)
     assert snapshot(checked) == before
     checked.execute("DROP TRIGGER poison ON tasks")
     assert revoke(checked).task.state is TaskState.CANCELLED
@@ -2600,8 +2632,8 @@ def test_cancellation_heartbeats_completion_and_recovery_never_deadlock(
             "request": partial(request_cancellation, task_id=task.id, grace=BRIEF_GRACE),
             "renew": partial(renew, attempt=attempt),
             "complete": partial(complete, attempt=attempt, outcome=SUCCESS),
-            "revoke": revoke_next_expired,
-            "revoke-again": revoke_next_expired,
+            "revoke": recover,
+            "revoke-again": recover,
         }
         calls = [
             jittered(call, seed=n * 10 + i, earliest=windows[name][0], latest=windows[name][1])
@@ -2625,7 +2657,7 @@ def test_cancellation_heartbeats_completion_and_recovery_never_deadlock(
             assert isinstance(completion, AttemptCompletion)
             assert completion.task.state is TaskState.SUCCEEDED  # a success stands (DEC-020)
             # The attempt is finished, so recovery finds nothing to revoke.
-            assert revoke_next_expired(checked) is None
+            assert recover(checked) is None
         assert_invariants(checked)
 
 
@@ -2979,3 +3011,378 @@ def test_concurrent_claimants_of_overlapping_kinds_never_share_a_generation(
             now = task_now(checked, task.id)
             assert (now.state, now.attempt_count) == (TaskState.RUNNING, 1)
         assert_invariants(checked)
+
+
+# --- 23. retry eligibility: available_at (DEC-053) --------------------------------
+
+# Test values only, not recommendations (DEC-034).
+US = timedelta(microseconds=1)
+BACKOFF = RetryPolicy(base_delay=timedelta(hours=1), max_delay=timedelta(hours=8))
+
+
+def available_at(db: Conn, task_id: uuid.UUID) -> datetime:
+    row = db.execute("SELECT available_at FROM tasks WHERE id = %s", (task_id,)).fetchone()
+    assert row is not None
+    return cast(datetime, row[0])
+
+
+def delay(db: Conn, task_id: uuid.UUID, by: timedelta) -> None:
+    """Move a queued task's eligibility ``by`` from the database clock (a test fixture write)."""
+    db.execute(
+        "UPDATE tasks SET available_at = statement_timestamp() + %s WHERE id = %s", (by, task_id)
+    )
+
+
+def db_clock(db: Conn) -> datetime:
+    row = db.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    return cast(datetime, row[0])
+
+
+def test_a_new_task_is_eligible_at_once(checked: Conn) -> None:
+    task = new_task(checked)
+    assert available_at(checked, task.id) <= db_clock(checked)
+    attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
+    assert attempt is not None
+    assert attempt.task_id == task.id
+
+
+def test_a_delayed_older_task_is_passed_over_for_an_eligible_newer_one(checked: Conn) -> None:
+    (older,) = new_tasks(checked, "older")
+    (newer,) = new_tasks(checked, "newer")
+    delay(checked, older.id, timedelta(hours=1))
+    attempt = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
+    assert attempt is not None
+    assert attempt.task_id == newer.id  # created_at order holds among eligible tasks only
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None  # only delayed
+    assert task_now(checked, older.id).state is TaskState.QUEUED
+    assert task_now(checked, older.id).attempt_count == 0
+
+
+def test_eligibility_is_inclusive_at_available_at(checked: Conn) -> None:
+    # The exact predicate both claim paths use, at fixed instants: no clock race.
+    (task,) = new_tasks(checked, "boundary")
+    at = available_at(checked, task.id)
+    probe = (
+        "SELECT EXISTS (SELECT FROM tasks WHERE id = %s AND "
+        f"{lifecycle._ELIGIBLE.format(now='%s::timestamptz')})"
+    )
+    assert checked.execute(probe, (task.id, at)).fetchone() == (True,)  # exactly at it
+    assert checked.execute(probe, (task.id, at - US)).fetchone() == (False,)  # 1 µs before
+    assert checked.execute(probe, (task.id, at + US)).fetchone() == (True,)
+    statement_now = lifecycle._ELIGIBLE.format(now="statement_timestamp()")
+    assert statement_now in lifecycle._LOCK_NEXT_CLAIMABLE_TASK
+    assert statement_now in lifecycle._CLAIM_TASK
+    # And through the claim itself: just past, it starts; just ahead, it does not.
+    delay(checked, task.id, -US)
+    assert start_attempt(checked, task.id, "w", policy=POLICY).task_id == task.id
+
+
+def test_an_explicit_start_before_eligibility_is_refused_and_changes_nothing(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    delay(checked, task.id, timedelta(hours=1))
+    before = snapshot(checked)
+    with pytest.raises(TaskNotEligibleError) as info:
+        start_attempt(checked, task.id, "w", policy=POLICY)
+    assert isinstance(info.value, TaskNotStartableError)  # existing handlers still catch it
+    assert (info.value.task_id, info.value.state) == (task.id, TaskState.QUEUED)
+    assert info.value.available_at == available_at(checked, task.id)
+    assert snapshot(checked) == before
+    delay(checked, task.id, -timedelta(seconds=1))  # its time has come
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    assert attempt.attempt_number == 1
+
+
+def test_concurrent_claimants_take_only_eligible_tasks_each_once(
+    checked: Conn, schema_url: str
+) -> None:
+    tasks = new_tasks(checked, *[f"t{i:02d}" for i in range(12)])
+    delayed = {t.id for t in tasks[::3]}
+    for task_id in delayed:
+        delay(checked, task_id, timedelta(hours=1))
+    eligible = {t.id for t in tasks} - delayed
+
+    def drain(conn: Conn) -> list[uuid.UUID]:
+        claimed = []
+        while (a := claim_next_attempt(conn, "w", policy=POLICY, kinds=KINDS)) is not None:
+            claimed.append(a.task_id)
+        return claimed
+
+    results = race(schema_url, [drain] * 8)
+    claimed = [task_id for result in results for task_id in result]
+    assert sorted(map(str, claimed)) == sorted(map(str, eligible))  # each once, none delayed
+
+
+def test_a_transient_failure_requeues_after_the_policys_delay_from_the_database_clock(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    done = complete_attempt(
+        checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=BACKOFF
+    )
+    after = db_clock(checked)
+    assert done.task.state is TaskState.QUEUED
+    not_before = available_at(checked, task.id) - retry_delay(BACKOFF, task.id, 1)
+    # The requeue's clock: read after the locks, at or after the attempt's end, before now.
+    assert done.attempt.finished_at is not None
+    assert done.attempt.finished_at <= not_before <= after
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
+    with pytest.raises(TaskNotEligibleError):
+        start_attempt(checked, task.id, "w", policy=POLICY)
+
+
+@pytest.mark.parametrize(
+    ("policy", "reason"),
+    [(EXPIRING, "lease_expired"), (DEADLINE_EXPIRING, "deadline_exceeded")],
+)
+def test_a_recoverable_revocation_requeues_after_the_policys_delay(
+    checked: Conn, policy: LeasePolicy, reason: str
+) -> None:
+    task = new_task(checked)
+    for generation in (1, 2):  # the second retry waits by the second generation's delay
+        delay(checked, task.id, -US)  # eligible now
+        attempt = start_attempt(checked, task.id, "dead-worker", policy=policy)
+        until_expired(checked, attempt)
+        revocation = revoke_next_expired(checked, retry_policy=BACKOFF)
+        assert revocation is not None
+        assert revocation.attempt.revoked_reason is not None
+        assert revocation.attempt.revoked_reason.value == reason
+        assert revocation.task.state is TaskState.QUEUED
+        # Exactly the recovery's database time (its updated_at) plus this generation's delay.
+        assert available_at(checked, task.id) == revocation.task.updated_at + retry_delay(
+            BACKOFF, task.id, generation
+        )
+        assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
+
+
+@pytest.mark.parametrize(
+    "ending",
+    ["permanent", "exhausted", "succeeded", "grace_expired"],
+)
+def test_no_other_ending_moves_available_at(checked: Conn, ending: str) -> None:
+    task = new_task(checked, max_attempts=1 if ending == "exhausted" else 3)
+    original = available_at(checked, task.id)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    if ending == "grace_expired":
+        request_cancellation(checked, task.id, grace=timedelta(microseconds=1))
+        shortened = get_attempt(checked, attempt.id)
+        assert shortened is not None
+        until_expired(checked, shortened)
+        revocation = revoke_next_expired(checked, retry_policy=BACKOFF)
+        assert revocation is not None
+        assert revocation.task.state is TaskState.CANCELLED
+    else:
+        outcomes: dict[str, AttemptOutcome] = {
+            "permanent": PERMANENT,
+            "exhausted": TRANSIENT,
+            "succeeded": SUCCESS,
+        }
+        outcome = outcomes[ending]
+        done = complete_attempt(
+            checked, attempt.id, generation=1, outcome=outcome, retry_policy=BACKOFF
+        )
+        expected = {
+            "permanent": TaskState.FAILED,
+            "exhausted": TaskState.FAILED,
+            "succeeded": TaskState.SUCCEEDED,
+        }[ending]
+        assert done.task.state is expected
+    assert available_at(checked, task.id) == original  # no retry was scheduled
+
+
+def test_a_task_in_backoff_is_cancelled_at_once_and_never_runs(checked: Conn) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    complete_attempt(checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=BACKOFF)
+    result = request_cancellation(checked, task.id, grace=GRACE)
+    assert result.outcome is CancellationOutcome.CANCELLED  # queued: cancelled at once
+    assert result.task.state is TaskState.CANCELLED
+    delay(checked, task.id, -timedelta(hours=2))  # even once its retry time has passed
+    assert claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS) is None
+    with pytest.raises(TaskNotStartableError) as info:
+        start_attempt(checked, task.id, "w", policy=POLICY)
+    assert not isinstance(info.value, TaskNotEligibleError)  # refused for its state
+
+
+def test_a_stale_worker_cannot_write_while_the_task_waits_or_after_the_next_generation(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    first = start_attempt(checked, task.id, "dead-worker", policy=EXPIRING)
+    until_expired(checked, first)
+    assert revoke_next_expired(checked, retry_policy=BACKOFF) is not None
+    waiting = snapshot(checked)
+    with pytest.raises(AttemptRevokedError):  # during the backoff
+        complete_attempt(checked, first.id, generation=1, outcome=SUCCESS, retry_policy=BACKOFF)
+    assert snapshot(checked) == waiting  # nothing changed, available_at included
+    delay(checked, task.id, -US)
+    second = start_attempt(checked, task.id, "w", policy=POLICY)
+    assert second.attempt_number == 2
+    with pytest.raises(StaleAttemptError):  # after another generation began
+        complete_attempt(checked, first.id, generation=1, outcome=SUCCESS, retry_policy=BACKOFF)
+    done = complete_attempt(checked, second.id, generation=2, outcome=SUCCESS, retry_policy=BACKOFF)
+    assert done.task.state is TaskState.SUCCEEDED
+
+
+UNCLASSIFIED = AttemptFailed(FailureKind.UNCLASSIFIED, "builtins.KeyError", "'total'")
+
+# name: (lease policy, outcome or None for a revocation, cancellation requested first,
+#        max_attempts, expected task state, expected revocation reason)
+NOT_SCHEDULED: dict[
+    str, tuple[LeasePolicy, AttemptOutcome | None, bool, int, TaskState, str | None]
+] = {
+    "unclassified": (POLICY, UNCLASSIFIED, False, 3, TaskState.FAILED, None),
+    "transient-with-cancellation-pending": (
+        POLICY,
+        TRANSIENT,
+        True,
+        3,
+        TaskState.CANCELLED,
+        None,
+    ),
+    "acknowledged-cancellation": (
+        POLICY,
+        AttemptCancelled(),
+        True,
+        3,
+        TaskState.CANCELLED,
+        None,
+    ),
+    "lease-expired-with-cancellation-pending": (
+        EXPIRING,
+        None,
+        True,
+        3,
+        TaskState.CANCELLED,
+        "lease_expired",
+    ),
+    "deadline-exceeded-with-cancellation-pending": (
+        DEADLINE_EXPIRING,
+        None,
+        True,
+        3,
+        TaskState.CANCELLED,
+        "deadline_exceeded",
+    ),
+    "revoked-on-the-last-attempt": (EXPIRING, None, False, 1, TaskState.FAILED, "lease_expired"),
+}
+
+
+@pytest.mark.parametrize("case", list(NOT_SCHEDULED))
+def test_endings_that_do_not_requeue_leave_available_at_alone(checked: Conn, case: str) -> None:
+    lease, outcome, cancel, max_attempts, expected, reason = NOT_SCHEDULED[case]
+    task = new_task(checked, max_attempts=max_attempts)
+    original = available_at(checked, task.id)
+    attempt = start_attempt(checked, task.id, "w", policy=lease)
+    if outcome is None:  # recovery; a request made after the lease expired does not extend it
+        until_expired(checked, attempt)
+        if cancel:
+            request_cancellation(checked, task.id, grace=GRACE)
+        revocation = revoke_next_expired(checked, retry_policy=BACKOFF)
+        assert revocation is not None
+        assert revocation.attempt.revoked_reason is not None
+        assert revocation.attempt.revoked_reason.value == reason
+        state = revocation.task.state
+    else:
+        if cancel:
+            request_cancellation(checked, task.id, grace=GRACE)
+        done = complete_attempt(
+            checked, attempt.id, generation=1, outcome=outcome, retry_policy=BACKOFF
+        )
+        state = done.task.state
+    assert state is expected
+    assert available_at(checked, task.id) == original  # no retry was scheduled
+
+
+def test_claims_follow_created_at_not_available_at(checked: Conn) -> None:
+    (older,) = new_tasks(checked, "older")
+    first = start_attempt(checked, older.id, "w", policy=POLICY)
+    done = complete_attempt(
+        checked, first.id, generation=1, outcome=TRANSIENT, retry_policy=BACKOFF
+    )
+    assert done.task.state is TaskState.QUEUED
+    (newer,) = new_tasks(checked, "newer")  # submitted after the older task was requeued
+    delay(checked, older.id, -US)  # the older task's retry time has come, just now
+    assert available_at(checked, older.id) > available_at(checked, newer.id)
+    again = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
+    assert again is not None
+    assert (again.task_id, again.attempt_number) == (older.id, 2)  # created_at, not available_at
+    other = claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)
+    assert other is not None
+    assert other.task_id == newer.id
+
+
+# The latest minute the calendar has: any retry delay of 30 minutes or more overflows it.
+FAR = datetime(9999, 12, 31, 23, 59, tzinfo=UTC)
+HOUR = RetryPolicy(base_delay=timedelta(hours=1), max_delay=timedelta(hours=1))
+
+
+@contextmanager
+def retry_instant_at_the_end_of_time() -> Iterator[None]:
+    """Feed the real ``retry_at`` a fixed instant instead of the database's clock.
+
+    Only the instant changes: the guard, the locks and the writes all still run.
+    """
+    real = retry_at  # the function the lifecycle module imported by this name
+
+    def at_far(
+        policy: RetryPolicy, task_id: uuid.UUID, attempt_number: int, now: datetime
+    ) -> datetime:
+        return real(policy, task_id, attempt_number, FAR)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lifecycle, "retry_at", at_far)
+        yield
+
+
+def assert_delay_overflows_far(task_id: uuid.UUID, generation: int) -> None:
+    """Whatever the task, a one-hour policy waits at least 30 minutes, past the end of time."""
+    left = datetime.max.replace(tzinfo=UTC) - FAR
+    assert retry_delay(HOUR, task_id, generation) > left
+
+
+def test_an_unrepresentable_retry_time_refuses_a_completion_and_changes_nothing(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "w", policy=POLICY)
+    assert_delay_overflows_far(task.id, 1)
+    before = snapshot(checked)
+    with (
+        retry_instant_at_the_end_of_time(),
+        pytest.raises(ValueError, match="not representable"),
+    ):
+        complete_attempt(checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=HOUR)
+    assert snapshot(checked) == before
+    assert task_now(checked, task.id).state is TaskState.RUNNING
+    running = get_attempt(checked, attempt.id)
+    assert running is not None
+    assert running.state is AttemptState.RUNNING
+    done = complete_attempt(checked, attempt.id, generation=1, outcome=TRANSIENT, retry_policy=HOUR)
+    assert done.task.state is TaskState.QUEUED  # the same completion succeeds with a real clock
+
+
+def test_an_unrepresentable_retry_time_refuses_a_revocation_and_changes_nothing(
+    checked: Conn,
+) -> None:
+    task = new_task(checked)
+    attempt = start_attempt(checked, task.id, "dead-worker", policy=EXPIRING)
+    until_expired(checked, attempt)
+    assert_delay_overflows_far(task.id, 1)
+    before = snapshot(checked)
+    with (
+        retry_instant_at_the_end_of_time(),
+        pytest.raises(ValueError, match="not representable"),
+    ):
+        revoke_next_expired(checked, retry_policy=HOUR)
+    assert snapshot(checked) == before
+    assert task_now(checked, task.id).state is TaskState.RUNNING
+    running = get_attempt(checked, attempt.id)
+    assert running is not None
+    assert running.state is AttemptState.RUNNING
+    revocation = revoke_next_expired(checked, retry_policy=HOUR)
+    assert revocation is not None
+    assert revocation.task.state is TaskState.QUEUED

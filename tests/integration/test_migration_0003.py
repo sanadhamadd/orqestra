@@ -1,11 +1,15 @@
 """Migration 0003 (cancellation-grace revocation reason) against real PostgreSQL.
 
-Each test starts from a schema at migration 0002 and builds its history with
-the current lifecycle operations, which run against 0002 except for revoking
-an attempt whose cancellation grace ran out: 0002 rejects that reason, and the
-whole revocation rolls back. The upgrade must keep every stored row valid,
-leave running attempts alone, fail at once rather than wait while a session
-uses ``attempts``, and roll back completely when it fails (DEC-041).
+Each test starts from a genuine schema at migration 0002 and upgrades to 0003
+only (later migrations have their own tests). History is built as the code of
+that time built it: the claim, completion and recovery come from ``historical``,
+since the current ones need 0004's column (DEC-053); submission, cancellation
+requests and heartbeats are the current code, which 0004 did not change.
+Revoking an attempt whose cancellation grace ran out fails on 0002: the schema
+rejects that reason, and the whole revocation rolls back. The upgrade must keep
+every stored row valid, leave running attempts alone, fail at once rather than
+wait while a session uses ``attempts``, and roll back completely when it fails
+(DEC-041).
 """
 
 import contextlib
@@ -23,22 +27,19 @@ import pytest
 from psycopg import errors
 from psycopg.rows import TupleRow
 
-from orqestra.domain.jobs import AttemptSucceeded, JobSubmission, Task, TaskSpec
+from orqestra.domain.jobs import JobSubmission, Task, TaskSpec
 from orqestra.domain.leases import RevocationReason
 from orqestra.domain.states import TaskState
 from orqestra.persistence.jobs import list_tasks, submit_job
 from orqestra.persistence.lifecycle import (
     CancellationRequestedError,
     LeaseExpiredError,
-    claim_next_attempt,
-    complete_attempt,
     get_attempt,
     renew_lease,
     request_cancellation,
-    revoke_next_expired,
-    start_attempt,
 )
 from orqestra.persistence.migrate import MigrationError, load_migrations, migrate
+from tests.integration import historical
 from tests.integration.test_attempt_lifecycle import (
     DEADLINE_EXPIRING,
     EXPIRING,
@@ -54,6 +55,7 @@ Conn = psycopg.Connection[TupleRow]
 
 INITIAL, LEASES, GRACE_REASON, *_ = load_migrations()
 UP_TO_0002 = [INITIAL, LEASES]
+UP_TO_0003 = [INITIAL, LEASES, GRACE_REASON]  # never 0004: it has its own tests
 BRIEF_GRACE = timedelta(microseconds=1)
 KINDS = ("cancellation",)  # the job kind new_tasks submits
 OLD_REASONS = {"lease_expired", "deadline_exceeded"}
@@ -122,7 +124,7 @@ def upgrade_refused(url: str) -> MigrationError:
 
     def run() -> None:
         try:
-            outcome.append(migrate(url))
+            outcome.append(migrate(url, UP_TO_0003))
         except Exception as exc:  # returned to the test thread, which inspects it
             outcome.append(exc)
 
@@ -138,7 +140,7 @@ def upgrade_refused(url: str) -> MigrationError:
 
 def grace_expired_attempt(conn: Conn, task: Task) -> None:
     """Claim ``task``, request its cancellation with a brief grace, and wait for it to pass."""
-    attempt = start_attempt(conn, task.id, "w", policy=POLICY)
+    attempt = historical.start(conn, task.id, "w", policy=POLICY)
     request_cancellation(conn, task.id, grace=BRIEF_GRACE)
     shortened = get_attempt(conn, attempt.id)
     assert shortened is not None
@@ -154,12 +156,11 @@ def test_upgrades_from_0002_keeping_revoked_history_and_running_attempts(
     conn = at_0002()
     lost, overdue, running, cancelling = new_tasks(conn, 4)
     for task, policy in ((lost, EXPIRING), (overdue, DEADLINE_EXPIRING)):
-        attempt = start_attempt(conn, task.id, "w", policy=policy)
+        attempt = historical.start(conn, task.id, "w", policy=policy)
         until_expired(conn, attempt)
-        revocation = revoke_next_expired(conn)
-        assert revocation is not None
-    live = start_attempt(conn, running.id, "w", policy=POLICY)
-    asked = start_attempt(conn, cancelling.id, "w", policy=POLICY)
+        assert historical.revoke(conn) is not None
+    live = historical.start(conn, running.id, "w", policy=POLICY)
+    asked = historical.start(conn, cancelling.id, "w", policy=POLICY)
     request_cancellation(conn, cancelling.id, grace=GRACE)
     reasons = {
         str(r)
@@ -168,7 +169,7 @@ def test_upgrades_from_0002_keeping_revoked_history_and_running_attempts(
     assert reasons == OLD_REASONS
     before = snapshot(conn)
 
-    assert [m.label for m in migrate(schema_url)] == [GRACE_REASON.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0003)] == [GRACE_REASON.label]
 
     assert versions(conn) == [1, 2, 3]
     assert allowed_reasons(conn) == ALL_REASONS
@@ -188,15 +189,15 @@ def test_the_new_reason_is_rejected_before_0003_and_accepted_after(
     grace_expired_attempt(conn, task)
     before = snapshot(conn)
     with pytest.raises(errors.CheckViolation) as info:
-        revoke_next_expired(conn)  # the schema refuses; the operation fails closed
+        historical.revoke(conn)  # the schema refuses; the revocation rolls back
     assert info.value.diag.constraint_name == "attempts_revoked_reason_valid"
     assert snapshot(conn) == before  # neither the attempt nor the task changed
 
-    migrate(schema_url)
-    revocation = revoke_next_expired(conn)
-    assert revocation is not None
-    assert revocation.attempt.revoked_reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
-    assert revocation.task.state is TaskState.CANCELLED
+    migrate(schema_url, UP_TO_0003)
+    assert historical.revoke(conn) == (
+        RevocationReason.CANCELLATION_GRACE_EXPIRED,
+        TaskState.CANCELLED,
+    )
     assert_invariants(conn)
 
 
@@ -211,7 +212,7 @@ def test_fails_at_once_while_a_reader_holds_attempts(
         assert "could not lock attempts" in str(refused)
         assert_not_upgraded(conn)  # rolled back: no history row, old reasons only
         reader.rollback()
-    assert [m.label for m in migrate(schema_url)] == [GRACE_REASON.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0003)] == [GRACE_REASON.label]
 
 
 def test_fails_at_once_while_a_lifecycle_write_holds_an_attempt(
@@ -219,13 +220,13 @@ def test_fails_at_once_while_a_lifecycle_write_holds_an_attempt(
 ) -> None:
     conn, holder = at_0002(), at_0002()
     (task,) = new_tasks(conn, 1)
-    attempt = start_attempt(conn, task.id, "w", policy=POLICY)
+    attempt = historical.start(conn, task.id, "w", policy=POLICY)
     holder.execute("BEGIN")
     holder.execute("SELECT id FROM attempts WHERE id = %s FOR UPDATE", (attempt.id,))
     assert upgrade_refused(schema_url).sqlstate == "55P03"
     assert_not_upgraded(conn)
     holder.execute("ROLLBACK")
-    assert [m.label for m in migrate(schema_url)] == [GRACE_REASON.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0003)] == [GRACE_REASON.label]
 
 
 def test_does_not_lock_the_tasks_table(schema_url: str, at_0002: Callable[[], Conn]) -> None:
@@ -236,7 +237,7 @@ def test_does_not_lock_the_tasks_table(schema_url: str, at_0002: Callable[[], Co
     holder.execute("BEGIN")
     holder.execute("SELECT id FROM tasks WHERE id = %s FOR UPDATE", (task.id,))
     started = time.monotonic()
-    assert [m.label for m in migrate(schema_url)] == [GRACE_REASON.label]
+    assert [m.label for m in migrate(schema_url, UP_TO_0003)] == [GRACE_REASON.label]
     assert time.monotonic() - started < 5
     holder.execute("ROLLBACK")
 
@@ -254,8 +255,8 @@ def test_a_retried_upgrade_applies_between_live_transactions_and_work_carries_on
     worker = at_0002()
     worker.prepare_threshold = 0
     running, cancelling, queued = new_tasks(admin, 3)
-    held = start_attempt(worker, running.id, "w", policy=POLICY)
-    asked = start_attempt(worker, cancelling.id, "w", policy=POLICY)
+    held = historical.start(worker, running.id, "w", policy=POLICY)
+    asked = historical.start(worker, cancelling.id, "w", policy=POLICY)
     request_cancellation(requester, cancelling.id, grace=BRIEF_GRACE)  # before the upgrade
 
     worker.execute("BEGIN")  # mid-transaction on an attempt row, as a heartbeat would be
@@ -266,7 +267,7 @@ def test_a_retried_upgrade_applies_between_live_transactions_and_work_carries_on
     assert snapshot(admin) == before
     worker.execute("COMMIT")
 
-    assert [m.label for m in migrate(schema_url)] == [GRACE_REASON.label]  # the retry
+    assert [m.label for m in migrate(schema_url, UP_TO_0003)] == [GRACE_REASON.label]  # the retry
     assert versions(admin) == [1, 2, 3]
 
     # The same sessions carry on across the upgrade.
@@ -274,29 +275,28 @@ def test_a_retried_upgrade_applies_between_live_transactions_and_work_carries_on
     with pytest.raises(LeaseExpiredError) as expired:  # its brief grace has run out
         renew_lease(worker, asked.id, generation=1, worker_id="w", policy=POLICY)
     assert expired.value.reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
-    done = complete_attempt(worker, held.id, generation=1, outcome=AttemptSucceeded({"ok": True}))
-    assert done.task.state is TaskState.SUCCEEDED
-    claimed = claim_next_attempt(worker, "w", policy=POLICY, kinds=KINDS)
+    assert historical.succeed(worker, held) is TaskState.SUCCEEDED
+    claimed = historical.claim(worker, "w", policy=POLICY, kinds=KINDS)
     assert claimed is not None
     assert claimed.task_id == queued.id
     # The request made before the upgrade ends in the new reason after it.
     shortened = get_attempt(admin, asked.id)
     assert shortened is not None
     until_expired(admin, shortened)
-    revocation = revoke_next_expired(requester)
-    assert revocation is not None
-    assert revocation.attempt.revoked_reason is RevocationReason.CANCELLATION_GRACE_EXPIRED
-    assert revocation.task.state is TaskState.CANCELLED
+    assert historical.revoke(requester) == (
+        RevocationReason.CANCELLATION_GRACE_EXPIRED,
+        TaskState.CANCELLED,
+    )
     assert_invariants(admin)
 
 
 def upgrade_during_live_work(url: str) -> tuple[list[str], list[str]]:
     """Race an operator retrying the upgrade against three workers and a canceller.
 
-    The workers run the current code, which works on either schema: claim,
-    heartbeat, complete. The canceller requests cancellation of queued and
-    running tasks. Returns every upgrade outcome in order and how each
-    participant stopped.
+    The workers claim, heartbeat and complete as the code of that time did
+    (``historical``, and the current heartbeat), which works on either schema.
+    The canceller requests cancellation of queued and running tasks. Returns
+    every upgrade outcome in order and how each participant stopped.
     """
     barrier = threading.Barrier(5)
 
@@ -305,7 +305,7 @@ def upgrade_during_live_work(url: str) -> tuple[list[str], list[str]]:
         with connect(url) as conn:
             barrier.wait()
             while (
-                attempt := claim_next_attempt(conn, f"w{seed}", policy=POLICY, kinds=KINDS)
+                attempt := historical.claim(conn, f"w{seed}", policy=POLICY, kinds=KINDS)
             ) is not None:
                 # The worker would wind down after a refused heartbeat; it still completes below.
                 with contextlib.suppress(CancellationRequestedError):
@@ -316,12 +316,7 @@ def upgrade_during_live_work(url: str) -> tuple[list[str], list[str]]:
                         worker_id=attempt.worker_id,
                         policy=POLICY,
                     )
-                complete_attempt(
-                    conn,
-                    attempt.id,
-                    generation=attempt.attempt_number,
-                    outcome=AttemptSucceeded({"by": seed}),
-                )
+                historical.succeed(conn, attempt)
                 time.sleep(idle.uniform(0, 0.002))  # idle between tasks, holding nothing
         return "drained"
 
@@ -337,7 +332,7 @@ def upgrade_during_live_work(url: str) -> tuple[list[str], list[str]]:
         outcomes: list[str] = []
         for _ in range(2000):  # retried at once, as a script would; each refusal is instant
             try:
-                outcomes.append(",".join(m.label for m in migrate(url)))
+                outcomes.append(",".join(m.label for m in migrate(url, UP_TO_0003)))
                 break
             except MigrationError as exc:
                 outcomes.append(str(exc.sqlstate))

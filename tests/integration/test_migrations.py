@@ -55,13 +55,15 @@ def test_applies_packaged_schema_to_an_empty_schema(schema_url: str) -> None:
         "0001_initial_schema",
         "0002_attempt_leases",
         "0003_cancellation_grace",
+        "0004_task_availability",
     ]
     assert _tables(schema_url) == {"schema_migrations", "jobs", "tasks", "attempts"}
-    initial, leases, grace = load_migrations()
+    initial, leases, grace, availability = load_migrations()
     assert _history(schema_url) == [
         (1, "initial_schema", initial.checksum),
         (2, "attempt_leases", leases.checksum),
         (3, "cancellation_grace", grace.checksum),
+        (4, "task_availability", availability.checksum),
     ]
 
 
@@ -285,8 +287,9 @@ def test_many_concurrent_runners_apply_each_migration_exactly_once(
             "0001_initial_schema",
             "0002_attempt_leases",
             "0003_cancellation_grace",
+            "0004_task_availability",
         ]
-        assert len(_history(url)) == 3
+        assert len(_history(url)) == 4
 
 
 def test_cli_migrate_applies_the_schema(
@@ -296,7 +299,12 @@ def test_cli_migrate_applies_the_schema(
     assert main(["migrate"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "status": "ok",
-        "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace"],
+        "applied": [
+            "0001_initial_schema",
+            "0002_attempt_leases",
+            "0003_cancellation_grace",
+            "0004_task_availability",
+        ],
     }
     assert main(["migrate"]) == 0
     assert json.loads(capsys.readouterr().out) == {"status": "ok", "applied": []}
@@ -411,10 +419,10 @@ def _changed(statement: str) -> Callable[[str], None]:
     [
         (lambda url: None, "has no migration history; run `orqestra migrate`"),
         (_empty_history, "is behind; pending migrations: 0001_initial_schema, 0002_attempt_leases"),
-        (_behind, "is behind; pending migrations: 0003_cancellation_grace"),
+        (_behind, "is behind; pending migrations: 0003_cancellation_grace, 0004_task_availability"),
         (
-            _changed("INSERT INTO schema_migrations VALUES (4, 'future', 'x', now())"),
-            "database has migrations this code does not know: 0004_future",
+            _changed("INSERT INTO schema_migrations VALUES (5, 'future', 'x', now())"),
+            "database has migrations this code does not know: 0005_future",
         ),
         (
             _changed("UPDATE schema_migrations SET name = 'renamed' WHERE version = 2"),

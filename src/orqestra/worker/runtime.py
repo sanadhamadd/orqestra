@@ -401,6 +401,7 @@ class Worker:
         self._registry = registry
         self._settings = settings
         self._policy = settings.lease_policy
+        self._retry_policy = settings.retry_policy
         self._connect = connect
         self._clock = clock
         self._watchdog = watchdog or Watchdog(clock=clock)
@@ -824,7 +825,11 @@ class Worker:
             completion = self._call(
                 "complete_attempt",
                 lambda conn: complete_attempt(
-                    conn, attempt.id, generation=attempt.attempt_number, outcome=outcome
+                    conn,
+                    attempt.id,
+                    generation=attempt.attempt_number,
+                    outcome=outcome,
+                    retry_policy=self._retry_policy,
                 ),
                 running.context,
             )
@@ -950,7 +955,11 @@ class Worker:
         if sweep.left == 0:
             sweep.started, sweep.left = self._clock(), self._settings.recovery_batch_limit
         try:
-            revocation = self._call("revoke_next_expired", revoke_next_expired, {})
+            revocation = self._call(
+                "revoke_next_expired",
+                lambda conn: revoke_next_expired(conn, retry_policy=self._retry_policy),
+                {},
+            )
         except (psycopg.Error, ConnectionUnavailable) as exc:
             self._event(logging.WARNING, "sweep_failed", type(exc).__name__)
             revocation, sweep.left = None, 1  # end this sweep

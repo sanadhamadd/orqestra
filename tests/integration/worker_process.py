@@ -12,7 +12,8 @@ test through their own connection to ``ORQESTRA_TEST_HANDLER_URL``:
   the handler;
 - ``abort``: records the run, then raises ``SystemExit`` (a control-plane signal);
 - ``cooperative``: records the run, then waits for its cancellation signal and
-  raises ``HandlerCancelled`` once told (DEC-048).
+  raises ``HandlerCancelled`` once told (DEC-048);
+- ``flaky``: records the run, then raises ``TransientError`` (DEC-053).
 """
 
 import functools
@@ -20,6 +21,7 @@ import os
 
 import psycopg
 
+from orqestra.domain.errors import TransientError
 from orqestra.domain.jobs import JsonValue
 from orqestra.logging import configure_logging
 from orqestra.worker.handlers import HandlerCancelled, HandlerRegistry, TaskContext
@@ -58,10 +60,17 @@ def cooperative(context: TaskContext, payload: JsonValue) -> JsonValue:
     return {"never": "told"}
 
 
+def flaky(context: TaskContext, payload: JsonValue) -> JsonValue:
+    _record_run(context).close()
+    raise TransientError("try again later")
+
+
 def main() -> None:
     configure_logging("INFO")
     settings = WorkerSettings(_env_file=None)
-    registry = HandlerRegistry({"gated": gated, "abort": abort, "cooperative": cooperative})
+    registry = HandlerRegistry(
+        {"gated": gated, "abort": abort, "cooperative": cooperative, "flaky": flaky}
+    )
     url = os.environ["ORQESTRA_TEST_WORKER_URL"]
     worker = Worker(
         registry=registry,

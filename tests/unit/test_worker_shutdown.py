@@ -54,7 +54,7 @@ BOUND = 10.0  # the bound on every wait for another thread; never reached when c
 def h(monkeypatch: pytest.MonkeyPatch) -> Iterator[Harness]:
     harness = Harness(monkeypatch)
     # Nothing to recover unless a test says so.
-    monkeypatch.setattr(runtime, "revoke_next_expired", lambda conn: None)
+    monkeypatch.setattr(runtime, "revoke_next_expired", lambda conn, *, retry_policy: None)
     yield harness
     harness.gate.set()
 
@@ -513,7 +513,7 @@ _FALSE_SUCCESS = textwrap.dedent(
     from tests.unit.test_worker_runtime import SETTINGS, FakeConn
     from orqestra.worker.handlers import HandlerRegistry
 
-    def exits(conn):
+    def exits(conn, **kwargs):
         sys.exit(0)
 
     runtime.revoke_next_expired = exits
