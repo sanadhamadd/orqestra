@@ -13,6 +13,7 @@ from orqestra.ai.provider import (
     ProviderRequest,
     ProviderResponse,
     ProviderTransientError,
+    ProviderUsage,
     TransientCode,
 )
 from orqestra.ai.routing import RouteOption
@@ -25,7 +26,11 @@ from orqestra.worker.handlers import (
     TaskContext,
     run_handler,
 )
-from orqestra.workloads.invoice.handler import JOB_KIND, invoice_verification_handler
+from orqestra.workloads.invoice.handler import (
+    JOB_KIND,
+    billable_routes,
+    invoice_verification_handler,
+)
 from orqestra.workloads.invoice.verify import REQUIRED_CAPABILITY
 from tests.unit.test_invoice_verify import (
     ROUTE,
@@ -340,3 +345,97 @@ def test_the_factory_refuses_bad_wiring_at_once() -> None:
     not_routes: Any = ["r1"]
     with pytest.raises(TypeError, match="RouteOption"):
         invoice_verification_handler({"r1": mock}, not_routes, TIMEOUT)
+
+
+class ClaimsToBeFree:
+    """A provider that declares itself non-billable; the declaration must be ignored."""
+
+    billable = False
+
+    def interpret(self, request: ProviderRequest) -> ProviderResponse:
+        return ProviderResponse("5")
+
+
+class ScriptedSubclass(MockProvider):
+    """Not the offline mock itself, so it may not be marked non-billable."""
+
+
+def test_every_provider_is_billable_by_default() -> None:
+    providers: dict[str, Provider] = {
+        "r1": MockProvider(),
+        "r2": ClaimsToBeFree(),
+        "r3": ScriptedSubclass(),
+    }
+    assert billable_routes(providers, frozenset()) == frozenset({"r1", "r2", "r3"})
+
+
+def test_only_a_marked_offline_mock_is_non_billable() -> None:
+    providers: dict[str, Provider] = {"r1": MockProvider(), "r2": MockProvider()}
+    assert billable_routes(providers, frozenset({"r1"})) == frozenset({"r2"})
+    assert billable_routes(providers, frozenset({"r1", "r2"})) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("provider", "match"),
+    [
+        (ClaimsToBeFree(), "not the offline mock"),
+        (CancelsWhenAsked(threading.Event()), "not the offline mock"),
+        (ScriptedSubclass(), "not the offline mock"),
+    ],
+)
+def test_the_factory_refuses_to_mark_anything_but_the_offline_mock(
+    provider: Provider, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        handler_for(provider, non_billable_routes=frozenset({"r1"}))
+    with pytest.raises(ValueError, match=match):
+        billable_routes({"r1": provider}, frozenset({"r1"}))
+
+
+def test_the_factory_refuses_an_unknown_non_billable_route() -> None:
+    with pytest.raises(ValueError, match="has no provider"):
+        handler_for(MockProvider(), non_billable_routes=frozenset({"r9"}))
+
+
+@pytest.mark.parametrize(
+    ("marked", "match"),
+    [
+        ("r1", "frozenset"),
+        ({"r1"}, "frozenset"),
+        (["r1"], "frozenset"),
+        (None, "frozenset"),
+        (frozenset({1}), "entries must be str"),
+        (frozenset({"r1", 1}), "entries must be str"),
+    ],
+)
+def test_the_factory_refuses_non_billable_routes_of_the_wrong_type(
+    marked: object, match: str
+) -> None:
+    with pytest.raises(TypeError, match=match):
+        handler_for(MockProvider(), non_billable_routes=marked)
+
+
+def test_a_marked_mock_still_gives_the_golden_result() -> None:
+    handler = handler_for(MockProvider(["5", "oops"]), non_billable_routes=frozenset({"r1"}))
+    outcome = run_handler(handler, context(), golden_batch())
+    assert outcome == AttemptSucceeded(GOLDEN)
+
+
+def test_provider_reported_usage_never_changes_or_reaches_the_stored_result() -> None:
+    usage = ProviderUsage("0.25", "credits")
+    with_usage = run_handler(
+        handler_for(MockProvider([ProviderResponse("5", usage=usage)])),
+        context(),
+        batch(0, ambiguous_unit()),
+    )
+    without_usage = run_handler(
+        handler_for(MockProvider([ProviderResponse("5")])),
+        context(),
+        batch(0, ambiguous_unit()),
+    )
+    assert isinstance(with_usage, AttemptSucceeded)
+    assert isinstance(without_usage, AttemptSucceeded)
+    text = json.dumps(with_usage.result, sort_keys=True)
+    assert text == json.dumps(without_usage.result, sort_keys=True)
+    for forbidden in ("0.25", "credits", "usage"):
+        assert forbidden not in text
