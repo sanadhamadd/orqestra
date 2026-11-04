@@ -366,7 +366,7 @@ def test_a_cancelled_outcome_without_a_request_writes_nothing(checked: Conn) -> 
 def test_a_closure_that_does_not_match_the_ledger_rolls_back_the_completion(
     checked: Conn, answered: int, unanswered: int
 ) -> None:
-    task, attempt = running(checked)
+    _, attempt = running(checked)
     calls(checked, attempt, answered=answered, unanswered=unanswered)
     engine, usage = snapshot(checked), ledger(checked)
     with pytest.raises(CaptureNotCompleteError):

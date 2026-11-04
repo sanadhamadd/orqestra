@@ -736,17 +736,32 @@ runtime passes neither yet.
 ```python
 from orqestra.persistence.lifecycle import complete_attempt, revoke_next_expired
 from orqestra.persistence.provider_usage import (
-    CaptureState, CaptureTier, ClosedBy, UsageClosure, capture_of, read_attempt_usage,
+    CaptureState,
+    CaptureTier,
+    ClosedBy,
+    UsageClosure,
+    capture_of,
+    read_attempt_usage,
 )
 
 closure = UsageClosure(
-    attempt_id=attempt.id, capture=CaptureState.COMPLETE, closed_by=ClosedBy.WORKER,
-    capture_tier=CaptureTier.T3, call_count=calls_made,
+    attempt_id=attempt.id,
+    capture=CaptureState.COMPLETE,
+    closed_by=ClosedBy.WORKER,
+    capture_tier=CaptureTier.T3,
+    call_count=calls_made,
 )
-complete_attempt(conn, attempt.id, generation=attempt.attempt_number, outcome=outcome,
-                 retry_policy=retry_policy, usage_closure=closure)
-revoke_next_expired(conn, retry_policy=retry_policy,
-                    usage_capture={"invoice_verification": CaptureTier.T3})
+complete_attempt(
+    conn,
+    attempt.id,
+    generation=attempt.attempt_number,
+    outcome=outcome,
+    retry_policy=retry_policy,
+    usage_closure=closure,
+)
+revoke_next_expired(
+    conn, retry_policy=retry_policy, usage_capture={"invoice_verification": CaptureTier.T3}
+)
 usage = read_attempt_usage(conn, attempt.id)
 print(capture_of(usage))  # open, closed, lower_bound or not_captured
 ```
