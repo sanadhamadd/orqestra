@@ -726,6 +726,58 @@ with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
   already inside a transaction. A database error propagates and no partial summary is
   returned.
 
+### Provider usage closure
+
+An attempt's provider usage capture can be closed in the same transaction that ends the
+attempt, so the closure commits or rolls back with the transition (DEC-057, Proposed).
+Both arguments are optional; without them nothing is written to the ledger, and the worker
+runtime passes neither yet.
+
+```python
+from orqestra.persistence.lifecycle import complete_attempt, revoke_next_expired
+from orqestra.persistence.provider_usage import (
+    CaptureState, CaptureTier, ClosedBy, UsageClosure, capture_of, read_attempt_usage,
+)
+
+closure = UsageClosure(
+    attempt_id=attempt.id, capture=CaptureState.COMPLETE, closed_by=ClosedBy.WORKER,
+    capture_tier=CaptureTier.T3, call_count=calls_made,
+)
+complete_attempt(conn, attempt.id, generation=attempt.attempt_number, outcome=outcome,
+                 retry_policy=retry_policy, usage_closure=closure)
+revoke_next_expired(conn, retry_policy=retry_policy,
+                    usage_capture={"invoice_verification": CaptureTier.T3})
+usage = read_attempt_usage(conn, attempt.id)
+print(capture_of(usage))  # open, closed, lower_bound or not_captured
+```
+
+- **Worker.** The closure is written last, after the attempt and the task, on the
+  completion's own cursor and under its locks. Every outcome closes, a requeued transient
+  failure included. A repeated identical closure is a replay.
+- **Recovery.** `usage_capture` maps job kinds to the tier their handlers record at. A
+  revoked attempt of a mapped kind is closed by `recovery`: at T3, `complete` with the
+  number of intents when every intent has a result (`complete(0)` when there are none),
+  otherwise `incomplete`; at T1 and T2 always `incomplete`. An unmapped kind gets no
+  closure. Map a kind to T3 only if its handlers record every intent before calling the
+  provider: that is the one way to over-claim.
+- **Late facts.** An intent waits behind the lifecycle's lock on its attempt and then
+  records the state that committed, so a call recorded after the attempt ended is flagged
+  late and was never counted by its closure. `record_late_usage` records a result and says
+  whether a closure already existed. Closures never change: later facts leave the attempt
+  `lower_bound`.
+- **Reading it.** `capture_of` is pure. `closed` needs a complete closure that counts
+  exactly the calls read, each with a result. `not_captured` means nothing was recorded,
+  never "zero calls".
+
+| Situation | What happens |
+|---|---|
+| A complete worker closure counts the wrong number of calls, or one has no result | `CaptureNotCompleteError`; nothing is recorded, the attempt still runs, and it may complete again with an `incomplete` closure |
+| A different closure is already stored for the attempt | Completion: `UsageReplayConflictError`, nothing recorded. Recovery: the stored closure is kept and the revocation commits |
+| Another session's closure for the attempt is not yet committed | The closure insert waits, up to `lock_timeout` on a worker session. Then: a replay, a conflict (completion only), or its own insert if the other rolls back |
+| The completion is fenced (stale, revoked or already finished) | The usual error; no closure is written |
+| The connection is lost, or any statement fails, before commit | Neither the transition nor the closure is recorded |
+| A call is recorded after the closure | Accepted and flagged late; the closure is unchanged and the attempt reads as `lower_bound` |
+
 ### Verification
 
 ```sh
@@ -748,12 +800,15 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   There is no guaranteed recovery delay: it depends on live workers, their sweep
   interval and batch limit, and the backlog of expired attempts.
 - Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
-  external AI call already made. Usage must be attributed to the revoked attempt when cost
-  tracking exists.
-- Invoice verification has no live provider and no usage ledger. Provider-reported usage is
-  discarded, and the stored `routing` shows only which route was chosen. A provider error
-  repeats the whole batch on retry, so billable calls could repeat; deterministic request
-  ids would let a real adapter deduplicate them, and no exactly-once claim is made.
+  external AI call already made. Calls recorded in the provider usage ledger stay
+  attributed to the revoked attempt, and recovery closes its capture only for job kinds it
+  is given a tier for (DEC-057); a call that was never recorded is not known.
+- Invoice verification has no live provider and does not record to the provider usage
+  ledger yet, and the worker runtime passes no closure or tier map, so its captures are not
+  closed. Provider-reported usage is discarded, and the stored `routing` shows only which
+  route was chosen. A provider error repeats the whole batch on retry, so billable calls
+  could repeat; deterministic request ids would let a real adapter deduplicate them, and no
+  exactly-once claim is made.
 - The invoice job summary is in process only: no command or API exposes it, and it
   summarizes one job per call. Its snapshot read grows with the number of tasks and the
   size of their stored results, and holds back vacuum while it lasts; the cost of the
