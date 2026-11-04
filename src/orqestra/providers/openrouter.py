@@ -339,9 +339,7 @@ class OpenRouterProvider:
             "Accept": "application/json",
         }
 
-    def _exchange(
-        self, body: bytes, deadline: Deadline
-    ) -> tuple[int, bytes | None] | Exception:
+    def _exchange(self, body: bytes, deadline: Deadline) -> tuple[int, bytes | None] | Exception:
         """The status and, for a 200, the body (``None`` if over the cap); or the error."""
         exchange: HttpExchange | None = None
         failure: Exception

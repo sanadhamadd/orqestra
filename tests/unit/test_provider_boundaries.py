@@ -196,7 +196,7 @@ def test_the_mirrored_limits_equal_the_ledgers() -> None:
 
 
 def test_the_mirrored_rules_equal_their_sources() -> None:
-    assert openrouter.ROUTE_ID_PATTERN == routing._ROUTE_ID.pattern
+    assert routing._ROUTE_ID.pattern == openrouter.ROUTE_ID_PATTERN
     assert openrouter.CHAT_COMPLETIONS_PATH == stdlib_transport.CHAT_COMPLETIONS_PATH
     assert provider_usage._IDENTIFIER.fullmatch(openrouter.PROMPT_VERSION) is not None
 

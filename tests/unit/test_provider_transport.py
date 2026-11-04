@@ -1,9 +1,11 @@
 """The stdlib HTTPS transport over a stand-in for ``http.client.HTTPSConnection``.
 
-No socket is opened: ``no_network`` is on, and ``HTTPSConnection`` is replaced by
-either a scripted fake (to check the order of steps, the timeouts and the failure
-mapping) or a subclass of the real class whose socket is a stand-in (so the real
-header checks and request framing run).
+No socket is opened: ``no_network`` is on, and the connection class the transport
+looks up is replaced by either a scripted fake set as ``http.client.HTTPSConnection``
+(to check the order of steps, the timeouts and the failure mapping) or a subclass of
+the real class whose socket is a stand-in, reached through a copy of ``http.client``
+set as the transport module's ``http`` name (so the real header checks and request
+framing run).
 """
 
 import http.client
@@ -12,6 +14,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -393,7 +396,9 @@ class SocketlessConnection(http.client.HTTPSConnection):
 @pytest.fixture
 def socketless(monkeypatch: pytest.MonkeyPatch) -> list[SocketlessConnection]:
     monkeypatch.setattr(SocketlessConnection, "made", [])
-    monkeypatch.setattr(http.client, "HTTPSConnection", SocketlessConnection)
+    # The stdlib global stays real: ``HTTPSConnection.__init__`` names it in ``super``.
+    client = SimpleNamespace(**{**vars(http.client), "HTTPSConnection": SocketlessConnection})
+    monkeypatch.setattr(stdlib_transport, "http", SimpleNamespace(client=client))
     return SocketlessConnection.made
 
 
