@@ -671,12 +671,17 @@ backward compatible. No command registers the handler, so only direct callers ch
   `execution_timeout − fence_margin`. That needs the worker's settings and the durable
   recorder's bounds, so it is left to the worker's wiring, and cap validation is not
   complete yet (DEC-057).
-- **Call recording.** With a `recorder` (a `ProviderCallRecorder`), every call is
-  recorded, including a marked mock's and a cached repeat's. Each call gets its own
-  `call_seq`: 0, 1, 2, … within the attempt. Each record carries the attempt id, the item's
-  absolute index, the route, the capability, the field kind and the route's estimate,
-  then the outcome and the provider's own `usage`. It never carries a raw string, a
-  request id, the reply's value or `reported_cost_units`. Intents use the usage ledger's
+- **Call recording.** With a `recorder` (a `ProviderCallRecorder`), every call's intent is
+  recorded before the call, including a marked mock's and a cached repeat's. Each call
+  gets its own `call_seq`: 0, 1, 2, … within the attempt. An intent carries the attempt
+  id, the item's absolute index, the route, the capability, the field kind and the
+  route's estimate. A result is recorded only when the outcome is known: `answered` with
+  the provider's own `usage`, if it reported one, or `failed` with its code and no usage.
+  A call has only its intent when the provider raises something that is not a provider
+  error, returns something that is not a `ProviderResponse`, or is interrupted by a
+  `BaseException`; when `record_result` fails; or when the process is interrupted before
+  the result (see the table below and Known limitations). No record carries a raw string,
+  a request id, the reply's value or `reported_cost_units`. Intents use the usage ledger's
   ranges: an intent whose `item_index` is above 2^31 − 1 or whose estimate is above
   2^63 − 1 raises `ValueError` before `record_intent`, so the task fails and no call is
   made. Here the route id comes from a checked `RouteOption`, which uses the ledger's
