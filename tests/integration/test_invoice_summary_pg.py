@@ -86,7 +86,13 @@ SET_READ_COMMITTED = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"
 
 
 def make_handler() -> Handler:
-    return invoice_verification_handler({"r1": MockProvider(["5"] * 4)}, [ROUTE], TIMEOUT)
+    return invoice_verification_handler(
+        {"r1": MockProvider(["5"] * 4)},
+        [ROUTE],
+        TIMEOUT,
+        max_provider_calls_per_attempt=64,
+        non_billable_routes=frozenset({"r1"}),
+    )
 
 
 def submit_items(db: Conn, items: Sequence[JsonValue], batch_size: int) -> Job:

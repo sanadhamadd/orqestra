@@ -40,6 +40,11 @@ Conn = psycopg.Connection[TupleRow]
 
 # Test value only (DEC-034): a delay far longer than any test, so "later than now" is exact.
 BACKOFF = RetryPolicy(base_delay=timedelta(hours=1), max_delay=timedelta(hours=8))
+# Test values only: the offline mock is marked non-billable, and the cap exceeds any batch here.
+WIRING: dict[str, Any] = {
+    "max_provider_calls_per_attempt": 64,
+    "non_billable_routes": frozenset({"r1"}),
+}
 
 
 def db_clock(db: Conn) -> datetime:
@@ -84,7 +89,7 @@ def test_a_partitioned_batch_is_stored_as_item_results_and_the_job_still_succeed
     specs = partition(items, batch_size=2, max_attempts=3, key_prefix="invoices")
     job = submit_job(db, JobSubmission(JOB_KIND, specs)).job
     mock = MockProvider(["5"])
-    handler = invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT)
+    handler = invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT, **WIRING)
 
     for _ in specs:
         outcome, completion = run_next(db, handler)
@@ -119,7 +124,7 @@ def test_a_transient_provider_error_requeues_the_batch_after_a_durable_delay(db:
     specs = partition([ambiguous_unit()], batch_size=1, max_attempts=3, key_prefix="invoices")
     job = submit_job(db, JobSubmission(JOB_KIND, specs)).job
     mock = MockProvider([ProviderTransientError(TransientCode.RATE_LIMITED), "5"])
-    handler = invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT)
+    handler = invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT, **WIRING)
 
     outcome, completion = run_next(db, handler)
 

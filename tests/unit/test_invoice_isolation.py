@@ -6,6 +6,9 @@ rejects dynamic imports and ``eval``/``exec``/``compile``. The scan sees direct
 imports only: a transitive import of a transport is covered by the runtime guard,
 the ``no_network`` fixture, which makes any connection or name lookup fail the
 test. A meta-test below shows that the guard fires.
+
+A second scan enforces the layers: ``ai/`` and ``workloads/`` never import storage or
+aggregation, and ``ai/`` never imports a workload or the worker.
 """
 
 import ast
@@ -36,6 +39,7 @@ ALLOWED_TOP_LEVEL = frozenset(
         "re",
         "types",
         "typing",
+        "uuid",
     }
 )
 # Named so that a failure reads clearly; the allow-list above already excludes them.
@@ -94,12 +98,93 @@ def test_the_scan_finds_every_new_module() -> None:
         "checks.py",
         "verify.py",
         "handler.py",
+        "recording.py",
     } <= names
 
 
 def test_no_new_module_imports_a_transport_or_evaluates_code() -> None:
     for path in new_modules():
         assert violations(path.read_text(encoding="utf-8")) == [], path.name
+
+
+# Which orqestra packages a layer may not import: ai/ knows no workload and no worker,
+# and neither ai/ nor workloads/ reaches storage or aggregation (DEC-057).
+LAYER_FORBIDDEN = {
+    "ai": (
+        "orqestra.persistence",
+        "orqestra.aggregation",
+        "orqestra.workloads",
+        "orqestra.worker",
+    ),
+    "workloads": ("orqestra.persistence", "orqestra.aggregation"),
+}
+
+
+def layer_violations(layer: str, source: str) -> list[str]:
+    """The imports in ``source`` that ``layer`` may not make."""
+    forbidden = LAYER_FORBIDDEN[layer]
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules = [node.module] + [f"{node.module}.{alias.name}" for alias in node.names]
+        else:
+            continue
+        for module in modules:
+            if any(module == p or module.startswith(f"{p}.") for p in forbidden):
+                found.append(f"{layer} imports {module}")
+                break
+    return found
+
+
+def test_no_ai_or_workload_module_imports_a_layer_it_must_not_know() -> None:
+    for package, layer in ((orqestra.ai, "ai"), (orqestra.workloads, "workloads")):
+        root = Path(package.__file__ or "").parent
+        for path in sorted(root.rglob("*.py")):
+            assert layer_violations(layer, path.read_text(encoding="utf-8")) == [], path.name
+
+
+@pytest.mark.parametrize(
+    ("layer", "source", "expected"),
+    [
+        ("ai", "import orqestra.persistence", ["ai imports orqestra.persistence"]),
+        (
+            "ai",
+            "from orqestra.persistence.provider_usage import CallOutcome",
+            ["ai imports orqestra.persistence.provider_usage"],
+        ),
+        ("ai", "from orqestra import worker", ["ai imports orqestra.worker"]),
+        (
+            "ai",
+            "from orqestra.workloads.invoice import verify",
+            ["ai imports orqestra.workloads.invoice"],
+        ),
+        (
+            "ai",
+            "import orqestra.aggregation.invoice",
+            ["ai imports orqestra.aggregation.invoice"],
+        ),
+        (
+            "workloads",
+            "from orqestra import persistence",
+            ["workloads imports orqestra.persistence"],
+        ),
+        (
+            "workloads",
+            "from orqestra.aggregation import invoice",
+            ["workloads imports orqestra.aggregation"],
+        ),
+        ("workloads", "from orqestra.worker.handlers import Handler", []),
+        ("workloads", "from orqestra.ai.recording import ProviderCallRecorder", []),
+        ("ai", "from orqestra.ai.provider import FieldKind", []),
+        ("ai", "import orqestra.persistence_like", []),
+    ],
+)
+def test_the_layer_scan_catches_what_it_is_meant_to_catch(
+    layer: str, source: str, expected: list[str]
+) -> None:
+    assert layer_violations(layer, source) == expected
 
 
 @pytest.mark.parametrize(

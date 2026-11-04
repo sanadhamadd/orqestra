@@ -10,7 +10,13 @@ It follows the engine's contracts and adds none:
   in-flight call is not interrupted. ``VerificationCancelled`` becomes
   ``HandlerCancelled``;
 - a provider error fails the whole batch task with the error's closed code, and a
-  retry runs the whole batch again (DEC-009, DEC-053).
+  retry runs the whole batch again (DEC-009, DEC-053);
+- each ``handle()`` is one attempt: one ``ProviderCalls`` for ``context.attempt_id``
+  numbers every provider call of the batch, across items and routes, and holds the
+  attempt to ``max_provider_calls_per_attempt``. An invoice that would exceed the
+  remaining cap is ``needs_review`` (``provider_call_cap_reached``) without a call;
+- with a ``recorder``, every call is recorded (DEC-057). A billable provider
+  requires one. Whatever the recorder raises fails the task like any handler error.
 
 An item result is::
 
@@ -34,13 +40,17 @@ from types import MappingProxyType
 
 from orqestra.ai.mock import MockProvider
 from orqestra.ai.provider import Provider
+from orqestra.ai.recording import ProviderCallRecorder
 from orqestra.ai.routing import RouteOption, check_routes, check_units
 from orqestra.domain.errors import PermanentError
 from orqestra.domain.jobs import JsonValue
 from orqestra.worker.handlers import Handler, HandlerCancelled, TaskContext
 from orqestra.workloads.invoice.verify import (
+    ProviderCalls,
     VerificationCancelled,
     VerificationOutcome,
+    check_call_cap,
+    check_recorder,
     check_wiring,
     verify_invoice,
 )
@@ -86,25 +96,40 @@ def invoice_verification_handler(
     timeout: timedelta,
     max_cost_units: int | None = None,
     *,
+    max_provider_calls_per_attempt: int,
+    recorder: ProviderCallRecorder | None = None,
     non_billable_routes: frozenset[str] = frozenset(),
 ) -> Handler:
     """The handler for ``JOB_KIND``.
 
     Every route needs a provider, ``timeout`` must be a positive duration,
     ``max_cost_units``, if given, a non-negative integer, and
-    ``non_billable_routes`` must pass ``billable_routes``; otherwise this raises
-    now, not when a task runs. The routes and providers are copied.
+    ``non_billable_routes`` must pass ``billable_routes``.
+    ``max_provider_calls_per_attempt`` is required: an ``int`` (not a ``bool``)
+    from 0 to ``MAX_CALL_SEQ``, where 0 allows deterministic results only.
+    ``recorder``, if given, must be a ``ProviderCallRecorder``, and it is required
+    when any provider is billable. Otherwise this raises now, not when a task
+    runs. The routes and providers are copied.
+
+    Whether the cap, the per-call timeout and the recorder's write bounds fit in
+    the worker's execution timeout is not checked here: that needs the worker's
+    settings and is left to the worker's wiring (DEC-057).
     """
     checked_routes = check_routes(routes)
     checked_providers: Mapping[str, Provider] = MappingProxyType(dict(providers))
     check_wiring(checked_routes, checked_providers, timeout)
     if max_cost_units is not None:
         check_units("max_cost_units", max_cost_units)
-    # Checked now so bad wiring fails at construction; nothing consumes it yet.
-    billable_routes(checked_providers, non_billable_routes)
+    cap = check_call_cap("max_provider_calls_per_attempt", max_provider_calls_per_attempt)
+    billable = billable_routes(checked_providers, non_billable_routes)
+    recorder = check_recorder(recorder)
+    if billable and recorder is None:
+        msg = "a billable provider needs a recorder: pass recorder, or mark the offline mock"
+        raise ValueError(msg)
 
     def handle(context: TaskContext, payload: JsonValue) -> JsonValue:
         offset, items = _batch(payload)
+        calls = ProviderCalls(attempt_id=context.attempt_id, cap=cap, recorder=recorder)
         results: list[JsonValue] = []
         for position, item in enumerate(items):
             if context.cancellation.is_set():
@@ -115,6 +140,8 @@ def invoice_verification_handler(
                     routes=checked_routes,
                     providers=checked_providers,
                     timeout=timeout,
+                    calls=calls,
+                    item_index=offset + position,
                     max_cost_units=max_cost_units,
                     cancelled=context.cancellation.is_set,
                 )
