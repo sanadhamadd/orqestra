@@ -26,12 +26,12 @@ from orqestra.worker import fence, runtime
 from orqestra.worker.fence import ExitCode, Expiry, Guard
 from orqestra.worker.runtime import Step, next_step
 from tests.integration.test_worker_cli import (
-    BOUND,
     STALE_DISCARD,
     Observed,
     check_resumed,
     describe,
 )
+from tests.integration.test_worker_runtime import WAIT as BOUND
 from tests.unit.test_worker_runtime import SETTINGS, Harness, attempt, running_of
 
 pytestmark = pytest.mark.unit
