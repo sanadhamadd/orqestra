@@ -61,8 +61,8 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed) | a live provider adapter; a usage and cost ledger |
-| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed) | a usage and cost ledger; an API (framework undecided) |
+| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); an append-only provider usage ledger of call intents, results and capture closures (migration 0005, PR #24), which no handler writes yet | a live provider adapter; recording usage from the handler path; prices, currencies or cost |
+| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-057, Proposed) | cost accounting; an API (framework undecided) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
 
@@ -720,11 +720,83 @@ with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
   hold; the schema does not enforce that, and a summary that is not complete is a
   point-in-time observation.
 - **Not a spend figure.** `provider_assisted_items` counts items a provider helped read,
-  not provider calls or cost. A retried batch repeats calls, and no usage is stored.
+  not provider calls or cost. A retried batch repeats calls; recorded calls are reported
+  by the provider usage report below.
 - **Errors.** `None` for a missing job; `WrongJobKindError` for another kind of job (no
   task is read); `ValueError` for a job without tasks; `RuntimeError` if the connection is
   already inside a transaction. A database error propagates and no partial summary is
   returned.
+
+### Provider usage report
+
+`report_job_usage` reads an invoice job's provider usage ledger (migration 0005) and reports
+what providers said they used, next to the unchanged summary (DEC-057, Proposed). It is a
+Python interface, with no command, API, table or migration. It reports provider-declared
+figures only: there are no prices, currencies or cost.
+
+```python
+import psycopg
+
+from orqestra.aggregation.usage import UsageFinality, report_job_usage
+
+with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
+    report = report_job_usage(conn, job_id)  # None if there is no such job
+    if report is not None:
+        for unit, total in report.reported_totals.items():
+            print(unit, total.amount, total.calls)
+        print(report.finality is UsageFinality.CLOSED, report.unresolved)
+```
+
+```mermaid
+flowchart LR
+    S["one REPEATABLE READ, READ ONLY snapshot"] --> J[job row]
+    J --> T["usage totals, summed in SQL"]
+    T --> A["attempt usage stream"]
+    A --> K["task stream"]
+    K --> B["UsageReportBuilder (pure)"]
+    B --> R[JobUsageReport]
+```
+
+- **One snapshot.** The job row, the exact totals, one row per attempt and the task rows
+  are read in one `REPEATABLE READ, READ ONLY` transaction, as for the summary, so every
+  figure describes the same past state. A call or result committed meanwhile is not seen.
+  The read takes no row locks, and holds back vacuum while it lasts.
+- **Exact, per unit.** Amounts are summed by PostgreSQL in `numeric`, never in Python, so a
+  38-digit amount is not rounded. A unit is the provider's exact string: `credits`,
+  `Credits` and `µ-credits` are three units, and nothing is converted. Each total says how
+  many calls reported it. A failed call that reported usage counts;
+  `settled_without_reported_usage` counts answered or failed calls that reported none.
+- **Attribution.** `by_attempt_state` splits the calls and totals by the current state of
+  the attempt that made them, so the usage of revoked and retried attempts stays visible.
+  `calls == answered + failed + unresolved`, and the per-state figures add up to the job's.
+  A call is `unresolved` while it has no result; a late result moves it to answered or
+  failed. `late_intents` and `late_results` count facts recorded after their attempt
+  stopped running (advisory).
+- **Finality.** Each attempt is `OPEN` (running), `CLOSED` (a complete closure that this
+  snapshot confirms), `LOWER_BOUND` (an incomplete closure, a finished attempt with calls
+  and no closure, or a complete closure that a later intent contradicts) or `NOT_CAPTURED`
+  (finished with nothing recorded). The job's `finality` is `OPEN` while the job or any
+  attempt is unfinished, `CLOSED` only when every attempt is `CLOSED`, and `LOWER_BOUND`
+  otherwise. `CLOSED` is a statement about this snapshot: the ledger accepts late writes.
+- **True zero versus not captured.** `CLOSED` with no call is a true zero. A job whose
+  attempts recorded nothing and closed nothing has no calls too, but it is `LOWER_BOUND`
+  with `NOT_CAPTURED` attempts: absent capture is never read as zero.
+- **Exposure.** `estimated_exposure_units` sums the route estimates of unresolved calls, in
+  the same opaque units as routing. It is never added to reported amounts, and a call
+  without an estimate is counted in `unresolved_without_estimate`, never as zero.
+- **Cross-check.** For each succeeded task whose succeeded attempt is `CLOSED`, the
+  report compares the items its result marks `provider_assisted` (by the summary's rules)
+  with that attempt's answered calls. Fewer answers than assisted items is the anomaly
+  `assisted_exceeds_answered`; a task whose attempt is not `CLOSED` is counted in
+  `assisted_unchecked_tasks`. `assisted_items` equals the summary's
+  `provider_assisted_items` for the same database state.
+- **Anomalies.** A closed set of codes (`closure_contradicted`,
+  `assisted_exceeds_answered`), with up to `MAX_SAMPLES` samples of the code, task key and
+  attempt number. They never contain a value from the data, and none is raised.
+- **Errors.** As for the summary: `None` for a missing job; `WrongJobKindError` for another
+  kind of job (nothing else is read); `ValueError` for a job without tasks; `RuntimeError`
+  if the connection is already inside a transaction. A database error propagates and no
+  partial report is returned.
 
 ### Verification
 
@@ -750,8 +822,10 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
 - Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
   external AI call already made. Usage must be attributed to the revoked attempt when cost
   tracking exists.
-- Invoice verification has no live provider and no usage ledger. Provider-reported usage is
-  discarded, and the stored `routing` shows only which route was chosen. A provider error
+- Invoice verification has no live provider, and its handler does not write the provider
+  usage ledger: the usage it sees is discarded, and the stored `routing` shows only which
+  route was chosen. The ledger and the usage report hold only what a caller records with
+  `orqestra.persistence.provider_usage`. A provider error
   repeats the whole batch on retry, so billable calls could repeat; deterministic request
   ids would let a real adapter deduplicate them, and no exactly-once claim is made.
 - The invoice job summary is in process only: no command or API exposes it, and it
@@ -760,6 +834,10 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   ordering, the effect of the fetch size and the behaviour under concurrent completions
   are measured by tests that no default lane runs, and no threshold or batch-size limit is
   decided. Counts are per-task tallies, not a final job tally unless `complete`.
+- The provider usage report is in process only and reports one job per call. Its read
+  grows with the number of tasks, attempts and ledger rows; it is measured at 50,000
+  invoices by a test that no default lane runs, and no threshold is decided. Tokens and
+  closure tiers are not totalled.
 - **The worker's local fence is limited.**
   - It cannot stop a handler that holds the GIL in native code: the watchdog thread then
     cannot run either.
