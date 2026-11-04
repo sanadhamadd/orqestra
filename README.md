@@ -62,7 +62,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
 | Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed) | a live provider adapter; a durable recorder that writes these calls to the usage ledger |
-| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005) that nothing writes to yet | an API (framework undecided) |
+| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed) that the worker runtime does not wire; no durable recorder writes calls to it yet | an API (framework undecided) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
 
@@ -671,12 +671,17 @@ backward compatible. No command registers the handler, so only direct callers ch
   `execution_timeout − fence_margin`. That needs the worker's settings and the durable
   recorder's bounds, so it is left to the worker's wiring, and cap validation is not
   complete yet (DEC-057).
-- **Call recording.** With a `recorder` (a `ProviderCallRecorder`), every call is
-  recorded, including a marked mock's and a cached repeat's. Each call gets its own
-  `call_seq`: 0, 1, 2, … within the attempt. Each record carries the attempt id, the item's
-  absolute index, the route, the capability, the field kind and the route's estimate,
-  then the outcome and the provider's own `usage`. It never carries a raw string, a
-  request id, the reply's value or `reported_cost_units`. Intents use the usage ledger's
+- **Call recording.** With a `recorder` (a `ProviderCallRecorder`), every call's intent is
+  recorded before the call, including a marked mock's and a cached repeat's. Each call
+  gets its own `call_seq`: 0, 1, 2, … within the attempt. An intent carries the attempt
+  id, the item's absolute index, the route, the capability, the field kind and the
+  route's estimate. A result is recorded only when the outcome is known: `answered` with
+  the provider's own `usage`, if it reported one, or `failed` with its code and no usage.
+  A call has only its intent when the provider raises something that is not a provider
+  error, returns something that is not a `ProviderResponse`, or is interrupted by a
+  `BaseException`; when `record_result` fails; or when the process is interrupted before
+  the result (see the table below and Known limitations). No record carries a raw string,
+  a request id, the reply's value or `reported_cost_units`. Intents use the usage ledger's
   ranges: an intent whose `item_index` is above 2^31 − 1 or whose estimate is above
   2^63 − 1 raises `ValueError` before `record_intent`, so the task fails and no call is
   made. Here the route id comes from a checked `RouteOption`, which uses the ledger's
@@ -792,6 +797,81 @@ with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
   already inside a transaction. A database error propagates and no partial summary is
   returned.
 
+### Provider usage closure
+
+An attempt's provider usage capture can be closed in the same transaction that ends the
+attempt, so the closure commits or rolls back with the transition (DEC-058, Proposed).
+Both arguments are optional; without them nothing is written to the ledger, and the worker
+runtime passes neither yet.
+
+```python
+from orqestra.persistence.lifecycle import complete_attempt, revoke_next_expired
+from orqestra.persistence.provider_usage import (
+    CaptureState,
+    CaptureTier,
+    ClosedBy,
+    UsageClosure,
+    capture_of,
+    read_attempt_usage,
+)
+
+closure = UsageClosure(
+    attempt_id=attempt.id,
+    capture=CaptureState.COMPLETE,
+    closed_by=ClosedBy.WORKER,
+    capture_tier=CaptureTier.T3,
+    call_count=calls_made,
+)
+complete_attempt(
+    conn,
+    attempt.id,
+    generation=attempt.attempt_number,
+    outcome=outcome,
+    retry_policy=retry_policy,
+    usage_closure=closure,
+)
+# Intended future configuration: safe only once a durable recorder writes this kind's
+# calls to the ledger (see "Until a durable recorder exists" below).
+revoke_next_expired(
+    conn, retry_policy=retry_policy, usage_capture={"invoice_verification": CaptureTier.T3}
+)
+usage = read_attempt_usage(conn, attempt.id)
+print(capture_of(usage))  # open, closed, lower_bound or not_captured
+```
+
+- **Worker.** The closure is written last, after the attempt and the task, on the
+  completion's own cursor and under its locks. Every outcome closes, a requeued transient
+  failure included. A repeated identical closure is a replay.
+- **Recovery.** `usage_capture` maps job kinds to the tier their handlers record at. A
+  revoked attempt of a mapped kind is closed by `recovery`: at T3, `complete` with the
+  number of intents when every intent has a result (`complete(0)` when there are none),
+  otherwise `incomplete`; at T1 and T2 always `incomplete`. An unmapped kind gets no
+  closure. Map a kind to T3 only if its handlers record every intent before calling the
+  provider: that is the one way to over-claim.
+- **Late facts.** An intent waits behind the lifecycle's lock on its attempt and then
+  records the state that committed, so a call recorded after the attempt ended is flagged
+  late and was never counted by its closure. `record_late_usage` records a result and says
+  whether a closure already existed. Closures never change: later facts leave the attempt
+  `lower_bound`.
+- **Reading it.** `capture_of` is pure. `closed` needs a complete closure that counts
+  exactly the calls read, each with a result. `not_captured` means nothing was recorded,
+  never "zero calls".
+- **Until a durable recorder exists.** The only recorder, `InMemoryCallRecorder`, writes
+  nothing to the ledger, so a closure cannot see the calls it holds. Do not map
+  `invoice_verification` (or any kind whose calls reach only that recorder) to T3, and do
+  not close its attempts as `complete`: either would claim `complete(0)` for calls that
+  were made. Leave such a kind unmapped; its attempts then read `not_captured`, or
+  `lower_bound` with an `incomplete` closure, never `closed`.
+
+| Situation | What happens |
+|---|---|
+| A complete worker closure counts the wrong number of calls, or one has no result | `CaptureNotCompleteError`; nothing is recorded, the attempt still runs, and it may complete again with an `incomplete` closure |
+| A different closure is already stored for the attempt | Completion: `UsageReplayConflictError`, nothing recorded. Recovery: the stored closure is kept and the revocation commits |
+| Another session's closure for the attempt is not yet committed | The closure insert waits, up to `lock_timeout` on a worker session. Then: a replay, a conflict (completion only), or its own insert if the other rolls back |
+| The completion is fenced (stale, revoked or already finished) | The usual error; no closure is written |
+| The connection is lost, or any statement fails, before commit | Neither the transition nor the closure is recorded |
+| A call is recorded after the closure | Accepted and flagged late; the closure is unchanged and the attempt reads as `lower_bound` |
+
 ### Verification
 
 ```sh
@@ -814,8 +894,11 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   There is no guaranteed recovery delay: it depends on live workers, their sweep
   interval and batch limit, and the backlog of expired attempts.
 - Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
-  external AI call already made. Usage must be attributed to the revoked attempt when cost
-  tracking exists.
+  external AI call already made. Calls recorded in the usage ledger stay attributed to the
+  revoked attempt through its `attempt_id`. Recovery closes an attempt's usage capture only
+  for kinds given a tier in `usage_capture`; an unmapped kind with no recorded calls reads
+  `not_captured`, never "zero", and an unrecorded call is not known to the ledger. The
+  worker runtime passes no usage closure or tier map yet (DEC-058).
 - Invoice verification has no live provider, and its calls are not yet written to the
   usage ledger. The only recorder, `InMemoryCallRecorder`, keeps records in memory and
   is not durable. The stored `routing` shows only which route was chosen. A provider error
