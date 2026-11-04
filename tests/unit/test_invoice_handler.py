@@ -16,6 +16,13 @@ from orqestra.ai.provider import (
     ProviderUsage,
     TransientCode,
 )
+from orqestra.ai.recording import (
+    MAX_CALL_SEQ,
+    MAX_COST_UNITS,
+    InMemoryCallRecorder,
+    ProviderCallIntent,
+    ProviderCallResult,
+)
 from orqestra.ai.routing import RouteOption
 from orqestra.domain.jobs import AttemptCancelled, AttemptFailed, AttemptSucceeded, JsonValue
 from orqestra.domain.policy import FailureKind
@@ -44,10 +51,13 @@ from tests.unit.test_invoice_verify import (
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
 
-def context(cancel: threading.Event | None = None) -> TaskContext:
+ATTEMPT = uuid.UUID(int=2)
+
+
+def context(cancel: threading.Event | None = None, attempt_id: uuid.UUID = ATTEMPT) -> TaskContext:
     return TaskContext(
         uuid.UUID(int=1),
-        uuid.UUID(int=2),
+        attempt_id,
         1,
         JOB_KIND,
         CancellationSignal(cancel or threading.Event()),
@@ -57,9 +67,14 @@ def context(cancel: threading.Event | None = None) -> TaskContext:
 PERMANENT_ERROR = "orqestra.domain.errors.PermanentError"
 PROVIDER_TRANSIENT = "orqestra.ai.provider.ProviderTransientError"
 PROVIDER_PERMANENT = "orqestra.ai.provider.ProviderPermanentError"
+CAP = 64  # more calls than any batch here needs
 
 
 def handler_for(provider: Provider, **kwargs: Any) -> Handler:
+    """The handler with a sufficient cap and, unless a test chooses, an in-memory recorder."""
+    kwargs.setdefault("max_provider_calls_per_attempt", CAP)
+    if "non_billable_routes" not in kwargs:
+        kwargs.setdefault("recorder", InMemoryCallRecorder())
     return invoice_verification_handler({"r1": provider}, [ROUTE], TIMEOUT, **kwargs)
 
 
@@ -167,7 +182,13 @@ def test_the_result_is_a_valid_json_task_result_and_the_registry_accepts_the_han
 def test_the_stored_result_has_no_usage_cost_count_identifier_or_provider_text() -> None:
     mock = MockProvider([ProviderResponse("5", 4242)])
     route = RouteOption("r1", frozenset({REQUIRED_CAPABILITY}), 777)
-    handler = invoice_verification_handler({"r1": mock}, [route], TIMEOUT)
+    handler = invoice_verification_handler(
+        {"r1": mock},
+        [route],
+        TIMEOUT,
+        max_provider_calls_per_attempt=CAP,
+        recorder=InMemoryCallRecorder(),
+    )
     outcome = run_handler(handler, context(), batch(0, ambiguous_unit()))
     assert isinstance(outcome, AttemptSucceeded)
     text = json.dumps(outcome.result)
@@ -288,6 +309,42 @@ def test_cancellation_between_provider_calls_stops_before_the_next_call() -> Non
     assert provider.calls == 1
 
 
+def test_a_cancellation_before_the_first_item_records_nothing() -> None:
+    cancel = threading.Event()
+    cancel.set()
+    mock = MockProvider(["5"])
+    recorder = InMemoryCallRecorder()
+    handler = handler_for(mock, recorder=recorder)
+    outcome = run_handler(handler, context(cancel), batch(0, ambiguous_unit()))
+    assert outcome == AttemptCancelled()
+    assert mock.requests == ()
+    assert recorder.events == ()
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        (ambiguous_unit(), ambiguous_unit()),  # stopped before the next item
+        (ambiguous_quantity_and_unit(),),  # stopped before the next call of the same item
+    ],
+)
+def test_a_cancellation_leaves_earlier_calls_resolved_and_records_no_later_intent(
+    items: tuple[dict[str, Any], ...],
+) -> None:
+    cancel = threading.Event()
+    provider = CancelsWhenAsked(cancel)
+    recorder = InMemoryCallRecorder()
+    handler = handler_for(provider, recorder=recorder)
+    outcome = run_handler(handler, context(cancel), batch(0, *items))
+    assert outcome == AttemptCancelled()
+    assert provider.calls == 1
+    assert [(i.attempt_id, i.call_seq, i.item_index) for i in recorder.intents] == [
+        (ATTEMPT, 0, 0),
+    ]
+    assert [r.call_seq for r in recorder.results] == [0]
+    assert recorder.unresolved() == ()
+
+
 def test_a_transient_provider_error_fails_the_batch_as_transient_with_only_its_code() -> None:
     mock = MockProvider([ProviderTransientError(TransientCode.UNAVAILABLE)])
     outcome = run_handler(handler_for(mock), context(), batch(0, known(), ambiguous_unit()))
@@ -328,7 +385,13 @@ def test_the_cost_ceiling_reaches_the_routing_decision() -> None:
 
 def test_the_handler_keeps_its_own_copy_of_the_providers() -> None:
     providers = {"r1": MockProvider(["5"])}
-    handler = invoice_verification_handler(providers, [ROUTE], TIMEOUT)
+    handler = invoice_verification_handler(
+        providers,
+        [ROUTE],
+        TIMEOUT,
+        max_provider_calls_per_attempt=CAP,
+        recorder=InMemoryCallRecorder(),
+    )
     providers.clear()
     outcome = run_handler(handler, context(), batch(0, ambiguous_unit()))
     assert isinstance(outcome, AttemptSucceeded)
@@ -336,15 +399,19 @@ def test_the_handler_keeps_its_own_copy_of_the_providers() -> None:
 
 def test_the_factory_refuses_bad_wiring_at_once() -> None:
     mock = MockProvider()
+    wired: dict[str, Any] = {
+        "max_provider_calls_per_attempt": CAP,
+        "recorder": InMemoryCallRecorder(),
+    }
     with pytest.raises(ValueError, match="has no provider"):
-        invoice_verification_handler({}, [ROUTE], TIMEOUT)
+        invoice_verification_handler({}, [ROUTE], TIMEOUT, **wired)
     with pytest.raises(ValueError, match="positive"):
-        invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT * 0)
+        invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT * 0, **wired)
     with pytest.raises(ValueError, match="max_cost_units"):
-        invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT, max_cost_units=-1)
+        invoice_verification_handler({"r1": mock}, [ROUTE], TIMEOUT, max_cost_units=-1, **wired)
     not_routes: Any = ["r1"]
     with pytest.raises(TypeError, match="RouteOption"):
-        invoice_verification_handler({"r1": mock}, not_routes, TIMEOUT)
+        invoice_verification_handler({"r1": mock}, not_routes, TIMEOUT, **wired)
 
 
 class ClaimsToBeFree:
@@ -439,3 +506,188 @@ def test_provider_reported_usage_never_changes_or_reaches_the_stored_result() ->
     assert text == json.dumps(without_usage.result, sort_keys=True)
     for forbidden in ("0.25", "credits", "usage"):
         assert forbidden not in text
+
+
+# --- the per-attempt cap and the recorder ------------------------------------------------
+
+
+def results_of(outcome: object) -> list[Any]:
+    assert isinstance(outcome, AttemptSucceeded)
+    assert isinstance(outcome.result, dict)
+    results: Any = outcome.result["results"]
+    return list(results)
+
+
+def test_a_marked_mock_gives_byte_identical_results_with_and_without_a_recorder() -> None:
+    marked = frozenset({"r1"})
+    recorder = InMemoryCallRecorder()
+    texts: list[str] = []
+    for chosen in (None, recorder):
+        handler = handler_for(
+            MockProvider(["5", "oops"]), non_billable_routes=marked, recorder=chosen
+        )
+        outcome = run_handler(handler, context(), golden_batch())
+        assert isinstance(outcome, AttemptSucceeded)
+        texts.append(json.dumps(outcome.result, sort_keys=True))
+    assert texts[0] == texts[1] == json.dumps(GOLDEN, sort_keys=True)
+    assert len(recorder.intents) == 2  # a marked mock is still recorded when a recorder is given
+
+
+def test_every_call_of_a_batch_is_recorded_under_the_attempt_with_absolute_indices() -> None:
+    recorder = InMemoryCallRecorder()
+    handler = handler_for(MockProvider(["5", "oops"]), recorder=recorder)
+    run_handler(handler, context(), golden_batch())
+    assert [(i.attempt_id, i.call_seq, i.item_index) for i in recorder.intents] == [
+        (ATTEMPT, 0, 13),
+        (ATTEMPT, 1, 14),
+    ]
+    assert [r.call_seq for r in recorder.results] == [0, 1]
+    assert recorder.unresolved() == ()
+
+
+def test_the_cap_spans_the_batch_and_is_checked_per_invoice() -> None:
+    recorder = InMemoryCallRecorder()
+    mock = MockProvider(["2", "5", "5"])
+    handler = handler_for(mock, max_provider_calls_per_attempt=3, recorder=recorder)
+    items = (ambiguous_quantity_and_unit(), ambiguous_quantity_and_unit(), ambiguous_unit())
+    results = results_of(run_handler(handler, context(), batch(20, *items)))
+    routed = {"route_id": "r1"}
+    assert [(r["index"], r["status"], r["reason"], r["routing"]) for r in results] == [
+        (20, "verified", None, routed),
+        (21, "needs_review", "provider_call_cap_reached", routed),
+        (22, "verified", None, routed),
+    ]
+    assert not results[1]["provider_assisted"]
+    assert [(i.call_seq, i.item_index) for i in recorder.intents] == [(0, 20), (1, 20), (2, 22)]
+    assert len(mock.requests) == 3
+
+
+def test_each_run_is_one_attempt_with_its_own_cap_and_numbering() -> None:
+    recorder = InMemoryCallRecorder()
+    mock = MockProvider(["5"])
+    handler = handler_for(mock, max_provider_calls_per_attempt=1, recorder=recorder)
+    other = uuid.UUID(int=3)
+    for attempt_id in (ATTEMPT, other):
+        outcome = run_handler(handler, context(attempt_id=attempt_id), batch(0, ambiguous_unit()))
+        assert [r["status"] for r in results_of(outcome)] == ["verified"]
+    assert [(i.attempt_id, i.call_seq) for i in recorder.intents] == [(ATTEMPT, 0), (other, 0)]
+
+
+def test_a_cap_of_zero_allows_deterministic_results_only() -> None:
+    mock = MockProvider(["5"])
+    handler = handler_for(mock, max_provider_calls_per_attempt=0)
+    items = (known(), rejected_invoice(), ambiguous_unit())
+    results = results_of(run_handler(handler, context(), batch(0, *items)))
+    assert [(r["status"], r["reason"]) for r in results] == [
+        ("verified", None),
+        ("rejected", None),
+        ("needs_review", "provider_call_cap_reached"),
+    ]
+    assert mock.requests == ()
+
+
+@pytest.mark.parametrize(
+    ("cap", "error"),
+    [
+        (True, TypeError),
+        (False, TypeError),
+        (1.0, TypeError),
+        ("1", TypeError),
+        (None, TypeError),
+        (-1, ValueError),
+        (MAX_CALL_SEQ + 1, ValueError),
+    ],
+)
+def test_the_factory_refuses_a_bad_cap(cap: object, error: type[Exception]) -> None:
+    with pytest.raises(error, match="max_provider_calls_per_attempt"):
+        handler_for(MockProvider(), max_provider_calls_per_attempt=cap)
+
+
+def test_the_cap_is_required_and_its_whole_range_is_accepted() -> None:
+    factory: Any = invoice_verification_handler
+    with pytest.raises(TypeError, match="max_provider_calls_per_attempt"):
+        factory({"r1": MockProvider()}, [ROUTE], TIMEOUT, recorder=InMemoryCallRecorder())
+    handler_for(MockProvider(), max_provider_calls_per_attempt=0)
+    handler_for(MockProvider(), max_provider_calls_per_attempt=MAX_CALL_SEQ)
+
+
+@pytest.mark.parametrize("provider", [MockProvider(), ClaimsToBeFree(), ScriptedSubclass()])
+def test_a_billable_provider_without_a_recorder_is_refused(provider: Provider) -> None:
+    with pytest.raises(ValueError, match="needs a recorder"):
+        invoice_verification_handler(
+            {"r1": provider}, [ROUTE], TIMEOUT, max_provider_calls_per_attempt=CAP
+        )
+
+
+def test_one_unmarked_provider_is_enough_to_require_a_recorder() -> None:
+    providers: dict[str, Provider] = {"r1": MockProvider(), "r2": MockProvider()}
+    routes = [ROUTE, RouteOption("r2", frozenset({REQUIRED_CAPABILITY}), 9)]
+    with pytest.raises(ValueError, match="needs a recorder"):
+        invoice_verification_handler(
+            providers,
+            routes,
+            TIMEOUT,
+            max_provider_calls_per_attempt=CAP,
+            non_billable_routes=frozenset({"r1"}),
+        )
+
+
+@pytest.mark.parametrize("recorder", [object(), [], "recorder"])
+def test_the_factory_refuses_a_recorder_of_the_wrong_type(recorder: object) -> None:
+    with pytest.raises(TypeError, match="ProviderCallRecorder"):
+        handler_for(MockProvider(), recorder=recorder)
+    with pytest.raises(TypeError, match="ProviderCallRecorder"):
+        handler_for(MockProvider(), recorder=recorder, non_billable_routes=frozenset({"r1"}))
+
+
+class RecorderDownError(Exception):
+    pass
+
+
+class Refuses:
+    """A recorder that cannot record an intent."""
+
+    def record_intent(self, intent: ProviderCallIntent) -> None:
+        raise RecorderDownError("recorder_down")
+
+    def record_result(self, result: ProviderCallResult) -> None:
+        raise AssertionError("no result without an intent")
+
+
+def test_a_recorder_failure_fails_the_task_as_the_recorders_error_and_no_call_is_made() -> None:
+    mock = MockProvider(["5"])
+    outcome = run_handler(
+        handler_for(mock, recorder=Refuses()), context(), batch(0, ambiguous_unit())
+    )
+    error_type = f"{RecorderDownError.__module__}.RecorderDownError"
+    assert outcome == AttemptFailed(FailureKind.UNCLASSIFIED, error_type, "recorder_down")
+    assert mock.requests == ()
+
+
+def test_an_estimate_beyond_the_recordable_range_fails_the_task_before_any_call() -> None:
+    mock = MockProvider(["5"])
+    recorder = InMemoryCallRecorder()
+    route = RouteOption("r1", frozenset({REQUIRED_CAPABILITY}), MAX_COST_UNITS + 1)
+    handler = invoice_verification_handler(
+        {"r1": mock},
+        [route],
+        TIMEOUT,
+        max_provider_calls_per_attempt=CAP,
+        recorder=recorder,
+    )
+    outcome = run_handler(handler, context(), batch(0, ambiguous_unit()))
+    assert isinstance(outcome, AttemptFailed)
+    assert (outcome.kind, outcome.error_type) == (FailureKind.UNCLASSIFIED, "builtins.ValueError")
+    assert mock.requests == ()
+    assert recorder.events == ()
+
+
+def test_an_item_index_beyond_the_recordable_range_fails_the_task_before_any_call() -> None:
+    mock = MockProvider(["5"])
+    recorder = InMemoryCallRecorder()
+    handler = handler_for(mock, recorder=recorder)
+    outcome = run_handler(handler, context(), batch(2**31, ambiguous_unit()))
+    assert isinstance(outcome, AttemptFailed)
+    assert (outcome.kind, outcome.error_type) == (FailureKind.UNCLASSIFIED, "builtins.ValueError")
+    assert mock.requests == ()
+    assert recorder.events == ()
