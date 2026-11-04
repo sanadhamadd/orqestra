@@ -15,7 +15,6 @@ import os
 import platform
 import random
 import resource
-import sys
 import threading
 import time
 import tracemalloc
@@ -43,7 +42,7 @@ from orqestra.aggregation.usage import (
     UsageReportBuilder,
     report_job_usage,
 )
-from orqestra.domain.jobs import Attempt, AttemptSucceeded, JobStatus, Task
+from orqestra.domain.jobs import Attempt, AttemptOutcome, AttemptSucceeded, JobStatus, Task
 from orqestra.domain.states import AttemptState
 from orqestra.persistence import snapshots
 from orqestra.persistence.jobs import list_tasks
@@ -710,6 +709,9 @@ def random_calls(db: Conn, rng: random.Random, attempt_id: uuid.UUID) -> tuple[i
     return count, pending
 
 
+OUTCOMES: dict[str, AttemptOutcome] = {"retry": TRANSIENT, "succeed": SUCCESS, "fail": PERMANENT}
+
+
 def random_ledger(db: Conn, rng: random.Random, tasks: int) -> uuid.UUID:
     """A job whose tasks retry, succeed, fail or keep running, with random ledger facts."""
     job_tasks = new_tasks(db, *(f"t-{i:02d}" for i in range(tasks)), max_attempts=3)
@@ -726,8 +728,7 @@ def random_ledger(db: Conn, rng: random.Random, tasks: int) -> uuid.UUID:
             ending = rng.choice(endings if number < 3 else endings[2:])
             if ending == "run":
                 break
-            outcome = {"retry": TRANSIENT, "succeed": SUCCESS, "fail": PERMANENT}[ending]
-            complete(db, attempt, outcome)
+            complete(db, attempt, OUTCOMES[ending])
             if rng.random() < 0.5:  # a late fact, after the attempt finished
                 if pending:
                     record_call_result(db, an_answer(attempt.id, pending[0]))
@@ -1147,9 +1148,8 @@ CGROUP_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
 
 def client_cpu_affinity() -> int | None:
     """How many CPUs the test process may be scheduled on, where the platform says."""
-    if sys.platform == "linux":
-        return len(os.sched_getaffinity(0))
-    return None
+    affinity: Callable[[int], set[int]] | None = getattr(os, "sched_getaffinity", None)
+    return None if affinity is None else len(affinity(0))
 
 
 def client_cgroup_cpu_max() -> str | None:

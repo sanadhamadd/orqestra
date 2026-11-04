@@ -123,6 +123,11 @@ def assisted(count: int) -> JsonValue:
     return envelope(0, [entry(i, assisted=True) for i in range(count)])
 
 
+def assisted_task(key: str, count: int) -> BatchTaskRow:
+    """A succeeded task whose payload has ``count`` items, all assisted in its result."""
+    return task(key, result=assisted(count), payload=payload_of(0, count))
+
+
 def total(state: AttemptState | None, unit: str, calls: int, amount: str) -> UsageTotalRow:
     return UsageTotalRow(state, unit, calls, Decimal(amount))
 
@@ -134,10 +139,10 @@ def build(
 ) -> JobUsageReport:
     builder = UsageReportBuilder(JOB, NOW)
     builder.add_totals(totals or [])
-    for row in attempts:
-        builder.add_attempt(row)
-    for row in tasks:
-        builder.add_task(row)
+    for attempt_row in attempts:
+        builder.add_attempt(attempt_row)
+    for task_row in tasks:
+        builder.add_task(task_row)
     return builder.finish()
 
 
@@ -471,7 +476,7 @@ def test_a_total_given_twice_is_refused(state: AttemptState | None) -> None:
 
 
 def test_a_closed_succeeded_attempt_with_enough_answers_is_checked() -> None:
-    report = build([closed("t-0", answered=2)], [task("t-0", result=assisted(2))])
+    report = build([closed("t-0", answered=2)], [assisted_task("t-0", 2)])
 
     assert report.assisted_items == 2
     assert (report.assisted_checked_tasks, report.assisted_unchecked_tasks) == (1, 0)
@@ -488,7 +493,7 @@ def test_more_answers_than_assisted_items_are_not_an_anomaly() -> None:
 def test_fewer_answers_than_assisted_items_are_reported_not_raised() -> None:
     report = build(
         [closed("t-0", 1, AttemptState.REVOKED, answered=5), closed("t-0", 2, answered=1)],
-        [task("t-0", result=assisted(2))],
+        [assisted_task("t-0", 2)],
     )
 
     assert raised(report) == {UsageAnomalyCode.ASSISTED_EXCEEDS_ANSWERED: 1}
@@ -512,7 +517,7 @@ def test_fewer_answers_than_assisted_items_are_reported_not_raised() -> None:
 def test_a_succeeded_task_whose_attempt_is_not_closed_is_unchecked(
     attempts: list[AttemptUsageRow],
 ) -> None:
-    report = build(attempts, [task("t-0", result=assisted(3))])
+    report = build(attempts, [assisted_task("t-0", 3)])
 
     assert report.assisted_items == 3
     assert (report.assisted_checked_tasks, report.assisted_unchecked_tasks) == (0, 1)
@@ -568,7 +573,7 @@ def test_every_attempt_must_come_before_the_first_task() -> None:
 def test_anomaly_samples_are_bounded_and_independent_of_the_order() -> None:
     count = MAX_SAMPLES * 3
     attempts = [closed(f"t-{i:03d}", 1, call_count=0, answered=1) for i in range(count)]
-    tasks = [task(f"t-{i:03d}", result=assisted(2)) for i in range(count)]
+    tasks = [assisted_task(f"t-{i:03d}", 2) for i in range(count)]
     code = UsageAnomalyCode.CLOSURE_CONTRADICTED
     expected = tuple(UsageAnomaly(code, f"t-{i:03d}", 1) for i in range(MAX_SAMPLES))
 
