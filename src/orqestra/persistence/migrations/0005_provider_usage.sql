@@ -1,4 +1,4 @@
--- Provider usage ledger (D7 sections 5.2, 5.5 and 7; N1).
+-- Provider usage ledger: append-only intent, result and closure records.
 --
 -- Additive: three new, append-only tables record what provider calls an attempt
 -- made. provider_calls holds each call's intent, written before the call;
