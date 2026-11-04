@@ -32,13 +32,21 @@ def test_packaged_migrations_load() -> None:
         "0002_attempt_leases",
         "0003_cancellation_grace",
         "0004_task_availability",
+        "0005_provider_usage",
     ]
-    initial, leases, grace, availability = migrations
-    assert (initial.version, leases.version, grace.version, availability.version) == (1, 2, 3, 4)
+    initial, leases, grace, availability, usage = migrations
+    assert (
+        initial.version,
+        leases.version,
+        grace.version,
+        availability.version,
+        usage.version,
+    ) == (1, 2, 3, 4, 5)
     assert "CREATE TABLE tasks" in initial.sql
     assert "ADD COLUMN lease_expires_at" in leases.sql
     assert "'cancellation_grace_expired'" in grace.sql
     assert "ADD COLUMN available_at timestamptz NOT NULL DEFAULT now()" in availability.sql
+    assert "CREATE TABLE provider_calls" in usage.sql
     for migration in migrations:
         assert migration.checksum == hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()
 

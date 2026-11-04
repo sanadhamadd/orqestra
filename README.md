@@ -91,7 +91,7 @@ creates, drops or resets a database.
 createdb orqestra
 export ORQESTRA_DATABASE_URL=postgresql:///orqestra
 uv run orqestra migrate
-# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace", "0004_task_availability"]}
+# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace", "0004_task_availability", "0005_provider_usage"]}
 uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 ```
 
