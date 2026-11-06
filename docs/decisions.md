@@ -4,7 +4,8 @@ Material engineering decisions in WHAT / WHY / RUNNER-UP form. A proposal is not
 decision: every entry stays **Proposed** until the owner marks it **Accepted** in a
 reviewed change. Trivial edits are not logged. Cross-cutting choices also get an ADR.
 
-Deliberately **undecided** (do not infer a choice from the code): API framework, which
+No inbound API or framework is planned (DEC-062). Deliberately **undecided** (do not
+infer a choice from the code): which
 models to use (the provider direction is OpenRouter, through an adapter that nothing
 wires in and that has no default model, DEC-060), operational lease and
 execution-timeout values and any per-job-kind policy (DEC-034). The Day 4 worker model and hosting boundary are
@@ -1482,3 +1483,45 @@ recorded on PR #17.
   - Tokens and closure tiers are not totalled in this version; units are not normalized or converted, and there is no price, currency or cost.
   - Invoice jobs only (`WrongJobKindError`), matching the report's place beside the invoice summary. `CLOSED` describes the snapshot only, since a later write can contradict a closure.
 - **VERIFICATION:** Unit tests (`tests/unit/test_usage_report.py`) cover the capture table over every finished attempt state and closure, intent and unresolved combination, a running attempt in every case, an exhaustive property check of `CLOSED`, `NOT_CAPTURED` and `OPEN`, job finality, not-captured versus zero, contradicted closures, every cross-check path including parity with `SummaryBuilder` on corrupt results, per-state totals and conservation, the sample bound and order independence, frozen and zero-filled output, and that no value from the data reaches an anomaly. Integration tests (`tests/integration/test_job_usage_report_pg.py`, real PostgreSQL) run a task revoked through lease expiry, failed transiently and then succeeded, and check the per-state split, totals, exposure and finality, then a late result; a missing closure, not captured versus a true zero, a contradicted closure and a job cancelled before any attempt; distinct units (`credits`, `Credits`, `µ-credits`), preserved scale (`0.25 + 1.50 = 1.75`) and an exact 39-digit sum, a failed call with usage and calls without usage; open finality for a running attempt and a queued task; the cross-check with real handler results from `MockProvider`, against `summarize_invoice_job`; a late result and a late intent committed after the job read are not seen, and a companion test with `READ COMMITTED` sees them; two fixed-order gates commit on another session between two reads of the same report: a late answer committed after the totals and before the attempts leaves the totals' call count equal to the answered calls, and a completion committed after the attempts and before the tasks leaves a running job with an open attempt, while a `READ COMMITTED` companion for each shows the mismatch (credits counted once beside two answered calls; a succeeded task beside a running attempt), so both tests are sensitive to the level; reports read while a writer thread records calls each satisfy conservation and never go backwards; three seeded random ledgers match an independent oracle built from `read_attempt_usage` and summed under an exact context; and the snapshot contract (isolation and read-only inside it, no table changed, the connection idle after success, an error and an abandoned stream in both commit modes, a caller transaction refused, a missing job, another kind refused before any ledger read, identical reports at fetch sizes 1, 2 and 1,000). A test marked `performance` seeds 50,000 invoices at batch sizes 1, 100 and 1,000 with set-based SQL that respects the fencing guard, and records the environment (including the test process's CPU affinity and cgroup CPU quota where available), row counts, wall time, `tracemalloc` peak, RSS and `EXPLAIN (ANALYZE, BUFFERS)` summaries of both ledger queries on standard output and in JUnit properties, asserting correctness only. The results of the fixed test profile are recorded on the pull request, not here.
+
+## Provider use boundaries
+
+### DEC-062 — Before live provider use: no inbound API, authorized live calls only, no prices in the ledger, synthetic data until retention is reviewed, gated registration and a measured claim index
+- **Status:** Proposed · the inbound-API direction is the owner's recorded guidance of 2026-11-03; the entry stays Proposed until the maintainer accepts it in a reviewed change. It narrows the "Costs" guidance in `docs/development.md` and adds registration conditions to DEC-057 and DEC-058 without changing their text. None of it is implemented by this entry.
+- **WHAT:**
+  - **No inbound API.** No inbound Orqestra API or web framework is planned. Jobs are submitted and read through the Python interfaces; the CLI runs migrations and workers. Any future inbound service needs its own decision, covering its framework, authentication and hosting.
+  - **Live calls.** Neither the change that builds the provider adapter (DEC-060) nor the change that wires it into a worker makes a live provider call. Every live call needs the maintainer's separate, explicit authorization, which names its scope. Ordinary tests stay offline.
+  - **No prices.** The usage ledger keeps the provider-reported amount with the unit label the provider declared, plus the provider, model and token counts. It records no price, published price version or currency, and nothing converts a reported amount into money. Provider-reported figures stay separate from route estimates.
+  - **Retention.** Version 1 has no deletion or retention mechanism: the ledger refuses `UPDATE` and `DELETE`, and no function removes its rows. Only synthetic data is recorded until a retention policy is reviewed and accepted.
+  - **Per-job spend.** A per-job spend gate, if one is added, is advisory. Only the per-attempt call cap (DEC-057) is enforced.
+  - **Registration.** Invoice verification is registered with `orqestra worker run` (DEC-051) only when all of these hold:
+    - a durable recorder writes its calls to the ledger;
+    - the per-attempt cap is required and set;
+    - the cap has been validated against the worker's timing, so that cap × (per-call timeout + the recorder's write bound) fits within `execution_timeout − fence_margin` (DEC-057 leaves that check to the wiring);
+    - the job kind's tier in `usage_capture` matches what its recorder writes (DEC-058);
+    - live calls are authorized as above.
+  - **Claim index.** Claim ordering (DEC-033) is measured against the CI PostgreSQL image (`postgres:16.15`, pinned by digest), and the observations are recorded on the pull request that makes them. The partial index DEC-033 left open is added only if repeated measurements show that the scan-and-sort cost matters and the index's write overhead is acceptable. No fixed threshold is set.
+- **WHY:**
+  - Orqestra runs as independent single-slot workers with no service of its own (DEC-054). An inbound API would add an authentication boundary, a framework dependency and a hosting model that no requirement asks for. Recording that stops "API framework" reading as a pending choice.
+  - A live call is billable and sends data off the machine, so it needs the same explicit approval as any other spending.
+  - A price table would be invented data that drifts from what the provider actually bills. The provider's own figure and unit are the only usage facts the system can observe.
+  - An append-only ledger with no deletion path is safe only for data whose retention needs no policy.
+  - Workers claim independently, so a job-wide limit can't be enforced without a shared count taken on every call.
+  - Each registration condition closes a known gap:
+    - without a durable recorder, a billed call can go unrecorded;
+    - without the timing check, a capped attempt can still outlive its fence;
+    - without a matching tier, recovery can over-claim a revoked attempt as `complete(0)`.
+  - DEC-033 records that each claim scans and sorts queued tasks. Measurement, not assumption, decides whether that cost justifies an index.
+- **RUNNER-UP:** Record none of these now, and decide each boundary in the change that first needs it: adapter wiring, registration, retention and the claim index.
+- **WHY NOT:**
+  - The header would keep listing an API framework as undecided, and `docs/development.md` would keep asking for a price version the ledger doesn't store.
+  - The change that registers invoice verification could land without the conditions it must meet.
+  - An enforced per-job spend limit was also considered: a row-locked counter on the job, taken before every billable call. It was not chosen. It serializes every call of a job on one row and adds a lock outside the task, attempt and closure order that DEC-058 keeps cycle-free. It would also still need a price to turn calls into spend.
+- **TRADE-OFF:**
+  - With no inbound API, external systems can't submit or read jobs, so any integration waits for a new decision.
+  - The ledger can't give a money figure. A cost report needs a later decision on a price source and its versioning.
+  - Ledger rows accumulate with no deletion path, and real data can't be recorded until retention is reviewed.
+  - Concurrent workers can exceed an advisory per-job gate. A task's provider calls are bounded only by its attempts × the per-attempt cap.
+  - Invoice verification stays unavailable from `orqestra worker run` until every registration condition is met.
+  - Until the measurements justify an index, each claim keeps scanning and sorting the queued tasks.
+- **VERIFICATION:** This entry changes documentation only, with no code, schema or test changes. Each condition is verified by tests in the change that implements it. The registration change shows each condition refusing registration when unmet. The claim-index choice rests on recorded measurements, not on a fixed threshold.
