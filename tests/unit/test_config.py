@@ -12,6 +12,8 @@ def test_defaults() -> None:
     assert settings.log_level == "INFO"
     assert settings.database_url is None
     assert settings.worker_concurrency == 4
+    assert settings.openrouter_api_key is None
+    assert settings.redacted()["openrouter_api_key"] is None
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -46,3 +48,15 @@ def test_database_url_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "hunter2" not in repr(settings)
     assert "hunter2" not in str(settings.redacted())
     assert settings.redacted()["database_url"] == "***"
+
+
+def test_openrouter_api_key_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "sk-or-v1-synthetic-not-a-key-0000"
+    monkeypatch.setenv("ORQESTRA_OPENROUTER_API_KEY", secret)
+    settings = Settings()
+    assert settings.openrouter_api_key is not None
+    assert settings.openrouter_api_key.get_secret_value() == secret
+    assert secret not in repr(settings)
+    assert secret not in str(settings)
+    assert secret not in str(settings.redacted())
+    assert settings.redacted()["openrouter_api_key"] == "***"

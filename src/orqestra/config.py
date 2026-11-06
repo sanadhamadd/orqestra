@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # Concurrent task slots per worker process (not OS threads or hosts). Not read by
     # anything yet: the worker is single-slot by approved direction (DEC-044).
     worker_concurrency: int = Field(default=4, ge=1, le=256)
+    # OpenRouter API key. Optional, and not read by anything yet: the OpenRouter adapter
+    # (orqestra.providers.openrouter) is not wired into a worker or the CLI.
+    openrouter_api_key: SecretStr | None = None
 
     def redacted(self) -> dict[str, object]:
         """Return settings safe to print: secrets replaced, not revealed."""
@@ -35,4 +38,5 @@ class Settings(BaseSettings):
             "log_level": self.log_level,
             "database_url": "***" if self.database_url is not None else None,
             "worker_concurrency": self.worker_concurrency,
+            "openrouter_api_key": "***" if self.openrouter_api_key is not None else None,
         }

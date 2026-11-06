@@ -36,6 +36,23 @@ def test_health_never_prints_secrets(
     assert json.loads(out)["settings"]["database_url"] == "***"
 
 
+def test_health_never_prints_the_openrouter_api_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ORQESTRA_OPENROUTER_API_KEY", "sk-or-v1-synthetic-s3cret")
+    assert main(["health"]) == 0
+    out = capsys.readouterr().out
+    assert "s3cret" not in out
+    assert json.loads(out)["settings"]["openrouter_api_key"] == "***"
+
+
+def test_health_reports_no_openrouter_api_key_by_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["health"]) == 0
+    assert json.loads(capsys.readouterr().out)["settings"]["openrouter_api_key"] is None
+
+
 def test_health_reports_invalid_configuration(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

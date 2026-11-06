@@ -48,8 +48,9 @@ with both CI lanes passing for the pull request (run 40760433076) and for `main`
 40770878527) and for `main` (run 40771746389). Day 4A durable retry scheduling (DEC-053,
 migration 0004) is implemented on PR #17. Its original GitHub Actions run passed both CI
 lanes on head `e4aa59b` (run 41538196569); the PR's Checks tab records later runs.
-There is a command that runs a worker with diagnostic handlers only, and an invoice batch
-handler that no command registers; there is no service, deployment or production workload
+There is a command that runs a worker with diagnostic handlers only, an invoice batch
+handler that no command registers, and an OpenRouter adapter that nothing wires in (no
+test makes a live provider call); there is no service, deployment or production workload
 registration. No benchmark has been run. The planned column lists work that is not
 implemented; do not read it as a claim about shipped behaviour.
 
@@ -61,7 +62,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed) | a live provider adapter; registering the invoice handler with a worker and its usage sink |
+| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Proposed) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
 | Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Proposed) | an API (framework undecided) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
@@ -976,6 +977,108 @@ the SQLSTATE only: never an amount, a unit, a prompt or provider text.
   (marked `performance`) prints the per-call cost of the sink beside the in-memory
   recorder and direct ledger writes; see [the development guide](docs/development.md).
 
+### OpenRouter adapter (not wired in)
+
+`orqestra.providers.openrouter.OpenRouterProvider` implements the `Provider` contract with
+one non-streaming request to OpenRouter's chat completions endpoint (DEC-060, Proposed).
+**Nothing uses it yet.** No worker, handler or command imports `orqestra.providers`, no
+test makes a live call, and live calls need separate authorization.
+
+```python
+from pydantic import SecretStr
+
+from orqestra.providers.openrouter import OpenRouterConfig, OpenRouterProvider
+from orqestra.providers.stdlib_transport import HttpsTransport
+
+config = OpenRouterConfig(
+    credential=SecretStr("..."),  # any object with get_secret_value()
+    route_models={"route-a": "vendor/model"},  # explicit: there is no default model
+)
+provider = OpenRouterProvider(config, HttpsTransport())
+report = provider.call(request)  # a CallReport; provider.interpret(request) is report.response
+```
+
+- **Configuration.** `OpenRouterConfig` has no defaults. The credential must be 1 to 512
+  visible ASCII characters, so it cannot carry a space or a line break into a header, and
+  it is shown as `***` in `repr`. `route_models` maps route ids (the routing rule) to model
+  slugs (`[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`, a project rule); it must not be empty, and
+  it is copied into an immutable mapping. `Settings` has an optional
+  `ORQESTRA_OPENROUTER_API_KEY` (`SecretStr`, `***` in `orqestra health`) that nothing
+  reads yet.
+- **Before any I/O.** A capability other than `interpret_amount`, a route without a model,
+  or a request whose fields have the wrong types is `unsupported_request`, and the
+  transport is never called.
+- **One request.** The body is exactly `model`, `messages` (a fixed system prompt carrying
+  `PROMPT_VERSION`, and a user message with the canonical JSON of `field_kind` and `raw`)
+  and `"stream": false`. The headers are exactly `Authorization` (Bearer), `Content-Type`
+  and `Accept`; the transport adds only `Host` and `Content-Length`. There is one POST
+  per call and no retry.
+- **Transport.** The adapter is given an `HttpTransport`, so every test uses a fake one.
+  `HttpsTransport` (`http.client` and `ssl`, the only module that may open a socket)
+  posts to the fixed host `openrouter.ai`, port 443 and path `/api/v1/chat/completions`.
+  It follows no redirect, reads no proxy setting from the environment and prints no debug
+  output. It closes the connection on every path.
+- **Deadline.** `request.timeout` is the budget, measured on a monotonic clock. The time
+  left is checked before the POST and before every body read. The transport also uses it
+  as the connect timeout, and sets it as the socket timeout before sending, before reading
+  the response head and before each read. With no time left the step does not start.
+- **Response.** A status other than 200 is mapped from the status alone and its body is
+  never read. A 200 body is read up to 256 KiB and must be strict UTF-8 JSON: one object,
+  no duplicate keys, no `NaN` or `Infinity`, numbers kept exact. Then:
+  - an embedded `error` is mapped by its `code`, like a status;
+  - otherwise `id` (1 to 128 visible ASCII characters), `model` (the slug rule) and
+    exactly one choice are required, with `finish_reason` `"stop"` and string content;
+  - the value is the content with surrounding whitespace removed, and the verifier still
+    decides whether it is an amount.
+- **Usage.** `usage.cost` becomes `ProviderUsage(amount, "openrouter_credits")`, its value
+  and scale kept in fixed-point text (`1.50` stays `1.50`, `1.5e-3` becomes `0.0015`).
+  The amount must also be recordable in the usage ledger: finite, unsigned (`-0`
+  included), at most 18 decimal places, and below 10^20. Token counts must be integers
+  from 0 to 2^63-1. Absent usage is `None`, never zero.
+- **Nothing leaks.** The package logs nothing. Every error carries a fixed code, and is
+  raised with no `__cause__` or `__context__`, so no credential, prompt, remote message or
+  standard-library message travels with it. Standard-library messages matter: an illegal
+  header value would be quoted in one.
+
+| Outcome | Raised |
+| --- | --- |
+| Status 400 | `ProviderPermanentError(unsupported_request)` |
+| Status 401, 402 or 403 (402 even with `Retry-After`) | `ProviderPermanentError(rejected)` |
+| Status 408, the deadline spent, or a socket timeout | `ProviderTransientError(timeout)` |
+| Status 429 | `ProviderTransientError(rate_limited)` |
+| Status 502 or 503, or a connection, TLS or HTTP protocol failure | `ProviderTransientError(unavailable)` |
+| Any other status, including 3xx, other 2xx, 500 and 504 | `OpenRouterProtocolError`, defect `unknown_status` |
+| A 200 with an embedded error | The error for its `code` above; an unlisted code or a malformed envelope is `malformed_error` |
+| A 200 body over 256 KiB | `body_too_large` |
+| Not one strict JSON object | `malformed_json` |
+| A missing or invalid `id`, `model` or `choices` | `invalid_schema` |
+| `finish_reason` not `"stop"`, or content that is not a string | `unsupported_content` |
+| Usage or cost outside the rules above | `invalid_usage` |
+
+`OpenRouterProtocolError` is a `PermanentError` whose text is
+`provider_protocol_violation`, the same text the invoice verifier uses for a provider that
+breaks the contract.
+
+**Limits.**
+- The standard library has no timeout for name lookup (`getaddrinfo`). Every other
+  blocking step (connecting, including the TLS handshake; sending; reading the response
+  head; each body read) is given the time left when that step starts, and the time is
+  checked again only before the next step. Reading the response head (the status line,
+  up to 100 header lines, and any `100 Continue` responses) and reading one body chunk
+  can each wait on the socket several times, and sending writes the head and the body
+  separately. So a slow server can make one call overrun its budget by more than one
+  wait.
+- A handler thread cannot be interrupted, and cancellation is checked only between
+  provider calls. The hard bound on a call is therefore the worker's watchdog and fence
+  (DEC-045, DEC-048). If the worker is fenced mid-call, the call stays unresolved in the
+  usage ledger.
+- A failure after the request was sent may still have been billed. It is reported as
+  `unavailable`, and whatever wires the adapter in must treat it as an ambiguous outcome.
+- Status 500 and 504 are not retried. Strict parsing may reject a valid future response
+  shape.
+- The usage ledger's failure codes have no protocol-violation code yet. Recording that
+  outcome is left to the change that wires the adapter in.
+
 ### Verification
 
 ```sh
@@ -1003,6 +1106,8 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   for kinds given a tier in `usage_capture`; an unmapped kind with no recorded calls reads
   `not_captured`, never "zero", and an unrecorded call is not known to the ledger. A
   worker passes a closure and a tier map only for the kinds of its `UsageSink` (DEC-059).
+- The OpenRouter adapter is not wired in; its own limits are listed in
+  [OpenRouter adapter](#openrouter-adapter-not-wired-in).
 - Invoice verification has no live provider and is registered with no worker, so its
   calls are not yet written to the usage ledger; with `InMemoryCallRecorder` they stay in
   memory. The worker's `UsageSink` is durable, but nothing checks that a sink kind's
