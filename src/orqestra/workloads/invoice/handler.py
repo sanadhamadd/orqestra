@@ -17,6 +17,9 @@ It follows the engine's contracts and adds none:
   remaining cap is ``needs_review`` (``provider_call_cap_reached``) without a call;
 - with a ``recorder``, every call is recorded (DEC-057). A billable provider
   requires one. Whatever the recorder raises fails the task like any handler error.
+  The worker's durable sink (``orqestra.worker.usage``, DEC-059) raises only for an
+  invalid record (``ValueError``) or a cancellation (``HandlerCancelled``): a ledger
+  failure ends the worker process and never fails the task.
 
 An item result is::
 
@@ -113,7 +116,8 @@ def invoice_verification_handler(
 
     Whether the cap, the per-call timeout and the recorder's write bounds fit in
     the worker's execution timeout is not checked here: that needs the worker's
-    settings and is left to the worker's wiring (DEC-057).
+    settings and is left to the worker's wiring (DEC-057), which can check it with
+    ``orqestra.worker.usage.check_provider_call_budget`` (DEC-059).
     """
     checked_routes = check_routes(routes)
     checked_providers: Mapping[str, Provider] = MappingProxyType(dict(providers))

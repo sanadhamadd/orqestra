@@ -106,7 +106,9 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
     the call);
   - refuse connections, and accept them again;
   - cut a completion either just after or just before its `COMMIT` reaches the server, for
-    several completions in a row, optionally refusing new connections from then on;
+    several completions in a row, optionally refusing new connections from then on; and
+    the same for any transaction that sends a given statement (`drop_commit`), such as a
+    usage intent or result;
   - cut a connection, or stall all traffic, when the client sends a given statement, to
     place a race (such as recovery between a reconciliation read and the rewrite) exactly.
 - "Ended before its lease" is checked against PostgreSQL's own clock and the stored
@@ -159,6 +161,14 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   neither lane runs them; run them by hand with
   `uv run pytest -m performance -s tests/integration/test_invoice_summary_pg.py` against the
   test database, and record what they print. They assert correctness, never a threshold.
+- The worker's usage sink (DEC-059) has its own measurement, also marked `performance`
+  (and `integration`), so `make verify` does not run it. A measurement profile runs every
+  standard check (`make check`, `make verify`) and then, against the test database,
+  `uv run pytest -m performance -s tests/integration/test_worker_usage_performance.py`,
+  recording the PostgreSQL version, platform, Python, sample sizes, raw samples and
+  percentiles it prints. Tests that call a provider through the sink use synthetic
+  doubles only; the process tests' `metered` kind (`tests/integration/worker_process.py`)
+  records, from PostgreSQL, whether each call's intent had committed before the call.
 
 ## Costs
 

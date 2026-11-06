@@ -48,8 +48,9 @@ with both CI lanes passing for the pull request (run 40760433076) and for `main`
 40770878527) and for `main` (run 40771746389). Day 4A durable retry scheduling (DEC-053,
 migration 0004) is implemented on PR #17. Its original GitHub Actions run passed both CI
 lanes on head `e4aa59b` (run 41538196569); the PR's Checks tab records later runs.
-There is a command that runs a worker with diagnostic handlers only, and an invoice batch
-handler that no command registers; there is no service, deployment or production workload
+There is a command that runs a worker with diagnostic handlers only, an invoice batch
+handler that no command registers, and an OpenRouter adapter that nothing wires in (no
+test makes a live provider call); there is no service, deployment or production workload
 registration. No benchmark has been run. The planned column lists work that is not
 implemented; do not read it as a claim about shipped behaviour.
 
@@ -61,8 +62,8 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed) | a live provider adapter; a durable recorder that writes these calls to the usage ledger |
-| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed) that the worker runtime does not wire; no durable recorder writes calls to it yet; an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Proposed) | prices, currencies or cost accounting; an API (framework undecided) |
+| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Proposed) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
+| Aggregation, cost ledger, API | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Proposed); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Proposed) | prices, currencies or cost accounting; an API (framework undecided) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
 
@@ -418,7 +419,9 @@ any thread.
   `heartbeat_interval` and runs recovery sweeps (at most `recovery_batch_limit`
   revocations every `recovery_interval`), idle or busy. A sweep step starts only if it
   can take its full `db_operation_timeout` and still end before the next heartbeat is
-  due, so sweeps never delay a heartbeat. Idle, it claims every `poll_interval`.
+  due, so sweeps never delay a heartbeat. Idle, it claims every `poll_interval`. With a
+  usage sink, the provider usage records a handler waits on are written by the same rule,
+  before sweeps ([Provider usage sink](#provider-usage-sink)).
 - **Local fence.** A watchdog thread ends the process (`os._exit`) when either guard
   expires:
   - **ownership:** the attempt's lease, mapped to the local clock from the claim so it
@@ -524,7 +527,7 @@ any thread.
   | 5 | Handler aborted: a control-plane signal, nothing recorded |
   | 6 | Whether a completion committed could not be established by the attempt's deadline |
   | 7 | Defect |
-  | 8 | Outcome unrecorded before the deadline |
+  | 8 | Outcome, or a provider call's usage record (DEC-059), unrecorded before the deadline; for usage records, a backstop behind the fence (exit 3), which ends the process first |
   | 9 | Shutdown: the task was not settled by the drain deadline, or a second signal came |
 
   Each exit writes one JSON line with its `event`, best effort: if stderr is closed or a
@@ -693,7 +696,8 @@ backward compatible. No command registers the handler, so only direct callers ch
   only by `ProviderUsage` (up to 64 characters, any number of decimal places), which is
   looser than the ledger's amount range (below 1E+20, at most 18 decimal places). That is
   known only after the call, so a durable recorder that refuses such an amount leaves a
-  billed call unresolved; how it should handle one is left to the durable recorder.
+  billed call unresolved. The worker's durable sink does exactly that: it writes no result
+  for such an amount, and the task goes on ([Provider usage sink](#provider-usage-sink)).
   A cancellation stops before the next call's intent, so it never leaves an unresolved
   intent, and the calls already made keep their results. The records do not name the
   provider, job, task or prompt version: a durable recorder adds those from its own
@@ -716,7 +720,7 @@ backward compatible. No command registers the handler, so only direct callers ch
   | The intent is outside the ledger's ranges | nothing; no call is made | `ValueError` fails the task |
   | `record_intent` raises | nothing; no call is made | the recorder's error fails the task |
   | `record_result` raises | intent only (unresolved) | the recorder's error fails the task |
-  | A reported `usage` outside the ledger's amount range | in memory: `answered`, with its `usage`; a durable recorder may refuse it | if `record_result` raises, the call is unresolved and the task fails |
+  | A reported `usage` outside the ledger's amount range | in memory: `answered`, with its `usage`; the worker's sink: intent only (unresolved) | the reply is judged as before; the sink never raises for it |
   | Cancellation before a call | nothing for that call; earlier calls keep their results | `HandlerCancelled` |
 - **Stored result.** `{"offset": n, "results": [...]}`, one result per item:
   `{"index", "status", "provider_assisted", "findings": [{"rule", "verdict", "path"}],
@@ -802,8 +806,9 @@ with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
 
 An attempt's provider usage capture can be closed in the same transaction that ends the
 attempt, so the closure commits or rolls back with the transition (DEC-058, Proposed).
-Both arguments are optional; without them nothing is written to the ledger, and the worker
-runtime passes neither yet.
+Both arguments are optional; without them nothing is written to the ledger. A worker with a
+`UsageSink` passes both for the sink's kinds, and only for them
+([Provider usage sink](#provider-usage-sink)).
 
 ```python
 from orqestra.persistence.lifecycle import complete_attempt, revoke_next_expired
@@ -831,11 +836,9 @@ complete_attempt(
     retry_policy=retry_policy,
     usage_closure=closure,
 )
-# Intended future configuration: safe only once a durable recorder writes this kind's
-# calls to the ledger (see "Until a durable recorder exists" below).
-revoke_next_expired(
-    conn, retry_policy=retry_policy, usage_capture={"invoice_verification": CaptureTier.T3}
-)
+# Safe only for a kind whose handlers record every call through a durable recorder,
+# such as the worker's UsageSink (see "Which kinds may be mapped" below).
+revoke_next_expired(conn, retry_policy=retry_policy, usage_capture={"metered": CaptureTier.T3})
 usage = read_attempt_usage(conn, attempt.id)
 print(capture_of(usage))  # open, closed, lower_bound or not_captured
 ```
@@ -857,11 +860,12 @@ print(capture_of(usage))  # open, closed, lower_bound or not_captured
 - **Reading it.** `capture_of` is pure. `closed` needs a complete closure that counts
   exactly the calls read, each with a result. `not_captured` means nothing was recorded,
   never "zero calls".
-- **Until a durable recorder exists.** The only recorder, `InMemoryCallRecorder`, writes
-  nothing to the ledger, so a closure cannot see the calls it holds. Do not map
-  `invoice_verification` (or any kind whose calls reach only that recorder) to T3, and do
-  not close its attempts as `complete`: either would claim `complete(0)` for calls that
-  were made. Leave such a kind unmapped; its attempts then read `not_captured`, or
+- **Which kinds may be mapped.** `InMemoryCallRecorder` writes nothing to the ledger, so
+  a closure cannot see the calls it holds. Map a kind to T3, or close its attempts as
+  `complete`, only if every handler of that kind records every call through a durable
+  recorder: the worker's `UsageSink` (DEC-059) is the only one. Otherwise either would
+  claim `complete(0)` for calls that were made. `invoice_verification` is registered with
+  no worker and no sink, so it stays unmapped; its attempts read `not_captured`, or
   `lower_bound` with an `incomplete` closure, never `closed`.
 
 | Situation | What happens |
@@ -872,6 +876,209 @@ print(capture_of(usage))  # open, closed, lower_bound or not_captured
 | The completion is fenced (stale, revoked or already finished) | The usual error; no closure is written |
 | The connection is lost, or any statement fails, before commit | Neither the transition nor the closure is recorded |
 | A call is recorded after the closure | Accepted and flagged late; the closure is unchanged and the attempt reads as `lower_bound` |
+
+### Provider usage sink
+
+A worker can write its handlers' provider calls to the usage ledger as they happen
+(DEC-059, Proposed). The `UsageSink` in `orqestra.worker.usage` is the durable
+`ProviderCallRecorder` of DEC-057; the worker's supervisor, still the only database
+client, writes every record.
+
+```python
+from datetime import timedelta
+
+from orqestra.worker.handlers import HandlerRegistry
+from orqestra.worker.runtime import Worker
+from orqestra.worker.usage import UsageSink, check_provider_call_budget
+
+sink = UsageSink(
+    ["metered"],  # job kinds whose calls are captured, each at tier T3
+    provider_for_route={"route-a": "provider-a"},
+    model_for_route={"route-a": "model-a"},  # optional
+    prompt_version="v1",  # optional
+)
+check_provider_call_budget(  # optional, pure: refuses a cap that cannot fit
+    settings, max_provider_calls_per_attempt=20, provider_call_timeout=timedelta(seconds=5)
+)
+handler = make_handler(recorder=sink.recorder)  # your factory: every call goes through it
+worker = Worker(
+    registry=HandlerRegistry({"metered": handler}),
+    settings=settings,
+    connect=connect,
+    usage=sink,
+)
+```
+
+- **Flow.** For each call the handler's `record_intent` posts the intent and waits; the
+  supervisor writes it in one guarded call and answers only once it has committed, so the
+  call is made only then. After the call, `record_result` posts the result and waits
+  until it has committed too. `ProviderCalls` posts each result before its next intent.
+  The sink does not enforce that order: it checks only that `call_seq` starts at 0 and
+  goes up by 1. A result still outstanding makes the worker's closure `incomplete`, so
+  `complete(n)` is never a guess.
+- **Scheduling.** A due heartbeat comes first. A record waits while the next heartbeat is
+  due within `db_operation_timeout`, as sweeps do, and once renewals have stopped after a
+  cancellation it never waits. Records come before sweeps and are written while a
+  stopping worker drains.
+- **Closures.** The completion closes the attempt's capture by `worker` at T3:
+  `complete(n)` when every confirmed intent has its confirmed result, otherwise
+  `incomplete`, in the completion's own transaction (DEC-058). Sweeps pass
+  `usage_capture={kind: t3}` for the sink's kinds, so a revoked attempt of those kinds is
+  closed by recovery at T3. Every worker of a fleet must use the same kind-to-tier map;
+  nothing checks this.
+- **The T3 contract.** Every handler registered for a sink kind must record every call
+  through `sink.recorder`. A handler that calls a provider some other way makes both
+  closures claim `complete` for fewer calls than were made. Nothing enforces this yet;
+  checking it at registration is a required future step.
+- **Cancellation.** An intent that is still waiting when the supervisor learns of a
+  committed cancellation request is withdrawn: no row and no call, and the handler gets
+  `HandlerCancelled`. An intent that was acknowledged is a call in flight: it goes
+  ahead, and its result is always written, never withdrawn.
+- **Invalid records** raise `ValueError` in the handler before anything is posted: a
+  route the sink does not map, a record for another attempt, a `call_seq` that does not
+  start at 0 and go up by 1, or a value the ledger refuses. The task fails and no call is
+  made (DEC-057). A second record while one waits is a `RuntimeError`.
+
+| What happens to a record | What the worker does |
+| --- | --- |
+| A retryable error (`40001`, `40P01`, `55P03`, `57014`) or a failed connect | Retries every `db_operation_timeout` until the attempt's local deadline |
+| The answer is lost (the write may have committed) | Closes the connection and replays the same keyed write at once, then every `db_operation_timeout`; a replay is matched, never doubled |
+| An intent cannot be confirmed while the handler waits | In practice the ownership fence ends the process first (exit 3, `ownership_deadline_passed`) and no call is made; exit 8 (`usage_intent_unrecorded`) at the deadline is the supervisor's backstop |
+| A result cannot be confirmed while the handler waits | In practice the ownership fence ends the process first (exit 3); the call stays unresolved and recovery closes the capture `incomplete` at T3; exit 8 (`usage_result_unrecorded`) at the deadline is the supervisor's backstop |
+| The database rejects it, or `NotFoundError`, `CallIntentNotFoundError`, `UsageReplayConflictError`, a `RuntimeError`, or a first intent finds a row already there | Exit 7 (`usage_write_rejected`) |
+| The intent is stored late (the attempt had stopped running) | Exit 3 (`usage_intent_late`), no call; the row stays, an unresolved call that may overcount |
+| Ownership is lost | Exit 3, as before |
+| The reported amount is 1E+20 or more, or has more than 18 decimal places | No result row, nothing clamped or zeroed; `usage_result_unrepresentable` with ids only; the handler goes on and the closure is `incomplete` |
+| A complete closure is refused at completion (`CaptureNotCompleteError`, `UsageReplayConflictError`) | Exit 7 (`completion_refused`) |
+
+None of these is ever the handler's outcome. While a handler waits, the ownership fence
+stays armed before the attempt's deadline D (the lease is capped at D), so in practice
+it ends the process first. While heartbeats succeed or are not due, the supervisor's
+exit 8 comes at worst at D plus four times `db_operation_timeout` (a retry due at D may
+still wait for a step in progress and a heartbeat, lose a write's answer and fail its
+immediate replay). Heartbeats that keep failing are retried within one bound, which
+holds usage writes back as it holds sweeps, so exit 8 may then never come. If the
+supervisor never answers, the handler's wait ends at D plus five times
+`db_operation_timeout` (`usage_handoff_bound` plus two more) with a never-classified
+signal (exit 5): strictly later than the four-bound worst case, and the end when
+failing heartbeats hold writes back and the fence has not ended the process first. `usage_handoff_bound` and
+`check_provider_call_budget` are limits for the case with no failures; retries and
+replays are bounded by the attempt's deadline and by the fence, not by these limits.
+Diagnostics carry the worker, task and attempt ids, `call_seq`, the exception type and
+the SQLSTATE only: never an amount, a unit, a prompt or provider text.
+
+- **Overhead.** Each call waits for two serialized supervisor round trips, plus at most
+  one step in progress or a heartbeat. When PostgreSQL is slow, calls are delayed, never
+  made unrecorded. Sweeps may be postponed while records wait.
+- **Limits.** `usage_handoff_bound(settings)` is the longest one record may wait.
+  `check_provider_call_budget` refuses a cap unless `cap × (provider_call_timeout + 2 ×
+  usage_handoff_bound) ≤ execution_timeout − fence_margin`. It is a pure check that the
+  wiring may call; nothing calls it for you, and `WorkerSettings` has no new field.
+- **Measured, not asserted.** `tests/integration/test_worker_usage_performance.py`
+  (marked `performance`) prints the per-call cost of the sink beside the in-memory
+  recorder and direct ledger writes; see [the development guide](docs/development.md).
+
+### OpenRouter adapter (not wired in)
+
+`orqestra.providers.openrouter.OpenRouterProvider` implements the `Provider` contract with
+one non-streaming request to OpenRouter's chat completions endpoint (DEC-060, Proposed).
+**Nothing uses it yet.** No worker, handler or command imports `orqestra.providers`, no
+test makes a live call, and live calls need separate authorization.
+
+```python
+from pydantic import SecretStr
+
+from orqestra.providers.openrouter import OpenRouterConfig, OpenRouterProvider
+from orqestra.providers.stdlib_transport import HttpsTransport
+
+config = OpenRouterConfig(
+    credential=SecretStr("..."),  # any object with get_secret_value()
+    route_models={"route-a": "vendor/model"},  # explicit: there is no default model
+)
+provider = OpenRouterProvider(config, HttpsTransport())
+report = provider.call(request)  # a CallReport; provider.interpret(request) is report.response
+```
+
+- **Configuration.** `OpenRouterConfig` has no defaults. The credential must be 1 to 512
+  visible ASCII characters, so it cannot carry a space or a line break into a header, and
+  it is shown as `***` in `repr`. `route_models` maps route ids (the routing rule) to model
+  slugs (`[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`, a project rule); it must not be empty, and
+  it is copied into an immutable mapping. `Settings` has an optional
+  `ORQESTRA_OPENROUTER_API_KEY` (`SecretStr`, `***` in `orqestra health`) that nothing
+  reads yet.
+- **Before any I/O.** A capability other than `interpret_amount`, a route without a model,
+  or a request whose fields have the wrong types is `unsupported_request`, and the
+  transport is never called.
+- **One request.** The body is exactly `model`, `messages` (a fixed system prompt carrying
+  `PROMPT_VERSION`, and a user message with the canonical JSON of `field_kind` and `raw`)
+  and `"stream": false`. The headers are exactly `Authorization` (Bearer), `Content-Type`
+  and `Accept`; the transport adds only `Host` and `Content-Length`. There is one POST
+  per call and no retry.
+- **Transport.** The adapter is given an `HttpTransport`, so every test uses a fake one.
+  `HttpsTransport` (`http.client` and `ssl`, the only module that may open a socket)
+  posts to the fixed host `openrouter.ai`, port 443 and path `/api/v1/chat/completions`.
+  It follows no redirect, reads no proxy setting from the environment and prints no debug
+  output. It closes the connection on every path.
+- **Deadline.** `request.timeout` is the budget, measured on a monotonic clock. The time
+  left is checked before the POST and before every body read. The transport also uses it
+  as the connect timeout, and sets it as the socket timeout before sending, before reading
+  the response head and before each read. With no time left the step does not start.
+- **Response.** A status other than 200 is mapped from the status alone and its body is
+  never read. A 200 body is read up to 256 KiB and must be strict UTF-8 JSON: one object,
+  no duplicate keys, no `NaN` or `Infinity`, numbers kept exact. Then:
+  - an embedded `error` is mapped by its `code`, like a status;
+  - otherwise `id` (1 to 128 visible ASCII characters), `model` (the slug rule) and
+    exactly one choice are required, with `finish_reason` `"stop"` and string content;
+  - the value is the content with surrounding whitespace removed, and the verifier still
+    decides whether it is an amount.
+- **Usage.** `usage.cost` becomes `ProviderUsage(amount, "openrouter_credits")`, its value
+  and scale kept in fixed-point text (`1.50` stays `1.50`, `1.5e-3` becomes `0.0015`).
+  The amount must also be recordable in the usage ledger: finite, unsigned (`-0`
+  included), at most 18 decimal places, and below 10^20. Token counts must be integers
+  from 0 to 2^63-1. Absent usage is `None`, never zero.
+- **Nothing leaks.** The package logs nothing. Every error carries a fixed code, and is
+  raised with no `__cause__` or `__context__`, so no credential, prompt, remote message or
+  standard-library message travels with it. Standard-library messages matter: an illegal
+  header value would be quoted in one.
+
+| Outcome | Raised |
+| --- | --- |
+| Status 400 | `ProviderPermanentError(unsupported_request)` |
+| Status 401, 402 or 403 (402 even with `Retry-After`) | `ProviderPermanentError(rejected)` |
+| Status 408, the deadline spent, or a socket timeout | `ProviderTransientError(timeout)` |
+| Status 429 | `ProviderTransientError(rate_limited)` |
+| Status 502 or 503, or a connection, TLS or HTTP protocol failure | `ProviderTransientError(unavailable)` |
+| Any other status, including 3xx, other 2xx, 500 and 504 | `OpenRouterProtocolError`, defect `unknown_status` |
+| A 200 with an embedded error | The error for its `code` above; an unlisted code or a malformed envelope is `malformed_error` |
+| A 200 body over 256 KiB | `body_too_large` |
+| Not one strict JSON object | `malformed_json` |
+| A missing or invalid `id`, `model` or `choices` | `invalid_schema` |
+| `finish_reason` not `"stop"`, or content that is not a string | `unsupported_content` |
+| Usage or cost outside the rules above | `invalid_usage` |
+
+`OpenRouterProtocolError` is a `PermanentError` whose text is
+`provider_protocol_violation`, the same text the invoice verifier uses for a provider that
+breaks the contract.
+
+**Limits.**
+- The standard library has no timeout for name lookup (`getaddrinfo`). Every other
+  blocking step (connecting, including the TLS handshake; sending; reading the response
+  head; each body read) is given the time left when that step starts, and the time is
+  checked again only before the next step. Reading the response head (the status line,
+  up to 100 header lines, and any `100 Continue` responses) and reading one body chunk
+  can each wait on the socket several times, and sending writes the head and the body
+  separately. So a slow server can make one call overrun its budget by more than one
+  wait.
+- A handler thread cannot be interrupted, and cancellation is checked only between
+  provider calls. The hard bound on a call is therefore the worker's watchdog and fence
+  (DEC-045, DEC-048). If the worker is fenced mid-call, the call stays unresolved in the
+  usage ledger.
+- A failure after the request was sent may still have been billed. It is reported as
+  `unavailable`, and whatever wires the adapter in must treat it as an ambiguous outcome.
+- Status 500 and 504 are not retried. Strict parsing may reject a valid future response
+  shape.
+- The usage ledger's failure codes have no protocol-violation code yet. Recording that
+  outcome is left to the change that wires the adapter in.
 
 ### Provider usage report
 
@@ -969,24 +1176,28 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   external AI call already made. Calls recorded in the usage ledger stay attributed to the
   revoked attempt through its `attempt_id`. Recovery closes an attempt's usage capture only
   for kinds given a tier in `usage_capture`; an unmapped kind with no recorded calls reads
-  `not_captured`, never "zero", and an unrecorded call is not known to the ledger. The
-  worker runtime passes no usage closure or tier map yet (DEC-058).
-- Invoice verification has no live provider, and its calls are not yet written to the
-  usage ledger. The only recorder, `InMemoryCallRecorder`, keeps records in memory and
-  is not durable. The ledger, and so the usage report, holds only what is recorded
-  through `orqestra.persistence.provider_usage`. The stored `routing` shows only which
-  route was chosen. A provider error
+  `not_captured`, never "zero", and an unrecorded call is not known to the ledger. A
+  worker passes a closure and a tier map only for the kinds of its `UsageSink` (DEC-059).
+- The OpenRouter adapter is not wired in; its own limits are listed in
+  [OpenRouter adapter](#openrouter-adapter-not-wired-in).
+- Invoice verification has no live provider and is registered with no worker, so its
+  calls are not yet written to the usage ledger; with `InMemoryCallRecorder` they stay in
+  memory. The worker's `UsageSink` is durable, but nothing checks that a sink kind's
+  handlers record every call through it (the T3 contract), or that every worker of a fleet
+  uses the same tier map. The ledger, and so the usage report, holds only what is
+  recorded through `orqestra.persistence.provider_usage`. The stored `routing` shows only
+  which route was chosen. A provider error
   repeats the whole batch on retry, so billable calls could repeat (each attempt keeps
   its own cap); deterministic request ids would let a real adapter deduplicate them, and
   no exactly-once claim is made.
 - A provider call can be left unresolved: an intent with no result. This happens when
   the provider raises something that is not a provider error, returns something that is
-  not a `ProviderResponse`, the process is interrupted, or `record_result` fails (for
-  example, a durable recorder refusing a reported usage amount outside the ledger's
-  range; how to handle such an amount is not decided yet). Until a
-  durable recorder exists, a recorder failure is a handler failure: an unclassified
-  error that is not retried. The cap is not yet checked against the worker's execution
-  timeout (DEC-057).
+  not a `ProviderResponse`, the process is interrupted, or the result is not written (the
+  worker's sink writes none for a reported amount outside the ledger's range). With
+  another recorder, a recorder failure is a handler failure: an unclassified error that
+  is not retried; with the worker's sink, a ledger failure ends the process instead. The
+  cap is checked against the worker's execution timeout only by
+  `check_provider_call_budget`, which nothing calls for you (DEC-059).
 - The invoice job summary is in process only: no command or API exposes it, and it
   summarizes one job per call. Its snapshot read grows with the number of tasks and the
   size of their stored results, and holds back vacuum while it lasts; the cost of the

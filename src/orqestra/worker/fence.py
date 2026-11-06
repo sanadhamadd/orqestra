@@ -49,7 +49,9 @@ class ExitCode(IntEnum):
     HANDLER_ABORTED = 5  # the handler raised a control-plane signal; nothing was recorded
     AMBIGUOUS = 6  # whether a completion committed could not be established in time
     DEFECT = 7  # an invariant broke, or a valid outcome was rejected by the database
-    UNRECORDED = 8  # the outcome could not be recorded before the attempt's deadline
+    # The outcome, or a provider call's intent or result (DEC-059), could not be
+    # recorded before the attempt's deadline.
+    UNRECORDED = 8
     SHUTDOWN = 9  # a stopping worker's task was not settled in time, or a second signal came
 
 
