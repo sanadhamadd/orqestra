@@ -1,4 +1,4 @@
-"""Orqestra: a distributed AI workload execution platform."""
+"""Orqestra: a distributed workload execution platform."""
 
 from importlib.metadata import PackageNotFoundError, version
 

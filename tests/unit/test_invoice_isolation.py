@@ -7,8 +7,8 @@ imports only: a transitive import of a transport is covered by the runtime guard
 the ``no_network`` fixture, which makes any connection or name lookup fail the
 test. A meta-test below shows that the guard fires.
 
-A second scan enforces the layers: ``ai/`` and ``workloads/`` never import storage or
-aggregation, and ``ai/`` never imports a workload or the worker.
+A second scan enforces the layers: ``calls/`` and ``workloads/`` never import storage or
+aggregation, and ``calls/`` never imports a workload or the worker.
 """
 
 import ast
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-import orqestra.ai
+import orqestra.calls
 import orqestra.workloads
 from orqestra import cli
 from orqestra.config import Settings
@@ -84,7 +84,9 @@ def violations(source: str) -> list[str]:
 
 
 def new_modules() -> list[Path]:
-    roots = [Path(package.__file__ or "").parent for package in (orqestra.ai, orqestra.workloads)]
+    roots = [
+        Path(package.__file__ or "").parent for package in (orqestra.calls, orqestra.workloads)
+    ]
     return sorted(path for root in roots for path in root.rglob("*.py"))
 
 
@@ -107,10 +109,10 @@ def test_no_new_module_imports_a_transport_or_evaluates_code() -> None:
         assert violations(path.read_text(encoding="utf-8")) == [], path.name
 
 
-# Which orqestra packages a layer may not import: ai/ knows no workload and no worker,
-# and neither ai/ nor workloads/ reaches storage or aggregation (DEC-057).
+# Which orqestra packages a layer may not import: calls/ knows no workload and no worker,
+# and neither calls/ nor workloads/ reaches storage or aggregation (DEC-057).
 LAYER_FORBIDDEN = {
-    "ai": (
+    "calls": (
         "orqestra.persistence",
         "orqestra.aggregation",
         "orqestra.workloads",
@@ -138,8 +140,8 @@ def layer_violations(layer: str, source: str) -> list[str]:
     return found
 
 
-def test_no_ai_or_workload_module_imports_a_layer_it_must_not_know() -> None:
-    for package, layer in ((orqestra.ai, "ai"), (orqestra.workloads, "workloads")):
+def test_no_calls_or_workload_module_imports_a_layer_it_must_not_know() -> None:
+    for package, layer in ((orqestra.calls, "calls"), (orqestra.workloads, "workloads")):
         root = Path(package.__file__ or "").parent
         for path in sorted(root.rglob("*.py")):
             assert layer_violations(layer, path.read_text(encoding="utf-8")) == [], path.name
@@ -148,22 +150,22 @@ def test_no_ai_or_workload_module_imports_a_layer_it_must_not_know() -> None:
 @pytest.mark.parametrize(
     ("layer", "source", "expected"),
     [
-        ("ai", "import orqestra.persistence", ["ai imports orqestra.persistence"]),
+        ("calls", "import orqestra.persistence", ["calls imports orqestra.persistence"]),
         (
-            "ai",
+            "calls",
             "from orqestra.persistence.provider_usage import CallOutcome",
-            ["ai imports orqestra.persistence.provider_usage"],
+            ["calls imports orqestra.persistence.provider_usage"],
         ),
-        ("ai", "from orqestra import worker", ["ai imports orqestra.worker"]),
+        ("calls", "from orqestra import worker", ["calls imports orqestra.worker"]),
         (
-            "ai",
+            "calls",
             "from orqestra.workloads.invoice import verify",
-            ["ai imports orqestra.workloads.invoice"],
+            ["calls imports orqestra.workloads.invoice"],
         ),
         (
-            "ai",
+            "calls",
             "import orqestra.aggregation.invoice",
-            ["ai imports orqestra.aggregation.invoice"],
+            ["calls imports orqestra.aggregation.invoice"],
         ),
         (
             "workloads",
@@ -176,9 +178,9 @@ def test_no_ai_or_workload_module_imports_a_layer_it_must_not_know() -> None:
             ["workloads imports orqestra.aggregation"],
         ),
         ("workloads", "from orqestra.worker.handlers import Handler", []),
-        ("workloads", "from orqestra.ai.recording import ProviderCallRecorder", []),
-        ("ai", "from orqestra.ai.provider import FieldKind", []),
-        ("ai", "import orqestra.persistence_like", []),
+        ("workloads", "from orqestra.calls.recording import ProviderCallRecorder", []),
+        ("calls", "from orqestra.calls.provider import FieldKind", []),
+        ("calls", "import orqestra.persistence_like", []),
     ],
 )
 def test_the_layer_scan_catches_what_it_is_meant_to_catch(
@@ -201,7 +203,7 @@ def test_the_layer_scan_catches_what_it_is_meant_to_catch(
         ("exec('x = 1')", ["use of exec"]),
         ("compile('1', 'f', 'eval')", ["use of compile"]),
         ("import re\nre.compile('x')", []),
-        ("import json\nfrom orqestra.ai import provider", []),
+        ("import json\nfrom orqestra.calls import provider", []),
     ],
 )
 def test_the_scan_catches_what_it_is_meant_to_catch(source: str, expected: list[str]) -> None:

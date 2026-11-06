@@ -51,7 +51,7 @@ from datetime import timedelta
 from enum import StrEnum
 from typing import cast
 
-from orqestra.ai.provider import (
+from orqestra.calls.provider import (
     PermanentCode,
     Provider,
     ProviderPermanentError,
@@ -62,14 +62,14 @@ from orqestra.ai.provider import (
     TransientCode,
     make_request,
 )
-from orqestra.ai.recording import (
+from orqestra.calls.recording import (
     MAX_CALL_SEQ,
     CallOutcome,
     ProviderCallIntent,
     ProviderCallRecorder,
     ProviderCallResult,
 )
-from orqestra.ai.routing import RouteOption, check_routes, check_units, choose_route
+from orqestra.calls.routing import RouteOption, check_routes, check_units, choose_route
 from orqestra.domain.errors import PermanentError
 from orqestra.domain.leases import check_duration
 from orqestra.workloads.invoice.checks import Finding, Verdict, run_checks

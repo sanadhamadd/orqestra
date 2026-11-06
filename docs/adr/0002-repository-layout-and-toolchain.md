@@ -7,14 +7,14 @@
 ## Context
 
 Day 1 must deliver a working, reproducible Python package with quality gates that every
-later milestone (persistence, queue, workers, AI adapters) builds on. The task queue,
-API framework, worker hosting, AI providers, DB driver and async model are intentionally
+later milestone (persistence, queue, workers, provider adapters) builds on. The task queue,
+API framework, worker hosting, model providers, DB driver and async model are intentionally
 undecided, so the toolchain must not pre-empt them.
 
 ## Decision
 
 - **Layout:** `src/orqestra/` with `domain/` as the only subpackage today. Planned
-  subpackages (`persistence/`, `queue/`, `worker/`, `workloads/invoice/`, `ai/`,
+  subpackages (`persistence/`, `queue/`, `worker/`, `workloads/invoice/`, `calls/`,
   `cost/`) are created only when they ship tested code. Tests live in `tests/unit`,
   `tests/integration`, `tests/e2e`, `tests/performance`, selected by pytest markers.
 - **Toolchain:** uv (lockfile; CI installs with `--locked`), Python 3.12, Ruff (format + lint),

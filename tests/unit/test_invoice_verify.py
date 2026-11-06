@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.mock import MockProvider
-from orqestra.ai.provider import (
+from orqestra.calls.mock import MockProvider
+from orqestra.calls.provider import (
     FieldKind,
     PermanentCode,
     Provider,
@@ -19,7 +19,7 @@ from orqestra.ai.provider import (
     TransientCode,
     make_request,
 )
-from orqestra.ai.recording import (
+from orqestra.calls.recording import (
     MAX_CALL_SEQ,
     MAX_COST_UNITS,
     CallOutcome,
@@ -28,7 +28,7 @@ from orqestra.ai.recording import (
     ProviderCallRecorder,
     ProviderCallResult,
 )
-from orqestra.ai.routing import RouteOption
+from orqestra.calls.routing import RouteOption
 from orqestra.domain.errors import PermanentError, TransientError, is_retryable
 from orqestra.domain.jobs import AttemptFailed
 from orqestra.domain.policy import FailureKind, classify_failure

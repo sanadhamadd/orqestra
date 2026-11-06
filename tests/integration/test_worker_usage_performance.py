@@ -28,8 +28,8 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from orqestra.ai.provider import ProviderRequest, ProviderResponse
-from orqestra.ai.recording import (
+from orqestra.calls.provider import ProviderRequest, ProviderResponse
+from orqestra.calls.recording import (
     MAX_CALL_SEQ,
     InMemoryCallRecorder,
     ProviderCallIntent,

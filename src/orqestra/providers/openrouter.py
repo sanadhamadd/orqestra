@@ -42,7 +42,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
 
-from orqestra.ai.provider import (
+from orqestra.calls.provider import (
     FieldKind,
     PermanentCode,
     ProviderPermanentError,

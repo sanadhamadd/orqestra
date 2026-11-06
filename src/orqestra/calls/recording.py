@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from orqestra.ai.provider import FieldKind, PermanentCode, ProviderUsage, TransientCode
+from orqestra.calls.provider import FieldKind, PermanentCode, ProviderUsage, TransientCode
 
 MAX_CALL_SEQ = 2**31 - 1
 MAX_COST_UNITS = 2**63 - 1

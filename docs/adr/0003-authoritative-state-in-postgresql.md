@@ -42,7 +42,7 @@ detect this: after `running → queued → running`, the state matches again.
   commits the revocation, after which the attempt's writes are rejected like any other
   stale write (DEC-034 … DEC-038).
 - Writes use short READ COMMITTED transactions, locking a task before its attempts, and
-  never hold a transaction open across external or AI work (DEC-021).
+  never hold a transaction open across external or provider work (DEC-021).
 - The schema is managed by forward-only, checksummed SQL migrations applied under an
   advisory lock, with transaction control rejected by PostgreSQL (DEC-017).
 
@@ -127,7 +127,7 @@ detect this: after `running → queued → running`, the state matches again.
 - Lease renewal is the one write that locks only the attempt row; it never waits for a task
   lock while holding it, so it cannot deadlock with the task-first writes (DEC-036).
 - Every started attempt consumes retry budget, including attempts lost to crashes.
-- Revoking an attempt's database ownership does not stop or un-bill an external AI call;
+- Revoking an attempt's database ownership does not stop or un-bill an external provider call;
   usage records must be attributable to the attempt that incurred them even after it
   loses ownership.
 

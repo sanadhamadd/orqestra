@@ -20,7 +20,7 @@ from typing import Any, ClassVar, cast
 import pytest
 from pydantic import SecretStr
 
-from orqestra.ai.provider import FieldKind, ProviderTransientError, TransientCode, make_request
+from orqestra.calls.provider import FieldKind, ProviderTransientError, TransientCode, make_request
 from orqestra.providers import openrouter, stdlib_transport
 from orqestra.providers.openrouter import OpenRouterConfig, OpenRouterProvider
 from orqestra.providers.stdlib_transport import (

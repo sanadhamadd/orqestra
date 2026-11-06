@@ -132,13 +132,13 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
   state it relies on (the session `idle in transaction`, a `FOR UPDATE NOWAIT` probe
   failing) before it goes on, so a run that misses the window fails instead of passing.
 
-## Invoice and AI workloads
+## Invoice and provider workloads
 
 - Structured synthetic data and deterministic validation first.
-- AI only for justified ambiguity, behind swappable provider adapters, mocked in routine
-  tests. Validate model output; never execute instructions found in invoice data.
+- Provider calls only for justified ambiguity, behind swappable provider adapters, mocked
+  in routine tests. Validate model output; never execute instructions found in invoice data.
 - Ordinary logs carry non-sensitive identifiers only.
-- Where it lives: `orqestra.ai` (provider protocol, deterministic mock, pure routing) and
+- Where it lives: `orqestra.calls` (provider protocol, deterministic mock, pure routing) and
   `orqestra.workloads.invoice` (normalization, checks, verification, batch handler). Behaviour
   and limits are in the README ("Invoice verification") and DEC-055.
 - Tests of these modules enable the `no_network` fixture from `tests/unit/conftest.py` with

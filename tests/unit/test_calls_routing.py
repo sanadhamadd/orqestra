@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.routing import (
+from orqestra.calls.routing import (
     ExclusionReason,
     RouteOption,
     check_routes,

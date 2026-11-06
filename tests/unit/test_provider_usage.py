@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.provider import FieldKind, PermanentCode, TransientCode
-from orqestra.ai.routing import RouteOption, choose_route
+from orqestra.calls.provider import FieldKind, PermanentCode, TransientCode
+from orqestra.calls.routing import RouteOption, choose_route
 from orqestra.domain.states import AttemptState
 from orqestra.persistence import provider_usage
 from orqestra.persistence.provider_usage import (

@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.provider import FieldKind
+from orqestra.calls.provider import FieldKind
 from orqestra.workloads.invoice.model import (
     MAX_AMOUNT,
     AmbiguousField,

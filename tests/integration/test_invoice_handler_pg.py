@@ -13,8 +13,8 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from orqestra.ai.mock import MockProvider
-from orqestra.ai.provider import ProviderTransientError, TransientCode
+from orqestra.calls.mock import MockProvider
+from orqestra.calls.provider import ProviderTransientError, TransientCode
 from orqestra.domain.jobs import AttemptFailed, AttemptSucceeded, JobStatus, JobSubmission
 from orqestra.domain.partitioning import partition
 from orqestra.domain.policy import FailureKind

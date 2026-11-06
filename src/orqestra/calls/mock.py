@@ -19,7 +19,7 @@ recorded, repeats included.
 from collections.abc import Iterable
 from typing import cast
 
-from orqestra.ai.provider import ProviderRequest, ProviderResponse
+from orqestra.calls.provider import ProviderRequest, ProviderResponse
 
 
 class ScriptExhaustedError(RuntimeError):

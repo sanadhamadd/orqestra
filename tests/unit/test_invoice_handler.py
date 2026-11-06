@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.mock import MockProvider
-from orqestra.ai.provider import (
+from orqestra.calls.mock import MockProvider
+from orqestra.calls.provider import (
     PermanentCode,
     Provider,
     ProviderPermanentError,
@@ -16,14 +16,14 @@ from orqestra.ai.provider import (
     ProviderUsage,
     TransientCode,
 )
-from orqestra.ai.recording import (
+from orqestra.calls.recording import (
     MAX_CALL_SEQ,
     MAX_COST_UNITS,
     InMemoryCallRecorder,
     ProviderCallIntent,
     ProviderCallResult,
 )
-from orqestra.ai.routing import RouteOption
+from orqestra.calls.routing import RouteOption
 from orqestra.domain.jobs import AttemptCancelled, AttemptFailed, AttemptSucceeded, JsonValue
 from orqestra.domain.policy import FailureKind
 from orqestra.worker.handlers import (
@@ -65,8 +65,8 @@ def context(cancel: threading.Event | None = None, attempt_id: uuid.UUID = ATTEM
 
 
 PERMANENT_ERROR = "orqestra.domain.errors.PermanentError"
-PROVIDER_TRANSIENT = "orqestra.ai.provider.ProviderTransientError"
-PROVIDER_PERMANENT = "orqestra.ai.provider.ProviderPermanentError"
+PROVIDER_TRANSIENT = "orqestra.calls.provider.ProviderTransientError"
+PROVIDER_PERMANENT = "orqestra.calls.provider.ProviderPermanentError"
 CAP = 64  # more calls than any batch here needs
 
 

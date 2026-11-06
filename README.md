@@ -1,7 +1,7 @@
 # Orqestra
 
-Distributed AI workload execution platform: concurrent workers, fault-tolerant task
-processing, and cost-aware AI orchestration.
+Distributed workload execution platform: concurrent workers, fault-tolerant task
+processing, cost-aware provider orchestration.
 
 Orqestra is a portfolio-grade engineering project. Its first proving workload is
 verification of up to 50,000 **synthetic** invoices and purchase orders; invoices are a
@@ -62,7 +62,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and AI adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Proposed) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
+| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Proposed) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
 | Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Proposed); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Proposed) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | — | Docker Compose for PostgreSQL (local development only) |
@@ -612,8 +612,8 @@ not an accounting standard.
 ```python
 from datetime import timedelta
 
-from orqestra.ai.mock import MockProvider
-from orqestra.ai.routing import RouteOption
+from orqestra.calls.mock import MockProvider
+from orqestra.calls.routing import RouteOption
 from orqestra.workloads.invoice.handler import JOB_KIND, invoice_verification_handler
 from orqestra.workloads.invoice.verify import REQUIRED_CAPABILITY
 
@@ -629,7 +629,7 @@ handler = invoice_verification_handler(
 ```
 
 Any other provider is billable and needs a recorder, for example
-`recorder=InMemoryCallRecorder()` from `orqestra.ai.recording`; without one the factory
+`recorder=InMemoryCallRecorder()` from `orqestra.calls.recording`; without one the factory
 raises `ValueError`. Existing callers must now pass `max_provider_calls_per_attempt`,
 and, for the mock, either mark it or pass a recorder: the factory signature is not
 backward compatible. No command registers the handler, so only direct callers change.
@@ -701,7 +701,7 @@ backward compatible. No command registers the handler, so only direct callers ch
   A cancellation stops before the next call's intent, so it never leaves an unresolved
   intent, and the calls already made keep their results. The records do not name the
   provider, job, task or prompt version: a durable recorder adds those from its own
-  wiring, and `orqestra.ai` never depends on the worker.
+  wiring, and `orqestra.calls` never depends on the worker.
 
   ```mermaid
   flowchart LR
@@ -1173,7 +1173,7 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   There is no guaranteed recovery delay: it depends on live workers, their sweep
   interval and batch limit, and the backlog of expired attempts.
 - Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
-  external AI call already made. Calls recorded in the usage ledger stay attributed to the
+  external provider call already made. Calls recorded in the usage ledger stay attributed to the
   revoked attempt through its `attempt_id`. Recovery closes an attempt's usage capture only
   for kinds given a tier in `usage_capture`; an unmapped kind with no recorded calls reads
   `not_captured`, never "zero", and an unrecorded call is not known to the ledger. A

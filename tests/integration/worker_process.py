@@ -29,14 +29,14 @@ from datetime import timedelta
 
 import psycopg
 
-from orqestra.ai.provider import (
+from orqestra.calls.provider import (
     FieldKind,
     ProviderRequest,
     ProviderResponse,
     ProviderUsage,
     make_request,
 )
-from orqestra.ai.recording import MAX_CALL_SEQ
+from orqestra.calls.recording import MAX_CALL_SEQ
 from orqestra.domain.errors import TransientError
 from orqestra.domain.jobs import JsonValue
 from orqestra.logging import configure_logging

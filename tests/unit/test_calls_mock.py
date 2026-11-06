@@ -2,8 +2,8 @@ from datetime import timedelta
 
 import pytest
 
-from orqestra.ai.mock import MockProvider, ScriptExhaustedError
-from orqestra.ai.provider import (
+from orqestra.calls.mock import MockProvider, ScriptExhaustedError
+from orqestra.calls.provider import (
     FieldKind,
     Provider,
     ProviderRequest,
