@@ -10,6 +10,7 @@ tasks through ``submit_job`` and read its derived status (DEC-064).
 import argparse
 import functools
 import json
+import math
 import sys
 import uuid
 from collections.abc import Callable, Sequence
@@ -99,10 +100,11 @@ def _connection_string(settings: Settings) -> tuple[str, str | None]:
         raise _Refused(msg)
     dsn = settings.database_url.get_secret_value()
     # libpq parse errors can echo fragments of the URL, password included, so
-    # they are reported generically.
+    # they are reported generically. A byte that is not UTF-8 in the environment
+    # arrives as a lone surrogate, which cannot be encoded for libpq at all.
     try:
         password = conninfo_to_dict(dsn).get("password")
-    except psycopg.ProgrammingError:
+    except (psycopg.ProgrammingError, UnicodeError):
         msg = "ORQESTRA_DATABASE_URL is not a valid PostgreSQL connection string"
         raise _Refused(msg) from None
     return dsn, None if password is None else str(password)
@@ -216,9 +218,48 @@ def _worker_run(kinds: Sequence[str]) -> int:
 _TASK_FIELDS = frozenset({"task_key", "payload", "max_attempts"})
 
 
+_NOT_FINITE = "a number that is not finite (NaN, Infinity or out of range) is not valid JSON"
+
+
 def _refuse_constant(name: str) -> NoReturn:
-    msg = f"{name} is not valid JSON"
-    raise ValueError(msg)
+    raise ValueError(_NOT_FINITE)
+
+
+def _finite_float(literal: str) -> float:
+    """A JSON number with a fraction or exponent, refused if it overflows to infinity."""
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError(_NOT_FINITE)
+    return value
+
+
+def _encodable(text: str) -> bool:
+    """Whether ``text`` can be sent to PostgreSQL: a lone surrogate has no UTF-8 encoding."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _all_encodable(value: object) -> bool:
+    """Whether every string and object key inside a parsed JSON value is encodable.
+
+    Iterative, so a value nested as deeply as the parser allows cannot exhaust the stack.
+    """
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if not _encodable(item):
+                return False
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            if not all(_encodable(key) for key in item):
+                return False
+            pending.extend(item.values())
+    return True
 
 
 def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -246,7 +287,12 @@ def _read_tasks_file(path: str) -> Any:
         msg = "TASKS_FILE is not UTF-8"
         raise _Refused(msg) from None
     try:
-        return json.loads(text, parse_constant=_refuse_constant, object_pairs_hook=_unique_keys)
+        return json.loads(
+            text,
+            parse_constant=_refuse_constant,
+            parse_float=_finite_float,
+            object_pairs_hook=_unique_keys,
+        )
     except RecursionError:
         msg = "TASKS_FILE is nested too deeply"
         raise _Refused(msg) from None
@@ -272,6 +318,12 @@ def _task(index: int, item: object, default_max_attempts: int | None) -> TaskSpe
     if not isinstance(item["task_key"], str):
         msg = f"{where}: task_key must be a string"
         raise _Refused(msg)
+    if not _encodable(item["task_key"]):
+        msg = f"{where}: task_key cannot be encoded as UTF-8"
+        raise _Refused(msg)
+    if not _all_encodable(item["payload"]):
+        msg = f"{where}: payload holds a string or key that cannot be encoded as UTF-8"
+        raise _Refused(msg)
     if "max_attempts" in item:
         max_attempts = item["max_attempts"]
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
@@ -287,6 +339,11 @@ def _task(index: int, item: object, default_max_attempts: int | None) -> TaskSpe
 
 def _submission(args: argparse.Namespace) -> JobSubmission:
     """The submission ``job submit`` describes; ``_Refused`` before any database access."""
+    # Arguments that are not UTF-8 on the command line arrive as lone surrogates.
+    for option, value in (("--kind", args.kind), ("--idempotency-key", args.idempotency_key)):
+        if value is not None and not _encodable(value):
+            msg = f"{option} cannot be encoded as UTF-8"
+            raise _Refused(msg)
     try:
         check_job_kinds([args.kind])
     except (TypeError, ValueError) as exc:
@@ -359,6 +416,10 @@ def _on_current_schema(
             return action(conn)
     except psycopg.Error as exc:
         raise _Refused(_database_error(exc)) from None
+    except UnicodeError:
+        # A backstop: every string is checked before this point.
+        msg = "a value cannot be encoded as UTF-8 for the database"
+        raise _Refused(msg) from None
 
 
 def _job(args: argparse.Namespace) -> int:

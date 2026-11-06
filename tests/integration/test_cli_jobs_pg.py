@@ -6,6 +6,9 @@ code, with the rows the command wrote checked directly.
 """
 
 import json
+import os
+import subprocess
+import sys
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
@@ -206,3 +209,74 @@ def test_a_schema_without_migrations_is_refused_before_any_write(
     with psycopg.connect(url, autocommit=True) as conn:
         row = conn.execute("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema()")
         assert row.fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        (
+            '[{"task_key": "\\ud800", "payload": 1, "max_attempts": 1}]',
+            "task 0: task_key cannot be encoded as UTF-8",
+        ),
+        (
+            '[{"task_key": "a", "payload": {"k\\udfff": ["\\ud800"]}, "max_attempts": 1}]',
+            "task 0: payload holds a string or key that cannot be encoded as UTF-8",
+        ),
+        (
+            '[{"task_key": "a", "payload": [1e400], "max_attempts": 1}]',
+            "TASKS_FILE is not valid JSON: "
+            "a number that is not finite (NaN, Infinity or out of range) is not valid JSON",
+        ),
+    ],
+)
+def test_a_value_postgresql_cannot_take_is_refused_before_the_database(
+    cli_env: Conn,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    content: str,
+    error: str,
+) -> None:
+    path = tmp_path / "tasks.json"
+    path.write_text(content, "utf-8")
+    assert submit(capsys, str(path), code=1)["error"] == error
+    assert job_count(cli_env) == 0
+
+
+def test_a_command_line_byte_that_is_not_utf8_never_reaches_the_database(
+    cli_env: Conn, schema_url: str, write_tasks: Callable[[object], str]
+) -> None:
+    # A real process, so the byte goes through the interpreter's own argv decoding.
+    env = {**os.environ, "ORQESTRA_DATABASE_URL": schema_url}
+    argv: list[str | bytes] = [sys.executable, "-m", "orqestra.cli", "job", "submit"]
+    argv += [b"--kind", b"k\xff", b"--max-attempts", b"1", write_tasks(TASKS).encode()]
+    done = subprocess.run(argv, env=env, capture_output=True, timeout=60, check=False)
+    assert done.returncode == 1
+    assert b"Traceback" not in done.stderr
+    assert json.loads(done.stdout) == {
+        "status": "error",
+        "error": "--kind cannot be encoded as UTF-8",
+    }
+    assert job_count(cli_env) == 0
+
+
+@pytest.mark.parametrize(
+    ("options", "error"),
+    [
+        (["--idempotency-key", "nul\x00"], "the database request failed (DataError)"),
+        (
+            ["--max-attempts", str(2**70)],
+            "the database request failed (NumericValueOutOfRange, SQLSTATE 22003)",
+        ),
+    ],
+)
+def test_arguments_the_database_refuses_are_reported_without_their_values(
+    cli_env: Conn,
+    write_tasks: Callable[[object], str],
+    capsys: pytest.CaptureFixture[str],
+    options: list[str],
+    error: str,
+) -> None:
+    tasks = [{"task_key": "a", "payload": 1}]
+    opts = options if "--max-attempts" in options else [*options, "--max-attempts", "1"]
+    assert submit(capsys, write_tasks(tasks), *opts, code=1)["error"] == error
+    assert job_count(cli_env) == 0

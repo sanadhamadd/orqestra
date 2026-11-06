@@ -159,8 +159,12 @@ uv run orqestra job status <job_id>
 - **The file** is a UTF-8 JSON array of task objects with exactly `task_key` (a string),
   `payload` (any JSON value) and, optionally, `max_attempts`; `-` reads it from standard
   input. A task without `max_attempts` takes `--max-attempts`; there is no default, so a
-  task with neither is refused. Unknown fields, repeated keys in an object, `NaN` and
-  `Infinity` are refused before anything is sent to the database. Everything else is
+  task with neither is refused. Unknown fields, repeated keys in an object, numbers that
+  are not finite (`NaN`, `Infinity`, or a literal such as `1e400` that overflows a double)
+  and strings or object keys that cannot be encoded as UTF-8 (a lone surrogate such as
+  `"\ud800"`) are refused before anything is sent to the database, and so are `--kind` and
+  `--idempotency-key` values that are not UTF-8. Numbers with a fraction or an exponent are
+  read as doubles, as Python's `json` reads them. Everything else is
   `submit_job`'s own validation, including the idempotency rules above: resubmitting the
   same tasks with the same `--idempotency-key` prints the original job with
   `"created": false`.
@@ -169,7 +173,8 @@ uv run orqestra job status <job_id>
 - **Exit codes:** 0 on success; 1 with a `{"status": "error", …}` line for a refusal
   (invalid settings, listed under `errors`; otherwise one `error` message for an invalid
   file, an idempotency conflict, an unknown job id, a schema that is not current or a
-  database error); 2 for argparse's usage errors, such as a malformed `JOB_ID`. A database error is
+  database error); 2 for argparse's usage errors, such as a malformed `JOB_ID`. A
+  connection string that is not UTF-8 is reported as invalid by every command. A database error is
   reported by its type, SQLSTATE and violated constraint only, never with the connection
   string or the submitted values.
 - **Timeouts:** like `orqestra migrate`, the commands set no timeout of their own. Bound the

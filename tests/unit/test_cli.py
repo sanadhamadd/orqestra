@@ -340,6 +340,10 @@ def test_the_cli_connects_with_the_supervisors_bounds() -> None:
 
 JOB_ID = uuid.UUID("0b9f3c52-6a4e-4d4b-9a51-2f1f0e9c7d10")
 CREATED_AT = datetime(2026, 11, 6, 16, 0, tzinfo=UTC)
+NOT_FINITE = (
+    "TASKS_FILE is not valid JSON: "
+    "a number that is not finite (NaN, Infinity or out of range) is not valid JSON"
+)
 TASKS: list[dict[str, Any]] = [
     {"task_key": "invoice-1", "payload": {"invoice_id": "INV-1"}, "max_attempts": 3},
     {"task_key": "invoice-2", "payload": {"invoice_id": "INV-2"}},
@@ -491,8 +495,30 @@ def test_job_submit_reads_standard_input_for_a_dash(
     [
         (b"\xff[]", "TASKS_FILE is not UTF-8"),
         ("[{", "TASKS_FILE is not valid JSON: Expecting property name enclosed in double quotes"),
-        ('[{"task_key": "a", "payload": NaN, "max_attempts": 1}]', "NaN is not valid JSON"),
-        ('[{"task_key": "a", "payload": -Infinity, "max_attempts": 1}]', "-Infinity is not valid"),
+        ('[{"task_key": "a", "payload": NaN, "max_attempts": 1}]', NOT_FINITE),
+        ('[{"task_key": "a", "payload": Infinity, "max_attempts": 1}]', NOT_FINITE),
+        ('[{"task_key": "a", "payload": -Infinity, "max_attempts": 1}]', NOT_FINITE),
+        # Overflowing literals parse to infinity, which PostgreSQL would refuse.
+        ('[{"task_key": "a", "payload": [1, 1e400], "max_attempts": 1}]', NOT_FINITE),
+        ('[{"task_key": "a", "payload": {"x": -1e400}, "max_attempts": 1}]', NOT_FINITE),
+        ('[{"task_key": "a", "payload": 1.5E+309, "max_attempts": 1}]', NOT_FINITE),
+        # A lone surrogate is valid JSON but has no UTF-8 encoding for the database.
+        (
+            '[{"task_key": "\\ud800", "payload": 1, "max_attempts": 1}]',
+            "task 0: task_key cannot be encoded as UTF-8",
+        ),
+        (
+            '[{"task_key": "a", "payload": {"x": [{"y": "ok \\udfff"}]}, "max_attempts": 1}]',
+            "task 0: payload holds a string or key that cannot be encoded as UTF-8",
+        ),
+        (
+            '[{"task_key": "a", "payload": {"x": {"\\udc80": 1}}, "max_attempts": 1}]',
+            "task 0: payload holds a string or key that cannot be encoded as UTF-8",
+        ),
+        (
+            '[{"task_key": "a", "payload": "\\ud800", "max_attempts": 1}]',
+            "task 0: payload holds a string or key that cannot be encoded as UTF-8",
+        ),
         (
             '[{"task_key": "a", "payload": {"x": 1, "x": 2}, "max_attempts": 1}]',
             "TASKS_FILE is not valid JSON: an object repeats a key",
@@ -691,6 +717,81 @@ def test_job_status_prints_the_derived_status_and_every_count(
         "task_counts": {"queued": 1, "running": 2, "succeeded": 0, "failed": 0, "cancelled": 0},
     }
     assert db.submissions == []
+
+
+def test_job_submit_accepts_valid_surrogate_pairs_and_large_finite_numbers(
+    job_env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = Database(job_env)
+    # A surrogate pair is one character; only a lone surrogate is refused.
+    content = (
+        '[{"task_key": "\\ud83d\\ude00", "payload": {"\\u00e9": [1.7e308, -1e-400, 10]},'
+        ' "max_attempts": 1}]'
+    )
+    job_output(capsys, ["job", "submit", "--kind", "k", tasks_file(tmp_path, content)], 0)
+    (task,) = db.submissions[0].tasks
+    assert task.task_key == "\N{GRINNING FACE}"
+    assert task.payload == {"\u00e9": [1.7e308, -0.0, 10]}
+
+
+def test_job_submit_checks_a_deeply_nested_payload_without_recursion(
+    job_env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Database(job_env, allowed=False)
+    depth = 500
+    payload = "[" * depth + '"\\ud800"' + "]" * depth
+    content = f'[{{"task_key": "a", "payload": {payload}, "max_attempts": 1}}]'
+    assert submit_refused(capsys, tasks_file(tmp_path, content)) == (
+        "task 0: payload holds a string or key that cannot be encoded as UTF-8"
+    )
+
+
+@pytest.mark.parametrize("option", ["--kind", "--idempotency-key"])
+def test_job_submit_refuses_an_argument_that_is_not_utf8(
+    job_env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], option: str
+) -> None:
+    Database(job_env, allowed=False)
+    # A byte that is not UTF-8 on the command line, such as $'\xff', arrives as a surrogate.
+    argv = ["job", "submit", "--kind", "k", "--max-attempts", "1", tasks_file(tmp_path, TASKS)]
+    if option == "--kind":
+        argv[3] = "k\udcff"
+    else:
+        argv[2:2] = [option, "key-\udcff"]
+    payload = job_output(capsys, argv, 1)
+    assert payload["error"] == f"{option} cannot be encoded as UTF-8"
+
+
+def test_job_submit_maps_an_encoding_failure_at_the_database_to_an_error_line(
+    job_env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Database(job_env)
+
+    def unencodable(conn: object, submission: JobSubmission) -> SubmissionResult:
+        raise UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+
+    job_env.setattr(cli, "submit_job", unencodable)
+    error = submit_refused(capsys, tasks_file(tmp_path, TASKS), "--max-attempts", "1")
+    assert error == "a value cannot be encoded as UTF-8 for the database"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["job", "status", str(JOB_ID)], ["migrate"], ["worker", "run", "--kind", "diagnostic.echo"]],
+)
+def test_a_database_url_that_is_not_utf8_is_reported_as_invalid(
+    worker_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    Started(worker_env, allowed=False)
+    Database(worker_env, allowed=False)
+    # A byte that is not UTF-8 in the environment arrives as a lone surrogate.
+    worker_env.setenv("ORQESTRA_DATABASE_URL", f"postgresql://u:{SECRET}\udcff@127.0.0.1:1/orq")
+    assert main(argv) == 1
+    out = capsys.readouterr().out
+    assert SECRET not in out
+    assert json.loads(out) == {
+        "status": "error",
+        "error": "ORQESTRA_DATABASE_URL is not a valid PostgreSQL connection string",
+    }
 
 
 def test_job_status_refuses_an_unknown_job(
