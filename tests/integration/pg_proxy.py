@@ -14,6 +14,9 @@ and a test can make it:
   hears of it) or before forwarding the ``COMMIT`` (the server rolls back).
   Drops queue up: each completion takes the next one. With ``then_refuse``,
   new connections are refused from the drop on, until ``accept()``.
+- ``drop_commit(marker, committed=...)``: the same for the next transaction in
+  which the client sends ``marker`` (``drop_completion`` is this with the
+  completion's marker). Each marker has its own queue of drops.
 - ``cut_on(marker)``: close the next connection whose client sends ``marker``,
   without forwarding it.
 - ``hold_on(marker)``: stall all traffic as soon as a client sends ``marker``,
@@ -31,6 +34,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 _COMPLETION = b"failure_kind = $"  # only complete_attempt's UPDATE sets failure_kind
 _COMMIT = b"COMMIT"
+_ROLLBACK = b"ROLLBACK"
 
 
 def upstream_for(database_url: str) -> Callable[[], socket.socket]:
@@ -60,7 +64,7 @@ class _Pair:
     def __init__(self, client: socket.socket, server: socket.socket) -> None:
         self.client, self.server = client, server
         self.seen = b""  # the tail of what the client sent, to find markers across reads
-        self.completion_seen = False
+        self.marked: bytes | None = None  # the drop marker this transaction has sent
         self.drop_reply: _Drop | None = None
 
     def close(self) -> None:
@@ -82,7 +86,7 @@ class PgProxy:
         self._forwarding = threading.Event()
         self._forwarding.set()
         self._refusing = False
-        self._drops: deque[_Drop] = deque()
+        self._drops: dict[bytes, deque[_Drop]] = {_COMPLETION: deque()}
         self._cut: bytes | None = None
         self._hold: bytes | None = None
         self.dropped = threading.Event()  # set on each drop
@@ -117,8 +121,11 @@ class PgProxy:
             self._refusing = False
 
     def drop_completion(self, *, committed: bool, then_refuse: bool = False) -> None:
+        self.drop_commit(_COMPLETION, committed=committed, then_refuse=then_refuse)
+
+    def drop_commit(self, marker: bytes, *, committed: bool, then_refuse: bool = False) -> None:
         with self._lock:
-            self._drops.append(_Drop(committed, then_refuse))
+            self._drops.setdefault(marker, deque()).append(_Drop(committed, then_refuse))
 
     def cut_on(self, marker: bytes) -> None:
         with self._lock:
@@ -194,17 +201,22 @@ class PgProxy:
                 self.held.set()
             if cut is not None and cut in window:
                 self._cut = None
+            markers = list(self._drops)
         if cut is not None and cut in window:
             pair.close()
             self.cut.set()
             return True
-        if _COMPLETION in window:
-            pair.completion_seen = True
-        if not (pair.completion_seen and _COMMIT in data):
+        if pair.marked is not None and _ROLLBACK in data:
+            pair.marked, pair.seen = None, b""  # that transaction ended without a COMMIT
             return False
-        pair.completion_seen, pair.seen = False, b""  # this COMMIT ends the completion
+        if pair.marked is None:
+            pair.marked = next((marker for marker in markers if marker in window), None)
+        if not (pair.marked is not None and _COMMIT in data):
+            return False
+        marker, pair.marked, pair.seen = pair.marked, None, b""  # this COMMIT ends it
         with self._lock:
-            drop = self._drops.popleft() if self._drops else None
+            queue = self._drops[marker]
+            drop = queue.popleft() if queue else None
         if drop is None:
             return False
         if drop.committed:
