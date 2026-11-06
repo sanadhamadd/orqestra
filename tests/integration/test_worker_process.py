@@ -8,7 +8,9 @@ through a ``PgProxy`` the test can stall or cut. "Before its lease ended" is
 checked against PostgreSQL's own clock and the stored ``lease_expires_at``.
 Graceful shutdown (DEC-049) is driven with real SIGTERM and SIGINT, sent only
 once the worker has logged that its handlers are installed, and timed from
-the worker's own log timestamps.
+the worker's own log timestamps. The worker writes the provider usage of its
+``metered`` kind through a ``UsageSink`` (DEC-059); its provider double records
+whether each call's intent row had committed before the call.
 """
 
 import itertools
@@ -30,9 +32,23 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from orqestra.domain.jobs import Task
+from orqestra.domain.jobs import JsonValue, Task
+from orqestra.domain.leases import LeasePolicy
 from orqestra.domain.retry import RetryPolicy, retry_delay
-from orqestra.persistence.lifecycle import request_cancellation, revoke_next_expired
+from orqestra.persistence.lifecycle import (
+    request_cancellation,
+    revoke_next_expired,
+    start_attempt,
+)
+from orqestra.persistence.provider_usage import (
+    AttemptCapture,
+    AttemptUsage,
+    CaptureState,
+    CaptureTier,
+    ClosedBy,
+    capture_of,
+    read_attempt_usage,
+)
 from orqestra.worker.fence import ExitCode
 from tests.integration.pg_proxy import PgProxy
 from tests.integration.test_worker_runtime import (
@@ -44,7 +60,7 @@ from tests.integration.test_worker_runtime import (
     submit,
     task_states,
 )
-from tests.integration.worker_process import HANDLER_RUNS
+from tests.integration.worker_process import HANDLER_RUNS, PROVIDER_INVOCATIONS
 
 pytestmark = pytest.mark.integration
 
@@ -109,6 +125,22 @@ class WorkerProcess:
                     break
                 self._read += chunk.decode()
         pytest.fail(f"the worker logged none of {events}")
+
+    def pump(self) -> None:
+        """Read what the worker has logged so far without waiting, so its stderr pipe never fills.
+
+        A worker making many calls logs every usage record; unread, the pipe fills and
+        the worker blocks in a log write. The text is kept for ``exit``.
+        """
+        assert self.process.stderr is not None
+        fd = self.process.stderr.fileno()
+        for _ in range(64):  # bounded: a pipe holds far less than this many chunks
+            if not select.select([fd], [], [], 0)[0]:
+                return
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return
+            self._read += chunk.decode()
 
     def exit(self) -> tuple[int, list[dict[str, Any]]]:
         """Wait (bounded) for the process to end; its exit code and its JSON log lines."""
@@ -679,3 +711,208 @@ def test_two_workers_both_wait_for_the_stored_time(handler_db: Conn, start: Any)
     assert runs(handler_db) == 3  # each generation ran once, by one of the two
     for worker in workers:
         stop(worker)
+
+
+# --- provider usage through the worker's sink (DEC-059) ------------------------------------
+
+# Test values only (DEC-034): a 0.4 s bound leaves 0.6 s of each 1 s heartbeat interval for
+# usage writes; 1 + 0.4 + 1 < 4 and 0.2 < 0.4.
+METERED = {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT0.4S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.2S",
+}
+T3 = {"metered": CaptureTier.T3}
+ENDLESS = 1_000_000  # calls in a first attempt: it is still calling when it is stopped
+INTENT_WRITE = b"INSERT INTO provider_calls ("
+
+
+@pytest.fixture
+def usage_db(handler_db: Conn) -> Conn:
+    handler_db.execute(PROVIDER_INVOCATIONS)
+    return handler_db
+
+
+def invocations(db: Conn, usage: AttemptUsage | None = None) -> int:
+    """How many calls the provider double saw: in all, or of ``usage``'s attempt."""
+    if usage is None:
+        return int(rows(db, "SELECT count(*) FROM provider_invocations")[0][0])
+    query = "SELECT count(*) FROM provider_invocations WHERE attempt_id = %s"
+    return int(rows(db, query, usage.attempt_id)[0][0])
+
+
+def no_call_without_its_row(db: Conn) -> bool:
+    """Every call the provider double saw had its intent row committed before it."""
+    return rows(db, "SELECT bool_and(intent_committed) FROM provider_invocations") in (
+        [(True,)],
+        [(None,)],  # no call at all
+    )
+
+
+def usage_of(db: Conn, task: Task, generation: int = 1) -> AttemptUsage:
+    ((attempt_id,),) = rows(
+        db,
+        "SELECT id FROM attempts WHERE task_id = %s AND attempt_number = %s",
+        task.id,
+        generation,
+    )
+    usage = read_attempt_usage(db, attempt_id)
+    assert usage is not None
+    return usage
+
+
+def assert_t3_recovery_closure(usage: AttemptUsage) -> None:
+    """Closed by recovery at T3, and complete only if it counts every call, each answered."""
+    assert usage.closure is not None
+    closure = usage.closure.closure
+    assert (closure.closed_by, closure.capture_tier) == (ClosedBy.RECOVERY, CaptureTier.T3)
+    if closure.capture is CaptureState.COMPLETE:
+        assert closure.call_count == len(usage.calls)
+        assert all(call.result is not None for call in usage.calls)
+        assert capture_of(usage) is AttemptCapture.CLOSED
+    else:
+        assert capture_of(usage) is AttemptCapture.LOWER_BOUND
+
+
+def revoked_while_metered(db: Conn, task: Task) -> int:
+    """How many other attempts were revoked after ``task``'s first attempt started."""
+    query = (
+        "SELECT count(*) FROM attempts o JOIN attempts m ON m.task_id = %s "
+        "AND m.attempt_number = 1 WHERE o.task_id <> m.task_id AND o.state = 'revoked' "
+        "AND o.finished_at > m.started_at"
+    )
+    return int(rows(db, query, task.id)[0][0])
+
+
+def test_competing_work_and_a_stall_never_let_a_call_run_without_its_row(
+    schema_url: str, usage_db: Conn, start: Any
+) -> None:
+    # The named disproof test: sweeps and heartbeats compete with waiting intents, then
+    # the database stalls. A call made without its committed row, a renewal crowded out,
+    # a failed attempt or a retry that does not number from 0 would each fail it.
+    orphan_payloads: list[JsonValue] = [{"i": i} for i in range(8)]
+    orphans = submit(usage_db, "orphaned", *orphan_payloads)
+    for i, orphan in enumerate(orphans):
+        # Attempts of a kind no worker runs, with leases staggered from 0.5 s to 7.5 s: they
+        # keep expiring while the metered handler runs, so its sweeps really compete.
+        expiring = LeasePolicy(
+            lease=timedelta(milliseconds=500 + 1_000 * i), execution_timeout=timedelta(minutes=1)
+        )
+        start_attempt(usage_db, orphan.id, "dead-worker", policy=expiring)
+    (task,) = submit(usage_db, "metered", {"calls": 5, "first_attempt_calls": ENDLESS})
+    with PgProxy(schema_url) as proxy:
+        first = start(proxy.url(schema_url), METERED)
+        leases: list[Any] = []
+        calls: list[int] = []
+
+        def renewals() -> bool:
+            first.pump()  # every intent and result is logged: keep the worker's pipe drained
+            found = rows(
+                usage_db,
+                "SELECT lease_expires_at FROM attempts WHERE task_id = %s AND state = 'running'",
+                task.id,
+            )
+            if found and (not leases or found[0][0] != leases[-1]):
+                leases.append(found[0][0])
+                calls.append(invocations(usage_db))
+            return len(leases) >= 4 and revoked_while_metered(usage_db, task) > 0
+
+        eventually(renewals, "three renewals and a revocation while calls are made")
+        revoked_before_the_stall = revoked_while_metered(usage_db, task)
+        proxy.stall()
+        code, lines = first.exit()
+    # Before the stall: renewals kept their cadence while calls went on between them, and
+    # at least one orphan was revoked after the metered attempt started.
+    gaps = [later - earlier for earlier, later in itertools.pairwise(leases)]
+    assert max(gaps) < timedelta(seconds=2)  # heartbeat 1 s; a crowded-out one would show
+    assert calls == sorted(calls)
+    assert calls[-1] > calls[0]
+    assert revoked_before_the_stall > 0
+    assert rows(usage_db, "SELECT count(*) FROM attempts WHERE state = 'revoked'") != [(0,)]
+    # The stall ends the process through the watchdog or the fence, never as a failure.
+    assert (code, lines[-1]["event"]) in {
+        (ExitCode.STALLED, "operation_deadline_passed"),
+        (ExitCode.FENCED, "ownership_deadline_passed"),
+    }
+    assert no_failure_recorded(usage_db, task)
+    assert no_call_without_its_row(usage_db)
+    # Recovery by another worker closes the revoked attempt at T3; the retry numbers from 0.
+    second = start(overrides=METERED)
+    eventually(lambda: task_states(usage_db, [task]) == [("succeeded", 2)], "the retry")
+    stop(second)
+    first_usage = usage_of(usage_db, task, 1)
+    assert first_usage.attempt_state.value == "revoked"
+    assert_t3_recovery_closure(first_usage)
+    made = invocations(usage_db, first_usage)
+    assert made <= len(first_usage.calls) <= made + 1  # at most one intent without its call
+    retry = usage_of(usage_db, task, 2)
+    assert [call.call.intent.call_seq for call in retry.calls] == [0, 1, 2, 3, 4]
+    assert retry.closure is not None
+    assert (retry.closure.closure.capture, retry.closure.closure.call_count) == (
+        CaptureState.COMPLETE,
+        5,
+    )
+    assert no_call_without_its_row(usage_db)
+
+
+def test_a_fence_during_a_stalled_call_leaves_it_unresolved_for_recovery(
+    schema_url: str, usage_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(usage_db, "metered", {"calls": 1, "gate": gate.key})
+    with PgProxy(schema_url) as proxy:
+        worker = start(proxy.url(schema_url), METERED)
+        eventually(lambda: invocations(usage_db) == 1, "the call in flight")
+        proxy.refuse()  # heartbeats are never confirmed again
+        code, lines = worker.exit()
+    assert code == ExitCode.FENCED
+    assert lines[-1]["event"] == "ownership_deadline_passed"
+    assert no_failure_recorded(usage_db, task)
+    revocation = eventually(
+        lambda: revoke_next_expired(usage_db, retry_policy=RETRY, usage_capture=T3),
+        "the lease to end",
+    )
+    assert revocation.usage_closure is not None
+    usage = usage_of(usage_db, task)
+    assert [call.result for call in usage.calls] == [None]  # the call stays unresolved
+    assert_t3_recovery_closure(usage)
+    assert usage.closure is not None
+    assert usage.closure.closure.capture is CaptureState.INCOMPLETE
+    assert no_call_without_its_row(usage_db)
+
+
+def test_a_stalled_intent_write_ends_the_process_before_any_call(
+    schema_url: str, usage_db: Conn, start: Any
+) -> None:
+    (task,) = submit(usage_db, "metered", {"calls": 1})
+    with PgProxy(schema_url) as proxy:
+        proxy.hold_on(INTENT_WRITE)  # the intent's write never gets an answer
+        worker = start(proxy.url(schema_url), METERED)
+        code, lines = worker.exit()
+    assert code == ExitCode.STALLED
+    assert lines[-1]["event"] == "operation_deadline_passed"
+    assert lines[-1]["operation"] == "record_call_intent"
+    assert lines[-1]["call_seq"] == "0"
+    assert invocations(usage_db) == 0  # no call
+    assert usage_of(usage_db, task).calls == ()
+    assert no_failure_recorded(usage_db, task)
+
+
+def test_a_killed_worker_mid_batch_leaves_no_call_without_its_row(
+    usage_db: Conn, start: Any
+) -> None:
+    (task,) = submit(usage_db, "metered", {"calls": 1, "first_attempt_calls": ENDLESS})
+    worker = start(overrides=METERED)
+    eventually(lambda: invocations(usage_db) >= 20, "calls under way")
+    worker.kill()  # SIGKILL: no exit path runs
+    revocation = eventually(
+        lambda: revoke_next_expired(usage_db, retry_policy=RETRY, usage_capture=T3),
+        "the lease to end",
+    )
+    assert revocation.usage_closure is not None
+    usage = usage_of(usage_db, task)
+    made = invocations(usage_db, usage)
+    assert made <= len(usage.calls) <= made + 1
+    assert [call.call.intent.call_seq for call in usage.calls] == list(range(len(usage.calls)))
+    assert sum(call.result is None for call in usage.calls) <= 1
+    assert_t3_recovery_closure(usage)
+    assert no_call_without_its_row(usage_db)
+    assert no_failure_recorded(usage_db, task)
