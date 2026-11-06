@@ -63,7 +63,7 @@ from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 
-from orqestra.ai.recording import MAX_CALL_SEQ, ProviderCallIntent, ProviderCallResult
+from orqestra.calls.recording import MAX_CALL_SEQ, ProviderCallIntent, ProviderCallResult
 from orqestra.domain.kinds import check_job_kinds
 from orqestra.domain.leases import check_duration
 from orqestra.persistence.provider_usage import (

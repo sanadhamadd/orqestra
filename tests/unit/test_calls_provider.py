@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.provider import (
+from orqestra.calls.provider import (
     FieldKind,
     PermanentCode,
     ProviderPermanentError,

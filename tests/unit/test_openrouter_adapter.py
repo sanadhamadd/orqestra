@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from orqestra.ai.provider import (
+from orqestra.calls.provider import (
     FieldKind,
     PermanentCode,
     ProviderPermanentError,

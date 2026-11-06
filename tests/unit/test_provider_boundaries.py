@@ -21,8 +21,8 @@ from pydantic import SecretStr
 
 import orqestra
 import orqestra.providers
-from orqestra.ai import routing
-from orqestra.ai.provider import FieldKind, make_request
+from orqestra.calls import routing
+from orqestra.calls.provider import FieldKind, make_request
 from orqestra.persistence import provider_usage
 from orqestra.persistence.provider_usage import CallIntent, CallOutcome, CallResult
 from orqestra.providers import openrouter, stdlib_transport
@@ -48,7 +48,7 @@ STDLIB = frozenset(
 )
 NETWORK = frozenset({"http", "ssl", "socket"})
 NETWORK_MODULE = "stdlib_transport.py"
-ORQESTRA = ("orqestra.ai.provider", "orqestra.domain", "orqestra.providers")
+ORQESTRA = ("orqestra.calls.provider", "orqestra.domain", "orqestra.providers")
 FORBIDDEN_CALLS = frozenset({"__import__", "eval", "exec", "compile"})
 
 
@@ -112,8 +112,8 @@ def test_every_module_keeps_to_the_allow_list() -> None:
         ("import orqestra.workloads", False, ["import orqestra.workloads is not allowed"]),
         ("import orqestra.aggregation", False, ["import orqestra.aggregation is not allowed"]),
         ("from orqestra import cli", False, ["import orqestra is not allowed"]),
-        ("import orqestra.ai.routing", False, ["import orqestra.ai.routing is not allowed"]),
-        ("from orqestra.ai.provider import x", False, []),
+        ("import orqestra.calls.routing", False, ["import orqestra.calls.routing is not allowed"]),
+        ("from orqestra.calls.provider import x", False, []),
         ("from orqestra.domain.errors import x", False, []),
         ("from orqestra.providers.transport import x", False, []),
         ("import orqestra.providersx", False, ["import orqestra.providersx is not allowed"]),
@@ -161,7 +161,7 @@ def test_no_module_outside_the_package_imports_it() -> None:
         ("import orqestra.providers.openrouter", True),
         ("from orqestra.providers import openrouter", True),
         ("from orqestra import providers", True),
-        ("from orqestra.ai import provider", False),
+        ("from orqestra.calls import provider", False),
         ("import orqestra.persistence", False),
     ],
 )

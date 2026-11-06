@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
-from orqestra.ai.provider import FieldKind
+from orqestra.calls.provider import FieldKind
 
 AMOUNT_DIGITS = 64
 MAX_AMOUNT = 10**AMOUNT_DIGITS - 1

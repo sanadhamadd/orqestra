@@ -23,14 +23,14 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from orqestra.ai.provider import (
+from orqestra.calls.provider import (
     FieldKind,
     ProviderRequest,
     ProviderResponse,
     ProviderUsage,
     make_request,
 )
-from orqestra.ai.recording import MAX_CALL_SEQ
+from orqestra.calls.recording import MAX_CALL_SEQ
 from orqestra.domain.jobs import JsonValue, Task
 from orqestra.persistence.lifecycle import request_cancellation, revoke_next_expired
 from orqestra.persistence.provider_usage import (

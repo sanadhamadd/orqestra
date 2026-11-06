@@ -1,7 +1,7 @@
 [project]
 name = "orqestra"
 version = "0.1.0.dev0"
-description = "Distributed AI workload execution platform: concurrent workers, fault-tolerant task processing, cost-aware AI orchestration."
+description = "Distributed workload execution platform: concurrent workers, fault-tolerant task processing, cost-aware provider orchestration."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

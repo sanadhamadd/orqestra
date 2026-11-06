@@ -41,10 +41,10 @@ from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from types import MappingProxyType
 
-from orqestra.ai.mock import MockProvider
-from orqestra.ai.provider import Provider
-from orqestra.ai.recording import ProviderCallRecorder
-from orqestra.ai.routing import RouteOption, check_routes, check_units
+from orqestra.calls.mock import MockProvider
+from orqestra.calls.provider import Provider
+from orqestra.calls.recording import ProviderCallRecorder
+from orqestra.calls.routing import RouteOption, check_routes, check_units
 from orqestra.domain.errors import PermanentError
 from orqestra.domain.jobs import JsonValue
 from orqestra.worker.handlers import Handler, HandlerCancelled, TaskContext

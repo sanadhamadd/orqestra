@@ -69,7 +69,7 @@ from enum import StrEnum
 from psycopg import errors
 from psycopg.rows import TupleRow
 
-from orqestra.ai.provider import FieldKind
+from orqestra.calls.provider import FieldKind
 from orqestra.domain.errors import OrqestraError
 from orqestra.domain.states import AttemptState
 from orqestra.persistence._shared import (
@@ -92,7 +92,7 @@ GENERATION_ID_MAX_LENGTH = 128
 AMOUNT_MAX_SCALE = 18
 AMOUNT_LIMIT = Decimal("1E+20")  # exclusive
 
-# The routing route-id pattern (orqestra.ai.routing), also used for provider names
+# The routing route-id pattern (orqestra.calls.routing), also used for provider names
 # and prompt versions.
 _IDENTIFIER = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 

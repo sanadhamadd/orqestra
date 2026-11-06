@@ -21,7 +21,7 @@ import pytest
 from psycopg import errors, sql
 from psycopg.rows import TupleRow
 
-from orqestra.ai.provider import FieldKind
+from orqestra.calls.provider import FieldKind
 from orqestra.domain.jobs import Attempt, Task
 from orqestra.domain.states import AttemptState
 from orqestra.persistence.lifecycle import NotFoundError, get_attempt, start_attempt

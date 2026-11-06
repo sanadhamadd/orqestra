@@ -26,7 +26,7 @@ from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
 from orqestra.aggregation.invoice import WrongJobKindError, summarize_invoice_job
-from orqestra.ai.mock import MockProvider
+from orqestra.calls.mock import MockProvider
 from orqestra.domain.errors import PermanentError
 from orqestra.domain.jobs import (
     Attempt,

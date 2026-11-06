@@ -18,8 +18,8 @@ import psycopg
 import pytest
 from psycopg import errors
 
-from orqestra.ai.provider import FieldKind, PermanentCode, ProviderUsage, TransientCode
-from orqestra.ai.recording import (
+from orqestra.calls.provider import FieldKind, PermanentCode, ProviderUsage, TransientCode
+from orqestra.calls.recording import (
     MAX_CALL_SEQ,
     CallOutcome,
     ProviderCallIntent,

@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-from orqestra.ai.provider import FieldKind, PermanentCode, ProviderUsage, TransientCode
-from orqestra.ai.recording import (
+from orqestra.calls.provider import FieldKind, PermanentCode, ProviderUsage, TransientCode
+from orqestra.calls.recording import (
     MAX_CALL_SEQ,
     MAX_COST_UNITS,
     CallOutcome,
