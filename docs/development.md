@@ -40,6 +40,33 @@ local `orqestra_test`. A missing URL is an error, never a skip. Each test works 
 schema (prefix `orq_test_`), dropped afterwards; cleanup only drops schemas with that
 prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production database.
 
+## Local PostgreSQL with Docker Compose
+
+`compose.yaml` runs one PostgreSQL server for local development and the integration
+tests, from the same `postgres:16.15` image digest that CI uses. It is not for production:
+like CI's service container, it accepts the local-only user `orqestra_local` without a
+password, and it has no backups, tuning or restart policy. The port is bound to
+`127.0.0.1` only, on 5433 so that a server already using 5432 is not in the way, and the
+data lives in the named volume `orqestra_postgres-data`.
+
+```sh
+docker compose up -d --wait         # starts the server and waits for its health check
+export ORQESTRA_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_local
+uv run orqestra migrate
+```
+
+For the integration tests, create the test database once and point the tests at it:
+
+```sh
+docker compose exec postgres createdb -U orqestra_local orqestra_test   # once per volume
+export ORQESTRA_TEST_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_test
+make verify
+```
+
+`docker compose down` stops the server and keeps the data. `docker compose down -v` also
+removes the volume, so both databases are gone; the next `up` starts from an empty server,
+and the test database has to be created again.
+
 ## Migrations
 
 - One versioned file per change in `src/orqestra/persistence/migrations/`, named
