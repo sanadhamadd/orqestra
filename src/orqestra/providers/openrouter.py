@@ -2,7 +2,7 @@
 
 ``OpenRouterProvider(config, transport)`` answers one ``ProviderRequest`` with one
 non-streaming POST through the injected ``HttpTransport``. It never retries, logs
-nothing, and imports nothing outside the standard library, ``orqestra.ai.provider``,
+nothing, and imports nothing outside the standard library, the provider contract,
 ``orqestra.domain`` and this package.
 
 Flow of ``call(request)``:
@@ -82,7 +82,7 @@ TOKEN_MAX = 2**63 - 1
 ID_MAX_LENGTH = 128
 MODEL_MAX_LENGTH = 128
 
-# The routing route-id rule (orqestra.ai.routing); a test keeps them equal.
+# The routing module's route-id rule; a test keeps them equal.
 ROUTE_ID_PATTERN = r"[A-Za-z0-9._-]{1,64}"
 # A project rule for an OpenRouter model slug, such as ``vendor/model:variant``.
 MODEL_PATTERN = rf"[A-Za-z0-9][A-Za-z0-9._:/-]{{0,{MODEL_MAX_LENGTH - 1}}}"

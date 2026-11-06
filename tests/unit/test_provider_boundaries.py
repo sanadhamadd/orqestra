@@ -1,7 +1,7 @@
 """The providers package's import boundary, that nothing uses it yet, and its mirrored limits.
 
 An AST scan holds every module of ``orqestra.providers`` to an allow-list: the
-standard library modules below, ``orqestra.ai.provider``, ``orqestra.domain`` and the
+standard library modules below, the provider contract module, ``orqestra.domain`` and the
 package itself. Only ``stdlib_transport`` may import the network stack. No other
 ``src`` module imports the package, so the adapter is unwired. The adapter copies
 the usage ledger's limits instead of importing persistence; a test keeps them equal.

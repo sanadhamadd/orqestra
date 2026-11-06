@@ -25,11 +25,22 @@ A real replay resends the same ``Decimal``; two readings of one provider figure
 that differ in scale point to a parsing defect, which is not hidden.
 
 Writes are accepted whatever state the attempt is in: a provider that was called
-was called. A fact recorded after its attempt stopped running is flagged ``late``,
-which is advisory only. An intent or result committed after a complete closure is
-also accepted, so a report must re-check completeness. Nothing here changes a task
-or an attempt. No write locks a task row; an intent waits only for a lifecycle
-``FOR UPDATE`` lock on its own attempt row (the foreign key's ``KEY SHARE``).
+was called. A fact recorded after its attempt stopped running is flagged ``late``.
+An intent reads its attempt ``FOR KEY SHARE`` (the foreign key's own lock mode,
+taken earlier), so an intent that waited behind a completion or a revocation reads
+the state that transition committed and is flagged late accurately; a result's
+flag is advisory. An intent or result committed after a complete closure is also
+accepted, so a report must re-check completeness (``capture_of``). Nothing here
+changes a task or an attempt. No write locks a task row; an intent waits only for
+a lifecycle ``FOR UPDATE`` lock on its own attempt row.
+
+Closures written by the lifecycle (DEC-057). ``complete_attempt`` can close the
+capture with the worker's closure, and ``revoke_next_expired`` with a closure it
+derives for the kinds it is told about, each in the transaction that ends the
+attempt (``close_capture`` and ``close_capture_on_recovery``). That transaction
+holds the attempt row ``FOR UPDATE``, so no intent can be added while the closure
+is checked and written. ``record_late_usage`` records a result that arrives after
+the attempt may have ended and says whether a closure already exists.
 
 Text rule. ``capability``, ``model``, ``reported_unit``, ``model_served`` and
 ``provider_generation_id`` must be a ``str`` that is not blank after ``.strip()``
@@ -41,7 +52,8 @@ The database's ``btrim`` checks are looser than this rule on purpose: they are a
 backstop, not the gate. Non-ASCII text assumes a UTF-8 server encoding.
 
 ``read_attempt_usage`` reads one attempt's ledger in one ``REPEATABLE READ, READ
-ONLY`` transaction. It computes no totals.
+ONLY`` transaction, and ``capture_of`` classifies what it read. Neither computes
+totals.
 
 The module has no function that removes ledger rows, and logs carry ids only.
 """
@@ -64,10 +76,10 @@ from orqestra.persistence._shared import (
     _CALLER_TRANSACTION,
     Conn,
     Cursor,
+    NotFoundError,
     owned_transaction,
     tuple_cursor,
 )
-from orqestra.persistence.lifecycle import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +486,10 @@ class CaptureNotCompleteError(OrqestraError):
 
 # Every parameter in a SELECT list is cast: psycopg sends str and None untyped, and
 # PostgreSQL would resolve them to text there, whatever the target column.
+# FOR KEY SHARE OF a is the lock the foreign key takes anyway, taken before the row is
+# read: an intent that waits behind a lifecycle lock on its attempt re-reads a.state
+# once that transaction commits (READ COMMITTED), so the late flag is the committed
+# state. The task row is read without a lock.
 _INSERT_INTENT = """
 INSERT INTO provider_calls (
     attempt_id, call_seq, job_id, task_id, provider, route_id, prompt_version, capability,
@@ -483,6 +499,7 @@ SELECT a.id, %s::integer, t.job_id, t.id, %s::text, %s::text, %s::text, %s::text
     %s::text, %s::text, %s::integer, %s::bigint, a.state
 FROM attempts a JOIN tasks t ON t.id = a.task_id
 WHERE a.id = %s::uuid
+FOR KEY SHARE OF a
 ON CONFLICT (attempt_id, call_seq) DO NOTHING
 RETURNING job_id, task_id, attempt_state_at_record, recorded_at
 """
@@ -663,28 +680,76 @@ def record_call_result(conn: Conn, result: CallResult) -> Recorded[StoredResult]
     ``created=False``; different content raises ``UsageReplayConflictError``. Raises
     ``RuntimeError`` if the caller already has a transaction open on ``conn``.
     """
-    content = _result_content(result)
     with owned_transaction(conn, "record_call_result") as cur:
-        row = cur.execute(_INSERT_RESULT, (*content, result.attempt_id, result.call_seq)).fetchone()
-        created = row is not None
-        if row is None:
-            row = cur.execute(_SELECT_RESULT, (result.attempt_id, result.call_seq)).fetchone()
-            if row is None:
-                raise CallIntentNotFoundError(result.attempt_id, result.call_seq)
-            *stored, state, recorded_at = row
-            if _result_identity(tuple(stored)) != _result_identity(content):
-                raise UsageReplayConflictError("call result", result.attempt_id, result.call_seq)
-        else:
-            state, recorded_at = row
-    record = StoredResult(result, AttemptState(state), recorded_at)
-    if created:
+        recorded = _write_result(cur, result)
+    if recorded.created:
         logger.info(
             "recorded provider call result: attempt %s call %s%s",
             result.attempt_id,
             result.call_seq,
-            _late_note(record.attempt_state_at_record),
+            _late_note(recorded.record.attempt_state_at_record),
         )
-    return Recorded(record, created)
+    return recorded
+
+
+def _write_result(cur: Cursor, result: CallResult) -> Recorded[StoredResult]:
+    """Insert the result or match it against the stored one, on the caller's cursor."""
+    content = _result_content(result)
+    row = cur.execute(_INSERT_RESULT, (*content, result.attempt_id, result.call_seq)).fetchone()
+    created = row is not None
+    if row is None:
+        row = cur.execute(_SELECT_RESULT, (result.attempt_id, result.call_seq)).fetchone()
+        if row is None:
+            raise CallIntentNotFoundError(result.attempt_id, result.call_seq)
+        *stored, state, recorded_at = row
+        if _result_identity(tuple(stored)) != _result_identity(content):
+            raise UsageReplayConflictError("call result", result.attempt_id, result.call_seq)
+    else:
+        state, recorded_at = row
+    return Recorded(StoredResult(result, AttemptState(state), recorded_at), created)
+
+
+@dataclass(frozen=True, slots=True)
+class LateUsage:
+    """A result recorded by ``record_late_usage``, and the attempt's closure as then read.
+
+    ``closure`` is the closure committed when the result was written, or ``None``.
+    It is read, never written or changed.
+    """
+
+    result: Recorded[StoredResult]
+    closure: StoredClosure | None
+
+    @property
+    def after_closure(self) -> bool:
+        """The attempt's capture was already closed: the closure may not count this call."""
+        return self.closure is not None
+
+
+def record_late_usage(conn: Conn, result: CallResult) -> LateUsage:
+    """Record a call's result that may arrive after its attempt ended, and read its closure.
+
+    One READ COMMITTED transaction: the same insert-or-match as
+    ``record_call_result``, then a read of the attempt's closure. It never writes or
+    changes a closure, and it does not refuse a running attempt: whether the attempt
+    has ended is decided by the stored state, which is the authoritative late flag
+    (``result.record.late``). A created late row is logged as a warning. Raises
+    exactly what ``record_call_result`` raises.
+    """
+    with owned_transaction(conn, "record_late_usage") as cur:
+        recorded = _write_result(cur, result)
+        row = cur.execute(_SELECT_CLOSURE, (result.attempt_id,)).fetchone()
+    late = LateUsage(recorded, None if row is None else _stored_closure(result.attempt_id, row))
+    if recorded.created:
+        log = logger.warning if recorded.record.late else logger.info
+        log(
+            "recorded provider call result: attempt %s call %s%s%s",
+            result.attempt_id,
+            result.call_seq,
+            _late_note(recorded.record.attempt_state_at_record),
+            " after its usage closure" if late.after_closure else "",
+        )
+    return late
 
 
 def record_usage_closure(conn: Conn, closure: UsageClosure) -> Recorded[StoredClosure]:
@@ -695,7 +760,9 @@ def record_usage_closure(conn: Conn, closure: UsageClosure) -> Recorded[StoredCl
     the stored record with ``created=False``, even if a call was recorded since;
     different content raises ``UsageReplayConflictError``. Raises ``NotFoundError``
     if the attempt does not exist, and ``RuntimeError`` if the caller already has a
-    transaction open on ``conn``.
+    transaction open on ``conn``. It does not lock the attempt: a closure recorded here
+    while the attempt runs can be followed by intents that are not late. Pass the
+    closure to ``complete_attempt`` to close the capture atomically with the attempt.
     """
     with owned_transaction(conn, "record_usage_closure") as cur:
         recorded_at, created = _write_closure(cur, closure)
@@ -761,6 +828,75 @@ def _insert_closure(
         if constraint == _ATTEMPT_EXISTS_CONSTRAINT:  # pragma: no cover - attempts stay
             raise NotFoundError("attempt", closure.attempt_id) from exc
         raise
+
+
+# --- closures written by the lifecycle (DEC-057) -----------------------------------------
+#
+# Both run on the lifecycle's cursor, inside the transaction that ends the attempt and
+# after it has locked the attempt row FOR UPDATE. No intent of the attempt can commit
+# while that lock is held (an intent needs KEY SHARE on the row), and results are only
+# added, so the counts read here stay true until the transaction commits.
+
+
+def close_capture(cur: Cursor, closure: UsageClosure) -> Recorded[StoredClosure]:
+    """Write the worker's closure in the caller's transaction, by ``record_usage_closure``'s rule.
+
+    An identical stored closure is a replay (``created=False``); a different one
+    raises ``UsageReplayConflictError``; a complete closure that does not count every
+    recorded intent, each with its result, raises ``CaptureNotCompleteError``. Any
+    error leaves the caller's transaction to roll back. For ``complete_attempt`` only.
+    """
+    recorded_at, created = _write_closure(cur, closure)
+    return Recorded(StoredClosure(closure, recorded_at), created)
+
+
+def close_capture_on_recovery(
+    cur: Cursor, attempt_id: uuid.UUID, tier: CaptureTier
+) -> Recorded[StoredClosure]:
+    """Close a revoked attempt's capture in the caller's transaction; never a replay conflict.
+
+    An existing closure, whatever it says, is kept and returned with
+    ``created=False``. Otherwise, at tier T3 the capture is ``complete`` with
+    ``call_count`` the number of intents when every intent has a result (zero
+    intents is ``complete(0)``), and ``incomplete`` otherwise; at T1 and T2 it is
+    ``incomplete``. It is closed by ``RECOVERY`` at ``tier``. If a concurrent
+    closure commits first, that one is kept and returned with ``created=False``.
+    For ``revoke_next_expired`` only.
+    """
+    stored = cur.execute(_SELECT_CLOSURE, (attempt_id,)).fetchone()
+    if stored is not None:
+        return Recorded(_stored_closure(attempt_id, stored), False)
+    closure = _recovery_closure(cur, attempt_id, tier)
+    inserted = _insert_closure(cur, closure, _closure_content(closure))
+    if inserted is not None:
+        return Recorded(StoredClosure(closure, inserted[0]), True)
+    # Another transaction committed a closure for this attempt meanwhile: it stands.
+    stored = cur.execute(_SELECT_CLOSURE, (attempt_id,)).fetchone()
+    if stored is None:  # pragma: no cover - a conflict leaves a committed row
+        msg = f"the closure of attempt {attempt_id} could not be read"
+        raise RuntimeError(msg)
+    return Recorded(_stored_closure(attempt_id, stored), False)
+
+
+def _recovery_closure(cur: Cursor, attempt_id: uuid.UUID, tier: CaptureTier) -> UsageClosure:
+    """The closure recovery can vouch for at ``tier``, from the intents and results now stored."""
+    if tier is CaptureTier.T3:
+        counts = cur.execute(_CAPTURE_COUNTS, (attempt_id,)).fetchone()
+        intents, unanswered = (0, 0) if counts is None else counts
+        if unanswered == 0:
+            return UsageClosure(
+                attempt_id=attempt_id,
+                capture=CaptureState.COMPLETE,
+                closed_by=ClosedBy.RECOVERY,
+                capture_tier=tier,
+                call_count=intents,
+            )
+    return UsageClosure(
+        attempt_id=attempt_id,
+        capture=CaptureState.INCOMPLETE,
+        closed_by=ClosedBy.RECOVERY,
+        capture_tier=tier,
+    )
 
 
 # --- read -------------------------------------------------------------------------------
@@ -870,3 +1006,41 @@ def _stored_closure(attempt_id: uuid.UUID, row: TupleRow) -> StoredClosure:
         call_count=call_count,
     )
     return StoredClosure(closure, recorded_at)
+
+
+# --- classification ---------------------------------------------------------------------
+
+
+class AttemptCapture(StrEnum):
+    """What one attempt's ledger can be trusted to say. Values are stable identifiers."""
+
+    OPEN = "open"  # the attempt is still running: calls may still be recorded
+    CLOSED = "closed"  # a complete closure counts exactly the calls stored, each answered
+    LOWER_BOUND = "lower_bound"  # calls are stored, but more may have been made
+    NOT_CAPTURED = "not_captured"  # nothing was recorded: unknown, never zero
+
+
+def capture_of(usage: AttemptUsage) -> AttemptCapture:
+    """Classify an attempt's ledger as read by ``read_attempt_usage``. Pure; no totals.
+
+    In order: a running attempt is ``OPEN``, even if a closure exists. A complete
+    closure whose ``call_count`` equals the number of calls read, each with a
+    result, is ``CLOSED``. Any other closure (incomplete, or contradicted by a call
+    or a result recorded since), and a finished attempt with calls but no closure,
+    is ``LOWER_BOUND``. A finished attempt with neither is ``NOT_CAPTURED``: its
+    calls were not recorded, which is not the same as none being made.
+    """
+    if usage.attempt_state is AttemptState.RUNNING:
+        return AttemptCapture.OPEN
+    if usage.closure is not None:
+        closure = usage.closure.closure
+        if (
+            closure.capture is CaptureState.COMPLETE
+            and closure.call_count == len(usage.calls)
+            and all(call.result is not None for call in usage.calls)
+        ):
+            return AttemptCapture.CLOSED
+        return AttemptCapture.LOWER_BOUND
+    if usage.calls:
+        return AttemptCapture.LOWER_BOUND
+    return AttemptCapture.NOT_CAPTURED

@@ -42,6 +42,12 @@ Reconciliation (DEC-047): when a completion's answer is lost,
 and says whether that completion committed, the attempt is still running, or
 recovery revoked it, comparing a result with PostgreSQL's ``jsonb`` equality.
 
+Usage closure (DEC-057): ``complete_attempt`` and ``revoke_next_expired`` can
+close the attempt's provider usage capture as the last write of the transaction
+that ends it, after the attempt row is locked, so the closure commits or rolls
+back with the transition. The lock order is unchanged: task, attempt, then the
+closure's key. Without their new arguments neither writes to the ledger.
+
 These operations are building blocks for at-least-once execution. The worker
 runtime (``orqestra.worker.runtime``) runs them; revoking an attempt in the
 database does not by itself stop its worker.
@@ -49,7 +55,7 @@ database does not by itself stop its worker.
 
 import logging
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -95,6 +101,17 @@ from orqestra.persistence._shared import (
     owned_transaction,
     task_from_row,
     tuple_cursor,
+)
+from orqestra.persistence._shared import NotFoundError as NotFoundError  # re-exported
+from orqestra.persistence.provider_usage import (
+    CaptureState,
+    CaptureTier,
+    ClosedBy,
+    Recorded,
+    StoredClosure,
+    UsageClosure,
+    close_capture,
+    close_capture_on_recovery,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,15 +221,9 @@ _RECOVER_TASK = (
     "available_at = COALESCE(%s, available_at) "
     f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
-
-
-class NotFoundError(OrqestraError, LookupError):
-    """The task or attempt a write refers to does not exist."""
-
-    def __init__(self, kind: str, record_id: uuid.UUID) -> None:
-        super().__init__(f"{kind} {record_id} does not exist")
-        self.kind = kind
-        self.record_id = record_id
+# Recovery reads the revoked attempt's job kind without a lock, to choose its capture
+# tier (DEC-057). Like discovery, it relies on a job's kind never changing.
+_JOB_KIND = "SELECT kind FROM jobs WHERE id = %s"
 
 
 class TaskNotStartableError(OrqestraError):
@@ -334,18 +345,28 @@ class WorkerMismatchError(OrqestraError):
 
 @dataclass(frozen=True, slots=True)
 class AttemptCompletion:
-    """The finished attempt and its task as stored by ``complete_attempt``."""
+    """The finished attempt and its task as stored by ``complete_attempt``.
+
+    ``usage_closure`` is the closure written or matched in the same transaction,
+    or ``None`` when the completion was given no closure.
+    """
 
     attempt: Attempt
     task: Task
+    usage_closure: Recorded[StoredClosure] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class AttemptRevocation:
-    """The revoked attempt and its task as stored by ``revoke_next_expired``."""
+    """The revoked attempt and its task as stored by ``revoke_next_expired``.
+
+    ``usage_closure`` is the attempt's closure after the revocation, written or kept
+    in the same transaction, or ``None`` when its job kind has no capture tier.
+    """
 
     attempt: Attempt
     task: Task
+    usage_closure: Recorded[StoredClosure] | None = None
 
 
 class CancellationOutcome(StrEnum):
@@ -472,8 +493,9 @@ def complete_attempt(
     generation: int,
     outcome: AttemptOutcome,
     retry_policy: RetryPolicy,
+    usage_closure: UsageClosure | None = None,
 ) -> AttemptCompletion:
-    """Record how an attempt ended and move its task accordingly.
+    """Record how an attempt ended, move its task accordingly, and close its usage capture.
 
     ``generation`` is the attempt's number as returned by ``start_attempt``.
     The write takes effect only if the attempt still holds the task's current
@@ -493,7 +515,20 @@ def complete_attempt(
     ``ValueError`` from the policy for a cancelled outcome without a
     cancellation request, or when the retry time of a requeued task is not a
     representable timestamp.
+
+    Usage closure (DEC-057). With ``usage_closure``, the attempt's provider usage
+    capture is closed in the same transaction, after the attempt and the task are
+    written, whatever the outcome (a requeued attempt is closed too). It is checked
+    before anything is sent: ``TypeError`` if it is not a ``UsageClosure``,
+    ``ValueError`` if it names another attempt or is not closed by ``WORKER``. A
+    stored identical closure is a replay (``created=False``). Raises, and then
+    neither the closure nor the completion is recorded: ``UsageReplayConflictError``
+    when a different closure is stored; ``CaptureNotCompleteError`` when a complete
+    closure does not count every recorded intent, each with its result. That is a
+    defect of the caller's count; it may complete again with an ``incomplete``
+    closure. Without ``usage_closure`` nothing is written to the ledger.
     """
+    _check_worker_closure(attempt_id, usage_closure)
     with owned_transaction(conn, "complete_attempt") as cur:
         task = _lock_task(cur, _LOCK_TASK_OF_ATTEMPT, attempt_id, "attempt")
         current = attempt_from_row(_locked(cur, _LOCK_ATTEMPT, attempt_id, "attempt"))
@@ -551,12 +586,70 @@ def complete_attempt(
                 ),
             )
         )
-        completion = AttemptCompletion(attempt_from_row(attempt_row), task_from_row(task_row))
+        # Last, on this cursor: the attempt row is locked, so its intents cannot change.
+        closure = None if usage_closure is None else close_capture(cur, usage_closure)
+        completion = AttemptCompletion(
+            attempt_from_row(attempt_row), task_from_row(task_row), closure
+        )
     logger.info(
         "attempt completed",
         extra={"task_id": str(task.id), "attempt_id": str(attempt_id)},
     )
+    if closure is not None:
+        _log_closure(task.id, attempt_id, closure)
     return completion
+
+
+def _check_worker_closure(attempt_id: uuid.UUID, closure: object) -> None:
+    """Refuse a worker closure that cannot be this attempt's, before any I/O."""
+    if closure is None:
+        return
+    if not isinstance(closure, UsageClosure):
+        msg = f"usage_closure must be a UsageClosure, got {type(closure).__name__}"
+        raise TypeError(msg)
+    if closure.attempt_id != attempt_id:
+        msg = f"usage_closure names attempt {closure.attempt_id}, not {attempt_id}"
+        raise ValueError(msg)
+    if closure.closed_by is not ClosedBy.WORKER:
+        msg = "a completion's usage_closure must be closed by WORKER"
+        raise ValueError(msg)
+
+
+def _log_closure(
+    task_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    closure: Recorded[StoredClosure],
+    *,
+    warn_if_kept: bool = False,
+) -> None:
+    """Log a lifecycle closure after commit, ids only.
+
+    A warning when the closure is incomplete, and, with ``warn_if_kept``, when an
+    existing closure was kept instead of the one this transaction would have written.
+    """
+    stored = closure.record.closure
+    extra = {"task_id": str(task_id), "attempt_id": str(attempt_id)}
+    if warn_if_kept and not closure.created:
+        logger.warning(
+            "usage closure kept: %s by %s",
+            stored.capture.value,
+            stored.closed_by.value,
+            extra=extra,
+        )
+    elif stored.capture is CaptureState.INCOMPLETE:
+        logger.warning(
+            "usage closed incomplete by %s at %s",
+            stored.closed_by.value,
+            stored.capture_tier.value,
+            extra=extra,
+        )
+    else:
+        logger.info(
+            "usage closed complete by %s at %s",
+            stored.closed_by.value,
+            stored.capture_tier.value,
+            extra=extra,
+        )
 
 
 def renew_lease(
@@ -617,8 +710,13 @@ def renew_lease(
     return attempt
 
 
-def revoke_next_expired(conn: Conn, *, retry_policy: RetryPolicy) -> AttemptRevocation | None:
-    """Revoke one running attempt whose lease has expired, and move its task.
+def revoke_next_expired(
+    conn: Conn,
+    *,
+    retry_policy: RetryPolicy,
+    usage_capture: Mapping[str, CaptureTier] | None = None,
+) -> AttemptRevocation | None:
+    """Revoke one running attempt whose lease has expired, move its task, and close its capture.
 
     In one transaction: lock the task of the most overdue expired attempt that
     no other transaction has locked, then the attempt; re-check against the
@@ -637,7 +735,22 @@ def revoke_next_expired(conn: Conn, *, retry_policy: RetryPolicy) -> AttemptRevo
     revoked nothing: no expired attempt was unlocked, or the one found was
     renewed before it could be locked. It revokes at most one attempt;
     sweeping repeatedly is the caller's job.
+
+    Usage closure (DEC-057). ``usage_capture`` maps job kinds to the capture tier
+    their handlers record at. It is checked and copied before anything is sent:
+    ``TypeError`` if it is not a mapping or a tier is not a ``CaptureTier``, and
+    the kinds as ``claim_next_attempt`` checks them (so an empty mapping is a
+    ``ValueError``). In the revocation's transaction, an attempt of a mapped kind
+    gets a closure by ``RECOVERY``: at T3 ``complete`` with the number of intents
+    when every intent has a result, otherwise ``incomplete``; at T1 and T2 always
+    ``incomplete``. An attempt that already has a closure keeps it, and the
+    revocation still commits; recovery never raises a replay conflict. An
+    attempt of an unmapped kind, or any attempt when ``usage_capture`` is
+    ``None``, gets no closure. Map a kind to T3 only if its handlers record every
+    intent before making the call: a T3 closure of a kind that records nothing is
+    ``complete(0)``.
     """
+    tiers = _check_usage_capture(usage_capture)
     with owned_transaction(conn, "revoke_next_expired") as cur:
         row = cur.execute(_LOCK_NEXT_EXPIRED_TASK).fetchone()
         if row is None:
@@ -689,7 +802,15 @@ def revoke_next_expired(conn: Conn, *, retry_policy: RetryPolicy) -> AttemptRevo
         task_row = _one(
             cur.execute(_RECOVER_TASK, (next_state.value, now, finished_at, not_before, task.id))
         )
-        revocation = AttemptRevocation(attempt_from_row(attempt_row), task_from_row(task_row))
+        closure: Recorded[StoredClosure] | None = None
+        if tiers is not None:
+            (kind,) = _one(cur.execute(_JOB_KIND, (task.job_id,)))
+            tier = tiers.get(kind)
+            if tier is not None:  # the attempt row is locked: its intents cannot change
+                closure = close_capture_on_recovery(cur, current.id, tier)
+        revocation = AttemptRevocation(
+            attempt_from_row(attempt_row), task_from_row(task_row), closure
+        )
     logger.warning(
         "attempt revoked: %s",
         reason.value,
@@ -699,7 +820,25 @@ def revoke_next_expired(conn: Conn, *, retry_policy: RetryPolicy) -> AttemptRevo
             "worker_id": current.worker_id,
         },
     )
+    if closure is not None:
+        _log_closure(task.id, current.id, closure, warn_if_kept=True)
     return revocation
+
+
+def _check_usage_capture(usage_capture: object) -> dict[str, CaptureTier] | None:
+    """A checked copy of recovery's kind-to-tier map, before any I/O."""
+    if usage_capture is None:
+        return None
+    if not isinstance(usage_capture, Mapping):
+        msg = f"usage_capture must be a mapping of job kinds, got {type(usage_capture).__name__}"
+        raise TypeError(msg)
+    tiers = dict(usage_capture)
+    check_job_kinds(tiers.keys())
+    for tier in tiers.values():
+        if not isinstance(tier, CaptureTier):
+            msg = f"each capture tier must be a CaptureTier, got {type(tier).__name__}"
+            raise TypeError(msg)
+    return tiers
 
 
 def request_cancellation(conn: Conn, task_id: uuid.UUID, *, grace: timedelta) -> CancellationResult:
