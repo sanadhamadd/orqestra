@@ -59,7 +59,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
 | Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules; deterministic partitioning of an ordered item list into fixed-size batch tasks (DEC-052); `RetryPolicy` and a bounded exponential retry delay with deterministic jitter (DEC-053, PR #17) | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
-| CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051) | job submission and status |
+| CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051); `orqestra job submit` from a JSON file of tasks and `orqestra job status` (DEC-064, Proposed) | — |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
 | Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Proposed) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
@@ -98,9 +98,9 @@ uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 
 ### Submitting jobs
 
-Job submission is a Python interface for now; there is no CLI command or HTTP API for it
-yet. `submit_job` stores a job and all of its tasks in one transaction, so either the
-whole submission is stored or none of it is.
+Jobs are submitted through the Python interface or the CLI (`orqestra job submit`, below);
+there is no HTTP API (DEC-062). `submit_job` stores a job and all of its tasks in one
+transaction, so either the whole submission is stored or none of it is.
 
 ```python
 import psycopg
@@ -136,6 +136,49 @@ nothing is stored.
 raises `RuntimeError` if the caller has a transaction open. On a connection that is not in
 autocommit mode, reads leave an implicit transaction open; commit or roll back before
 submitting again.
+
+From the command line (DEC-064), `orqestra job submit` sends a JSON file of tasks through
+the same `submit_job`, and `orqestra job status` reads a job's derived status. Both use
+`ORQESTRA_DATABASE_URL`, refuse a schema that is not current (run `orqestra migrate`), and
+print one JSON line on stdout.
+
+```sh
+cat > tasks.json <<'JSON'
+[
+  {"task_key": "invoice-1", "payload": {"invoice_id": "INV-1"}, "max_attempts": 2},
+  {"task_key": "invoice-2", "payload": {"invoice_id": "INV-2"}}
+]
+JSON
+uv run orqestra job submit --kind invoice_verification --idempotency-key batch-2026-11-06 \
+    --max-attempts 3 tasks.json
+# {"status": "ok", "job_id": "…", "kind": "invoice_verification", "idempotency_key": "batch-2026-11-06", "created": true, "created_at": "…"}
+uv run orqestra job status <job_id>
+# {"status": "ok", "job_id": "…", "kind": "invoice_verification", "idempotency_key": "batch-2026-11-06", "created_at": "…", "job_status": "queued", "task_counts": {"queued": 2, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0}}
+```
+
+- **The file** is a UTF-8 JSON array of task objects with exactly `task_key` (a string),
+  `payload` (any JSON value) and, optionally, `max_attempts`; `-` reads it from standard
+  input. A task without `max_attempts` takes `--max-attempts`; there is no default, so a
+  task with neither is refused. Unknown fields, repeated keys in an object, numbers that
+  are not finite (`NaN`, `Infinity`, or a literal such as `1e400` that overflows a double)
+  and strings or object keys that cannot be encoded as UTF-8 (a lone surrogate such as
+  `"\ud800"`) are refused before anything is sent to the database, and so are `--kind` and
+  `--idempotency-key` values that are not UTF-8. Numbers with a fraction or an exponent are
+  read as doubles, as Python's `json` reads them. Everything else is
+  `submit_job`'s own validation, including the idempotency rules above: resubmitting the
+  same tasks with the same `--idempotency-key` prints the original job with
+  `"created": false`.
+- **Any non-blank kind** is accepted, including one no worker runs (the invoice kind is not
+  registered with `orqestra worker run`, DEC-062); such a job stays queued.
+- **Exit codes:** 0 on success; 1 with a `{"status": "error", …}` line for a refusal
+  (invalid settings, listed under `errors`; otherwise one `error` message for an invalid
+  file, an idempotency conflict, an unknown job id, a schema that is not current or a
+  database error); 2 for argparse's usage errors, such as a malformed `JOB_ID`. A
+  connection string that is not UTF-8 is reported as invalid by every command. A database error is
+  reported by its type, SQLSTATE and violated constraint only, never with the connection
+  string or the submitted values.
+- **Timeouts:** like `orqestra migrate`, the commands set no timeout of their own. Bound the
+  connection attempt with `connect_timeout` in the URL or `PGCONNECT_TIMEOUT`.
 
 ### Partitioning items into tasks
 

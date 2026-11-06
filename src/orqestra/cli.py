@@ -3,23 +3,37 @@
 Intentionally small: ``version`` and ``health`` prove the package installs,
 configuration loads and logging works; ``migrate`` applies the database
 schema; ``worker run`` runs one single-slot worker until SIGTERM or SIGINT
-(DEC-051). Job submission arrives with later milestones.
+(DEC-051); ``job submit`` and ``job status`` submit a job from a JSON file of
+tasks through ``submit_job`` and read its derived status (DEC-064).
 """
 
 import argparse
 import functools
 import json
+import math
 import sys
-from collections.abc import Sequence
+import uuid
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any, NoReturn
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
+from psycopg.rows import TupleRow
 from pydantic import ValidationError
 
 from orqestra import __version__
 from orqestra.config import Settings
+from orqestra.domain.jobs import JobSubmission, TaskSpec
 from orqestra.domain.kinds import check_job_kinds
+from orqestra.domain.states import TaskState
 from orqestra.logging import configure_logging
+from orqestra.persistence.jobs import (
+    IdempotencyConflictError,
+    get_job,
+    get_job_progress,
+    submit_job,
+)
 from orqestra.persistence.migrate import MigrationError, migrate, verify_current
 from orqestra.worker import builtin
 from orqestra.worker.handlers import HandlerRegistry
@@ -49,6 +63,28 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="KIND",
         help=f"a job kind to run, one of: {', '.join(builtin.KINDS)}; repeat for more",
     )
+    job = sub.add_parser("job", help="submit a job or read its status")
+    job_actions = job.add_subparsers(dest="job_command", required=True)
+    submit = job_actions.add_parser("submit", help="submit a job from a JSON file of tasks")
+    submit.add_argument("--kind", required=True, help="the job's kind")
+    submit.add_argument(
+        "--idempotency-key",
+        metavar="KEY",
+        help="return the earlier job instead of creating another if this key was used",
+    )
+    submit.add_argument(
+        "--max-attempts",
+        type=int,
+        metavar="N",
+        help="the retry limit of every task that does not set its own",
+    )
+    submit.add_argument(
+        "tasks_file",
+        metavar="TASKS_FILE",
+        help="a JSON array of tasks, or - to read it from standard input",
+    )
+    status = job_actions.add_parser("status", help="print a job's derived status as JSON")
+    status.add_argument("job_id", type=uuid.UUID, metavar="JOB_ID")
     return parser
 
 
@@ -64,10 +100,11 @@ def _connection_string(settings: Settings) -> tuple[str, str | None]:
         raise _Refused(msg)
     dsn = settings.database_url.get_secret_value()
     # libpq parse errors can echo fragments of the URL, password included, so
-    # they are reported generically.
+    # they are reported generically. A byte that is not UTF-8 in the environment
+    # arrives as a lone surrogate, which cannot be encoded for libpq at all.
     try:
         password = conninfo_to_dict(dsn).get("password")
-    except psycopg.ProgrammingError:
+    except (psycopg.ProgrammingError, UnicodeError):
         msg = "ORQESTRA_DATABASE_URL is not a valid PostgreSQL connection string"
         raise _Refused(msg) from None
     return dsn, None if password is None else str(password)
@@ -176,6 +213,239 @@ def _worker_run(kinds: Sequence[str]) -> int:
     return 0
 
 
+# --- job submit / job status (DEC-064) ------------------------------------------------------
+
+_TASK_FIELDS = frozenset({"task_key", "payload", "max_attempts"})
+
+
+_NOT_FINITE = "a number that is not finite (NaN, Infinity or out of range) is not valid JSON"
+
+
+def _refuse_constant(name: str) -> NoReturn:
+    raise ValueError(_NOT_FINITE)
+
+
+def _finite_float(literal: str) -> float:
+    """A JSON number with a fraction or exponent, refused if it overflows to infinity."""
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError(_NOT_FINITE)
+    return value
+
+
+def _encodable(text: str) -> bool:
+    """Whether ``text`` can be sent to PostgreSQL: a lone surrogate has no UTF-8 encoding."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _all_encodable(value: object) -> bool:
+    """Whether every string and object key inside a parsed JSON value is encodable.
+
+    Iterative, so a value nested as deeply as the parser allows cannot exhaust the stack.
+    """
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if not _encodable(item):
+                return False
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            if not all(_encodable(key) for key in item):
+                return False
+            pending.extend(item.values())
+    return True
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object, refused if it repeats a key: ``json`` would keep only the last."""
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        msg = "an object repeats a key"
+        raise ValueError(msg)
+    return obj
+
+
+def _read_tasks_file(path: str) -> Any:
+    """The parsed JSON document in ``path``, or standard input for ``-``.
+
+    Messages name the file and the position of a syntax error, never its content.
+    """
+    try:
+        raw = sys.stdin.buffer.read() if path == "-" else Path(path).read_bytes()
+    except OSError as exc:
+        msg = f"cannot read TASKS_FILE: {exc.strerror or type(exc).__name__}"
+        raise _Refused(msg) from None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        msg = "TASKS_FILE is not UTF-8"
+        raise _Refused(msg) from None
+    try:
+        return json.loads(
+            text,
+            parse_constant=_refuse_constant,
+            parse_float=_finite_float,
+            object_pairs_hook=_unique_keys,
+        )
+    except RecursionError:
+        msg = "TASKS_FILE is nested too deeply"
+        raise _Refused(msg) from None
+    except ValueError as exc:
+        msg = f"TASKS_FILE is not valid JSON: {exc}"
+        raise _Refused(msg) from None
+
+
+def _task(index: int, item: object, default_max_attempts: int | None) -> TaskSpec:
+    """One task object of the file; messages name the task's index and field, not its values."""
+    where = f"task {index}"
+    if not isinstance(item, dict):
+        msg = f"{where} must be a JSON object"
+        raise _Refused(msg)
+    unknown = sorted(set(item) - _TASK_FIELDS)
+    if unknown:
+        msg = f"{where} has unknown fields {unknown}; allowed: {sorted(_TASK_FIELDS)}"
+        raise _Refused(msg)
+    missing = [field for field in ("task_key", "payload") if field not in item]
+    if missing:
+        msg = f"{where} is missing {missing}"
+        raise _Refused(msg)
+    if not isinstance(item["task_key"], str):
+        msg = f"{where}: task_key must be a string"
+        raise _Refused(msg)
+    if not _encodable(item["task_key"]):
+        msg = f"{where}: task_key cannot be encoded as UTF-8"
+        raise _Refused(msg)
+    if not _all_encodable(item["payload"]):
+        msg = f"{where}: payload holds a string or key that cannot be encoded as UTF-8"
+        raise _Refused(msg)
+    if "max_attempts" in item:
+        max_attempts = item["max_attempts"]
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+            msg = f"{where}: max_attempts must be an integer"
+            raise _Refused(msg)
+    elif default_max_attempts is None:
+        msg = f"{where} sets no max_attempts and --max-attempts was not given"
+        raise _Refused(msg)
+    else:
+        max_attempts = default_max_attempts
+    return TaskSpec(item["task_key"], item["payload"], max_attempts)
+
+
+def _submission(args: argparse.Namespace) -> JobSubmission:
+    """The submission ``job submit`` describes; ``_Refused`` before any database access."""
+    # Arguments that are not UTF-8 on the command line arrive as lone surrogates.
+    for option, value in (("--kind", args.kind), ("--idempotency-key", args.idempotency_key)):
+        if value is not None and not _encodable(value):
+            msg = f"{option} cannot be encoded as UTF-8"
+            raise _Refused(msg)
+    try:
+        check_job_kinds([args.kind])
+    except (TypeError, ValueError) as exc:
+        msg = f"invalid --kind: {exc}"
+        raise _Refused(msg) from None
+    document = _read_tasks_file(args.tasks_file)
+    if not isinstance(document, list):
+        msg = "TASKS_FILE must hold a JSON array of tasks"
+        raise _Refused(msg)
+    tasks = tuple(_task(i, item, args.max_attempts) for i, item in enumerate(document))
+    try:
+        return JobSubmission(args.kind, tasks, args.idempotency_key)
+    except ValueError as exc:
+        raise _Refused(str(exc)) from None
+
+
+def _database_error(exc: psycopg.Error) -> str:
+    """A database failure described by its type, SQLSTATE and constraint only.
+
+    Driver messages can quote the connection string or the submitted values.
+    """
+    detail = f", SQLSTATE {exc.sqlstate}" if exc.sqlstate else ""
+    if isinstance(exc, psycopg.errors.IntegrityError) and exc.diag.constraint_name:
+        detail += f", constraint {exc.diag.constraint_name}"
+    return f"the database request failed ({type(exc).__name__}{detail})"
+
+
+def _submit(conn: psycopg.Connection[TupleRow], submission: JobSubmission) -> dict[str, object]:
+    try:
+        result = submit_job(conn, submission)
+    except IdempotencyConflictError as exc:
+        raise _Refused(str(exc)) from None
+    return {
+        "job_id": str(result.job.id),
+        "kind": result.job.kind,
+        "idempotency_key": result.job.idempotency_key,
+        "created": result.created,
+        "created_at": result.job.created_at.isoformat(),
+    }
+
+
+def _status(conn: psycopg.Connection[TupleRow], job_id: uuid.UUID) -> dict[str, object]:
+    # A job row never changes and the counts are one statement, so two reads suffice.
+    job = get_job(conn, job_id)
+    progress = None if job is None else get_job_progress(conn, job_id)
+    if job is None or progress is None:
+        msg = f"job {job_id} not found"
+        raise _Refused(msg)
+    return {
+        "job_id": str(job.id),
+        "kind": job.kind,
+        "idempotency_key": job.idempotency_key,
+        "created_at": job.created_at.isoformat(),
+        "job_status": progress.status.value,
+        "task_counts": {state.value: progress.task_counts[state] for state in TaskState},
+    }
+
+
+def _on_current_schema(
+    dsn: str, action: Callable[[psycopg.Connection[TupleRow]], dict[str, object]]
+) -> dict[str, object]:
+    """Run ``action`` on an autocommit connection once the schema is checked to be current."""
+    try:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            try:
+                verify_current(conn)
+            except MigrationError as exc:
+                msg = f"the database schema is not current: {exc}"
+                raise _Refused(msg) from None
+            return action(conn)
+    except psycopg.Error as exc:
+        raise _Refused(_database_error(exc)) from None
+    except UnicodeError:
+        # A backstop: every string is checked before this point.
+        msg = "a value cannot be encoded as UTF-8 for the database"
+        raise _Refused(msg) from None
+
+
+def _job(args: argparse.Namespace) -> int:
+    """``job submit`` or ``job status``: one JSON line on stdout, exit 0 or 1 (DEC-064)."""
+    try:
+        settings = Settings()
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_context=False, include_input=False)
+        print(json.dumps({"status": "error", "errors": errors}, default=str))
+        return 1
+    configure_logging(settings.log_level)
+    try:
+        action: Callable[[psycopg.Connection[TupleRow]], dict[str, object]]
+        if args.job_command == "submit":
+            submission = _submission(args)
+            action = functools.partial(_submit, submission=submission)
+        else:
+            action = functools.partial(_status, job_id=args.job_id)
+        dsn, _ = _connection_string(settings)
+        output = _on_current_schema(dsn, action)
+    except _Refused as exc:
+        return _error(str(exc))
+    print(json.dumps({"status": "ok", **output}))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI; returns the process exit code."""
     args = _build_parser().parse_args(argv)
@@ -188,6 +458,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _migrate()
     if args.command == "worker":
         return _worker_run(args.kinds)
+    if args.command == "job":
+        return _job(args)
     return 2  # pragma: no cover - argparse rejects unknown commands first
 
 
