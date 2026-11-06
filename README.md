@@ -62,8 +62,8 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051); `orqestra job submit` from a JSON file of tasks and `orqestra job status` (DEC-064, Proposed) | — |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Proposed) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
-| Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Proposed); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Proposed) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
+| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Accepted) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
+| Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Proposed); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Proposed); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Accepted); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Accepted) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | Docker Compose for PostgreSQL, local development and integration tests only ([guide](docs/development.md#local-postgresql-with-docker-compose)) | — |
 
@@ -923,7 +923,7 @@ print(capture_of(usage))  # open, closed, lower_bound or not_captured
 ### Provider usage sink
 
 A worker can write its handlers' provider calls to the usage ledger as they happen
-(DEC-059, Proposed). The `UsageSink` in `orqestra.worker.usage` is the durable
+(DEC-059, Accepted). The `UsageSink` in `orqestra.worker.usage` is the durable
 `ProviderCallRecorder` of DEC-057; the worker's supervisor, still the only database
 client, writes every record.
 
@@ -1024,7 +1024,7 @@ the SQLSTATE only: never an amount, a unit, a prompt or provider text.
 ### OpenRouter adapter (not wired in)
 
 `orqestra.providers.openrouter.OpenRouterProvider` implements the `Provider` contract with
-one non-streaming request to OpenRouter's chat completions endpoint (DEC-060, Proposed).
+one non-streaming request to OpenRouter's chat completions endpoint (DEC-060, Accepted).
 **Nothing uses it yet.** No worker, handler or command imports `orqestra.providers`, no
 test makes a live call, and live calls need separate authorization.
 
@@ -1126,7 +1126,7 @@ breaks the contract.
 ### Provider usage report
 
 `report_job_usage` reads an invoice job's provider usage ledger (migration 0005) and reports
-what providers said they used, next to the unchanged summary (DEC-061, Proposed). It is a
+what providers said they used, next to the unchanged summary (DEC-061, Accepted). It is a
 Python interface, with no command, API, table or migration. It reports provider-declared
 figures only: there are no prices, currencies or cost.
 
