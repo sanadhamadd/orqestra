@@ -173,7 +173,9 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 ## Costs
 
 Track per-job and per-attempt usage including billable retries: provider, model, tokens and
-the published price version. Distinguish provider-reported figures from estimates. Any real
+the provider-reported amount with its unit label. The usage ledger records no price,
+published price version or currency (DEC-062). Distinguish provider-reported figures from
+estimates. Any real
 API budget or spending cap requires maintainer approval.
 
 ## Decision records
