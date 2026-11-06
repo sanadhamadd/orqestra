@@ -3,8 +3,12 @@
 Every write operation runs one short READ COMMITTED transaction that it owns
 (DEC-024, DEC-028) and reads rows through its own tuple-row cursor, so the
 caller's isolation settings and row factory do not matter.
+
+``NotFoundError`` lives here so that ``lifecycle`` and ``provider_usage`` can
+both raise it without importing each other; ``lifecycle`` re-exports it.
 """
 
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -13,6 +17,7 @@ import psycopg
 from psycopg.pq import TransactionStatus
 from psycopg.rows import TupleRow, tuple_row
 
+from orqestra.domain.errors import OrqestraError
 from orqestra.domain.jobs import Attempt, Task
 from orqestra.domain.leases import RevocationReason
 from orqestra.domain.policy import FailureKind
@@ -35,6 +40,15 @@ ATTEMPT_COLUMNS = (
     "id, task_id, attempt_number, worker_id, state, failure_kind, error_type, error_message, "
     "started_at, finished_at, lease_expires_at, deadline_at, revoked_reason"
 )
+
+
+class NotFoundError(OrqestraError, LookupError):
+    """The task or attempt a write refers to does not exist."""
+
+    def __init__(self, kind: str, record_id: uuid.UUID) -> None:
+        super().__init__(f"{kind} {record_id} does not exist")
+        self.kind = kind
+        self.record_id = record_id
 
 
 @contextmanager
