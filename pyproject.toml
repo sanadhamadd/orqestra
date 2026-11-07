@@ -30,7 +30,7 @@ packages = ["src/orqestra"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = [".", "src", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -53,7 +53,7 @@ ignore = ["ANN401"]  # explicit Any is sometimes the honest type at boundaries
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "benchmarks"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 
