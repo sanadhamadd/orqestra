@@ -4,7 +4,9 @@ Intentionally small: ``version`` and ``health`` prove the package installs,
 configuration loads and logging works; ``migrate`` applies the database
 schema; ``worker run`` runs one single-slot worker until SIGTERM or SIGINT
 (DEC-051); ``job submit`` and ``job status`` submit a job from a JSON file of
-tasks through ``submit_job`` and read its derived status (DEC-064).
+tasks through ``submit_job`` and read its derived status (DEC-064); ``job
+summary`` and ``job usage`` print an invoice job's outcome summary and provider
+usage report, with the call budget check on request (DEC-066).
 """
 
 import argparse
@@ -13,7 +15,9 @@ import json
 import math
 import sys
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -23,8 +27,11 @@ from psycopg.rows import TupleRow
 from pydantic import ValidationError
 
 from orqestra import __version__
+from orqestra.aggregation.budget import CallBudgetCheck, read_job_call_budget
+from orqestra.aggregation.invoice import WrongJobKindError, summarize_invoice_job
+from orqestra.aggregation.usage import JobUsageReport, UnitTotal, report_job_usage
 from orqestra.config import Settings
-from orqestra.domain.jobs import JobSubmission, TaskSpec
+from orqestra.domain.jobs import Job, JobStatus, JobSubmission, TaskSpec
 from orqestra.domain.kinds import check_job_kinds
 from orqestra.domain.states import TaskState
 from orqestra.logging import configure_logging
@@ -40,6 +47,9 @@ from orqestra.worker.handlers import HandlerRegistry
 from orqestra.worker.runtime import Worker, connect_supervisor
 from orqestra.worker.settings import WorkerSettings
 from orqestra.worker.shutdown import run_until_signalled
+from orqestra.workloads.invoice.handler import JOB_KIND as INVOICE_JOB_KIND
+from orqestra.workloads.invoice.summary import InvoiceJobSummary
+from orqestra.workloads.invoice.verify import check_call_cap
 
 
 class _Refused(Exception):  # noqa: N818 - a refusal to start, with a message safe to print
@@ -63,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="KIND",
         help=f"a job kind to run, one of: {', '.join(builtin.KINDS)}; repeat for more",
     )
-    job = sub.add_parser("job", help="submit a job or read its status")
+    job = sub.add_parser("job", help="submit a job, or read its status, summary or usage")
     job_actions = job.add_subparsers(dest="job_command", required=True)
     submit = job_actions.add_parser("submit", help="submit a job from a JSON file of tasks")
     submit.add_argument("--kind", required=True, help="the job's kind")
@@ -85,6 +95,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     status = job_actions.add_parser("status", help="print a job's derived status as JSON")
     status.add_argument("job_id", type=uuid.UUID, metavar="JOB_ID")
+    summary = job_actions.add_parser(
+        "summary", help="print an invoice job's outcome summary as JSON"
+    )
+    summary.add_argument("job_id", type=uuid.UUID, metavar="JOB_ID")
+    usage = job_actions.add_parser(
+        "usage", help="print an invoice job's provider usage report as JSON"
+    )
+    usage.add_argument("job_id", type=uuid.UUID, metavar="JOB_ID")
+    usage.add_argument(
+        "--max-provider-calls-per-attempt",
+        type=int,
+        dest="cap",
+        metavar="N",
+        help=(
+            "the per-attempt call cap the job's workers ran with, as you assume it "
+            "(it is not stored); adds the call budget check"
+        ),
+    )
     return parser
 
 
@@ -402,6 +430,169 @@ def _status(conn: psycopg.Connection[TupleRow], job_id: uuid.UUID) -> dict[str, 
     }
 
 
+# --- job summary / job usage (DEC-066) ------------------------------------------------------
+
+
+def _by_value[K: StrEnum](counts: Mapping[K, int]) -> dict[str, int]:
+    """A count per enum member, keyed by its stable value."""
+    return {key.value: count for key, count in counts.items()}
+
+
+def _unit_totals(totals: Mapping[str, UnitTotal]) -> dict[str, dict[str, object]]:
+    """Exact amounts per unit, as plain decimal strings so no digit is lost to a float."""
+    return {
+        unit: {"amount": format(total.amount, "f"), "calls": total.calls}
+        for unit, total in totals.items()
+    }
+
+
+def _job_head(job: Job, observed_at: datetime, job_status: JobStatus) -> dict[str, object]:
+    return {
+        "job_id": str(job.id),
+        "kind": job.kind,
+        "observed_at": observed_at.isoformat(),
+        "job_status": job_status.value,
+    }
+
+
+def summary_document(summary: InvoiceJobSummary) -> dict[str, object]:
+    """Every field and property of ``summary`` as JSON values: identifiers and counts only."""
+    return {
+        **_job_head(summary.job, summary.observed_at, summary.job_status),
+        "task_counts": _by_value(summary.task_counts),
+        "expected_items": summary.expected_items,
+        "processed_items": summary.processed_items,
+        "verified": summary.verified,
+        "rejected": summary.rejected,
+        "needs_review": summary.needs_review,
+        "malformed": summary.malformed,
+        "provider_assisted_items": summary.provider_assisted_items,
+        "unprocessed_items": summary.unprocessed_items,
+        "missing_items": summary.missing_items,
+        "invalid_items": summary.invalid_items,
+        "finished": summary.finished,
+        "integrity_ok": summary.integrity_ok,
+        "complete": summary.complete,
+        "anomalies": _by_value(summary.anomalies),
+        "anomaly_samples": [
+            {"code": sample.code.value, "task_key": sample.task_key, "index": sample.index}
+            for sample in summary.anomaly_samples
+        ],
+    }
+
+
+def budget_document(check: CallBudgetCheck) -> dict[str, object]:
+    """``check`` as JSON values; ``unknown_reason`` is ``null`` unless the verdict is unknown."""
+    return {
+        "cap": check.cap,
+        "cap_source": check.cap_source,
+        "max_attempts_total": check.max_attempts_total,
+        "bound": check.bound,
+        "calls": check.calls,
+        "finality": check.finality.value,
+        "verdict": check.verdict.value,
+        "unknown_reason": None if check.unknown_reason is None else check.unknown_reason.value,
+    }
+
+
+def usage_document(
+    report: JobUsageReport, check: CallBudgetCheck | None = None
+) -> dict[str, object]:
+    """Every field of ``report`` as JSON values, and ``budget`` when ``check`` is given."""
+    document: dict[str, object] = {
+        **_job_head(report.job, report.observed_at, report.job_status),
+        "finished": report.finished,
+        "finality": report.finality.value,
+        "attempts_by_capture": _by_value(report.attempts_by_capture),
+        "unclosed_attempts": report.unclosed_attempts,
+        "calls": report.calls,
+        "answered": report.answered,
+        "failed": report.failed,
+        "unresolved": report.unresolved,
+        "settled_without_reported_usage": report.settled_without_reported_usage,
+        "reported_totals": _unit_totals(report.reported_totals),
+        "by_attempt_state": {
+            state.value: {
+                "attempts": usage.attempts,
+                "calls": usage.calls,
+                "answered": usage.answered,
+                "failed": usage.failed,
+                "unresolved": usage.unresolved,
+                "reported_totals": _unit_totals(usage.reported_totals),
+            }
+            for state, usage in report.by_attempt_state.items()
+        },
+        "late_intents": report.late_intents,
+        "late_results": report.late_results,
+        "estimated_exposure_units": report.estimated_exposure_units,
+        "unresolved_without_estimate": report.unresolved_without_estimate,
+        "assisted_items": report.assisted_items,
+        "assisted_checked_tasks": report.assisted_checked_tasks,
+        "assisted_unchecked_tasks": report.assisted_unchecked_tasks,
+        "anomalies": _by_value(report.anomalies),
+        "anomaly_samples": [
+            {
+                "code": sample.code.value,
+                "task_key": sample.task_key,
+                "attempt_number": sample.attempt_number,
+            }
+            for sample in report.anomaly_samples
+        ],
+    }
+    if check is not None:
+        document["budget"] = budget_document(check)
+    return document
+
+
+def _not_found(job_id: uuid.UUID) -> NoReturn:
+    msg = f"job {job_id} not found"
+    raise _Refused(msg)
+
+
+def _read_invoice_job[T](job_id: uuid.UUID, read: Callable[[], T | None]) -> T:
+    """``read()``, refusing an unknown job, another kind and a job without tasks.
+
+    The refusals name the job id only, never the stored kind or any task value.
+    """
+    try:
+        result = read()
+    except WrongJobKindError:
+        msg = f"job {job_id} is not an {INVOICE_JOB_KIND} job"
+        raise _Refused(msg) from None
+    except ValueError:
+        # submit_job never creates a job without tasks; only a manual edit can.
+        msg = f"job {job_id} has no tasks"
+        raise _Refused(msg) from None
+    if result is None:
+        _not_found(job_id)
+    return result
+
+
+def _summary(conn: psycopg.Connection[TupleRow], job_id: uuid.UUID) -> dict[str, object]:
+    summary = _read_invoice_job(job_id, lambda: summarize_invoice_job(conn, job_id))
+    return summary_document(summary)
+
+
+def _usage(
+    conn: psycopg.Connection[TupleRow], job_id: uuid.UUID, cap: int | None
+) -> dict[str, object]:
+    if cap is None:
+        report = _read_invoice_job(job_id, lambda: report_job_usage(conn, job_id))
+        return usage_document(report)
+    report, check = _read_invoice_job(job_id, lambda: read_job_call_budget(conn, job_id, cap=cap))
+    return usage_document(report, check)
+
+
+def _checked_cap(cap: int | None) -> int | None:
+    """The ``--max-provider-calls-per-attempt`` value, or ``_Refused`` without echoing it."""
+    if cap is None:
+        return None
+    try:
+        return check_call_cap("--max-provider-calls-per-attempt", cap)
+    except (TypeError, ValueError) as exc:
+        raise _Refused(str(exc)) from None
+
+
 def _on_current_schema(
     dsn: str, action: Callable[[psycopg.Connection[TupleRow]], dict[str, object]]
 ) -> dict[str, object]:
@@ -423,7 +614,7 @@ def _on_current_schema(
 
 
 def _job(args: argparse.Namespace) -> int:
-    """``job submit`` or ``job status``: one JSON line on stdout, exit 0 or 1 (DEC-064)."""
+    """Any ``job`` command: one JSON line on stdout, exit 0 or 1 (DEC-064, DEC-066)."""
     try:
         settings = Settings()
     except ValidationError as exc:
@@ -436,6 +627,11 @@ def _job(args: argparse.Namespace) -> int:
         if args.job_command == "submit":
             submission = _submission(args)
             action = functools.partial(_submit, submission=submission)
+        elif args.job_command == "summary":
+            action = functools.partial(_summary, job_id=args.job_id)
+        elif args.job_command == "usage":
+            cap = _checked_cap(args.cap)
+            action = functools.partial(_usage, job_id=args.job_id, cap=cap)
         else:
             action = functools.partial(_status, job_id=args.job_id)
         dsn, _ = _connection_string(settings)
