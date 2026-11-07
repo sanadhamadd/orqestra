@@ -59,7 +59,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | Package and toolchain | `uv` lockfile, Ruff, mypy strict, pytest with coverage, `make check` and `make verify` | — |
 | Domain contracts | `TaskState` and `AttemptState` with explicit transition tables; `TransientError` / `PermanentError` taxonomy; failure classification; retry and cancellation policy functions, including for revoked attempts and cancellation grace periods; `LeasePolicy` and the lease, deadline and revocation rules; `JobSubmission`, `TaskSpec`, `Job`, `Task` and `Attempt` records; typed attempt outcomes; derived job status rules; deterministic partitioning of an ordered item list into fixed-size batch tasks (DEC-052); `RetryPolicy` and a bounded exponential retry delay with deterministic jitter (DEC-053, PR #17) | — |
 | Configuration and logging | Validated `ORQESTRA_*` settings with secret redaction; required, validated `ORQESTRA_WORKER_*` timing settings with no defaults; single-line JSON logs with job/task/attempt IDs | — |
-| CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051); `orqestra job submit` from a JSON file of tasks and `orqestra job status` (DEC-064, Proposed) | — |
+| CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051); `orqestra job submit` from a JSON file of tasks and `orqestra job status` (DEC-064, Proposed); `orqestra job summary` and `orqestra job usage` for an invoice job, with an optional call budget check (DEC-066, Proposed) | — |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, owner-approved direction); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
 | Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Proposed); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Proposed); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Accepted) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
@@ -179,6 +179,31 @@ uv run orqestra job status <job_id>
   string or the submitted values.
 - **Timeouts:** like `orqestra migrate`, the commands set no timeout of their own. Bound the
   connection attempt with `connect_timeout` in the URL or `PGCONNECT_TIMEOUT`.
+
+For an `invoice_verification` job, two more commands print what the library reads, as one
+JSON line each (DEC-066). `orqestra job summary JOB_ID` prints `summarize_invoice_job`: the
+derived status, task counts, item outcome counts, `complete`, and anomaly counts with up to
+20 samples (a code, a task key and an index). `orqestra job usage JOB_ID` prints
+`report_job_usage`: finality, call counts, reported amounts per exact unit (as decimal
+strings), counts per attempt state, exposure and anomalies. Neither prints a payload, a
+result or an invoice value.
+
+```sh
+uv run orqestra job summary <job_id>
+# {"status": "ok", "job_id": "…", "kind": "invoice_verification", "observed_at": "…", "job_status": "succeeded", …, "complete": true, …}
+uv run orqestra job usage <job_id> --max-provider-calls-per-attempt 16
+# {"status": "ok", …, "finality": "closed", "calls": 3, …, "budget": {"cap": 16, "cap_source": "operator", "max_attempts_total": 6, "bound": 96, "calls": 3, "finality": "closed", "verdict": "within", "unknown_reason": null}}
+```
+
+- **`--max-provider-calls-per-attempt N`** adds `budget`, the call budget check of DEC-065,
+  read in the same snapshot as the report: `bound` is `N` times the sum of the tasks'
+  `max_attempts`. `N` is your assumption about the cap the job's workers ran with; it is
+  not stored, so the check holds only if they all used it. `within` needs a `closed`
+  report, `exceeded` means more calls are recorded than the bound allows, and anything
+  else is `unknown`, with the finality as `unknown_reason`. `N` must be an integer from 0
+  to 2,147,483,647; anything else is refused before the database is reached.
+- **Refusals** exit 1 like the commands above: an unknown job id, a job of another kind
+  (named by its id only), a schema that is not current and database errors.
 
 ### Partitioning items into tasks
 
