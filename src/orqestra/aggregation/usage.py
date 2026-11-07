@@ -399,11 +399,17 @@ def report_job_usage(
     with job_batch_snapshot(conn, job_id, fetch_size=fetch_size) as snapshot:
         if snapshot is None:
             return None
-        builder = _read(snapshot)
+        builder = read_job_usage(snapshot)
     return builder.finish()
 
 
-def _read(snapshot: JobBatchSnapshot) -> UsageReportBuilder:
+def read_job_usage(snapshot: JobBatchSnapshot) -> UsageReportBuilder:
+    """Fold ``snapshot``'s job, ledger and task reads into a builder; finish it after the block.
+
+    Raises ``WrongJobKindError`` before any ledger row or task is read for
+    another kind of job. Use it to read more from the same snapshot, as
+    ``orqestra.aggregation.budget`` does; ``report_job_usage`` is the usual entry point.
+    """
     job = snapshot.job
     if job.kind != JOB_KIND:
         raise WrongJobKindError(job.id, job.kind)

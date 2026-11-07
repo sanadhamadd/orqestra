@@ -40,7 +40,10 @@ for a usage report:
   named cursor, with that attempt's call counts and its closure. Rows are
   ordered by ``task_key`` by code point, then ``attempt_number``.
 
-Neither returns a provider's text, a model name or any other ledger content.
+``max_attempts_total`` sums the job's task retry limits, for a call budget
+(``orqestra.aggregation.budget``).
+
+None of them returns a provider's text, a model name or any other ledger content.
 The ledger is filtered on ``provider_calls.job_id``, copied from the attempt
 when each intent was recorded.
 """
@@ -111,6 +114,8 @@ FROM (
 GROUP BY GROUPING SETS ((u.unit, u.state), (u.unit))
 ORDER BY 1, 2, 3
 """
+
+_MAX_ATTEMPTS_TOTAL = "SELECT coalesce(sum(max_attempts), 0) FROM tasks WHERE job_id = %s"
 
 # One row per attempt of the job, with its calls counted and its closure, if any.
 # A call is unresolved while it has no result.
@@ -234,9 +239,9 @@ class JobBatchSnapshot:
     """The job row read at the start of the snapshot and, on request, its other reads.
 
     ``tasks`` and ``attempt_usage`` are streams; each can be opened once.
-    ``usage_totals`` is a single bounded query. All of them run only while the
-    snapshot block is open, and describe the snapshot, whatever has been
-    committed since.
+    ``usage_totals`` and ``max_attempts_total`` are single bounded queries. All
+    of them run only while the snapshot block is open, and describe the
+    snapshot, whatever has been committed since.
     """
 
     def __init__(self, conn: Conn, job: Job, observed_at: datetime, fetch_size: int) -> None:
@@ -273,6 +278,13 @@ class JobBatchSnapshot:
             UsageTotalRow(None if job_level else AttemptState(state), unit, calls, amount)
             for job_level, state, unit, calls, amount in rows
         ]
+
+    def max_attempts_total(self) -> int:
+        """The sum of the job's task retry limits: the most attempts its tasks may start."""
+        self._check_open()
+        with tuple_cursor(self._conn) as cur:
+            row = cur.execute(_MAX_ATTEMPTS_TOTAL, (self.job.id,)).fetchone()
+        return 0 if row is None else int(row[0])
 
     def _check_open(self) -> None:
         if self._closed:
