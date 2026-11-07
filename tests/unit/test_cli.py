@@ -1,8 +1,10 @@
+import dataclasses
 import io
 import json
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -13,12 +15,25 @@ from psycopg import errors
 
 import orqestra
 from orqestra import cli
+from orqestra.aggregation.budget import CallBudgetCheck, check_call_budget
+from orqestra.aggregation.invoice import WrongJobKindError
+from orqestra.aggregation.usage import (
+    AttemptCapture,
+    JobUsageReport,
+    ProvenanceUsage,
+    UnitTotal,
+    UsageAnomaly,
+    UsageAnomalyCode,
+    UsageFinality,
+)
+from orqestra.calls.recording import MAX_CALL_SEQ
 from orqestra.cli import main
 from orqestra.domain.jobs import Job, JobProgress, JobStatus, JobSubmission
-from orqestra.domain.states import TaskState
+from orqestra.domain.states import AttemptState, TaskState
 from orqestra.persistence.jobs import IdempotencyConflictError, SubmissionResult
 from orqestra.persistence.migrate import MigrationError
 from orqestra.worker.runtime import connect_supervisor
+from orqestra.workloads.invoice.summary import Anomaly, AnomalyCode, InvoiceJobSummary
 
 pytestmark = pytest.mark.unit
 
@@ -395,6 +410,15 @@ def job_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
 
 
+ALL_JOB_COMMANDS = [
+    ["submit"],
+    ["status", str(JOB_ID)],
+    ["summary", str(JOB_ID)],
+    ["usage", str(JOB_ID)],
+    ["usage", str(JOB_ID), "--max-provider-calls-per-attempt", "4"],
+]
+
+
 def tasks_file(tmp_path: Path, content: object) -> str:
     path = tmp_path / "tasks.json"
     if isinstance(content, bytes):
@@ -437,6 +461,11 @@ def submit_refused(
         ["job", "submit", "--kind", "k", "--max-attempts", "3.5", "tasks.json"],
         ["job", "status"],
         ["job", "status", "not-a-uuid"],
+        ["job", "summary"],
+        ["job", "summary", "not-a-uuid"],
+        ["job", "usage"],
+        ["job", "usage", str(JOB_ID), "--max-provider-calls-per-attempt", "1.5"],
+        ["job", "usage", str(JOB_ID), "--max-provider-calls-per-attempt"],
     ],
 )
 def test_job_commands_report_usage_errors_through_argparse(argv: list[str]) -> None:
@@ -600,7 +629,7 @@ def test_job_submit_refuses_an_invalid_kind(
     assert error in message
 
 
-@pytest.mark.parametrize("command", [["submit"], ["status", str(JOB_ID)]])
+@pytest.mark.parametrize("command", ALL_JOB_COMMANDS)
 def test_job_commands_refuse_missing_or_invalid_settings(
     job_env: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -620,7 +649,7 @@ def test_job_commands_refuse_missing_or_invalid_settings(
     )
 
 
-@pytest.mark.parametrize("command", [["submit"], ["status", str(JOB_ID)]])
+@pytest.mark.parametrize("command", ALL_JOB_COMMANDS)
 def test_job_commands_report_an_unreachable_database_without_secrets(
     job_env: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -801,3 +830,358 @@ def test_job_status_refuses_an_unknown_job(
     assert job_output(capsys, ["job", "status", str(JOB_ID)], 1)["error"] == (
         f"job {JOB_ID} not found"
     )
+
+
+# --- job summary / job usage (DEC-066) ------------------------------------------------------
+
+INVOICE_JOB = Job(JOB_ID, "invoice_verification", "k-1", CREATED_AT)
+OBSERVED_AT = datetime(2026, 11, 7, 9, 30, tzinfo=UTC)
+TASK_COUNTS = dict.fromkeys(TaskState, 0) | {TaskState.SUCCEEDED: 2, TaskState.FAILED: 1}
+SUMMARY = InvoiceJobSummary(
+    job=INVOICE_JOB,
+    observed_at=OBSERVED_AT,
+    job_status=JobStatus.FAILED,
+    task_counts=MappingProxyType(TASK_COUNTS),
+    expected_items=9,
+    verified=3,
+    rejected=1,
+    needs_review=1,
+    malformed=0,
+    provider_assisted_items=2,
+    unprocessed_items=3,
+    missing_items=0,
+    invalid_items=1,
+    anomalies=MappingProxyType(dict.fromkeys(AnomalyCode, 0) | {AnomalyCode.ITEM_INVALID: 1}),
+    anomaly_samples=(Anomaly(AnomalyCode.ITEM_INVALID, "invoices-0002", 7),),
+)
+NO_UNITS: MappingProxyType[str, UnitTotal] = MappingProxyType({})
+TOTALS = MappingProxyType(
+    {"credits": UnitTotal(Decimal("1.75"), 2), "tiny": UnitTotal(Decimal("1E-7"), 1)}
+)
+
+
+def provenance(attempts: int = 0, calls: int = 0, **totals: UnitTotal) -> ProvenanceUsage:
+    return ProvenanceUsage(attempts, calls, calls, 0, 0, MappingProxyType(totals))
+
+
+REPORT = JobUsageReport(
+    job=INVOICE_JOB,
+    observed_at=OBSERVED_AT,
+    job_status=JobStatus.SUCCEEDED,
+    finality=UsageFinality.LOWER_BOUND,
+    attempts_by_capture=MappingProxyType(
+        dict.fromkeys(AttemptCapture, 0) | {AttemptCapture.CLOSED: 2, AttemptCapture.LOWER_BOUND: 1}
+    ),
+    unclosed_attempts=1,
+    calls=4,
+    answered=3,
+    failed=0,
+    unresolved=1,
+    settled_without_reported_usage=0,
+    reported_totals=TOTALS,
+    by_attempt_state=MappingProxyType(
+        {state: provenance() for state in AttemptState}
+        | {AttemptState.SUCCEEDED: provenance(3, 3, **TOTALS)}
+    ),
+    late_intents=0,
+    late_results=1,
+    estimated_exposure_units=5,
+    unresolved_without_estimate=0,
+    assisted_items=2,
+    assisted_checked_tasks=1,
+    assisted_unchecked_tasks=1,
+    anomalies=MappingProxyType(
+        dict.fromkeys(UsageAnomalyCode, 0) | {UsageAnomalyCode.CLOSURE_CONTRADICTED: 1}
+    ),
+    anomaly_samples=(UsageAnomaly(UsageAnomalyCode.CLOSURE_CONTRADICTED, "invoices-0001", 2),),
+)
+EXPECTED_SUMMARY = {
+    "status": "ok",
+    "job_id": str(JOB_ID),
+    "kind": "invoice_verification",
+    "observed_at": "2026-11-07T09:30:00+00:00",
+    "job_status": "failed",
+    "task_counts": {"queued": 0, "running": 0, "succeeded": 2, "failed": 1, "cancelled": 0},
+    "expected_items": 9,
+    "processed_items": 5,
+    "verified": 3,
+    "rejected": 1,
+    "needs_review": 1,
+    "malformed": 0,
+    "provider_assisted_items": 2,
+    "unprocessed_items": 3,
+    "missing_items": 0,
+    "invalid_items": 1,
+    "finished": True,
+    "integrity_ok": False,
+    "complete": False,
+    "anomalies": {code.value: int(code is AnomalyCode.ITEM_INVALID) for code in AnomalyCode},
+    "anomaly_samples": [{"code": "item_invalid", "task_key": "invoices-0002", "index": 7}],
+}
+EMPTY_STATE = {
+    "attempts": 0,
+    "calls": 0,
+    "answered": 0,
+    "failed": 0,
+    "unresolved": 0,
+    "reported_totals": {},
+}
+EXPECTED_TOTALS = {
+    "credits": {"amount": "1.75", "calls": 2},
+    "tiny": {"amount": "0.0000001", "calls": 1},
+}
+EXPECTED_USAGE = {
+    "status": "ok",
+    "job_id": str(JOB_ID),
+    "kind": "invoice_verification",
+    "observed_at": "2026-11-07T09:30:00+00:00",
+    "job_status": "succeeded",
+    "finished": True,
+    "finality": "lower_bound",
+    "attempts_by_capture": {"open": 0, "closed": 2, "lower_bound": 1, "not_captured": 0},
+    "unclosed_attempts": 1,
+    "calls": 4,
+    "answered": 3,
+    "failed": 0,
+    "unresolved": 1,
+    "settled_without_reported_usage": 0,
+    "reported_totals": EXPECTED_TOTALS,
+    "by_attempt_state": {state.value: EMPTY_STATE for state in AttemptState}
+    | {
+        "succeeded": EMPTY_STATE
+        | {"attempts": 3, "calls": 3, "answered": 3, "reported_totals": EXPECTED_TOTALS}
+    },
+    "late_intents": 0,
+    "late_results": 1,
+    "estimated_exposure_units": 5,
+    "unresolved_without_estimate": 0,
+    "assisted_items": 2,
+    "assisted_checked_tasks": 1,
+    "assisted_unchecked_tasks": 1,
+    "anomalies": {"closure_contradicted": 1, "assisted_exceeds_answered": 0},
+    "anomaly_samples": [
+        {"code": "closure_contradicted", "task_key": "invoices-0001", "attempt_number": 2}
+    ],
+}
+
+
+class Reports:
+    """Stands in for the summary, usage and budget reads; each must follow the schema check."""
+
+    def __init__(self, db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.db = db
+        self.found = True
+        self.calls: list[tuple[str, uuid.UUID, int | None]] = []
+        monkeypatch.setattr(cli, "summarize_invoice_job", self._summary)
+        monkeypatch.setattr(cli, "report_job_usage", self._usage)
+        monkeypatch.setattr(cli, "read_job_call_budget", self._budget)
+
+    def _read(self, name: str, job_id: uuid.UUID, cap: int | None = None) -> None:
+        assert self.db.verified == 1, "read before the schema check"
+        self.calls.append((name, job_id, cap))
+
+    def _summary(self, conn: object, job_id: uuid.UUID) -> InvoiceJobSummary | None:
+        self._read("summary", job_id)
+        return SUMMARY if self.found else None
+
+    def _usage(self, conn: object, job_id: uuid.UUID) -> JobUsageReport | None:
+        self._read("usage", job_id)
+        return REPORT if self.found else None
+
+    def _budget(
+        self, conn: object, job_id: uuid.UUID, *, cap: int
+    ) -> tuple[JobUsageReport, CallBudgetCheck] | None:
+        self._read("budget", job_id, cap)
+        if not self.found:
+            return None
+        return REPORT, check_call_budget(REPORT, max_attempts_total=3, cap=cap)
+
+
+@pytest.fixture
+def reports(job_env: pytest.MonkeyPatch) -> Reports:
+    return Reports(Database(job_env), job_env)
+
+
+def test_job_summary_prints_every_count_of_summarize_invoice_job(
+    reports: Reports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert job_output(capsys, ["job", "summary", str(JOB_ID)], 0) == EXPECTED_SUMMARY
+    assert reports.calls == [("summary", JOB_ID, None)]
+
+
+def test_the_summary_document_holds_every_field_and_property() -> None:
+    fields = {field.name for field in dataclasses.fields(InvoiceJobSummary)}
+    properties = {"processed_items", "finished", "integrity_ok", "complete"}
+    expected = (fields - {"job"}) | properties | {"job_id", "kind"}
+    assert set(cli.summary_document(SUMMARY)) == expected
+
+
+def test_job_usage_prints_every_figure_of_report_job_usage(
+    reports: Reports, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert job_output(capsys, ["job", "usage", str(JOB_ID)], 0) == EXPECTED_USAGE
+    assert reports.calls == [("usage", JOB_ID, None)]
+
+
+def test_the_usage_document_holds_every_field() -> None:
+    fields = {field.name for field in dataclasses.fields(JobUsageReport)}
+    expected = (fields - {"job"}) | {"finished", "job_id", "kind"}
+    assert set(cli.usage_document(REPORT)) == expected
+    provenance_fields = {field.name for field in dataclasses.fields(ProvenanceUsage)}
+    for state in cli.usage_document(REPORT)["by_attempt_state"].values():  # type: ignore[attr-defined]
+        assert set(state) == provenance_fields
+
+
+@pytest.mark.parametrize(
+    ("cap", "budget"),
+    [
+        pytest.param(
+            "1",
+            {"bound": 3, "verdict": "exceeded", "unknown_reason": None},
+            id="exceeded",
+        ),
+        pytest.param(
+            "2",
+            {"bound": 6, "verdict": "unknown", "unknown_reason": "lower_bound"},
+            id="unknown",
+        ),
+    ],
+)
+def test_job_usage_adds_the_call_budget_check_from_one_snapshot(
+    reports: Reports, capsys: pytest.CaptureFixture[str], cap: str, budget: dict[str, Any]
+) -> None:
+    argv = ["job", "usage", str(JOB_ID), "--max-provider-calls-per-attempt", cap]
+    out = job_output(capsys, argv, 0)
+    assert out == EXPECTED_USAGE | {
+        "budget": {
+            "cap": int(cap),
+            "cap_source": "operator",
+            "max_attempts_total": 3,
+            "calls": 4,
+            "finality": "lower_bound",
+        }
+        | budget
+    }
+    # The report and the check come from read_job_call_budget alone, never a second read.
+    assert reports.calls == [("budget", JOB_ID, int(cap))]
+
+
+def test_a_within_verdict_has_no_unknown_reason() -> None:
+    report = dataclasses.replace(REPORT, finality=UsageFinality.CLOSED)
+    check = check_call_budget(report, max_attempts_total=3, cap=2)
+    assert cli.budget_document(check) == {
+        "cap": 2,
+        "cap_source": "operator",
+        "max_attempts_total": 3,
+        "bound": 6,
+        "calls": 4,
+        "finality": "closed",
+        "verdict": "within",
+        "unknown_reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("cap", "error"),
+    [
+        ("-7", "--max-provider-calls-per-attempt must be between 0 and"),
+        (str(MAX_CALL_SEQ + 1), "--max-provider-calls-per-attempt must be between 0 and"),
+    ],
+)
+def test_job_usage_refuses_an_invalid_cap_before_reaching_the_database(
+    job_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], cap: str, error: str
+) -> None:
+    Database(job_env, allowed=False)
+    argv = ["job", "usage", str(JOB_ID), "--max-provider-calls-per-attempt", cap]
+    message = job_output(capsys, argv, 1)["error"]
+    assert message.startswith(error)
+    assert cap not in message
+
+
+@pytest.mark.parametrize("cap", [0, MAX_CALL_SEQ])
+def test_job_usage_accepts_a_cap_of_zero_and_the_largest_cap(
+    reports: Reports, capsys: pytest.CaptureFixture[str], cap: int
+) -> None:
+    argv = ["job", "usage", str(JOB_ID), "--max-provider-calls-per-attempt", str(cap)]
+    assert job_output(capsys, argv, 0)["budget"]["cap"] == cap
+    assert reports.calls == [("budget", JOB_ID, cap)]
+
+
+READ_COMMANDS = ALL_JOB_COMMANDS[2:]
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS)
+def test_summary_and_usage_refuse_an_unknown_job(
+    reports: Reports, capsys: pytest.CaptureFixture[str], command: list[str]
+) -> None:
+    reports.found = False
+    assert job_output(capsys, ["job", *command], 1)["error"] == f"job {JOB_ID} not found"
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS)
+def test_summary_and_usage_refuse_another_kind_without_naming_it(
+    reports: Reports,
+    job_env: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+) -> None:
+    def wrong_kind(conn: object, job_id: uuid.UUID, **kwargs: object) -> None:
+        raise WrongJobKindError(job_id, "secret-kind")
+
+    for name in ("summarize_invoice_job", "report_job_usage", "read_job_call_budget"):
+        job_env.setattr(cli, name, wrong_kind)
+    out = job_output(capsys, ["job", *command], 1)
+    assert out["error"] == f"job {JOB_ID} is not an invoice_verification job"
+    assert "secret-kind" not in json.dumps(out)
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS)
+def test_summary_and_usage_refuse_a_job_without_tasks(
+    reports: Reports,
+    job_env: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+) -> None:
+    def no_tasks(conn: object, job_id: uuid.UUID, **kwargs: object) -> None:
+        msg = f"job {job_id} has no tasks to summarize"
+        raise ValueError(msg)
+
+    for name in ("summarize_invoice_job", "report_job_usage", "read_job_call_budget"):
+        job_env.setattr(cli, name, no_tasks)
+    assert job_output(capsys, ["job", *command], 1)["error"] == f"job {JOB_ID} has no tasks"
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS)
+def test_summary_and_usage_refuse_a_schema_that_is_not_current(
+    reports: Reports,
+    job_env: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+) -> None:
+    def behind(conn: object) -> None:
+        msg = "schema 'public' is behind; pending migrations: 0005_provider_usage"
+        raise MigrationError(msg)
+
+    job_env.setattr(cli, "verify_current", behind)
+    assert job_output(capsys, ["job", *command], 1)["error"] == (
+        "the database schema is not current: "
+        "schema 'public' is behind; pending migrations: 0005_provider_usage"
+    )
+    assert reports.calls == []
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS)
+def test_summary_and_usage_report_database_errors_by_type_and_sqlstate(
+    reports: Reports,
+    job_env: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+) -> None:
+    def broken(conn: object, job_id: uuid.UUID, **kwargs: object) -> None:
+        msg = 'relation "usage_closures" does not exist near secret-value'
+        raise errors.UndefinedTable(msg)
+
+    for name in ("summarize_invoice_job", "report_job_usage", "read_job_call_budget"):
+        job_env.setattr(cli, name, broken)
+    error = job_output(capsys, ["job", *command], 1)["error"]
+    assert error == "the database request failed (UndefinedTable, SQLSTATE 42P01)"

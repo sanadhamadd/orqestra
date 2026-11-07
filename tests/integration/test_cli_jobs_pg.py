@@ -1,4 +1,4 @@
-"""`orqestra job submit` and `orqestra job status` against real PostgreSQL (DEC-064).
+"""The `orqestra job` commands against real PostgreSQL (DEC-064, DEC-066).
 
 The commands run in-process through ``main`` with ``ORQESTRA_DATABASE_URL`` pointing at a
 test schema, so these tests see exactly what an operator would: one JSON line and an exit
@@ -11,7 +11,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,13 +19,25 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from orqestra.cli import main
+from orqestra.aggregation.budget import read_job_call_budget
+from orqestra.aggregation.invoice import summarize_invoice_job
+from orqestra.aggregation.usage import report_job_usage
+from orqestra.cli import main, summary_document, usage_document
 from orqestra.domain.jobs import AttemptSucceeded
 from orqestra.domain.leases import LeasePolicy
 from orqestra.domain.retry import RetryPolicy
 from orqestra.domain.states import TaskState
 from orqestra.persistence.jobs import list_tasks
 from orqestra.persistence.lifecycle import claim_next_attempt, complete_attempt
+from tests.integration.test_attempt_lifecycle import SUCCESS, complete
+from tests.integration.test_invoice_summary_pg import (
+    make_handler,
+    put_in_state,
+    run_task,
+    submit_items,
+)
+from tests.integration.test_job_usage_report_pg import answered, close, one_attempt, retried
+from tests.unit.test_invoice_verify import ambiguous_unit, known
 
 pytestmark = pytest.mark.integration
 
@@ -280,3 +292,188 @@ def test_arguments_the_database_refuses_are_reported_without_their_values(
     opts = options if "--max-attempts" in options else [*options, "--max-attempts", "1"]
     assert submit(capsys, write_tasks(tasks), *opts, code=1)["error"] == error
     assert job_count(cli_env) == 0
+
+
+# --- job summary / job usage (DEC-066) ------------------------------------------------------
+
+
+def untimed(document: dict[str, Any]) -> dict[str, Any]:
+    """A command's output or a library document without ``status`` and ``observed_at``."""
+    return {k: v for k, v in document.items() if k not in {"status", "observed_at"}}
+
+
+def run_untimed(capsys: pytest.CaptureFixture[str], *argv: str) -> dict[str, Any]:
+    out = run(capsys, *argv)
+    datetime.fromisoformat(out["observed_at"])
+    return untimed(out)
+
+
+def test_summary_prints_what_summarize_invoice_job_reads(
+    cli_env: Conn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rejected = known()
+    rejected["total"] = 14
+    job = submit_items(cli_env, [known(), rejected, ambiguous_unit()], batch_size=2)
+    handler = make_handler()
+    for task in list_tasks(cli_env, job.id):
+        run_task(cli_env, task, handler)
+
+    out = run_untimed(capsys, "job", "summary", str(job.id))
+
+    summary = summarize_invoice_job(cli_env, job.id)
+    assert summary is not None
+    assert out == untimed(summary_document(summary))
+    assert (out["job_status"], out["expected_items"], out["complete"]) == ("succeeded", 3, True)
+    assert (out["verified"], out["rejected"], out["provider_assisted_items"]) == (2, 1, 1)
+    # Counts and identifiers only: no invoice value from any payload or result.
+    assert not {"INV-1", "L1", "L2"} & set(json.dumps(out).replace('"', " ").split())
+
+
+def test_summary_counts_unfinished_and_failed_tasks_as_the_library_does(
+    cli_env: Conn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = submit_items(cli_env, [known(), known(), known()], batch_size=1)
+    first, second, third = list_tasks(cli_env, job.id)
+    run_task(cli_env, first, make_handler())
+    put_in_state(cli_env, second, "failed")
+    put_in_state(cli_env, third, "running")
+
+    out = run_untimed(capsys, "job", "summary", str(job.id))
+
+    summary = summarize_invoice_job(cli_env, job.id)
+    assert summary is not None
+    assert out == untimed(summary_document(summary))
+    assert out["task_counts"] == {
+        "queued": 0,
+        "running": 1,
+        "succeeded": 1,
+        "failed": 1,
+        "cancelled": 0,
+    }
+    assert (out["job_status"], out["unprocessed_items"], out["complete"]) == ("running", 2, False)
+
+
+def test_usage_prints_what_report_job_usage_reads(
+    cli_env: Conn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task, *_ = retried(cli_env)
+
+    out = run_untimed(capsys, "job", "usage", str(task.job_id))
+
+    report = report_job_usage(cli_env, task.job_id)
+    assert report is not None
+    assert out == untimed(usage_document(report))
+    assert "budget" not in out
+    assert (out["finality"], out["calls"], out["unresolved"]) == ("lower_bound", 4, 1)
+    assert out["reported_totals"] == {"credits": {"amount": "2.00", "calls": 3}}
+    assert out["estimated_exposure_units"] == 5
+
+
+@pytest.mark.parametrize(
+    ("cap", "bound", "verdict", "reason"),
+    [
+        pytest.param(1, 3, "exceeded", None, id="exceeded"),
+        pytest.param(2, 6, "unknown", "lower_bound", id="unknown"),
+    ],
+)
+def test_usage_with_a_cap_adds_the_budget_check_of_read_job_call_budget(
+    cli_env: Conn,
+    capsys: pytest.CaptureFixture[str],
+    cap: int,
+    bound: int,
+    verdict: str,
+    reason: str | None,
+) -> None:
+    task, *_ = retried(cli_env)  # one task, max_attempts 3, four calls
+
+    out = run_untimed(
+        capsys, "job", "usage", str(task.job_id), "--max-provider-calls-per-attempt", str(cap)
+    )
+
+    read = read_job_call_budget(cli_env, task.job_id, cap=cap)
+    assert read is not None
+    assert out == untimed(usage_document(*read))
+    assert out["budget"] == {
+        "cap": cap,
+        "cap_source": "operator",
+        "max_attempts_total": 3,
+        "bound": bound,
+        "calls": 4,
+        "finality": "lower_bound",
+        "verdict": verdict,
+        "unknown_reason": reason,
+    }
+
+
+def test_usage_with_a_cap_reads_within_for_a_closed_job(
+    cli_env: Conn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task, attempt = one_attempt(cli_env)
+    answered(cli_env, attempt.id, 0)
+    answered(cli_env, attempt.id, 1)
+    close(cli_env, attempt.id, 2)
+    complete(cli_env, attempt, SUCCESS)
+
+    out = run(capsys, "job", "usage", str(task.job_id), "--max-provider-calls-per-attempt", "1")
+
+    assert out["finality"] == "closed"
+    assert (out["budget"]["bound"], out["budget"]["calls"]) == (3, 2)
+    assert (out["budget"]["verdict"], out["budget"]["unknown_reason"]) == ("within", None)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["summary"], ["usage"], ["usage", "--max-provider-calls-per-attempt", "4"]],
+)
+def test_summary_and_usage_refuse_an_unknown_job(
+    cli_env: Conn, capsys: pytest.CaptureFixture[str], command: list[str]
+) -> None:
+    job_id = uuid.uuid4()
+    out = run(capsys, "job", command[0], str(job_id), *command[1:], code=1)
+    assert out["error"] == f"job {job_id} not found"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["summary"], ["usage"], ["usage", "--max-provider-calls-per-attempt", "4"]],
+)
+def test_summary_and_usage_refuse_another_kind_without_naming_it(
+    cli_env: Conn,
+    write_tasks: Callable[[object], str],
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+) -> None:
+    job_id = submit(capsys, write_tasks(TASKS), "--max-attempts", "1")["job_id"]
+
+    out = run(capsys, "job", command[0], job_id, *command[1:], code=1)
+
+    assert out["error"] == f"job {job_id} is not an invoice_verification job"
+    assert KIND not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["summary"], ["usage"], ["usage", "--max-provider-calls-per-attempt", "4"]],
+)
+def test_summary_and_usage_refuse_a_schema_without_migrations(
+    monkeypatch: pytest.MonkeyPatch,
+    schema_factory: Callable[[], str],
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+) -> None:
+    monkeypatch.setenv("ORQESTRA_DATABASE_URL", schema_factory())
+    out = run(capsys, "job", command[0], str(uuid.uuid4()), *command[1:], code=1)
+    assert out["error"].startswith("the database schema is not current: ")
+
+
+def test_a_database_error_during_a_read_is_reported_without_its_message(
+    cli_env: Conn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task, _ = one_attempt(cli_env)
+    # A ledger table that is gone: the schema check passes (it reads the migration
+    # record), and the usage read then fails inside its snapshot.
+    cli_env.execute("ALTER TABLE attempt_usage_closures RENAME TO closures_gone")
+
+    out = run(capsys, "job", "usage", str(task.job_id), code=1)
+
+    assert out["error"] == "the database request failed (UndefinedTable, SQLSTATE 42P01)"
