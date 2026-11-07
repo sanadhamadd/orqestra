@@ -1,6 +1,6 @@
 # ADR-0005: Provider calls: deterministic checks decide; intent-first usage ledger; no prices
 
-- **Status:** Proposed
+- **Status:** Accepted (owner, 2026-11-07; was Proposed)
 - **Date:** 2026-11-07
 - **Ledger entries:** DEC-055, DEC-057 … DEC-062
 
@@ -23,7 +23,7 @@ crash cannot hide it, and what a report of those calls can honestly claim.
 - **Deterministic checks decide** (DEC-055). Each synthetic invoice is `verified`,
   `rejected`, `needs_review` or `malformed` by two arithmetic checks. A provider is called
   only for an ambiguous amount string, once per such amount, with the capability, route,
-  field kind and raw string and nothing else. Its reply must be a digit string; the value is
+  field kind, raw string, `request_id` and `timeout` and nothing else. Its reply must be a digit string; the value is
   substituted and the same checks run again, so the checks, not the provider, decide the
   status. Route choice is pure: the lowest estimate among eligible routes, and a missing
   estimate is never read as zero.
