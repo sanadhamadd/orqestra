@@ -745,7 +745,9 @@ class Worker:
         this waits at least until the real end of the lease.
         """
         lease_expires_at, _ = _lease(attempt)
-        until = returned + (lease_expires_at - attempt.started_at).total_seconds()
+        until = local_deadline(
+            anchor=returned, started_at=attempt.started_at, instant=lease_expires_at
+        )
         self._held = _Held(attempt, until)
         self._schedule.claim_due = until
 

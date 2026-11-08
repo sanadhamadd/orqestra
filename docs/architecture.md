@@ -190,7 +190,8 @@ sequenceDiagram
   attempt, decides with the domain tables and commits. The heartbeat is the one exception, and
   it locks the attempt only (DEC-021, DEC-028, DEC-036).
 - No transaction stays open while a handler runs.
-- Every instant that decides expiry comes from the database clock.
+- Every instant that decides expiry comes from the database clock and is decoded in UTC whatever
+  the session TimeZone (DEC-067).
 - A provider call is made only after its intent row has committed (DEC-059).
 - A report reads one snapshot and says whether its counts are final (DEC-056, DEC-061).
 

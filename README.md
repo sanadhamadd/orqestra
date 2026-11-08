@@ -327,6 +327,9 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   `timedelta`s, with the lease no longer than the timeout. The attempt gets a lease and a
   non-renewable deadline, both measured from one claim instant on the database clock, read
   after the task lock is held, so waiting for that lock does not shorten the lease.
+  Lease, deadline and retry times are exact in any session TimeZone: the library decodes them in
+  UTC inside its own transactions (DEC-067). Records read outside them, such as `get_attempt` or
+  `get_job`, keep the session's zone.
 - `claim_next_attempt(conn, worker_id, kinds=..., policy=...)` finds the next queued,
   eligible task whose job kind is one of `kinds` and claims it the same way, returning its
   attempt, or `None` when nothing of those kinds is claimable right now. `kinds` is required: a

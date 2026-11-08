@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -39,11 +40,12 @@ from orqestra.domain.jobs import (
     Task,
     TaskSpec,
 )
-from orqestra.domain.leases import LeasePolicy, RevocationReason
+from orqestra.domain.leases import LeasePolicy, RevocationReason, initial_lease, revocation_reason
 from orqestra.domain.policy import FailureKind
 from orqestra.domain.retry import RetryPolicy, retry_at, retry_delay
 from orqestra.domain.states import AttemptState, TaskState
 from orqestra.persistence import lifecycle
+from orqestra.persistence._shared import owned_transaction
 from orqestra.persistence.jobs import get_job_progress, get_task, list_tasks, submit_job
 from orqestra.persistence.lifecycle import (
     AttemptCompletion,
@@ -3386,3 +3388,130 @@ def test_an_unrepresentable_retry_time_refuses_a_revocation_and_changes_nothing(
     revocation = revoke_next_expired(checked, retry_policy=HOUR)
     assert revocation is not None
     assert revocation.task.state is TaskState.QUEUED
+
+
+# --- 24. session time zone: instants are decoded in UTC (DEC-067) -----------------
+
+
+def zoned(conn: Conn, zone: str) -> None:
+    """Set the session TimeZone to ``zone``, and check the client decodes in it."""
+    conn.execute(sql.SQL("SET TimeZone = {}").format(sql.Literal(zone)))
+    # Without the zone on the server or in the client's tz database, decoding would
+    # fall back to UTC and these tests would pass without testing anything.
+    assert conn.info.timezone == ZoneInfo(zone)
+
+
+# The London fold of 2026-10-25: 01:00-02:00 local happens twice, BST then GMT.
+FOLD = (
+    "SELECT '2026-10-25 00:30:00+00'::timestamptz, "  # 01:30 BST: the lease's end
+    "'2026-10-25 01:10:00+00'::timestamptz, "  # 01:10 GMT: 40 minutes after it
+    "'2026-10-24 23:30:00+00'::timestamptz"  # 00:30 BST: a claim before the fold
+)
+
+
+def test_owned_transactions_compare_instants_across_a_dst_fold(checked: Conn) -> None:
+    zoned(checked, "Europe/London")
+    two_hours = LeasePolicy(lease=timedelta(hours=2), execution_timeout=timedelta(hours=2))
+    with owned_transaction(checked, "probe") as cur:
+        row = cur.execute(FOLD).fetchone()
+    assert row is not None
+    lease, now, claimed = row
+    assert lease.tzinfo is UTC
+    assert now - lease == timedelta(minutes=40)
+    reason = revocation_reason(
+        lease_expires_at=lease,
+        deadline_at=lease + timedelta(hours=1),
+        cancel_requested_at=None,
+        now=now,
+    )
+    assert reason is RevocationReason.LEASE_EXPIRED
+    assert initial_lease(two_hours, claimed)[1] - claimed == timedelta(hours=2)
+
+    # The caller's own queries keep the session zone, where wall-time arithmetic
+    # still takes the expired lease for a live one.
+    outside = checked.execute(FOLD).fetchone()
+    assert outside is not None
+    lease, now, _ = outside
+    assert lease.tzinfo == ZoneInfo("Europe/London")
+    reason = revocation_reason(
+        lease_expires_at=lease,
+        deadline_at=lease + timedelta(hours=1),
+        cancel_requested_at=None,
+        now=now,
+    )
+    assert reason is None
+
+
+def instants(value: object, path: str = "") -> Iterator[tuple[str, datetime]]:
+    """Every datetime in ``value``: a record, an error, or what either holds."""
+    if isinstance(value, datetime):
+        yield path, value
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for item in dataclasses.fields(value):
+            yield from instants(getattr(value, item.name), f"{path}.{item.name}")
+    elif isinstance(value, BaseException):
+        for name, item in vars(value).items():
+            yield from instants(item, f"{path}.{name}")
+    elif isinstance(value, tuple | list):
+        for index, item in enumerate(value):
+            yield from instants(item, f"{path}[{index}]")
+
+
+@pytest.mark.parametrize(
+    "zone",
+    # London is at offset 0 in winter, so only `tzinfo is UTC` tells the fix apart.
+    ["America/New_York", "Australia/Lord_Howe", "Europe/London"],
+)
+def test_lifecycle_instants_are_utc_whatever_the_session_time_zone(
+    checked: Conn, zone: str
+) -> None:
+    zoned(checked, zone)
+    seen: list[tuple[str, object]] = []
+
+    def record(name: str, value: object) -> None:
+        seen.append((name, value))
+
+    specs = tuple(TaskSpec(key, {"invoice": key}, 3) for key in ("run", "wait", "cancel"))
+    submitted = submit_job(checked, JobSubmission(KIND, specs))
+    record("submit_job", submitted)
+    run, wait, cancel = list_tasks(checked, submitted.job.id)
+    # Its own kind, so discovery below can only claim this task.
+    (expire,) = new_tasks(checked, "expire", kind="zone_probe")
+
+    attempt = start_attempt(checked, run.id, "w", policy=POLICY)
+    record("start_attempt", attempt)
+    record("renew_lease", renew(checked, attempt))
+    record("complete_attempt", complete(checked, attempt, TRANSIENT))
+
+    delay(checked, wait.id, timedelta(hours=1))
+    with pytest.raises(TaskNotEligibleError) as not_eligible:
+        start_attempt(checked, wait.id, "w", policy=POLICY)
+    record("TaskNotEligibleError", not_eligible.value)
+
+    cancelled = start_attempt(checked, cancel.id, "w", policy=POLICY)
+    record("request_cancellation", request_cancellation(checked, cancel.id, grace=GRACE))
+    with pytest.raises(CancellationRequestedError) as requested:
+        renew(checked, cancelled)
+    record("CancellationRequestedError", requested.value)
+
+    expiring = claim_next_attempt(checked, "w", policy=EXPIRING, kinds=("zone_probe",))
+    assert expiring is not None
+    assert expiring.task_id == expire.id
+    record("claim_next_attempt", expiring)
+    until_expired(checked, expiring)
+    with pytest.raises(LeaseExpiredError) as expired:
+        renew(checked, expiring)
+    record("LeaseExpiredError", expired.value)
+    record("revoke_next_expired", recover(checked))
+
+    found = [(f"{name}{path}", value) for name, item in seen for path, value in instants(item)]
+    assert {name.split(".")[0] for name, _ in found} == {name for name, _ in seen}
+    assert [(name, value.tzinfo) for name, value in found if value.tzinfo is not UTC] == []
+
+    # SET LOCAL ended with each transaction: the session, and reads outside the
+    # library's transactions, keep the caller's zone.
+    assert checked.execute("SHOW TimeZone").fetchone() == (zone,)
+    assert checked.info.timezone == ZoneInfo(zone)
+    read = get_attempt(checked, attempt.id)
+    assert read is not None
+    assert read.started_at.tzinfo == ZoneInfo(zone)
