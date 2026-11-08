@@ -357,6 +357,7 @@ is not stopped (left to the worker runtime).
 - **TRADE-OFF:** A claimant that stalls between its claim `UPDATE` and its commit still loses that time from its lease, which is right: it was not running the task. The claim's `updated_at` moves from transaction start to the claim statement. Expiry depends on one database clock: a step forward can expire leases early (fencing still holds), and a step back is absorbed because a lease never shrinks.
 - **VERIFICATION:** `test_a_claim_that_waited_for_the_task_lock_still_gets_its_full_lease`, for `start_attempt` and `claim_next_attempt`, with and without server-side prepared statements. A holder keeps the claimant waiting (observed in `pg_locks`) and reads `clock_timestamp()` before releasing; the attempt must start after that. Locally, deriving the instant from `now()` fails it.
 - **Cancellation grace note:** a cancellation request's instant (`cancel_requested_at`, and for a queued task `finished_at` and `updated_at`) is now `statement_timestamp()` of its task update, taken after its locks, because the revocation reason compares it with the lease (DEC-040).
+- **Session time zone note:** the instants it reads are decoded in UTC inside the library's own transaction, so expiry is decided on instants, not wall times, whatever the session TimeZone (DEC-067).
 
 ### DEC-036 — The heartbeat renews under the attempt lock alone and refuses expired leases
 - **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented (`renew_lease`)
@@ -372,6 +373,7 @@ is not stopped (left to the worker runtime).
   - A 40-round unforced race of heartbeat, completion, recovery and cancellation that asserts no deadlock, exactly one of completion or recovery per round, and the invariants. Which one wins is not asserted; `test_completion_and_recovery_in_either_order` forces both orders.
   - Locally, adding a task lock after the attempt lock made that race fail with `DeadlockDetected`; removing each check failed its test.
 - **Cancellation grace note:** the heartbeat also reads the task's `cancel_requested_at` without a lock, in the statement that reads the clock after the attempt lock, and refuses renewal with `CancellationRequestedError` once a request has committed. It still takes no task lock (DEC-040).
+- **Session time zone note:** refusing an expired lease now also holds across a daylight-saving change in the session TimeZone, because the heartbeat compares UTC instants (DEC-067).
 
 ### DEC-037 — Recovery revokes one expired attempt per transaction; ownership ends at its commit
 - **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented (`revoke_next_expired`)
@@ -719,6 +721,7 @@ runs a worker yet.
 - **Graceful shutdown note:** `run(stop)` is replaced by `run()` and `request_stop()`. The supervisor now waits on a self-pipe that the handler's end, `request_stop` and signals write to, rather than on the handler's `done` or the `stop` event; this also ended a busy wait while an outcome waited for a retry. A stop is latched and, while a task is held, drained rather than ignored; a third guard, drain, ends the process with exit 9. Signal handling, which the `SIGALRM` runner-up left to shutdown, is owned by `shutdown.run_until_signalled` on the main thread (DEC-049).
 - **Recovery correction note (DEC-050):** the supervisor's session also carries `lock_timeout` and `idle_in_transaction_session_timeout`. Neither changes what the watchdog guards; together they keep a frozen worker's open transaction from blocking recovery, and keep a recovering worker from being ended by its own operation guard while it waits for that lock.
 - **Provider usage note (DEC-059):** the schedule gains a `USAGE` step after the heartbeat: while a handler runs, the supervisor writes the provider usage record the handler waits on, under the same rule as a sweep step, so it never delays a heartbeat.
+- **Session time zone note:** `local_deadline` subtracts in UTC and refuses naive instants, and the hold of a claimed but unstarted attempt (DEC-049) uses it, so the fence and the hold measure elapsed time in any session TimeZone (DEC-067).
 
 ### DEC-046 — Outcome policy: database errors are never handler failures; an ambiguous completion ends the process
 - **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); the ambiguous case is reconciled by DEC-047
@@ -1619,3 +1622,52 @@ recorded on PR #17.
   - The cap is the operator's assumption, as in DEC-065; the command cannot check it.
   - As in DEC-064, the commands set no timeout of their own, and there is still no command to list jobs or show their tasks.
 - **VERIFICATION:** Unit tests (`tests/unit/test_cli.py`) print a summary and a usage report built field by field, compare each document's keys with the dataclass fields so a new field cannot be dropped silently, check a small amount printed without an exponent, the budget for `exceeded`, `unknown` and `within`, a cap of 0 and of `MAX_CALL_SEQ`, the refusal of a negative cap and of one above `MAX_CALL_SEQ` before the database without the value, argparse errors for a missing or malformed `JOB_ID` or cap, and for each command an unknown job, another kind without its name, a job without tasks, a schema that is not current, a database error by type and SQLSTATE, invalid and missing settings, a malformed URL and an unreachable database without secrets. PostgreSQL tests (`tests/integration/test_cli_jobs_pg.py`) compare each command's output, except `observed_at`, with the library's own result serialized the same way: a complete job run through the real handler (no invoice value in the output), a job with succeeded, failed and running tasks, a retried task's usage, the budget `exceeded` and `unknown` on that task and `within` on a closed job. They also refuse an unknown job, an echo job (without its kind), an unmigrated schema, and report a missing ledger table by type and SQLSTATE.
+
+## Session time zone
+
+### DEC-067 — Library transactions decode instants in UTC, so lease, deadline and retry arithmetic measures elapsed time
+- **Status:** Accepted (owner full-auto rule, 2026-11-08) · implemented (`owned_transaction`, `local_deadline`, the claim hold) · cites ADR-0003 (the database clock decides)
+- **WHAT:**
+  - `owned_transaction` runs `SET LOCAL TimeZone = 'UTC'` as its own statement, right after the isolation statement. Every `timestamptz` decoded inside a library-owned transaction is therefore a `datetime.UTC` value. The setting is transaction-local: commit or rollback restores the caller's session zone.
+  - `local_deadline` converts both instants to UTC before subtracting, and refuses naive ones. The hold of a claimed but unstarted attempt (DEC-049) goes through it.
+  - Reads outside `owned_transaction` (`get_attempt`, `get_job`, `list_tasks`, the snapshots and the other `tuple_cursor` reads) keep the session zone. They are a reviewed list, and none feeds lease, deadline or retry arithmetic.
+- **WHY:**
+  - psycopg decodes `timestamptz` in the session TimeZone, all values sharing one `ZoneInfo`, and Python compares, subtracts and adds datetimes that share a zone by wall time.
+  - In a zone with daylight saving, a lease or a retry delay computed across a clock change was an hour long or short (DEC-034, DEC-053). An expired lease could compare as live, so a heartbeat could renew it (DEC-036). And the ownership fence of a lease crossing a spring change was armed an hour late.
+  - Examples: the Europe/London fold of 2026-10-25, where a lease that ended at 01:30 BST compared as live at 01:10 GMT, 40 minutes later; and the America/New_York changes of 2026-03-08 and 2026-11-01, where a 30 s lease mapped to an hour more or an hour less.
+  - CI and the Compose server run in UTC, so no test saw it.
+- **RUNNER-UP:**
+  - `-c TimeZone=UTC` in `supervisor_conninfo`.
+  - Refusing sessions whose TimeZone is not UTC.
+  - `.astimezone(UTC)` in every domain rule.
+  - A custom UTC `timestamptz` loader.
+  - Doing the arithmetic in SQL.
+- **WHY NOT:**
+  - The connection option covers the worker's connection only, not library callers, and it changes DEC-050's option list.
+  - A refusal would stop deployments behind poolers or with `PGTZ` set.
+  - Converting in every rule spreads the rule over five files, and every future site must remember it.
+  - A custom loader replaces psycopg's C loader, and one registered globally would change user code in the same process.
+  - SQL `interval` days follow wall time too.
+- **TRADE-OFF:**
+  - One more statement per owned transaction, heartbeats and claims included. The measurement campaign measures this code.
+  - In a session whose TimeZone is not UTC, `orqestra job submit` prints `created_at` with `+00:00` while `orqestra job status` keeps the session's offset; the instant is the same.
+  - Correctness relies on psycopg reading the session TimeZone for each query's loaders, and on PostgreSQL reporting the revert of `SET LOCAL`. The integration tests check both.
+  - Open: a CI lane whose test sessions use a TimeZone with daylight saving (needs the owner).
+- **VERIFICATION:**
+  - `tests/integration/test_attempt_lifecycle.py`, section 24:
+    - with the session in Europe/London, instants read on the 2026-10-25 fold inside `owned_transaction` are UTC; the expired lease is `lease_expired`, 40 minutes past; a 2 h lease from before the fold is exactly 2 h long;
+    - the same values read outside it keep London's zone and show the defect;
+    - in America/New_York, Australia/Lord_Howe and Europe/London, every instant in the records and errors of submission, claim, renewal, completion, an ineligible start, cancellation, an expired renewal and recovery is UTC, and the session keeps its zone afterwards.
+  - `tests/unit/test_worker_fence.py`: `local_deadline` maps a 30 s lease across the New York spring and autumn changes to 30 s, and refuses naive instants.
+  - `tests/unit/test_worker_runtime.py`: across both changes, the hold of an unreadable claim and the ownership fence each wait one real lease.
+  - `tests/unit/test_persistence_boundaries.py` (AST):
+    - cursors are made only by the shared helpers;
+    - connections run statements directly only in migrations;
+    - the reads outside `owned_transaction` are a fixed list;
+    - lifecycle applies the lease and retry rules only inside the operations that own their transaction.
+  - Mutation checks: locally, each of these failed tests:
+    - removing the `SET LOCAL`;
+    - merging it into the isolation statement, which the prepared-statement variant of the claim test refuses;
+    - reverting `local_deadline` to a plain subtraction;
+    - reverting the hold to a plain subtraction;
+    - a new lifecycle read outside `owned_transaction` that applies a lease rule.

@@ -3,8 +3,9 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any, NoReturn
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -344,7 +345,18 @@ class FakeConn:
         self.closed = True
 
 
-def attempt(lease_seconds: float = 30.0, worker: str = "worker-1") -> Attempt:
+def attempt(
+    lease_seconds: float = 30.0,
+    worker: str = "worker-1",
+    *,
+    start: datetime = T0,
+    zone: tzinfo = UTC,
+) -> Attempt:
+    """A running attempt claimed at ``start``, its instants decoded in ``zone``.
+
+    Each instant is computed in UTC and only then converted: adding a timedelta to
+    a datetime in a zone with daylight saving would itself be wall-time arithmetic.
+    """
     return Attempt(
         uuid.UUID(int=1),
         uuid.UUID(int=2),
@@ -354,10 +366,10 @@ def attempt(lease_seconds: float = 30.0, worker: str = "worker-1") -> Attempt:
         None,
         None,
         None,
-        T0,
+        start.astimezone(zone),
         None,
-        T0 + timedelta(seconds=lease_seconds),
-        T0 + timedelta(minutes=10),
+        (start + timedelta(seconds=lease_seconds)).astimezone(zone),
+        (start + timedelta(minutes=10)).astimezone(zone),
         None,
     )
 
@@ -730,6 +742,35 @@ def test_a_claim_whose_task_cannot_be_read_is_held_until_its_lease_ends(harness:
     assert harness.deadline() is None  # no handler, so no fence
     # No other claim until the unstarted attempt's lease has certainly ended.
     assert harness.worker._schedule.claim_due == 100.0 + 30.0
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+# 15 s before a clock change, so a 30 s lease ends after it (DEC-067).
+AUTUMN = datetime(2026, 11, 1, 5, 59, 45, tzinfo=UTC)  # 01:59:45 EDT; +30 s is 01:00:15 EST
+SPRING = datetime(2026, 3, 8, 6, 59, 45, tzinfo=UTC)  # 01:59:45 EST; +30 s is 03:00:15 EDT
+TRANSITIONS = pytest.mark.parametrize("claimed", [AUTUMN, SPRING], ids=["autumn", "spring"])
+
+
+@TRANSITIONS
+def test_a_held_claim_waits_one_real_lease_across_a_transition(
+    harness: Harness, claimed: datetime
+) -> None:
+    zoned = attempt(start=claimed, zone=NEW_YORK)
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", lambda *a, **k: zoned)
+    harness.monkeypatch.setattr(runtime, "get_task", raising(psycopg.OperationalError("lost")))
+    harness.worker._claim()
+    assert harness.worker._schedule.running is None
+    assert harness.worker._schedule.claim_due == 130.0  # 30 s of real time, not wall time
+
+
+@TRANSITIONS
+def test_the_fence_is_armed_at_the_real_lease_end_across_a_transition(
+    harness: Harness, claimed: datetime
+) -> None:
+    zoned = attempt(start=claimed, zone=NEW_YORK)
+    harness.worker._start(zoned, 100.0, {"worker_id": "worker-1"}, {}, "k")
+    assert harness.worker._schedule.running is not None
+    assert harness.deadline() == 127.0  # the 30 s lease, less the 3 s margin
 
 
 def test_a_claimed_lease_too_short_to_run_is_held_until_it_ends(harness: Harness) -> None:
