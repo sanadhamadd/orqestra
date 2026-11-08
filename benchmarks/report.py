@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmarks import claims
-from benchmarks.result import RESULTS_DIR, ROOT, Status, validate_result
+from benchmarks.result import RESULTS_DIR, ROOT, Status, WaitEnded, validate_result
 
 BEGIN = "<!-- BEGIN GENERATED: python -m benchmarks.report -->"
 END = "<!-- END GENERATED -->"
@@ -222,12 +222,23 @@ def clean(record: Mapping[str, Any]) -> bool:
 def reason(record: Mapping[str, Any]) -> str:
     """Why a cell result is not in the tables."""
     reasons = []
+    timing = record.get("timing")
+    ended = timing.get("wait_ended") if isinstance(timing, Mapping) else None
+    waited = fixed(_number(record, "timing", "waited_s"), 1)
     if record["status"] == Status.INCOMPLETE:
-        stop = _number(record, "timing", "stop_after_s")
-        reasons.append(f"incomplete: stopped after {fixed(stop, 1)} s")
+        if ended == WaitEnded.STOP_AFTER:
+            reasons.append(f"incomplete: stopped at the limit after {waited} s")
+        else:  # a record from before the wait was recorded
+            stop = _number(record, "timing", "stop_after_s")
+            reasons.append(
+                f"incomplete: stopped before every task ended (limit {fixed(stop, 1)} s)"
+            )
     elif record["status"] == Status.FAILED_CORRECTNESS:
-        failed = [str(check["name"]) for check in record["gate"] if not check["passed"]]
-        reasons.append("failed_correctness: " + ", ".join(failed))
+        failed = ", ".join(str(check["name"]) for check in record["gate"] if not check["passed"])
+        if ended == WaitEnded.NO_WORKERS:
+            reasons.append(f"failed_correctness: every worker exited after {waited} s; {failed}")
+        else:
+            reasons.append(f"failed_correctness: {failed}")
     if record["environment"]["git_dirty"]:
         reasons.append("dirty tree (dirty_allowed)")
     return "; ".join(reasons)

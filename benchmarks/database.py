@@ -19,7 +19,7 @@ from collections.abc import Mapping
 
 import psycopg
 from psycopg import sql
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import TupleRow
 
 BENCH_DATABASE_URL_ENV = "ORQESTRA_BENCH_DATABASE_URL"
@@ -37,7 +37,7 @@ class UnsafeBenchDatabaseError(RuntimeError):
 
 
 def require_bench_database_url(environ: Mapping[str, str]) -> str:
-    """The configured benchmark database URL; raise if it is not set."""
+    """The configured benchmark database URL; raise if it is not set or cannot be parsed."""
     url = environ.get(BENCH_DATABASE_URL_ENV, "").strip()
     if not url:
         msg = (
@@ -45,7 +45,25 @@ def require_bench_database_url(environ: Mapping[str, str]) -> str:
             f"database named {BENCH_DATABASE_NAME!r}"
         )
         raise UnsafeBenchDatabaseError(msg)
+    # libpq parse errors can echo fragments of the URL, password included, so the
+    # refusal names no part of it and does not chain the parse error. A byte that is
+    # not UTF-8 in the environment arrives as a lone surrogate, which libpq cannot take.
+    try:
+        conninfo_to_dict(url)
+    except (psycopg.ProgrammingError, UnicodeError):
+        msg = f"{BENCH_DATABASE_URL_ENV} is not a valid PostgreSQL connection string"
+        raise UnsafeBenchDatabaseError(msg) from None
     return url
+
+
+def unreachable_message(exc: psycopg.OperationalError) -> str:
+    """A one-line refusal for a server that could not be reached or refused the connection.
+
+    libpq's connection errors name the host, port and user, never the password;
+    only their first line is kept.
+    """
+    first = str(exc).strip().splitlines()
+    return "could not reach the benchmark database" + (f": {first[0]}" if first else "")
 
 
 def _is_loopback(address: str) -> bool:

@@ -64,6 +64,7 @@ from benchmarks.database import (
     require_bench_database_url,
     run_schema_name,
     schema_url,
+    unreachable_message,
 )
 from benchmarks.generate import (
     DEFAULT_SEED,
@@ -79,6 +80,7 @@ from benchmarks.result import (
     ROOT,
     DirtyTreeError,
     Status,
+    WaitEnded,
     code_state,
     environment,
     now,
@@ -584,6 +586,19 @@ class Running:
     task_counts: Mapping[TaskState, int]
 
 
+def cell_status(wait_ended: WaitEnded, gate: Sequence[Mapping[str, Any]]) -> Status:
+    """A cell's status from how its wait ended and its gate.
+
+    Only the time limit makes a cell ``incomplete``. A fleet that exited before
+    its job ended leaves the job unfinished, so the gate's ``terminal`` check
+    fails and the cell is ``failed_correctness``, not a timeout.
+    """
+    if wait_ended is WaitEnded.STOP_AFTER:
+        return Status.INCOMPLETE
+    passed = all(check["passed"] for check in gate)
+    return Status.COMPLETE if passed else Status.FAILED_CORRECTNESS
+
+
 def run_cell(
     url: str,
     cell: Cell,
@@ -601,8 +616,10 @@ def run_cell(
     """Run ``cell`` against the migrated schema ``url`` and return its result record.
 
     ``stop_after`` bounds the wait for the job in seconds; a job not finished by
-    then makes the cell ``incomplete``. Raw files go to ``raw_dir``. ``hook``,
-    if given, is called on every poll while the job runs (drills use it).
+    then makes the cell ``incomplete``. The wait also ends once every worker has
+    exited; ``timing`` records which ended it and how long it lasted
+    (``cell_status``). Raw files go to ``raw_dir``. ``hook``, if given, is called
+    on every poll while the job runs (drills use it).
     """
     run_id = run_id or uuid.uuid4().hex[:12]
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -627,19 +644,21 @@ def run_cell(
             before = metrics.database_counters(conn)
             job_id, submission = submit(url, KIND_OF[cell.profile], workload.tasks, raw_dir)
             began = time.monotonic()
-            finished = False
+            wait_ended = WaitEnded.STOP_AFTER
             while time.monotonic() - began < stop_after:
                 progress = get_job_progress(conn, job_id)
                 assert progress is not None
                 counts = progress.task_counts
                 if counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0:
-                    finished = True
+                    wait_ended = WaitEnded.FINISHED
                     break
                 if hook is not None:
                     hook(Running(conn, job_id, fleet, time.monotonic() - began, counts))
                 if fleet.alive() == 0:
+                    wait_ended = WaitEnded.NO_WORKERS
                     break
                 time.sleep(POLL)
+            waited = time.monotonic() - began
             time.sleep(STATS_SETTLE)
             after = metrics.database_counters(conn)
             idle_began = time.monotonic()
@@ -659,11 +678,7 @@ def run_cell(
         usage = (
             usage_figures(conn, job_id, DEFAULT_CAP) if cell.profile is Profile.INVOICE else None
         )
-    status = Status.INCOMPLETE
-    if finished:
-        status = (
-            Status.COMPLETE if all(check["passed"] for check in gate) else Status.FAILED_CORRECTNESS
-        )
+    status = cell_status(wait_ended, gate)
     database_stats = metrics.delta(before, after)
     tasks = len(workload.tasks)
     database_stats["commits_per_task"] = metrics.rate(
@@ -691,6 +706,8 @@ def run_cell(
             "tasks": tasks,
             "items": workload.items,
             "stop_after_s": stop_after,
+            "wait_ended": wait_ended.value,
+            "waited_s": waited,
         },
         "throughput": figures["throughput"] if status is Status.COMPLETE else None,
         "latency": figures["latency"],
@@ -822,6 +839,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except (ValueError, DirtyTreeError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    except psycopg.OperationalError as exc:
+        print(f"refused: {unreachable_message(exc)}", file=sys.stderr)
         return 1
     print(f"{record['status']} {path}")
     return 0 if record["status"] == Status.COMPLETE else 1

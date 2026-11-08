@@ -36,7 +36,6 @@ import json
 import math
 import os
 import platform
-import subprocess
 import sys
 import time
 import uuid
@@ -57,7 +56,9 @@ from benchmarks.database import (
     require_bench_database_url,
     run_schema_name,
     schema_url,
+    unreachable_message,
 )
+from benchmarks.result import code_state, server_info
 from orqestra.domain.jobs import AttemptSucceeded, JobSubmission, TaskSpec
 from orqestra.domain.leases import LeasePolicy
 from orqestra.domain.retry import RetryPolicy
@@ -84,7 +85,6 @@ DEFAULT_EXPLAINS = 20
 # no lease ends while a run is measured, so recovery never interferes.
 LEASE = LeasePolicy(lease=timedelta(minutes=10), execution_timeout=timedelta(minutes=10))
 RETRY = RetryPolicy(base_delay=timedelta(seconds=1), max_delay=timedelta(seconds=1))
-SERVER_SETTINGS = ("shared_buffers", "work_mem", "max_connections", "synchronous_commit", "fsync")
 
 _EXPLAIN = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {_LOCK_NEXT_CLAIMABLE_TASK}"
 _DELAY_FIRST = (
@@ -232,28 +232,6 @@ def measure_depth(
     }
 
 
-def server_info(conn: Conn) -> dict[str, str]:
-    """The server version and the settings that shape the measurement."""
-    info: dict[str, str] = {}
-    row = conn.execute("SELECT version()").fetchone()
-    info["version"] = str(row[0]) if row else ""
-    for name in SERVER_SETTINGS:
-        setting = conn.execute("SELECT current_setting(%s)", (name,)).fetchone()
-        info[name] = str(setting[0]) if setting else ""
-    return info
-
-
-def _git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True, timeout=30
-    ).stdout.strip()
-
-
-def code_state() -> dict[str, Any]:
-    """The commit measured and whether the working tree differs from it."""
-    return {"git_sha": _git("rev-parse", "HEAD"), "git_dirty": bool(_git("status", "--porcelain"))}
-
-
 def build_record(
     measurements: list[dict[str, Any]],
     *,
@@ -340,12 +318,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        url = require_bench_database_url(os.environ)
-        admin = connect_verified(url)
-    except UnsafeBenchDatabaseError as exc:
+        return _measure(args)
+    except (ValueError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
-    with admin:
+    except psycopg.OperationalError as exc:
+        print(f"refused: {unreachable_message(exc)}", file=sys.stderr)
+        return 1
+
+
+def _measure(args: argparse.Namespace) -> int:
+    url = require_bench_database_url(os.environ)
+    with connect_verified(url) as admin:
         code = code_state()
         if code["git_dirty"] and not args.allow_dirty:
             print("refused: the working tree has uncommitted changes", file=sys.stderr)
