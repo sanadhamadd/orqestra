@@ -125,8 +125,9 @@ def test_a_malformed_url_is_refused_without_quoting_it(url: str) -> None:
         require_bench_database_url({BENCH_DATABASE_URL_ENV: url})
     exc = caught.value
     assert str(exc) == f"{BENCH_DATABASE_URL_ENV} is not a valid PostgreSQL connection string"
+    # Neither chained nor kept as context: nothing that walks the chain finds the URL.
     assert exc.__cause__ is None
-    assert exc.__suppress_context__ is True
+    assert exc.__context__ is None
     assert SECRET not in _shown(exc)
 
 

@@ -46,13 +46,18 @@ def require_bench_database_url(environ: Mapping[str, str]) -> str:
         )
         raise UnsafeBenchDatabaseError(msg)
     # libpq parse errors can echo fragments of the URL, password included, so the
-    # refusal names no part of it and does not chain the parse error. A byte that is
-    # not UTF-8 in the environment arrives as a lone surrogate, which libpq cannot take.
+    # refusal names no part of it. It is raised after the except block, so the parse
+    # error is neither its cause nor its context. A byte that is not UTF-8 in the
+    # environment arrives as a lone surrogate, which libpq cannot take.
     try:
         conninfo_to_dict(url)
     except (psycopg.ProgrammingError, UnicodeError):
+        parsed = False
+    else:
+        parsed = True
+    if not parsed:
         msg = f"{BENCH_DATABASE_URL_ENV} is not a valid PostgreSQL connection string"
-        raise UnsafeBenchDatabaseError(msg) from None
+        raise UnsafeBenchDatabaseError(msg)
     return url
 
 
