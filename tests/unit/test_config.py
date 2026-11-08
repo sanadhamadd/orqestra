@@ -33,6 +33,40 @@ def test_invalid_concurrency_rejected(monkeypatch: pytest.MonkeyPatch, value: st
         Settings()
 
 
+BLANK = ["", "   ", "\t\n"]
+
+
+@pytest.mark.parametrize("blank", BLANK)
+@pytest.mark.parametrize("name", ["ORQESTRA_DATABASE_URL", "ORQESTRA_OPENROUTER_API_KEY"])
+def test_a_blank_secret_is_not_set(monkeypatch: pytest.MonkeyPatch, name: str, blank: str) -> None:
+    monkeypatch.setenv(name, blank)
+    settings = Settings()
+    assert settings.database_url is None
+    assert settings.openrouter_api_key is None
+    assert settings.redacted()["database_url"] is None
+    assert settings.redacted()["openrouter_api_key"] is None
+
+
+def test_a_blank_secret_given_directly_is_not_set() -> None:
+    assert Settings(database_url="  ", openrouter_api_key="").database_url is None
+
+
+def test_a_set_secret_is_kept_as_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ORQESTRA_DATABASE_URL", " postgresql://u@h/db ")
+    url = Settings().database_url
+    assert url is not None
+    assert url.get_secret_value() == " postgresql://u@h/db "
+
+
+@pytest.mark.parametrize("blank", BLANK)
+def test_a_blank_setting_that_is_not_a_secret_is_still_refused(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    monkeypatch.setenv("ORQESTRA_LOG_LEVEL", blank)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 def test_invalid_log_level_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ORQESTRA_LOG_LEVEL", "LOUD")
     with pytest.raises(ValidationError):

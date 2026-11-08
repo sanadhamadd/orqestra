@@ -123,10 +123,10 @@ def _error(message: str) -> int:
 
 def _connection_string(settings: Settings) -> tuple[str, str | None]:
     """The DSN and its password, if any; ``_Refused`` if there is none, or it is malformed."""
-    if settings.database_url is None:
+    dsn = None if settings.database_url is None else settings.database_url.get_secret_value()
+    if dsn is None or not dsn.strip():  # libpq reads a blank DSN as its default server
         msg = "ORQESTRA_DATABASE_URL is not set"
         raise _Refused(msg)
-    dsn = settings.database_url.get_secret_value()
     # libpq parse errors can echo fragments of the URL, password included, so
     # they are reported generically. A byte that is not UTF-8 in the environment
     # arrives as a lone surrogate, which cannot be encoded for libpq at all.
@@ -416,7 +416,12 @@ def _submit(conn: psycopg.Connection[TupleRow], submission: JobSubmission) -> di
 def _status(conn: psycopg.Connection[TupleRow], job_id: uuid.UUID) -> dict[str, object]:
     # A job row never changes and the counts are one statement, so two reads suffice.
     job = get_job(conn, job_id)
-    progress = None if job is None else get_job_progress(conn, job_id)
+    try:
+        progress = None if job is None else get_job_progress(conn, job_id)
+    except ValueError:
+        # submit_job never creates a job without tasks; only a manual edit can.
+        msg = f"job {job_id} has no tasks"
+        raise _Refused(msg) from None
     if job is None or progress is None:
         msg = f"job {job_id} not found"
         raise _Refused(msg)

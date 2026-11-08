@@ -7,11 +7,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NoReturn
 
 import psycopg
 import pytest
 from psycopg import errors
+from pydantic import SecretStr
 
 import orqestra
 from orqestra import cli
@@ -28,6 +29,7 @@ from orqestra.aggregation.usage import (
 )
 from orqestra.calls.recording import MAX_CALL_SEQ
 from orqestra.cli import main
+from orqestra.config import Settings
 from orqestra.domain.jobs import Job, JobProgress, JobStatus, JobSubmission
 from orqestra.domain.states import AttemptState, TaskState
 from orqestra.persistence.jobs import IdempotencyConflictError, SubmissionResult
@@ -92,6 +94,42 @@ def test_migrate_requires_database_url(capsys: pytest.CaptureFixture[str]) -> No
     assert main(["migrate"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"status": "error", "error": "ORQESTRA_DATABASE_URL is not set"}
+
+
+BLANK = ["", "   ", "\t\n"]
+
+
+@pytest.mark.parametrize("blank", BLANK)
+def test_migrate_treats_a_blank_database_url_as_unset(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], blank: str
+) -> None:
+    def no_migration(dsn: str) -> NoReturn:
+        pytest.fail("migrate reached a database although the URL was blank")
+
+    monkeypatch.setattr(cli, "migrate", no_migration)
+    monkeypatch.setenv("ORQESTRA_DATABASE_URL", blank)
+    assert main(["migrate"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"status": "error", "error": "ORQESTRA_DATABASE_URL is not set"}
+
+
+@pytest.mark.parametrize("blank", BLANK)
+def test_health_reports_a_blank_secret_as_unset(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], blank: str
+) -> None:
+    monkeypatch.setenv("ORQESTRA_DATABASE_URL", blank)
+    monkeypatch.setenv("ORQESTRA_OPENROUTER_API_KEY", blank)
+    assert main(["health"]) == 0
+    settings = json.loads(capsys.readouterr().out)["settings"]
+    assert settings["database_url"] is None
+    assert settings["openrouter_api_key"] is None
+
+
+def test_the_connection_string_refuses_a_blank_url_that_reaches_it() -> None:
+    # A backstop for settings built without validation.
+    settings = Settings.model_construct(database_url=SecretStr("  "))
+    with pytest.raises(cli._Refused, match="ORQESTRA_DATABASE_URL is not set"):
+        cli._connection_string(settings)
 
 
 def test_migrate_reports_invalid_configuration(
@@ -178,6 +216,10 @@ def worker_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("ORQESTRA_DATABASE_URL", URL)
     return monkeypatch
+
+
+def _no_connection(*args: object, **kwargs: object) -> NoReturn:
+    pytest.fail("a database was reached although the URL was refused")
 
 
 def refused(capsys: pytest.CaptureFixture[str], *argv: str) -> dict[str, Any]:
@@ -273,6 +315,18 @@ def test_worker_run_requires_a_database_url(
 ) -> None:
     Started(worker_env, allowed=False)
     worker_env.delenv("ORQESTRA_DATABASE_URL")
+    assert refused(capsys, "--kind", "diagnostic.echo")["error"] == (
+        "ORQESTRA_DATABASE_URL is not set"
+    )
+
+
+@pytest.mark.parametrize("blank", BLANK)
+def test_worker_run_treats_a_blank_database_url_as_unset(
+    worker_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], blank: str
+) -> None:
+    Started(worker_env, allowed=False)
+    worker_env.setattr(psycopg, "connect", _no_connection)
+    worker_env.setenv("ORQESTRA_DATABASE_URL", blank)
     assert refused(capsys, "--kind", "diagnostic.echo")["error"] == (
         "ORQESTRA_DATABASE_URL is not set"
     )
@@ -821,6 +875,39 @@ def test_a_database_url_that_is_not_utf8_is_reported_as_invalid(
         "status": "error",
         "error": "ORQESTRA_DATABASE_URL is not a valid PostgreSQL connection string",
     }
+
+
+@pytest.mark.parametrize("command", ALL_JOB_COMMANDS)
+@pytest.mark.parametrize("blank", BLANK)
+def test_job_commands_treat_a_blank_database_url_as_unset(
+    job_env: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: list[str],
+    blank: str,
+) -> None:
+    Database(job_env, allowed=False)
+    job_env.setenv("ORQESTRA_DATABASE_URL", blank)
+    argv = job_argv(tmp_path, command)
+    assert job_output(capsys, argv, 1)["error"] == "ORQESTRA_DATABASE_URL is not set"
+
+
+def test_job_status_refuses_a_job_without_tasks(
+    job_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = Database(job_env)
+    db.progress = JobProgress(JOB_ID, JobStatus.QUEUED, MappingProxyType({}))  # the job exists
+
+    def no_tasks(conn: object, job_id: uuid.UUID) -> NoReturn:
+        msg = "a job has at least one task"  # as derive_job_status raises it
+        raise ValueError(msg)
+
+    job_env.setattr(cli, "get_job_progress", no_tasks)
+    assert main(["job", "status", str(JOB_ID)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    [line] = captured.out.splitlines()
+    assert json.loads(line) == {"status": "error", "error": f"job {JOB_ID} has no tasks"}
 
 
 def test_job_status_refuses_an_unknown_job(

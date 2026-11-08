@@ -5,6 +5,7 @@ on real threads against a fake clock. The PostgreSQL behaviour is in
 ``tests/integration/test_worker_usage_pg.py``.
 """
 
+import json
 import logging
 import threading
 import time
@@ -28,6 +29,7 @@ from orqestra.calls.recording import (
 )
 from orqestra.domain.jobs import AttemptCancelled, AttemptSucceeded, JsonValue
 from orqestra.domain.states import AttemptState
+from orqestra.logging import JsonFormatter
 from orqestra.persistence.lifecycle import CancellationRequestedError, NotFoundError
 from orqestra.persistence.provider_usage import (
     CallFailure,
@@ -532,6 +534,10 @@ def test_an_unrepresentable_amount_leaves_the_call_unresolved_and_logs_ids_only(
         r for r in caplog.records if getattr(r, "event", "") == "usage_result_unrepresentable"
     ]
     assert (record.attempt_id, record.call_seq) == (str(ATTEMPT), "0")  # type: ignore[attr-defined]
+    line = JsonFormatter().format(record)  # the line a worker writes (DEC-059)
+    assert (json.loads(line)["attempt_id"], json.loads(line)["call_seq"]) == (str(ATTEMPT), "0")
+    assert huge not in line
+    assert "secret-unit" not in line
     text = record.getMessage() + repr(record.__dict__)
     assert huge not in text
     assert "secret-unit" not in text
@@ -1067,6 +1073,7 @@ def test_usage_diagnostics_carry_ids_only(make: Any, caplog: pytest.LogCaptureFi
     }
     for record in usage_records:
         assert record.call_seq == "0"  # type: ignore[attr-defined]
+        assert json.loads(JsonFormatter().format(record))["call_seq"] == "0"
         text = record.getMessage()
         for secret in ("route-a", "provider-a", "model-a", "prompt-v1", "interpret_amount"):
             assert secret not in text
