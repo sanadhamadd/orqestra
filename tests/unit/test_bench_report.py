@@ -122,6 +122,7 @@ def claims_record(*, dirty: bool = False) -> dict[str, Any]:
             "variant": variant,
             "depth": depth,
             "ready": depth,
+            "heap_pages": depth // 50,
             "claims": 10,
             "latency_ms": distribution(1.0 * depth / 100, 2.0 * depth / 100, 3.0 * depth / 100, 10),
             "explain": {
@@ -248,6 +249,60 @@ def test_a_reason_says_how_the_wait_ended(tmp_path: Path) -> None:
     excluded = report.render(tmp_path).split("## Not in the tables", 1)[1]
     assert "every worker exited after 5.0 s" in excluded
     assert "stopped at the limit after 3600.2 s" in excluded
+
+
+def test_an_incomplete_reason_names_the_failures_a_timeout_does_not_explain(
+    tmp_path: Path,
+) -> None:
+    stopped = cell_record(
+        status="incomplete",
+        failed_checks=("terminal", "nothing_running", "one_succeeded_attempt"),
+        wait=("stop_after", 60.2),
+    )
+    assert report.reason(stopped) == (
+        "incomplete: stopped at the limit after 60.2 s; also failed: one_succeeded_attempt"
+    )
+    plain = cell_record(status="incomplete", failed_checks=("terminal",), wait=("stop_after", 1.0))
+    assert "also failed" not in report.reason(plain)
+
+
+def _with(record: dict[str, Any], **environment: Any) -> dict[str, Any]:
+    record["environment"] |= environment
+    return record
+
+
+VM = {
+    "container": "bench",
+    "image": "postgres:16.15",
+    "image_id": "sha256:0",
+    "vm_cpus": 8,
+    "vm_memory_bytes": 4 * 1024**3,
+}
+
+
+def test_cells_with_other_server_settings_are_never_pooled(tmp_path: Path) -> None:
+    on = {**POSTGRES, "synchronous_commit": "on", "fsync": "on"}
+    off = {**POSTGRES, "synchronous_commit": "off", "fsync": "on"}
+    write(tmp_path, _with(cell_record(rep=1), postgres=on, docker=VM))
+    write(tmp_path, _with(cell_record(rep=2), postgres=off, docker=VM))
+    text = report.render(tmp_path)
+    assert text.count("### Ladder `overhead`") == 2  # two groups, one repetition each
+    assert "(fsync on, synchronous_commit off)" in text
+    assert "(fsync on, synchronous_commit on)" in text
+
+
+def test_cells_on_another_docker_vm_are_never_pooled(tmp_path: Path) -> None:
+    write(tmp_path, _with(cell_record(rep=1), docker=VM))
+    write(tmp_path, _with(cell_record(rep=2), docker={**VM, "vm_cpus": 4}))
+    text = report.render(tmp_path)
+    assert text.count("### Ladder `overhead`") == 2
+    assert "Docker VM: 8 CPUs, 4.0 GiB" in text
+    assert "Docker VM: 4 CPUs, 4.0 GiB" in text
+
+
+def test_a_cell_without_a_container_says_its_vm_was_not_measured(tmp_path: Path) -> None:
+    write(tmp_path, cell_record())
+    assert "Docker VM: not measured" in report.render(tmp_path)
 
 
 def test_the_warm_up_has_its_own_table(tmp_path: Path) -> None:

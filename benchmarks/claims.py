@@ -13,7 +13,9 @@ queue at each depth:
   claimant does not run, so they sort first and are never claimed.
 
 For each depth and shape it fills a fresh, migrated schema through
-``submit_job``, runs ``ANALYZE``, then:
+``submit_job``, then rewrites ``tasks`` with ``VACUUM (FULL, ANALYZE)``, so every
+shape is scanned over a compact heap of its own live rows, and records that
+heap's pages. Then it:
 
 1. runs ``EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`` of the exact statement
    ``claim_next_attempt`` runs, imported rather than copied so the two cannot
@@ -135,9 +137,21 @@ def fill(conn: Conn, depth: int, variant: Variant) -> int:
             held = 0
         else:
             conn.execute(_DELAY_FIRST, (held,))
-    conn.execute("ANALYZE tasks")
+    # Every variant is measured on a compact heap of its own live rows: the waiting
+    # variant's UPDATE leaves a dead version of half its rows, which the claim's
+    # sequential scan would otherwise read too. VACUUM FULL rewrites the table
+    # without them; a plain VACUUM would free them but keep the larger heap.
+    conn.execute("VACUUM (FULL, ANALYZE) tasks")
     conn.execute("ANALYZE jobs")
     return depth - held
+
+
+def heap_pages(conn: Conn) -> int:
+    """The pages of the ``tasks`` heap, which the claim's sequential scan reads."""
+    row = conn.execute(
+        "SELECT pg_relation_size('tasks') / current_setting('block_size')::int"
+    ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def _plan_nodes(node: dict[str, Any]) -> list[str]:
@@ -220,12 +234,14 @@ def measure_depth(
         raise ValueError(msg)
     with psycopg.connect(url, autocommit=True) as conn:
         ready = fill(conn, depth, variant)
+        pages = heap_pages(conn)
         plan = explain_claims(conn, explains)
         latencies = time_claims(conn, min(claims, ready))
     return {
         "variant": variant.value,
         "depth": depth,
         "ready": ready,
+        "heap_pages": pages,
         "claims": len(latencies),
         "latency_ms": distribution(latencies),
         "explain": plan,
@@ -293,6 +309,10 @@ def validate_result(record: object) -> None:
             raise ValueError(msg)
         if not 0 <= item["claims"] <= item["ready"] <= item["depth"]:
             msg = "claims must not exceed the claimable tasks, nor those the depth"
+            raise ValueError(msg)
+        pages = item.get("heap_pages")
+        if isinstance(pages, bool) or not isinstance(pages, int) or pages < 0:
+            msg = "each measurement must record its heap's pages"
             raise ValueError(msg)
         _check_distribution("latency_ms", item["latency_ms"], item["claims"])
         plan = item["explain"]

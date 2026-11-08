@@ -84,6 +84,9 @@ def test_d2_a_frozen_worker_never_records_a_stale_completion(
     )
 
     checks = _passes(record, "d2")
+    [injection] = record["drill"]["injections"]
+    assert injection["thawed_by"] == "drill"  # the freeze ran its planned time
+    assert injection["frozen_s"] >= lease + FREEZE_EXTRA
     assert checks["stale_completion_not_recorded"]["detail"]["state"] in {"revoked", "succeeded"}
 
 

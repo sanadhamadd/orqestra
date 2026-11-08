@@ -178,25 +178,56 @@ def _memory(value: object) -> str:
     return str(value)
 
 
-def cell_environment(record: Mapping[str, Any]) -> tuple[str, str, str]:
-    """``(sha, machine, PostgreSQL version)`` of a cell or drill result."""
+def _server(postgres: object) -> str:
+    """The PostgreSQL version and every recorded server setting, in a fixed order.
+
+    Results whose settings differ are different measurements, so the settings are
+    part of a group's key and shown with it.
+    """
+    version = _postgres_version(postgres)
+    if not isinstance(postgres, Mapping):
+        return version
+    settings = ", ".join(
+        f"{name} {postgres[name]}" for name in sorted(postgres) if name != "version"
+    )
+    return f"{version} ({settings})" if settings else version
+
+
+def _docker_vm(docker: object) -> str:
+    """The Docker VM's CPUs and memory, or ``not measured``."""
+    if not isinstance(docker, Mapping):
+        return "not measured"
+    cpus, memory = docker.get("vm_cpus"), docker.get("vm_memory_bytes")
+    if not isinstance(cpus, int) or not isinstance(memory, int):
+        return "not measured"
+    return f"{cpus} CPUs, {_memory(memory)}"
+
+
+def cell_environment(record: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    """``(sha, machine, server and settings, Docker VM)`` of a cell or drill result."""
     environment = record["environment"]
     machine = (
         f"{environment['cpu_model']}, {environment['cores']} cores, "
         f"{_memory(environment['memory_bytes'])} memory"
     )
-    return str(environment["git_sha"]), machine, _postgres_version(environment["postgres"])
+    return (
+        str(environment["git_sha"]),
+        machine,
+        _server(environment["postgres"]),
+        _docker_vm(environment.get("docker")),
+    )
 
 
 def claims_environment(record: Mapping[str, Any]) -> tuple[str, str, str]:
-    """``(sha, machine, PostgreSQL version)`` of a claim-cost result."""
+    """``(sha, machine, server and settings)`` of a claim-cost result."""
     environment = record["environment"]
     machine = f"{environment.get('platform', DASH)}, {environment.get('cpu_count', DASH)} CPUs"
-    return str(environment["git_sha"]), machine, _postgres_version(environment["postgres"])
+    return str(environment["git_sha"]), machine, _server(environment["postgres"])
 
 
-def _environment_line(sha: str, machine: str, postgres: str) -> str:
-    return f"Commit `{sha[:12]}` · machine: {machine} · server: {postgres}"
+def _environment_line(sha: str, machine: str, server: str, vm: str | None = None) -> str:
+    line = f"Commit `{sha[:12]}` · machine: {machine} · server: {server}"
+    return line if vm is None else f"{line} · Docker VM: {vm}"
 
 
 # --- cells ---------------------------------------------------------------------------------
@@ -219,6 +250,10 @@ def clean(record: Mapping[str, Any]) -> bool:
     return record["status"] == Status.COMPLETE and record["environment"]["git_dirty"] is False
 
 
+# The gate checks a job stopped at its limit fails by being stopped.
+TIMEOUT_CHECKS = frozenset({"terminal", "nothing_running", "worker_exits"})
+
+
 def reason(record: Mapping[str, Any]) -> str:
     """Why a cell result is not in the tables."""
     reasons = []
@@ -233,6 +268,14 @@ def reason(record: Mapping[str, Any]) -> str:
             reasons.append(
                 f"incomplete: stopped before every task ended (limit {fixed(stop, 1)} s)"
             )
+        # A timeout explains only these failures; any other is a finding of its own.
+        others = [
+            str(check["name"])
+            for check in record["gate"]
+            if not check["passed"] and check["name"] not in TIMEOUT_CHECKS
+        ]
+        if others:
+            reasons.append("also failed: " + ", ".join(others))
     elif record["status"] == Status.FAILED_CORRECTNESS:
         failed = ", ".join(str(check["name"]) for check in record["gate"] if not check["passed"])
         if ended == WaitEnded.NO_WORKERS:
@@ -346,8 +389,8 @@ def _ladder_order(name: str) -> tuple[int, str]:
     return (LADDER_ORDER.index(name), "") if name in LADDER_ORDER else (len(LADDER_ORDER), name)
 
 
-def _groups(loaded: Sequence[Loaded]) -> dict[tuple[str, str, str, str], list[Loaded]]:
-    groups: dict[tuple[str, str, str, str], list[Loaded]] = defaultdict(list)
+def _groups(loaded: Sequence[Loaded]) -> dict[tuple[str, str, str, str, str], list[Loaded]]:
+    groups: dict[tuple[str, str, str, str, str], list[Loaded]] = defaultdict(list)
     for item in loaded:
         groups[(str(item.record["ladder"]), *cell_environment(item.record))].append(item)
     return groups
@@ -357,8 +400,8 @@ def ladder_sections(loaded: Sequence[Loaded]) -> list[str]:
     groups = _groups(loaded)
     lines: list[str] = []
     for key in sorted(groups, key=lambda k: (_ladder_order(k[0]), k[1:])):
-        ladder, sha, machine, postgres = key
-        lines += [f"### Ladder `{ladder}`", "", _environment_line(sha, machine, postgres), ""]
+        ladder, *environment = key
+        lines += [f"### Ladder `{ladder}`", "", _environment_line(*environment), ""]
         lines += cell_table(groups[key])
         lines += ["", f"_{DERIVED_NOTE}_", ""]
         lines += derived_table(groups[key])
@@ -410,7 +453,7 @@ def claims_sections(loaded: Sequence[Loaded]) -> list[str]:
 
 
 def drill_sections(loaded: Sequence[Loaded]) -> list[str]:
-    groups: dict[tuple[str, str, str], list[Loaded]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str], list[Loaded]] = defaultdict(list)
     for item in loaded:
         groups[cell_environment(item.record)].append(item)
     lines: list[str] = []
