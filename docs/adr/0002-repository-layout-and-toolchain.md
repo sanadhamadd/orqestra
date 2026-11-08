@@ -6,7 +6,7 @@
 
 ## Context
 
-Day 1 must deliver a working, reproducible Python package with quality gates that every
+The repository foundation must deliver a working, reproducible Python package with quality gates that every
 later milestone (persistence, queue, workers, provider adapters) builds on. The task queue,
 API framework, worker hosting, model providers, DB driver and async model are intentionally
 undecided, so the toolchain must not pre-empt them.
@@ -37,7 +37,7 @@ undecided, so the toolchain must not pre-empt them.
 - The domain package stays free of I/O and third-party imports so it remains cheap to
   test and reuse across worker, API and CLI.
 - Docker, pre-commit, security scanners and the integration lane are added with the
-  milestones that need them (Day 2 onward), not speculatively.
+  milestones that need them (persistence onward), not speculatively.
 
 **Runner-up:** a flat package with Poetry, Black, flake8 and pyright — equally workable,
 more tools and configuration dialects to keep aligned.
