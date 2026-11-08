@@ -5,6 +5,7 @@ import textwrap
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -51,6 +52,35 @@ def test_a_database_instant_maps_to_the_local_clock_from_the_claim() -> None:
     # mapped instant (130.0) is never later than the lease really ends.
     assert local_deadline(anchor=100.0, started_at=started_at, instant=lease_end) == 130.0
     assert local_deadline(anchor=100.0, started_at=started_at, instant=started_at) == 100.0
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+# 15 s before a clock change; 30 s later the wall clock has gone back (autumn) or
+# forward (spring) by an hour, though only 30 s have passed (DEC-067).
+AUTUMN = datetime(2026, 11, 1, 5, 59, 45, tzinfo=UTC)  # 01:59:45 EDT, then 01:00:15 EST
+SPRING = datetime(2026, 3, 8, 6, 59, 45, tzinfo=UTC)  # 01:59:45 EST, then 03:00:15 EDT
+
+
+@pytest.mark.parametrize("claimed", [AUTUMN, SPRING], ids=["autumn", "spring"])
+def test_a_database_instant_maps_to_the_local_clock_across_a_transition(
+    claimed: datetime,
+) -> None:
+    started_at = claimed.astimezone(NEW_YORK)
+    lease_end = (claimed + timedelta(seconds=30)).astimezone(NEW_YORK)
+    assert local_deadline(anchor=100.0, started_at=started_at, instant=lease_end) == 130.0
+
+
+def test_a_database_instant_maps_across_zones() -> None:
+    lease_end = (AUTUMN + timedelta(seconds=30)).astimezone(NEW_YORK)
+    assert local_deadline(anchor=100.0, started_at=AUTUMN, instant=lease_end) == 130.0
+
+
+def test_naive_instants_are_refused() -> None:
+    naive = datetime(2026, 11, 1, 1, 59, 45)
+    with pytest.raises(TypeError, match="timezone-aware"):
+        local_deadline(anchor=100.0, started_at=naive, instant=AUTUMN)
+    with pytest.raises(TypeError, match="timezone-aware"):
+        local_deadline(anchor=100.0, started_at=AUTUMN, instant=naive)
 
 
 # --- arming, moving and disarming ----------------------------------------------------

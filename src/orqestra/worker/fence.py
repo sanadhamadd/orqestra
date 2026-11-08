@@ -121,8 +121,15 @@ def local_deadline(*, anchor: float, started_at: datetime, instant: datetime) ->
     So ``anchor + (instant - started_at)`` comes no later than ``instant``
     does, assuming both clocks run at the same rate; the fencing margin
     absorbs small rate differences.
+
+    Both instants are converted to UTC first, so the difference is elapsed
+    time, not wall time, whatever zone they were decoded in (DEC-067). A naive
+    instant is refused: converting it would silently read it as local time.
     """
-    return anchor + (instant - started_at).total_seconds()
+    if started_at.utcoffset() is None or instant.utcoffset() is None:
+        msg = "local_deadline needs timezone-aware database instants"
+        raise TypeError(msg)
+    return anchor + (instant.astimezone(UTC) - started_at.astimezone(UTC)).total_seconds()
 
 
 @dataclass(slots=True)

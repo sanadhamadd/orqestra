@@ -2,7 +2,9 @@
 
 Every write operation runs one short READ COMMITTED transaction that it owns
 (DEC-024, DEC-028) and reads rows through its own tuple-row cursor, so the
-caller's isolation settings and row factory do not matter.
+caller's isolation settings and row factory do not matter. Values read through
+``tuple_cursor`` outside ``owned_transaction`` keep the session's TimeZone; do no
+lease, deadline or retry arithmetic on them (DEC-067).
 
 ``NotFoundError`` lives here so that ``lifecycle`` and ``provider_usage`` can
 both raise it without importing each other; ``lifecycle`` re-exports it.
@@ -55,6 +57,12 @@ class NotFoundError(OrqestraError, LookupError):
 def owned_transaction(conn: Conn, operation: str) -> Iterator[Cursor]:
     """Run one READ COMMITTED transaction that commits on exit and rolls back on error.
 
+    Inside it every ``timestamptz`` is decoded as a ``datetime.UTC`` value,
+    whatever the session TimeZone, so lease, deadline and retry arithmetic and
+    expiry comparisons in Python measure elapsed time, not wall time (DEC-035,
+    DEC-036, DEC-067). The setting is transaction-local: commit or rollback
+    restores the caller's zone.
+
     Raises ``RuntimeError`` if the caller already has a transaction open on
     ``conn``: the operation's atomicity depends on committing on its own.
     """
@@ -67,6 +75,8 @@ def owned_transaction(conn: Conn, operation: str) -> Iterator[Cursor]:
         raise RuntimeError(msg)
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cur:
         cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        # Its own statement: a string of two commands cannot be server-prepared.
+        cur.execute("SET LOCAL TimeZone = 'UTC'")
         yield cur
 
 
