@@ -781,12 +781,21 @@ def _write_closure(cur: Cursor, closure: UsageClosure) -> tuple[datetime, bool]:
     """Insert the closure or match it against the stored one; ``(recorded_at, created)``.
 
     An existing closure is looked up first, so a replay is not re-checked against
-    calls recorded since.
+    calls recorded since. That holds too for a closure committed after that lookup:
+    if the count check then refuses, because the original closure and a later intent
+    both committed in between, the stored closure decides instead.
     """
     content = _closure_content(closure)
     stored = cur.execute(_SELECT_CLOSURE, (closure.attempt_id,)).fetchone()
     if stored is None:
-        _check_closable(cur, closure)
+        try:
+            _check_closable(cur, closure)
+        except CaptureNotCompleteError:
+            # Raised in Python, so the transaction can still read. No closure: it stands.
+            stored = cur.execute(_SELECT_CLOSURE, (closure.attempt_id,)).fetchone()
+            if stored is None:
+                raise
+    if stored is None:
         inserted = _insert_closure(cur, closure, content)
         if inserted is not None:
             return inserted[0], True
