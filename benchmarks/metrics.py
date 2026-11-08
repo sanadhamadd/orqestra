@@ -384,8 +384,10 @@ def poll_exit(process: subprocess.Popen[Any]) -> dict[str, Any] | None:
     """``process``'s accounting if it has exited, else ``None``; never waits.
 
     Uses ``os.wait4``, so the CPU times and peak RSS are the process's own.
-    ``Popen.poll`` and ``Popen.wait`` must not be used on the same process: they
-    reap it too, and its accounting would be lost.
+    ``Popen.poll``, ``Popen.wait`` and ``Popen.send_signal`` (which polls first)
+    must not be used on the same process: they reap it too, and its accounting
+    would be lost. Signal it with ``os.kill``; until it is reaped here, its pid
+    cannot be reused.
     """
     pid, status, usage = os.wait4(process.pid, os.WNOHANG)
     return _accounting(process, status, usage, killed=False) if pid else None
@@ -400,7 +402,9 @@ def reap(process: subprocess.Popen[Any], timeout: float) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while (exited := poll_exit(process)) is None:
         if time.monotonic() >= deadline:
-            process.send_signal(signal.SIGKILL)
+            # os.kill, not Popen.send_signal: that polls first, and could reap the
+            # process before wait4 sees it, losing its accounting.
+            os.kill(process.pid, signal.SIGKILL)
             _, status, usage = os.wait4(process.pid, 0)
             return _accounting(process, status, usage, killed=True)
         time.sleep(0.05)

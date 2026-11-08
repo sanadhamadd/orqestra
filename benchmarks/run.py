@@ -279,7 +279,8 @@ class Fleet:
         """SIGTERM every worker still running, then reap each one; their accounting, in order."""
         for handle in self.workers:
             if handle.running():
-                handle.process.send_signal(signal.SIGTERM)
+                # never Popen.send_signal: it polls first (see metrics.poll_exit)
+                os.kill(handle.process.pid, signal.SIGTERM)
         for handle in self.workers:
             if handle.exited is None:
                 handle.exited = metrics.reap(handle.process, timeout)

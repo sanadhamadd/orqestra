@@ -12,7 +12,9 @@ carries throughput figures, and it must have passed every gate check.
 
 A result from a working tree with uncommitted changes cannot say what code it
 measured, so writing one is refused unless explicitly allowed; an allowed one
-is marked ``dirty_allowed`` and must never be committed.
+is marked ``dirty_allowed`` and must never be committed. The results directory
+itself is left out of that check, so the result files a ladder writes do not
+make its next cell's tree dirty.
 """
 
 import hashlib
@@ -34,6 +36,8 @@ FORMAT = 1
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks" / "results"
 RAW_DIR = ROOT / "build" / "bench"
+# Left out of the dirty check: results are written there while a ladder runs.
+RESULTS_PATHSPEC = ":(exclude)benchmarks/results"
 
 TOP_LEVEL = frozenset(
     {
@@ -89,9 +93,9 @@ class DirtyTreeError(RuntimeError):
     """The working tree has uncommitted changes, and a dirty result was not allowed."""
 
 
-def _command(*args: str) -> str:
+def _command(*args: str, cwd: Path = ROOT) -> str:
     return subprocess.run(  # fixed commands only
-        list(args), capture_output=True, text=True, check=True, timeout=30, cwd=ROOT
+        list(args), capture_output=True, text=True, check=True, timeout=30, cwd=cwd
     ).stdout.strip()
 
 
@@ -102,12 +106,14 @@ def _optional(*args: str) -> str | None:
         return None
 
 
-def code_state() -> dict[str, Any]:
-    """The commit measured, and whether the working tree differs from it."""
-    return {
-        "git_sha": _command("git", "rev-parse", "HEAD"),
-        "git_dirty": bool(_command("git", "status", "--porcelain")),
-    }
+def code_state(root: Path = ROOT) -> dict[str, Any]:
+    """The commit measured, and whether the working tree differs from it.
+
+    Files under ``benchmarks/results/`` do not count as a difference: they are
+    the measurements, not the code measured.
+    """
+    status = _command("git", "status", "--porcelain", "--", ".", RESULTS_PATHSPEC, cwd=root)
+    return {"git_sha": _command("git", "rev-parse", "HEAD", cwd=root), "git_dirty": bool(status)}
 
 
 def machine() -> dict[str, Any]:

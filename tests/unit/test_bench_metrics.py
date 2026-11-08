@@ -5,6 +5,7 @@ import ast
 import json
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -22,11 +23,13 @@ from benchmarks.ladder import (
     plan_cells,
     stop_limit,
 )
-from benchmarks.result import DirtyTreeError, Status, validate_result, write_result
+from benchmarks.result import DirtyTreeError, Status, code_state, validate_result, write_result
 from benchmarks.run import (
     BENCH_WORKER_SETTINGS,
     Cell,
+    Fleet,
     Profile,
+    WorkerHandle,
     build_workload,
     summary_check,
     usage_check,
@@ -178,6 +181,65 @@ def test_a_process_that_outlives_the_timeout_is_killed() -> None:
     assert metrics.poll_exit(process) is None
     exited = metrics.reap(process, timeout=0)
     assert (exited["exit_code"], exited["killed"]) == (-9, True)
+
+
+def _exited_unreaped(code: int) -> subprocess.Popen[bytes]:
+    """A child that has exited and is still unreaped (a zombie), so a poll would reap it."""
+    process = subprocess.Popen([sys.executable, "-c", f"raise SystemExit({code})"])
+    for _ in range(3000):  # a bound on a hung child, not an expectation
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(process.pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if state.startswith("Z"):
+            return process
+        time.sleep(0.01)
+    process.kill()
+    pytest.fail("the child never exited")
+
+
+def _hidden_once(monkeypatch: pytest.MonkeyPatch, process: subprocess.Popen[bytes]) -> None:
+    """The next ``poll_exit`` of ``process`` misses its exit, as if it exited just after."""
+    real = metrics.poll_exit
+    hidden = [process.pid]
+
+    def poll_exit(candidate: subprocess.Popen[Any]) -> dict[str, Any] | None:
+        if candidate.pid in hidden:
+            hidden.remove(candidate.pid)
+            return None
+        return real(candidate)
+
+    monkeypatch.setattr(metrics, "poll_exit", poll_exit)
+
+
+def test_a_process_that_exits_just_before_its_kill_keeps_its_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _exited_unreaped(3)
+    _hidden_once(monkeypatch, process)
+    exited = metrics.reap(process, timeout=0)  # kills an exited process, then waits for it
+    assert (exited["exit_code"], exited["killed"], process.returncode) == (3, True, 3)
+    assert exited["maxrss_bytes"] > 0
+
+
+def test_stopping_a_fleet_reaps_every_worker_when_one_exits_just_before_its_signal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
+    processes = [_exited_unreaped(3), subprocess.Popen(sleeper)]
+    fleet = Fleet(Profile.ECHO, {}, tmp_path)
+    for number, process in enumerate(processes, 1):
+        path = tmp_path / f"worker-{number}.log"
+        fleet.workers.append(WorkerHandle(process, path, path.open("wb")))
+    _hidden_once(monkeypatch, processes[0])
+
+    accounting = fleet.stop(timeout=30)
+
+    assert [entry["exit_code"] for entry in accounting] == [3, -15]
+    assert [entry["pid"] for entry in accounting] == [process.pid for process in processes]
+    assert all(handle.log.closed for handle in fleet.workers)
 
 
 # --- cells and ladders ---------------------------------------------------------------------
@@ -468,3 +530,40 @@ def test_the_worker_imports_no_network_module_and_no_real_provider() -> None:
     assert not {name for name in imported if name.split(".")[0] in NETWORK_ROOTS}
     assert not {name for name in imported if name.startswith("orqestra.providers")}
     assert "benchmarks.provider" in imported
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=bench",
+            "-c",
+            "user.email=bench@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_a_result_file_alone_does_not_make_the_tree_dirty(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "code.py").write_text("x = 1\n")
+    _git(tmp_path, "add", "code.py")
+    _git(tmp_path, "commit", "-q", "-m", "code")
+    assert code_state(tmp_path)["git_dirty"] is False
+
+    results = tmp_path / "benchmarks" / "results"
+    results.mkdir(parents=True)
+    (results / "20261108T000000Z-0123456-echo-50-b0-w2-r1.json").write_text("{}\n")
+    assert code_state(tmp_path)["git_dirty"] is False
+
+    (tmp_path / "benchmarks" / "other.py").write_text("y = 2\n")
+    assert code_state(tmp_path)["git_dirty"] is True
+    (tmp_path / "benchmarks" / "other.py").unlink()
+    (tmp_path / "code.py").write_text("x = 2\n")
+    assert code_state(tmp_path)["git_dirty"] is True
