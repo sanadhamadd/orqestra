@@ -78,7 +78,7 @@ detect this: after `running → queued → running`, the state matches again.
   timing settings with no defaults (DEC-042 … DEC-044).
 - Implemented and verified locally and in GitHub CI (PR #10): a first single-slot worker
   runtime. It claims supported kinds, runs one handler thread, renews the lease, sweeps for
-  expired attempts while idle or busy, and records outcomes through the Day 3A operations.
+  expired attempts while idle or busy, and records outcomes through the lifecycle and lease operations.
   A local watchdog ends the process when the worker cannot establish that it still owns a
   running task, or when a database call stalls (DEC-045, DEC-046).
 - Implemented and verified locally and in GitHub CI (PR #11): a completion whose answer was
@@ -106,7 +106,7 @@ detect this: after `running → queued → running`, the state matches again.
   a worker for explicitly named built-in kinds after a read-only check that the schema's
   migration history equals the packaged one exactly; it never migrates and refuses to
   start against any other history (DEC-051).
-- Implemented and verified locally only, not yet in GitHub CI (Day 4A): durable retry
+- Implemented and verified locally only, not yet in GitHub CI: durable retry
   eligibility. Every task stores `available_at`, the database time from which it may be
   claimed (migration 0004). A requeue after a transient failure, or after a
   `lease_expired` or `deadline_exceeded` revocation, sets it to the database clock at the
