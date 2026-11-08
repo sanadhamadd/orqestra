@@ -6,9 +6,13 @@ and repetition, named
 ``<UTC yyyymmddThhmmssZ>-<sha7>-<profile>-<size>-b<batch>-w<workers>-r<rep>.json``,
 where ``b0`` marks a profile whose tasks are not batches.
 
-``status`` is ``complete``, ``incomplete`` (stopped before every task ended) or
-``failed_correctness`` (some gate check failed). Only a ``complete`` record
-carries throughput figures, and it must have passed every gate check.
+``status`` is ``complete``, ``incomplete`` (stopped at the time limit before
+every task ended) or ``failed_correctness`` (some gate check failed, including
+a cell whose workers all exited before its job ended). Only a ``complete``
+record carries throughput figures, and it must have passed every gate check.
+A cell's ``timing`` says how the harness's wait for the job ended
+(``wait_ended``: ``finished``, ``stop_after`` or ``no_workers``) and how long it
+waited (``waited_s``); records written before these fields existed lack them.
 
 A result from a working tree with uncommitted changes cannot say what code it
 measured, so writing one is refused unless explicitly allowed; an allowed one
@@ -29,7 +33,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, NoReturn
 
-from benchmarks.claims import server_info
 from benchmarks.metrics import NOT_MEASURED, Conn
 
 FORMAT = 1
@@ -38,6 +41,7 @@ RESULTS_DIR = ROOT / "benchmarks" / "results"
 RAW_DIR = ROOT / "build" / "bench"
 # Left out of the dirty check: results are written there while a ladder runs.
 RESULTS_PATHSPEC = ":(exclude)benchmarks/results"
+SERVER_SETTINGS = ("shared_buffers", "work_mem", "max_connections", "synchronous_commit", "fsync")
 
 TOP_LEVEL = frozenset(
     {
@@ -89,6 +93,14 @@ class Status(StrEnum):
     FAILED_CORRECTNESS = "failed_correctness"
 
 
+class WaitEnded(StrEnum):
+    """How the harness's wait for a cell's job ended."""
+
+    FINISHED = "finished"  # no task queued or running
+    STOP_AFTER = "stop_after"  # the cell's time limit passed first
+    NO_WORKERS = "no_workers"  # every worker had exited first
+
+
 class DirtyTreeError(RuntimeError):
     """The working tree has uncommitted changes, and a dirty result was not allowed."""
 
@@ -104,6 +116,17 @@ def _optional(*args: str) -> str | None:
         return _command(*args)
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def server_info(conn: Conn) -> dict[str, str]:
+    """The server version and the settings that shape the measurement."""
+    info: dict[str, str] = {}
+    row = conn.execute("SELECT version()").fetchone()
+    info["version"] = str(row[0]) if row else ""
+    for name in SERVER_SETTINGS:
+        setting = conn.execute("SELECT current_setting(%s)", (name,)).fetchone()
+        info[name] = str(setting[0]) if setting else ""
+    return info
 
 
 def code_state(root: Path = ROOT) -> dict[str, Any]:
@@ -241,6 +264,21 @@ def validate_result(record: object) -> None:
         _fail("a failed_correctness result must name a failed gate check")
     if record["status"] != Status.COMPLETE and record["throughput"] is not None:
         _fail("only a complete result may report throughput")
+    _validate_wait(record)
+
+
+def _validate_wait(record: dict[str, Any]) -> None:
+    timing = record["timing"]
+    if not isinstance(timing, dict) or "wait_ended" not in timing:
+        return
+    if timing["wait_ended"] not in set(WaitEnded):
+        _fail(f"timing.wait_ended must be one of {sorted(WaitEnded)}")
+    waited = timing.get("waited_s")
+    if isinstance(waited, bool) or not isinstance(waited, int | float) or waited < 0:
+        _fail("timing.waited_s must be a non-negative number of seconds")
+    stopped = timing["wait_ended"] == WaitEnded.STOP_AFTER
+    if stopped != (record["status"] == Status.INCOMPLETE):
+        _fail("a result is incomplete exactly when its wait ended at stop_after")
 
 
 def write_result(record: dict[str, Any], directory: Path, *, allow_dirty: bool = False) -> Path:

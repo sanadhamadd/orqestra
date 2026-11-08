@@ -44,7 +44,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from benchmarks.database import UnsafeBenchDatabaseError
+import psycopg
+
+from benchmarks.database import UnsafeBenchDatabaseError, unreachable_message
 from benchmarks.result import RAW_DIR, DirtyTreeError, Status, code_state
 from benchmarks.run import Cell, Profile, add_common_arguments, refuse_dirty, run_in_bench_database
 
@@ -102,26 +104,30 @@ def large_stop(
 ) -> float | None:
     """The ``large`` rung's stop in seconds if its gate passes, else ``None``.
 
-    ``scale_records`` are the ``scale`` results of the commit being measured;
-    every one of its 10,000-invoice cells that is not skipped must be present
-    and ``complete``.
+    ``scale_records`` are the ``scale`` results of the commit being measured.
+    Every 10,000-invoice cell that is not skipped must be present, and every
+    record of such a cell must be ``complete``: a repeated run does not hide an
+    earlier incomplete one.
     """
     wanted = {
         (cell.workers, cell.repetition)
         for cell, skipped in plan_cells(LADDERS["scale"], cpu_count)
         if cell.size == LARGE_GATE_SIZE and not skipped
     }
-    found: dict[tuple[int, int], dict[str, Any]] = {}
+    found: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
     for record in scale_records:
         cell = record["cell"]
         if record["ladder"] == "scale" and cell["size"] == LARGE_GATE_SIZE:
-            found[(cell["workers"], cell["repetition"])] = record
-    if set(found) < wanted or not wanted:
+            found[(cell["workers"], cell["repetition"])].append(record)
+    if not wanted or not wanted <= set(found):
         return None
-    if any(found[key]["status"] != Status.COMPLETE for key in wanted):
+    if any(record["status"] != Status.COMPLETE for key in wanted for record in found[key]):
         return None
     makespans = [
-        float(found[key]["timing"]["makespan_s"]) for key in sorted(wanted) if key[0] == workers
+        float(record["timing"]["makespan_s"])
+        for key in sorted(wanted)
+        if key[0] == workers
+        for record in found[key]
     ]
     if not makespans:
         return None
@@ -218,6 +224,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_ladder(LADDERS[args.ladder], args)
     except (ValueError, DirtyTreeError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    except psycopg.OperationalError as exc:
+        print(f"refused: {unreachable_message(exc)}", file=sys.stderr)
         return 1
 
 
