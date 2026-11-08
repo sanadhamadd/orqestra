@@ -92,7 +92,7 @@ and the test database has to be created again.
 - Upgrading to 0003 is additive at the database: it takes only `attempts`, with `NOWAIT`
   (`55P03` while any session uses it), and may run while attempts are running. Application
   versions are the constraint the database cannot enforce: stop all application processes,
-  run `orqestra migrate`, then start only code from Slice 3 or later, because older code
+  run `orqestra migrate`, then start only code that includes migration 0003, because older code
   cannot read the `cancellation_grace_expired` reason and does not stop heartbeats after
   a cancellation request. Stopping claims and draining work first is preferable: SIGTERM
   drains a worker (DEC-049).
@@ -102,7 +102,7 @@ and the test database has to be created again.
   tasks become eligible at once. Application versions are again the constraint the
   database cannot enforce: code from before 0004 ignores `available_at` and would retry a
   requeued task at once. Stop all application processes (SIGTERM drains a worker), run
-  `orqestra migrate`, then start only code from Day 4A or later, every worker configured
+  `orqestra migrate`, then start only code that includes migration 0004, every worker configured
   with the same retry settings. `orqestra worker run`'s startup check refuses a history
   that differs from the packaged one, so new code refuses an unmigrated database and old
   code refuses a migrated one; it does not stop a worker that was already running, and

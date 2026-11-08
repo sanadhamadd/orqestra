@@ -4,54 +4,23 @@ Distributed workload execution platform: concurrent workers, fault-tolerant task
 processing, cost-aware provider orchestration.
 
 Orqestra is a portfolio-grade engineering project. Its first proving workload is
-verification of up to 50,000 **synthetic** invoices and purchase orders; invoices are a
+verification of **synthetic** invoices. 50,000 invoices is the evidence target, not a
+demonstrated result, and purchase-order matching is not implemented. Invoices are a
 demonstration scenario, not the product. The goal is a reliable, reproducible,
 well-tested foundation that demonstrates distributed-systems engineering, not an
 invoice SaaS.
 
 ## Status
 
-Day 1 (repository foundation) was merged in PR #1 and passed GitHub Actions CI. Day 2
-Step 1 (the PostgreSQL persistence foundation) was merged in PR #2; both CI lanes, including
-the PostgreSQL integration lane, passed on GitHub for the pull request and for `main` after
-the merge. Day 2 Step 2A (transactional job submission and job and task reads) was merged
-in PR #3, with both CI lanes passing for the pull request and for `main`. Day 2 Step 2B
-(the transactional attempt lifecycle and derived job status) was merged in PR #4, with both
-CI lanes passing for the pull request and for `main`. Day 3A Slice 1 (PostgreSQL task
-discovery) was merged in PR #5, with both CI lanes passing for `main` (run 40209662634).
-Day 3A Slice 2 (attempt leases, execution deadlines, heartbeats and recovery operations,
-with migration 0002) was merged in PR #6, with both CI lanes passing for `main` (run
-40260902718). Day 3A Slice 3 (bounded cancellation grace periods, with migration 0003)
-was merged in PR #7 (merge commit `d83afeb`), with both CI lanes passing for the pull
-request (run 40271111779) and for `main` after the merge (run 40271850302). Day 3B Slice
-1A (job-kind-filtered claims) was merged in PR #8 (merge commit `46acdd9`), with both CI
-lanes passing for the pull request (run 40397331066) and for `main` (run 40397973812).
-Day 3B Slice 1B-A (worker contracts: the handler protocol and registry, handler-outcome
-mapping and validated worker settings) was merged in PR #9 (merge commit `823530a`), with
-both CI lanes passing for the pull request (run 40408021385) and for `main` (run
-40408731149). Day 3B Slice 1B-B1 (the first single-slot worker runtime, with a local
-watchdog) was merged in PR #10 (merge commit `d498698`), with both CI lanes passing for the
-pull request (run 40487174691) and for `main` (run 40488034469). Day 3B Slice B2a-1
-(reconciling a completion whose answer was lost) was merged in PR #11 (merge commit
-`278cb74`), with both CI lanes passing for the pull request (run 40520647309) and for `main`
-(run 40524368913). Day 3B Slice B2a-2 (cooperative cancellation) was merged in PR #12
-(merge commit `308bb0a`), with both CI lanes passing for the pull request (run
-40598713849) and for `main` (run 40599609791). Day 3B Slice B2b (graceful, bounded
-shutdown) was merged in PR #13 (merge commit `155d319`), with both CI lanes passing for
-the pull request (run 40669564020) and for `main` (run 40671619033). A recovery
-correction for workers frozen inside a database transaction (DEC-050) was merged in PR #14
-(merge commit `0eab699`), with both CI lanes passing for `main` (run 40713618712). Day 3B
-Slice B3 (`orqestra worker run`, DEC-051) was merged in PR #15 (merge commit `71fab72`),
-with both CI lanes passing for the pull request (run 40760433076) and for `main` (run
-40761239383). Day 3C (deterministic task partitioning, DEC-052) was merged in PR #16
-(merge commit `da5b4b3`), with both CI lanes passing for the pull request (run
-40770878527) and for `main` (run 40771746389). Day 4A durable retry scheduling (DEC-053,
-migration 0004) is implemented on PR #17. Its original GitHub Actions run passed both CI
-lanes on head `e4aa59b` (run 41538196569); the PR's Checks tab records later runs.
-There is a command that runs a worker with diagnostic handlers only, an invoice batch
-handler that no command registers, and an OpenRouter adapter that nothing wires in (no
-test makes a live provider call); there is no service, deployment or production workload
-registration. No benchmark has been run. The planned column lists work that is not
+PostgreSQL is both the queue and the authoritative state, and independent single-slot
+worker processes claim, run and complete tasks from it (DEC-054). Jobs are submitted through
+the Python `submit_job` interface or `orqestra job submit`. `orqestra worker run` runs the
+built-in diagnostic handlers only. The synthetic invoice workload has a batch handler, a job
+summary and a provider usage ledger, but no shipped command registers the invoice kind, and
+no test makes a live provider call (DEC-062). There is no service, deployment or production
+workload. No measurement campaign has been run, so this README states no throughput or
+latency figures. The history of each change is in Git and in the
+[decision log](docs/decisions.md). The planned column lists work that is not
 implemented; do not read it as a claim about shipped behaviour.
 
 | Area | Implemented | Planned (not started) |
@@ -66,6 +35,12 @@ implemented; do not read it as a claim about shipped behaviour.
 | Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Accepted); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Accepted); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Accepted); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Accepted) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | Docker Compose for PostgreSQL, local development and integration tests only ([guide](docs/development.md#local-postgresql-with-docker-compose)) | — |
+
+## Architecture
+
+[docs/architecture.md](docs/architecture.md) shows how jobs, tasks, attempts, workers and
+the usage ledger fit together around PostgreSQL. The reasons behind each rule are in the
+[decision log](docs/decisions.md) and the [ADRs](docs/adr/).
 
 ## Quickstart
 
@@ -108,11 +83,21 @@ import psycopg
 from orqestra.domain.jobs import JobSubmission, TaskSpec
 from orqestra.persistence.jobs import get_task, list_tasks, submit_job
 
+invoice_1 = {
+    "invoice_id": "INV-1",
+    "lines": [{"line_id": "L1", "quantity": 2, "unit_amount": 150}],
+    "total": 300,
+}
+invoice_2 = {
+    "invoice_id": "INV-2",
+    "lines": [{"line_id": "L1", "quantity": 1, "unit_amount": 75}],
+    "total": 75,
+}
 submission = JobSubmission(
     kind="invoice_verification",
     tasks=(
-        TaskSpec("invoice-1", {"invoice_id": "INV-1"}, max_attempts=3),
-        TaskSpec("invoice-2", {"invoice_id": "INV-2"}, max_attempts=3),
+        TaskSpec("batch-0", {"offset": 0, "items": [invoice_1]}, max_attempts=3),
+        TaskSpec("batch-1", {"offset": 1, "items": [invoice_2]}, max_attempts=3),
     ),
     idempotency_key="batch-2026-10-25",
 )
@@ -121,6 +106,11 @@ with psycopg.connect("postgresql:///orqestra", autocommit=True) as conn:
     tasks = list_tasks(conn, result.job.id)  # ordered by task_key
     print(result.created, [t.state for t in tasks], get_task(conn, tasks[0].id))
 ```
+
+Each payload is a DEC-052 batch, the shape `partition` produces (see
+[Partitioning items into tasks](#partitioning-items-into-tasks)). This is a
+submission-only example: no shipped worker runs `invoice_verification`, so the job stays
+queued.
 
 With an `idempotency_key`, repeating an identical submission returns the original job
 with `created=False` and stores nothing new, including when the copies arrive
@@ -145,8 +135,10 @@ print one JSON line on stdout.
 ```sh
 cat > tasks.json <<'JSON'
 [
-  {"task_key": "invoice-1", "payload": {"invoice_id": "INV-1"}, "max_attempts": 2},
-  {"task_key": "invoice-2", "payload": {"invoice_id": "INV-2"}}
+  {"task_key": "batch-0", "max_attempts": 2, "payload": {"offset": 0, "items": [
+    {"invoice_id": "INV-1", "lines": [{"line_id": "L1", "quantity": 2, "unit_amount": 150}], "total": 300}]}},
+  {"task_key": "batch-1", "payload": {"offset": 1, "items": [
+    {"invoice_id": "INV-2", "lines": [{"line_id": "L1", "quantity": 1, "unit_amount": 75}], "total": 75}]}}
 ]
 JSON
 uv run orqestra job submit --kind invoice_verification --idempotency-key batch-2026-11-06 \
@@ -155,6 +147,10 @@ uv run orqestra job submit --kind invoice_verification --idempotency-key batch-2
 uv run orqestra job status <job_id>
 # {"status": "ok", "job_id": "…", "kind": "invoice_verification", "idempotency_key": "batch-2026-11-06", "created_at": "…", "job_status": "queued", "task_counts": {"queued": 2, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0}}
 ```
+
+As above, the payloads are DEC-052 batches and the example is submission-only: no shipped
+worker runs `invoice_verification`. [A complete run](#a-complete-run-with-a-diagnostic-worker)
+below submits a job that `orqestra worker run` does process.
 
 - **The file** is a UTF-8 JSON array of task objects with exactly `task_key` (a string),
   `payload` (any JSON value) and, optionally, `max_attempts`; `-` reads it from standard
@@ -205,6 +201,48 @@ uv run orqestra job usage <job_id> --max-provider-calls-per-attempt 16
 - **Refusals** exit 1 like the commands above: an unknown job id, a job of another kind
   (named by its id only), a schema that is not current and database errors.
 
+### A complete run with a diagnostic worker
+
+This runs a job end to end with the shipped commands: two `diagnostic.echo` tasks, one
+worker that processes them, and a controlled stop. It needs `ORQESTRA_DATABASE_URL` set to a
+migrated database (see [Database](#database)) and the environment from `uv sync`.
+
+```sh
+cat > echo-tasks.json <<'JSON'
+[
+  {"task_key": "echo-1", "payload": {"message": "hello"}},
+  {"task_key": "echo-2", "payload": {"message": "world"}}
+]
+JSON
+JOB_ID=$(uv run orqestra job submit --kind diagnostic.echo --max-attempts 3 echo-tasks.json \
+    | uv run python -c 'import json, sys; print(json.load(sys.stdin)["job_id"])')
+
+# Test values only, not recommendations (DEC-034), as in "Running a worker" below.
+export ORQESTRA_WORKER_LEASE=PT4S ORQESTRA_WORKER_EXECUTION_TIMEOUT=PT5M \
+    ORQESTRA_WORKER_HEARTBEAT_INTERVAL=PT1S ORQESTRA_WORKER_DB_OPERATION_TIMEOUT=PT0.8S \
+    ORQESTRA_WORKER_LOCK_TIMEOUT=PT0.3S ORQESTRA_WORKER_FENCE_MARGIN=PT1S \
+    ORQESTRA_WORKER_POLL_INTERVAL=PT0.1S ORQESTRA_WORKER_RECOVERY_INTERVAL=PT1S \
+    ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT=5 ORQESTRA_WORKER_SHUTDOWN_TIMEOUT=PT1S \
+    ORQESTRA_WORKER_RETRY_BASE_DELAY=PT0.1S ORQESTRA_WORKER_RETRY_MAX_DELAY=PT0.5S
+
+.venv/bin/orqestra worker run --kind diagnostic.echo 2> worker.log &   # one worker process
+WORKER=$!
+for _ in $(seq 60); do   # wait for both tasks, at most about a minute
+  uv run orqestra job status "$JOB_ID" | grep -q '"job_status": "succeeded"' && break
+  sleep 1
+done
+kill -TERM "$WORKER"   # a controlled stop: no new work, then exit 0
+wait "$WORKER"; echo "worker exit code: $?"
+uv run orqestra job status "$JOB_ID"
+# worker exit code: 0
+# {"status": "ok", "job_id": "…", "kind": "diagnostic.echo", "idempotency_key": null, "created_at": "…", "job_status": "succeeded", "task_counts": {"queued": 0, "running": 0, "succeeded": 2, "failed": 0, "cancelled": 0}}
+```
+
+The worker runs as `.venv/bin/orqestra`, not through `uv run`, so `kill` signals the worker
+itself. It logs JSON lines to `worker.log`, ending with `shutdown_requested` and
+`worker_stopped`, and exits 0 ([Running a worker](#running-a-worker)). Each echo task's
+stored result is its payload.
+
 ### Partitioning items into tasks
 
 `partition` (DEC-052, local only) turns an ordered list of JSON items into the tasks of
@@ -242,7 +280,7 @@ A worker claims the next queued task (or starts a task whose ID it already knows
 lease policy, does the work outside any database transaction while renewing the lease, and
 reports the outcome with the attempt's generation. The single-slot worker runtime runs
 these operations in a loop: it claims, renews leases on a schedule and sweeps for expired
-attempts (see [Worker runtime](#worker-runtime-first-slice) and
+attempts (see [Worker runtime](#worker-runtime) and
 [Running a worker](#running-a-worker)). There is no production worker service yet. The
 example below shows the operations themselves.
 
@@ -439,7 +477,7 @@ registry = HandlerRegistry({"invoice_verification": verify_invoice})
   and `retry_max_delay` form its `retry_policy` (base no longer than max). The worker will use
   the existing `ORQESTRA_DATABASE_URL`.
 
-### Worker runtime (first slice)
+### Worker runtime
 
 `Worker` runs one task at a time in one process. `orqestra worker run` starts one (see
 [Running a worker](#running-a-worker)); from Python:
@@ -663,8 +701,8 @@ the exit codes above.
   running, the worker keeps its normal behaviour during outages.
 - **Running.** After the checks it runs exactly as `run_until_signalled` does: exit 0
   after a controlled stop, the worker's exit codes otherwise (see above).
-- **Submitting work** is the Python `submit_job` interface; there is no submission
-  command.
+- **Submitting work** uses `orqestra job submit` or the Python `submit_job` interface (see
+  [Submitting jobs](#submitting-jobs)).
 - **Production restriction.** `diagnostic.*` kinds are refused only when
   `ORQESTRA_ENVIRONMENT` is `production`. An unset `ORQESTRA_ENVIRONMENT` defaults to
   `development`, so a production deployment must set it.
@@ -1239,7 +1277,10 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   deploys it, and it can run only the built-in diagnostic handlers. A task whose worker dies is
   recovered only while some worker is running: any live worker sweeps, idle or busy.
   There is no guaranteed recovery delay: it depends on live workers, their sweep
-  interval and batch limit, and the backlog of expired attempts.
+  interval and batch limit, and the backlog of expired attempts. It is never shorter than
+  the attempt's current lease: an attempt becomes revocable only when that lease ends
+  (normally a full lease after its last renewal, sooner after a cancellation request's
+  grace, DEC-040), and only a live worker's sweep revokes it.
 - Revoking an attempt ends its database ownership only, and does not cancel or un-bill an
   external provider call already made. Calls recorded in the usage ledger stay attributed to the
   revoked attempt through its `attempt_id`. Recovery closes an attempt's usage capture only
@@ -1266,16 +1307,34 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   is not retried; with the worker's sink, a ledger failure ends the process instead. The
   cap is checked against the worker's execution timeout only by
   `check_provider_call_budget`, which nothing calls for you (DEC-059).
-- The invoice job summary is in process only: no command or API exposes it, and it
-  summarizes one job per call. Its snapshot read grows with the number of tasks and the
+- The invoice job summary is read in process or with `orqestra job summary` (DEC-066), one
+  job per call; no API exposes it. Its snapshot read grows with the number of tasks and the
   size of their stored results, and holds back vacuum while it lasts; the cost of the
   ordering, the effect of the fetch size and the behaviour under concurrent completions
   are measured by tests that no default lane runs, and no threshold or batch-size limit is
   decided. Counts are per-task tallies, not a final job tally unless `complete`.
-- The provider usage report is in process only and reports one job per call. Its read
+- The provider usage report is read in process or with `orqestra job usage` (DEC-066), one
+  job per call; no API exposes it. Its read
   grows with the number of tasks, attempts and ledger rows; it is measured at 50,000
   invoices by a test that no default lane runs, and no threshold is decided. Tokens and
   closure tiers are not totalled.
+- Every integration test and benchmark run uses one machine and one local PostgreSQL server
+  (in Docker for the Compose setup and in CI), reached over a Unix socket or the loopback
+  network: the integration suite refuses any
+  other target (`check_test_target` in `tests/integration/postgres.py`), and so does the
+  benchmark database guard (`benchmarks/database.py`). There is no multi-host result.
+- `orqestra worker run` runs the diagnostic handlers only (`KINDS` in
+  `src/orqestra/worker/builtin.py`), so the shipped command never runs the invoice handler,
+  and no invoice result says anything about it.
+- The offline provider double for benchmarks, `SeparatorReader` (`benchmarks/provider.py`),
+  answers at once and makes no network call, so nothing here measures a real provider's
+  latency, cost or reliability.
+- There is no purchase-order matching: the invoice rules check each invoice on its own
+  (`src/orqestra/workloads/invoice/verify.py`).
+- Usage is totalled per exact unit that a provider reports, such as `tokens`, with no
+  price, currency or money figure (DEC-062).
+- The call budget check (`--max-provider-calls-per-attempt`, DEC-065) assumes that every
+  worker of the job used that cap; the cap is not stored, so nothing confirms it.
 - **The worker's local fence is limited.**
   - It cannot stop a handler that holds the GIL in native code: the watchdog thread then
     cannot run either.
@@ -1285,7 +1344,7 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
     lease before the local fence.
   - It has been shown under the tested conditions only: a stalled proxy, refused
     connections, a cancellation request, and a lease ended by the database.
-- **The worker runtime is a first slice.**
+- **Worker runtime limits.**
   - **Cancellation notice:** a handler is told of a request only at a heartbeat. With a
     grace period shorter than the time to the next heartbeat, or during a database
     outage, it is fenced without notice. Handlers that hold the GIL cannot react, and
@@ -1384,11 +1443,11 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   while any session uses `attempts`. Code from before 0003 must not run once the new code
   can write `cancellation_grace_expired`: it cannot read that reason, and its heartbeats
   ignore cancellation. Stop all application processes, apply 0003, then start only
-  Slice 3 code; draining first is preferable. The database does not enforce this order.
+  code that includes migration 0003; draining first is preferable. The database does not enforce this order.
 - Migration 0004 is additive and may run while attempts are running, but it fails at once
   while any session uses `tasks`. Code from before 0004 ignores `available_at` and would
   retry requeued tasks at once. Stop all application processes, apply 0004, then start
-  only Day 4A code with one shared retry policy. `orqestra worker run` refuses to start
+  only code that includes migration 0004, with one shared retry policy. `orqestra worker run` refuses to start
   against any other migration history, but a worker already running is not stopped, and
   direct callers of the lifecycle functions are not checked.
 - A job whose started tasks were all requeued reads as `queued`; one failed task makes a
