@@ -11,6 +11,8 @@ the short test profile of the process-level tests (lease ``PT4S``).
 import json
 import subprocess
 import sys
+import time
+import uuid
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
@@ -21,11 +23,21 @@ import pytest
 from psycopg.rows import TupleRow
 
 import benchmarks.drills
-from benchmarks.drills import KillDrill, OutageDrill, run_drill, standard_workload
+from benchmarks.drills import (
+    DrillFleet,
+    KillDrill,
+    OutageDrill,
+    Poll,
+    _await_started,
+    _process_state,
+    freeze_victims,
+    run_drill,
+    standard_workload,
+)
 from benchmarks.faults import Fault, FaultingReader, create_fault_table, poison_total
 from benchmarks.generate import generate_invoices
 from benchmarks.result import ROOT, Status, validate_result, write_result
-from benchmarks.run import Cell, Profile, run_cell
+from benchmarks.run import Cell, Profile, process_environment, run_cell, worker_command
 from orqestra.calls.provider import FieldKind, ProviderTransientError, make_request
 from tests.integration.test_worker_process import ENVIRONMENT
 
@@ -257,3 +269,44 @@ def test_the_always_fault_never_answers_and_other_strings_are_read(schema_url: s
             ask(poison_total(98765, Fault.ALWAYS))
     assert ask("98_765") == "98765"
     assert ask("1 234 567") == "1234567"
+
+
+# --- the drill harness's own cleanup -----------------------------------------------------
+
+
+def test_a_worker_stopped_once_it_has_started_exits_0(
+    db: psycopg.Connection[TupleRow], schema_url: str, tmp_path: Path
+) -> None:
+    env = process_environment(schema_url, ENVIRONMENT)
+    fleet = DrillFleet(Profile.INVOICE, env, tmp_path, command=worker_command(Profile.INVOICE))
+    fleet.start()  # stopped at once, as a replacement started at a job's end would be
+    _await_started(fleet)
+    assert [worker["exit_code"] for worker in fleet.stop(timeout=30)] == [0]
+
+
+class _FailingHarness:
+    """A harness whose database reads fail: ``freeze_victims`` must still continue everyone."""
+
+    @property
+    def conn(self) -> NoReturn:
+        raise psycopg.OperationalError("the harness lost its connection")
+
+
+def test_freezing_continues_every_worker_when_reading_fails(tmp_path: Path) -> None:
+    fleet = DrillFleet(
+        Profile.INVOICE, {}, tmp_path, command=[sys.executable, "-c", "import time; time.sleep(60)"]
+    )
+    fleet.start()
+    fleet.start()
+    poll = Poll(_FailingHarness(), uuid.uuid4(), fleet, 10, 10, quiet_bound=1.0)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(psycopg.OperationalError):
+            freeze_victims(poll, 1, set())
+        for _ in range(1000):  # a bound on signal delivery, not an expectation
+            states = [_process_state(handle.process.pid) for handle in fleet.workers]
+            if not [state for state in states if state.startswith("T")]:
+                break
+            time.sleep(0.01)
+        assert not [state for state in states if state.startswith("T")]
+    finally:
+        fleet.stop(timeout=10)

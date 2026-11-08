@@ -30,9 +30,14 @@ drill     injection, once the succeeded tasks reach 30 %
 The job is submitted before any worker starts, and the harness polls every
 10 ms until the injection, because a job of this size can pass 30 % within one
 ordinary poll. A victim is chosen without racing its own completion: the
-harness stops every live worker, waits until each shows as stopped, and only
-then reads which attempts are running and which PID (from ``worker_id``) owns
-each. Those owners are the candidates; every worker not chosen is continued.
+harness stops every live worker, waits until each shows as stopped and until
+no client backend of the database is still running a statement (one a worker
+sent before it stopped could otherwise still commit), and only then reads
+which attempts are running and which PID (from ``worker_id``) owns each. Those
+owners are the candidates; every worker not chosen is continued. Before the
+workers are stopped at the end, the harness waits until every running worker,
+replacements included, has logged ``worker_started``, so each one stops under
+its own signal handlers.
 
 Nothing here predicts a duration. Delays are measured from stored PostgreSQL
 timestamps and recorded; the checks assert outcomes and the order of stored
@@ -40,8 +45,10 @@ timestamps only.
 """
 
 import argparse
+import contextlib
 import copy
 import itertools
+import json
 import math
 import os
 import signal
@@ -92,6 +99,7 @@ from benchmarks.run import (
     BENCH_WORKER_SETTINGS,
     MAX_ATTEMPTS,
     POLL,
+    STARTUP_TIMEOUT,
     Cell,
     Fleet,
     Profile,
@@ -229,6 +237,7 @@ class Poll:
     fleet: DrillFleet
     tasks: int
     succeeded: int
+    quiet_bound: float  # how long a drill waits for in-flight statements to end
 
     @property
     def conn(self) -> Conn:
@@ -276,26 +285,59 @@ class Victim:
     attempt_id: uuid.UUID
 
 
+_ACTIVE_BACKENDS = (
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+    "AND backend_type = 'client backend' AND state = 'active' AND pid <> pg_backend_pid()"
+)
+
+
+def _await_quiet(poll: Poll) -> bool:
+    """Wait until no other client backend of this database runs a statement.
+
+    A stopped worker cannot send anything new, but a statement it had already
+    sent (a completion, a heartbeat) still runs on the server and may commit.
+    Once no backend is active, nothing a stopped worker sent is still running.
+    Bounded by ``poll.quiet_bound``; whether it became quiet is returned.
+    """
+    deadline = time.monotonic() + poll.quiet_bound
+    while True:
+        if _one(poll.conn, _ACTIVE_BACKENDS)[0] == 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def freeze_victims(poll: Poll, count: int, taken: set[int]) -> list[Victim]:
     """Stop up to ``count`` workers, each owning an attempt still running once it is stopped.
 
-    Every live worker not in ``taken`` is stopped first, so no attempt can end
-    while the owners are read; the workers that are not chosen are continued.
+    Every live worker not in ``taken`` is stopped first, and the owners are read
+    only once no statement a stopped worker sent is still running on the server
+    (``_await_quiet``), so no attempt can end while they are read. The workers
+    that are not chosen are always continued, also when reading fails.
     """
     live = [h for h in poll.fleet.workers if h.process.pid not in taken and h.running()]
-    for handle in live:
-        os.kill(handle.process.pid, signal.SIGSTOP)
-    stopped = {h.process.pid for h in live if _wait_stopped(h.process.pid)}
     victims: list[Victim] = []
-    for attempt_id, worker_id in poll.conn.execute(_RUNNING_ATTEMPTS, (poll.job_id,)):
-        pid = worker_pid(worker_id)
+    try:
+        for handle in live:
+            os.kill(handle.process.pid, signal.SIGSTOP)
+        stopped = {h.process.pid for h in live if _wait_stopped(h.process.pid)}
+        if not _await_quiet(poll):
+            return []  # tried again on a later poll
+        for attempt_id, worker_id in poll.conn.execute(_RUNNING_ATTEMPTS, (poll.job_id,)):
+            pid = worker_pid(worker_id)
+            chosen = {victim.pid for victim in victims}
+            if pid in stopped and pid not in chosen and len(victims) < count:
+                victims.append(Victim(pid, attempt_id))
+    except BaseException:
+        victims = []
+        raise
+    finally:
         chosen = {victim.pid for victim in victims}
-        if pid in stopped and pid not in chosen and len(victims) < count:
-            victims.append(Victim(pid, attempt_id))
-    chosen = {victim.pid for victim in victims}
-    for handle in live:
-        if handle.process.pid not in chosen:
-            os.kill(handle.process.pid, signal.SIGCONT)
+        for handle in live:
+            if handle.process.pid not in chosen:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(handle.process.pid, signal.SIGCONT)
     return victims
 
 
@@ -889,6 +931,31 @@ def retry_policy(worker_settings: Mapping[str, str]) -> RetryPolicy:
 # --- one drill run -----------------------------------------------------------------------
 
 
+def _started(handle: WorkerHandle) -> bool:
+    for line in handle.log_path.read_bytes().splitlines():
+        if line.startswith(b"{"):
+            try:
+                if json.loads(line).get("event") == "worker_started":
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _await_started(fleet: DrillFleet, bound: float = STARTUP_TIMEOUT) -> None:
+    """Wait, up to ``bound`` seconds, until every running worker has logged ``worker_started``.
+
+    A worker stopped before it has installed its signal handlers dies by the
+    signal's default action (exit -15), not by a controlled stop (exit 0); a
+    replacement started near the end of a job would otherwise be stopped so.
+    """
+    deadline = time.monotonic() + bound
+    while time.monotonic() < deadline:
+        if all(_started(handle) for handle in fleet.workers if handle.running()):
+            return
+        time.sleep(0.05)
+
+
 def _supervise(fleet: DrillFleet, seen: set[int], due: list[float], exits: list[Any]) -> None:
     """Record each worker that exited and replace it ``RESTART_DELAY`` seconds later."""
     for handle in list(fleet.workers):
@@ -928,6 +995,8 @@ def run_drill(
         cell.profile, env, raw_dir, command=list(command or worker_command(Profile.INVOICE))
     )
     harness = Harness(url)
+    operation = parse_duration(worker_settings["ORQESTRA_WORKER_DB_OPERATION_TIMEOUT"])
+    quiet = 2 * operation.total_seconds() + 1.0  # a statement outlives its bound by little
     seen: set[int] = set()
     due: list[float] = []
     exits: list[dict[str, Any]] = []
@@ -944,7 +1013,9 @@ def run_drill(
             if counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0:
                 finished = True
                 break
-            poll = Poll(harness, job_id, fleet, len(workload.tasks), counts[TaskState.SUCCEEDED])
+            poll = Poll(
+                harness, job_id, fleet, len(workload.tasks), counts[TaskState.SUCCEEDED], quiet
+            )
             drill.step(poll)
             _supervise(fleet, seen, due, exits)
             time.sleep(POLL if drill.injected else INJECTION_POLL)
@@ -952,10 +1023,17 @@ def run_drill(
         harness.close()
         raise
     finally:
-        drill.release()
-        shutdown = parse_duration(worker_settings["ORQESTRA_WORKER_SHUTDOWN_TIMEOUT"])
-        reaped = fleet.stop(timeout=shutdown.total_seconds() + 10.0)
-        drill.close()
+        # Each step runs even if an earlier one raised: a frozen worker is continued,
+        # every worker is stopped and reaped, and the proxy is closed.
+        try:
+            drill.release()
+        finally:
+            try:
+                _await_started(fleet)
+                shutdown = parse_duration(worker_settings["ORQESTRA_WORKER_SHUTDOWN_TIMEOUT"])
+                reaped = fleet.stop(timeout=shutdown.total_seconds() + 10.0)
+            finally:
+                drill.close()
     try:
         conn = harness.conn
         codes = [worker["exit_code"] for worker in reaped]
