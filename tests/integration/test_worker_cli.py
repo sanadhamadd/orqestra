@@ -441,6 +441,18 @@ def held_by(db: Conn, task: Task, worker_id: str) -> bool:
     ) == [(1,)]
 
 
+def wait_busy(start: Launcher, worker: CliWorker, db: Conn, task: Task, worker_id: str) -> None:
+    """Wait until ``worker``'s handler runs ``task``; a committed claim alone is not enough.
+
+    A claim commits before its handler starts, and a stop latched in between
+    leaves the attempt unstarted, for recovery (DEC-049). So a test of a busy
+    worker waits for ``handler_started``, then checks that PostgreSQL holds the
+    attempt for this worker.
+    """
+    worker.wait_for("handler_started", where={"task_id": str(task.id)})
+    assert held_by(db, task, worker_id), start.report()
+
+
 def result_of(db: Conn, task: Task) -> Any:
     return rows(db, "SELECT result FROM tasks WHERE id = %s", task.id)[0][0]
 
@@ -619,10 +631,15 @@ def test_a_busy_worker_that_settles_within_the_drain_exits_0(
     start.watch(db, task)
     worker = start(schema_url, [WAIT], {"ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT30S"})
     worker_id = worker.wait_for("worker_started")[1]["worker_id"]
-    start.settle(lambda: held_by(db, task, worker_id), "the worker to hold it")
+    wait_busy(start, worker, db, task, worker_id)
     code, lines = worker.stop()
     assert code == 0
     assert lines[-1]["event"] == "worker_stopped"
+    # The stop was latched while the handler ran, so the task was drained, not left unstarted.
+    events = [line.get("event") for line in lines]
+    latched = events.index("shutdown_requested")
+    assert events.index("handler_started") < latched, start.report()
+    assert lines[latched]["message"].startswith("shutdown_requested: draining"), start.report()
     assert task_states(db, [task]) == [("succeeded", 1)]
 
 
@@ -633,7 +650,7 @@ def test_a_busy_worker_that_cannot_settle_in_time_exits_9(
     start.watch(db, task)
     worker = start(schema_url, [WAIT])  # a 1 s drain
     worker_id = worker.wait_for("worker_started")[1]["worker_id"]
-    start.settle(lambda: held_by(db, task, worker_id), "the worker to hold it")
+    wait_busy(start, worker, db, task, worker_id)
     code, lines = worker.stop()
     assert code == ExitCode.SHUTDOWN
     assert lines[-1]["event"] == "drain_deadline_passed"
@@ -648,7 +665,7 @@ def test_a_lost_database_while_busy_still_fences_the_process(
     with PgProxy(schema_url) as proxy:
         worker = start(proxy.url(schema_url), [WAIT])
         worker_id = worker.wait_for("worker_started")[1]["worker_id"]
-        start.settle(lambda: held_by(db, task, worker_id), "the worker to hold it")
+        wait_busy(start, worker, db, task, worker_id)
         proxy.refuse()  # no heartbeat can be confirmed from now on
         code, _, lines, _ = worker.exit()
     assert code == ExitCode.FENCED  # never 0
