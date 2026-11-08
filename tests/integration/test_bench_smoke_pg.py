@@ -28,6 +28,7 @@ from benchmarks.drills import (
     KillDrill,
     OutageDrill,
     Poll,
+    RestartDrill,
     _await_started,
     _process_state,
     freeze_victims,
@@ -174,6 +175,45 @@ def test_d3a_connection_outage_passes_the_gate(
     _written(record, tmp_path / "results")
 
 
+def test_d3b_counts_no_injection_when_the_server_did_not_restart(
+    db: psycopg.Connection[TupleRow],
+    schema_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart command that exits 0 but restarts nothing: the record is not complete.
+
+    The command is a real process that does nothing; ``RESTART_COMMAND`` and Docker
+    are never run, so the real D3b still never runs in tests.
+    """
+    run = subprocess.run
+
+    def no_docker(command: Sequence[str], *args: Any, **kwargs: Any) -> Any:
+        if list(command)[:1] == ["docker"]:
+            pytest.fail("the test ran a docker command")
+        return run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", no_docker)
+    record = run_drill(
+        schema_url,
+        DRILL_CELL,
+        RestartDrill(command=(sys.executable, "-c", "pass")),
+        standard_workload(generate_invoices(DRILL_CELL.size), 100),
+        worker_settings=ENVIRONMENT,
+        raw_dir=tmp_path / "raw",
+        stop_after=STOP,
+    )
+
+    assert record["status"] == Status.FAILED_CORRECTNESS
+    assert record["drill"]["injected"] is False
+    [injection] = record["drill"]["injections"]
+    assert injection["restarted"] is False
+    assert injection["server_started_before"] == injection["server_started_after"]
+    failed = [check["name"] for check in record["gate"] if not check["passed"]]
+    assert failed == ["injected"]
+    _written(record, tmp_path / "results")
+
+
 # --- D3b's refusal, and the shared fail-once fault --------------------------------------
 
 
@@ -193,10 +233,13 @@ def test_d3b_is_refused_without_the_flag_and_the_bench_project(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     def no_command(*args: object, **kwargs: object) -> NoReturn:
-        pytest.fail("d3b ran a command although it was refused")
+        pytest.fail("d3b connected or ran a command although it was refused")
 
     monkeypatch.setattr(subprocess, "run", no_command)
     monkeypatch.setattr(benchmarks.drills, "run_named", no_command)
+    monkeypatch.setattr(benchmarks.drills, "connect_verified", no_command)
+    monkeypatch.setattr(benchmarks.drills, "check_restart_target", no_command)
+    monkeypatch.setattr(psycopg, "connect", no_command)
     if project is None:
         monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
     else:
