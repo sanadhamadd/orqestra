@@ -9,7 +9,8 @@ committed state, so a call recorded after a closure is flagged late and never co
 by it. ``record_late_usage`` and ``capture_of`` report what a late fact means.
 
 Deterministic tests hold one transaction at a known point with a test-only gate
-trigger and observe the competitor waiting in ``pg_locks``.
+trigger and observe the competitor waiting in ``pg_locks``, or replace one check
+with a hook that first commits on other connections.
 """
 
 import secrets
@@ -35,6 +36,7 @@ from orqestra.domain.jobs import (
 from orqestra.domain.leases import LeasePolicy, RevocationReason
 from orqestra.domain.retry import RetryPolicy
 from orqestra.domain.states import AttemptState, TaskState
+from orqestra.persistence import provider_usage
 from orqestra.persistence.lifecycle import (
     AttemptCompletion,
     AttemptFinishedError,
@@ -957,3 +959,83 @@ def test_heartbeats_completion_recovery_writers_and_cancellation_never_deadlock(
         if stored.capture is CaptureState.COMPLETE:
             assert stored.call_count == len([c for c in usage.calls if not c.call.late])
         assert_invariants(checked)
+
+
+# --- a replayed standalone closure against a later intent (DEC-058) ------------------------
+#
+# A retried ``record_usage_closure`` reads no closure; the original then commits its
+# closure and a further intent commits; only then does the retry count the intents. The
+# hook stands in for the retry's ``_check_closable`` once: it commits those two on other
+# connections and then runs the real check on the retry's cursor. Nothing in the retry's
+# transaction is locked by then, so nothing waits, and the steps run in this order on
+# one thread, with no sleep.
+
+
+def committed_first(monkeypatch: pytest.MonkeyPatch, *steps: Callable[[], object]) -> list[object]:
+    """Run ``steps``, then the real check, in place of the next ``_check_closable`` call."""
+    check = provider_usage._check_closable
+    done: list[object] = []
+
+    def hook(cur: Any, closure: UsageClosure) -> None:
+        monkeypatch.setattr(provider_usage, "_check_closable", check)  # once only
+        done.extend(step() for step in steps)
+        check(cur, closure)
+
+    monkeypatch.setattr(provider_usage, "_check_closable", hook)
+    return done
+
+
+def test_a_replayed_closure_wins_over_an_intent_recorded_after_the_original(
+    checked: Conn, worker: Callable[[], Conn], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, attempt = running(checked)
+    calls(checked, attempt, answered=2)
+    closure = a_closure(attempt.id, call_count=2)
+    original, late = worker(), worker()
+    done = committed_first(
+        monkeypatch,
+        lambda: record_usage_closure(original, closure),
+        lambda: record_call_intent(late, an_intent(attempt.id, 2)),
+    )
+
+    replay = record_usage_closure(checked, closure)
+
+    first = cast(Recorded[Any], done[0])
+    assert first.created
+    assert replay == Recorded(first.record, created=False)
+    assert count(checked, "provider_calls") == 3
+    assert count(checked, CLOSURES) == 1
+    assert stored_closure(checked, attempt.id) == closure
+
+
+def test_a_different_closure_committed_meanwhile_is_a_replay_conflict(
+    checked: Conn, worker: Callable[[], Conn], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, attempt = running(checked)
+    calls(checked, attempt, answered=2)
+    original, late = worker(), worker()
+    committed_first(
+        monkeypatch,
+        lambda: record_usage_closure(original, incomplete(attempt.id)),
+        lambda: record_call_intent(late, an_intent(attempt.id, 2)),
+    )
+
+    with pytest.raises(UsageReplayConflictError):
+        record_usage_closure(checked, a_closure(attempt.id, call_count=2))
+
+    assert stored_closure(checked, attempt.id) == incomplete(attempt.id)
+
+
+def test_a_count_that_is_still_wrong_without_a_closure_is_refused(
+    checked: Conn, worker: Callable[[], Conn], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, attempt = running(checked)
+    calls(checked, attempt, answered=2)
+    late = worker()
+    committed_first(monkeypatch, lambda: record_call_intent(late, an_intent(attempt.id, 2)))
+
+    with pytest.raises(CaptureNotCompleteError) as refused:
+        record_usage_closure(checked, a_closure(attempt.id, call_count=2))
+
+    assert (refused.value.intents, refused.value.unanswered) == (3, 1)
+    assert count(checked, CLOSURES) == 0
