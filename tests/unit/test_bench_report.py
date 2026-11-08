@@ -40,6 +40,7 @@ def cell_record(
     cpu: str = "Synthetic CPU",
     recorded_at: str = "20261108T000000Z",
     drill: dict[str, Any] | None = None,
+    wait: tuple[str, float] | None = None,
 ) -> dict[str, Any]:
     """A synthetic format 1 cell result that ``benchmarks.result`` accepts."""
     gate = [{"name": "terminal", "passed": True, "detail": None}]
@@ -74,7 +75,13 @@ def cell_record(
         },
         "worker_settings": dict(BENCH_WORKER_SETTINGS),
         "provider": None,
-        "timing": {"makespan_s": makespan, "tasks": size, "items": size, "stop_after_s": 60.0},
+        "timing": {
+            "makespan_s": makespan,
+            "tasks": size,
+            "items": size,
+            "stop_after_s": 60.0,
+            **({"wait_ended": wait[0], "waited_s": wait[1]} if wait else {}),
+        },
         "throughput": (
             {
                 "makespan_items_per_s": rate,
@@ -215,10 +222,32 @@ def test_records_that_do_not_count_are_listed_with_their_reason(tmp_path: Path) 
     row = rows(text, "echo 100 w1")[0]
     assert row[1] == "1"  # only the complete, clean repetition
     excluded = text.split("## Not in the tables", 1)[1]
-    assert "incomplete: stopped after 60.0 s" in excluded
+    assert "incomplete: stopped before every task ended (limit 60.0 s)" in excluded
     assert "failed_correctness: summary" in excluded
     assert "dirty tree (dirty_allowed)" in excluded
     assert excluded.count("| `") == 3
+
+
+def test_a_reason_says_how_the_wait_ended(tmp_path: Path) -> None:
+    lost = cell_record(
+        rep=1,
+        status="failed_correctness",
+        failed_checks=("worker_exits",),
+        wait=("no_workers", 5.0),
+    )
+    lost["timing"]["stop_after_s"] = 3600.0
+    limit = cell_record(rep=2, status="incomplete", failed_checks=("terminal",))
+    limit["timing"] |= {"wait_ended": "stop_after", "waited_s": 3600.2}
+    assert (
+        report.reason(lost) == "failed_correctness: every worker exited after 5.0 s; worker_exits"
+    )
+    assert "3600" not in report.reason(lost)
+    assert report.reason(limit) == "incomplete: stopped at the limit after 3600.2 s"
+    write(tmp_path, lost)
+    write(tmp_path, limit)
+    excluded = report.render(tmp_path).split("## Not in the tables", 1)[1]
+    assert "every worker exited after 5.0 s" in excluded
+    assert "stopped at the limit after 3600.2 s" in excluded
 
 
 def test_the_warm_up_has_its_own_table(tmp_path: Path) -> None:

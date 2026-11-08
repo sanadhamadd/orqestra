@@ -23,7 +23,14 @@ from benchmarks.ladder import (
     plan_cells,
     stop_limit,
 )
-from benchmarks.result import DirtyTreeError, Status, code_state, validate_result, write_result
+from benchmarks.result import (
+    DirtyTreeError,
+    Status,
+    WaitEnded,
+    code_state,
+    validate_result,
+    write_result,
+)
 from benchmarks.run import (
     BENCH_WORKER_SETTINGS,
     Cell,
@@ -31,6 +38,7 @@ from benchmarks.run import (
     Profile,
     WorkerHandle,
     build_workload,
+    cell_status,
     summary_check,
     usage_check,
     worker_command,
@@ -323,6 +331,20 @@ def test_the_large_rung_gate() -> None:
     assert large_stop(only_four_cores, workers=8, cpu_count=4) is None
 
 
+def test_the_large_rung_gate_never_raises_for_a_missing_cell() -> None:
+    # Records of a worker count this machine skips sit beside a missing wanted cell.
+    four_cores = [r for r in _scale(100.0) if r["cell"]["workers"] <= 4][1:]
+    eight = _scale_record(8, 1, 100.0, "complete")
+    assert large_stop([*four_cores, eight], workers=4, cpu_count=4) is None
+    assert large_stop(_scale(100.0)[1:], workers=4, cpu_count=4) is None
+
+
+def test_the_large_rung_gate_needs_every_record_of_a_cell_complete() -> None:
+    older = _scale_record(8, 2, 100.0, "incomplete")
+    assert large_stop([older, *_scale(100.0)], workers=4, cpu_count=8) is None
+    assert large_stop([*_scale(100.0), older], workers=4, cpu_count=8) is None
+
+
 # --- results -------------------------------------------------------------------------------
 
 
@@ -378,6 +400,25 @@ def test_a_well_formed_record_validates() -> None:
     validate_result(_record())
     validate_result(_record("incomplete", passed=False))
     validate_result(_record("failed_correctness", passed=False))
+    for status, passed, ended in (
+        ("complete", True, "finished"),
+        ("failed_correctness", False, "finished"),
+        ("incomplete", False, "stop_after"),
+        ("failed_correctness", False, "no_workers"),
+    ):
+        record = _record(status, passed=passed)
+        record["timing"] = {"wait_ended": ended, "waited_s": 5.0}
+        validate_result(record)
+
+
+def test_the_status_follows_how_the_wait_ended() -> None:
+    passed = [{"name": "terminal", "passed": True}]
+    failed = [{"name": "terminal", "passed": False}, {"name": "worker_exits", "passed": False}]
+    assert cell_status(WaitEnded.FINISHED, passed) is Status.COMPLETE
+    assert cell_status(WaitEnded.FINISHED, failed) is Status.FAILED_CORRECTNESS
+    assert cell_status(WaitEnded.STOP_AFTER, failed) is Status.INCOMPLETE
+    # A fleet that exited before its job ended failed a check; it was not stopped at the limit.
+    assert cell_status(WaitEnded.NO_WORKERS, failed) is Status.FAILED_CORRECTNESS
 
 
 @pytest.mark.parametrize(
@@ -395,6 +436,11 @@ def test_a_well_formed_record_validates() -> None:
         (lambda r: r.update(status="failed_correctness", throughput=None), "failed gate"),
         (lambda r: r.update(status="incomplete"), "throughput"),
         (lambda r: r["environment"].update(git_dirty=True), "dirty"),
+        (lambda r: r.update(timing={"wait_ended": "slept", "waited_s": 1.0}), "wait_ended"),
+        (lambda r: r.update(timing={"wait_ended": "finished", "waited_s": -1.0}), "waited_s"),
+        (lambda r: r.update(timing={"wait_ended": "finished", "waited_s": True}), "waited_s"),
+        (lambda r: r.update(timing={"wait_ended": "finished"}), "waited_s"),
+        (lambda r: r.update(timing={"wait_ended": "stop_after", "waited_s": 1.0}), "stop_after"),
     ],
 )
 def test_malformed_records_are_refused(change: Any, message: str) -> None:

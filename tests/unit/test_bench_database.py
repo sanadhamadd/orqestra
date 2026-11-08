@@ -1,11 +1,16 @@
 """The benchmark database guard and run-schema naming, without a database."""
 
+import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from pathlib import Path
+from typing import Any, NoReturn, cast
 
+import psycopg
 import pytest
 from psycopg import sql
 
+from benchmarks import ladder, run
 from benchmarks.database import (
     BENCH_DATABASE_NAME,
     BENCH_DATABASE_URL_ENV,
@@ -97,6 +102,91 @@ def test_the_url_is_required() -> None:
         require_bench_database_url({BENCH_DATABASE_URL_ENV: "   "})
     url = "postgresql:///orqestra_bench"
     assert require_bench_database_url({BENCH_DATABASE_URL_ENV: f" {url} "}) == url
+
+
+SECRET = "s3cr"
+MALFORMED = [
+    pytest.param(
+        f"postgresql://bench:{SECRET}%zzet@localhost:5433/orqestra_bench", id="bad-escape"
+    ),
+    pytest.param(f"host=localhost password {SECRET}et dbname=orqestra_bench", id="missing-equals"),
+    pytest.param(f"postgresql://bench:{SECRET}\udcff@localhost/orqestra_bench", id="not-utf8"),
+]
+
+
+def _shown(exc: BaseException) -> str:
+    """Everything a traceback of ``exc`` would print, its causes included."""
+    return "".join(traceback.format_exception(exc))
+
+
+@pytest.mark.parametrize("url", MALFORMED)
+def test_a_malformed_url_is_refused_without_quoting_it(url: str) -> None:
+    with pytest.raises(UnsafeBenchDatabaseError) as caught:
+        require_bench_database_url({BENCH_DATABASE_URL_ENV: url})
+    exc = caught.value
+    assert str(exc) == f"{BENCH_DATABASE_URL_ENV} is not a valid PostgreSQL connection string"
+    # Neither chained nor kept as context: nothing that walks the chain finds the URL.
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert SECRET not in _shown(exc)
+
+
+# --- the commands refuse a bad database in one line ------------------------------------------
+
+
+def _run_main(out: Path) -> int:
+    argv = ["--profile", "echo", "--size", "10", "--workers", "1", "--allow-dirty"]
+    return run.main([*argv, "--out-dir", str(out)])
+
+
+def _ladder_main(out: Path) -> int:
+    return ladder.main(["warm-up", "--allow-dirty", "--out-dir", str(out)])
+
+
+MAINS = [pytest.param(_run_main, id="run"), pytest.param(_ladder_main, id="ladder")]
+
+
+def _refused_once(capsys: pytest.CaptureFixture[str]) -> str:
+    captured = capsys.readouterr()
+    shown = captured.out + captured.err
+    assert "Traceback" not in shown
+    assert SECRET not in shown
+    lines = captured.err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("refused: ")
+    return lines[0]
+
+
+@pytest.mark.parametrize("main", MAINS)
+@pytest.mark.parametrize("url", MALFORMED)
+def test_a_command_refuses_a_malformed_url(
+    main: Callable[[Path], int],
+    url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(BENCH_DATABASE_URL_ENV, url)
+    assert main(tmp_path) == 1
+    assert "not a valid PostgreSQL connection string" in _refused_once(capsys)
+
+
+@pytest.mark.parametrize("main", MAINS)
+def test_a_command_refuses_a_database_it_cannot_reach(
+    main: Callable[[Path], int],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    def unreachable(url: str) -> NoReturn:
+        msg = "connection refused\n\tIs the server running?"
+        raise psycopg.OperationalError(msg)
+
+    monkeypatch.setenv(BENCH_DATABASE_URL_ENV, "postgresql://bench@localhost:5433/orqestra_bench")
+    monkeypatch.setattr(run, "connect_verified", unreachable)
+    assert main(tmp_path) == 1
+    line = _refused_once(capsys)
+    assert line == "refused: could not reach the benchmark database: connection refused"
 
 
 def test_the_connection_is_checked_against_the_server_answer() -> None:
