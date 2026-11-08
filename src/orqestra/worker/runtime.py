@@ -9,7 +9,8 @@ It never claims again until the previous task is settled.
 Every supervisor database call is bounded by ``statement_timeout`` and, on the
 client side, by the watchdog's operation guard; a running handler is bounded
 by the ownership guard (``fence``). When the supervisor cannot establish that
-it still owns a running task, it ends the process and Day 3A recovery decides.
+it still owns a running task, it ends the process and recovery (a live worker's
+sweep, ``revoke_next_expired``) decides.
 
 When a completion's answer is lost, the supervisor keeps the handler's outcome
 and reconciles it from PostgreSQL's evidence (DEC-047): the completion

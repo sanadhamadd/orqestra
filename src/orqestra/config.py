@@ -22,7 +22,8 @@ class Settings(BaseSettings):
 
     environment: Environment = "development"
     log_level: LogLevel = "INFO"
-    # PostgreSQL DSN. Optional on Day 1; persistence (Day 2) requires it.
+    # PostgreSQL DSN. Optional for `version` and `health`; every command that uses the
+    # database requires it.
     database_url: SecretStr | None = None
     # Concurrent task slots per worker process (not OS threads or hosts). Not read by
     # anything yet: the worker is single-slot by approved direction (DEC-044).
