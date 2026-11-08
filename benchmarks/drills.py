@@ -20,8 +20,10 @@ drill     injection, once the succeeded tasks reach 30 %
 ``d3a``   the workers reach PostgreSQL through ``PgProxy``, which cuts every
           connection and refuses new ones for 5 s; the harness connects directly
 ``d3b``   ``docker compose -p orqestra-bench restart postgres``; refused unless
-          ``--allow-db-restart`` is given and ``COMPOSE_PROJECT_NAME`` is
-          ``orqestra-bench``; never run by tests
+          ``--allow-db-restart`` is given, ``COMPOSE_PROJECT_NAME`` is
+          ``orqestra-bench``, and that project's container is the server the
+          URL reaches (the same ``system_identifier``); injected only if the
+          server's ``pg_postmaster_start_time()`` moved forward; never run by tests
 ``d4``    two jobs on workers with ``benchmarks.faults``: a payload job with one
           extra non-batch task, and a retry job with an always-failing and a
           fail-once provider answer
@@ -66,6 +68,7 @@ import psycopg
 
 from benchmarks import metrics
 from benchmarks.database import (
+    BENCH_DATABASE_URL_ENV,
     UnsafeBenchDatabaseError,
     connect_verified,
     create_run_schema,
@@ -135,6 +138,10 @@ STOP_BOUND = 10.0  # how long a signalled process may take to show as stopped or
 RECONNECT_BOUND = 300.0
 BENCH_PROJECT = "orqestra-bench"
 RESTART_COMMAND = ("docker", "compose", "-p", BENCH_PROJECT, "restart", "postgres")
+IDENTITY_COMMAND = (
+    *("docker", "compose", "-p", BENCH_PROJECT, "exec", "-T", "-u", "postgres", "postgres"),
+    "pg_controldata",
+)
 FAULTS_COMMAND = (
     sys.executable,
     "-m",
@@ -221,6 +228,12 @@ class Harness:
 
     def clock(self) -> datetime:
         row = self.conn.execute("SELECT clock_timestamp()").fetchone()
+        assert row is not None
+        return cast(datetime, row[0])
+
+    def server_started(self) -> datetime:
+        """When the server this connection reached last started: it moves only on a restart."""
+        row = self.conn.execute("SELECT pg_postmaster_start_time()").fetchone()
         assert row is not None
         return cast(datetime, row[0])
 
@@ -685,30 +698,79 @@ def check_restart_allowed(allow: bool, environ: Mapping[str, str]) -> None:
         raise RestartRefusedError(msg)
 
 
+_IDENTITY_LINE = "Database system identifier:"
+
+
+def check_restart_target(conn: Conn) -> None:
+    """Refuse D3b unless the ``orqestra-bench`` container is the server ``conn`` reached.
+
+    Both sides report the cluster's ``system_identifier``: the server through
+    ``pg_control_system()``, the container through ``pg_controldata``. Called
+    before any run schema is created, so nothing is restarted on a mismatch.
+    """
+    row = conn.execute("SELECT system_identifier FROM pg_control_system()").fetchone()
+    reached = "" if row is None else str(row[0])
+    try:
+        shown = subprocess.run(  # a fixed command
+            IDENTITY_COMMAND, cwd=ROOT, capture_output=True, text=True, check=True, timeout=60
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        msg = f"d3b could not read the identity of the {BENCH_PROJECT} container"
+        raise RestartRefusedError(msg) from None
+    container = next(
+        (
+            line.removeprefix(_IDENTITY_LINE).strip()
+            for line in shown.splitlines()
+            if line.startswith(_IDENTITY_LINE)
+        ),
+        "",
+    )
+    if not container or container != reached:
+        msg = (
+            f"d3b restarts only the {BENCH_PROJECT} container, which is not the server "
+            f"{BENCH_DATABASE_URL_ENV} reaches"
+        )
+        raise RestartRefusedError(msg)
+
+
 class RestartDrill(Drill):
-    """D3b: restart the dedicated project's server once, if ``check_restart_allowed`` passed."""
+    """D3b: restart the dedicated project's server once, if ``check_restart_allowed`` passed.
+
+    The restart counts as injected only if the server's ``pg_postmaster_start_time()``
+    moved forward across it; a command that restarted nothing, or restarted another
+    server, leaves the drill uninjected, so its record is not complete.
+    """
 
     name = "d3b"
 
-    def __init__(self) -> None:
+    def __init__(self, command: Sequence[str] = RESTART_COMMAND) -> None:
         super().__init__()
+        self.command = tuple(command)
+        self.attempted = False
         self.ended_at: datetime | None = None
 
     def step(self, poll: Poll) -> None:
-        if self.injected or not poll.reached():
+        if self.attempted or not poll.reached():
             return
+        self.attempted = True
         started_at = poll.harness.clock()
+        server_before = poll.harness.server_started()
         began = time.monotonic()
-        subprocess.run(RESTART_COMMAND, cwd=ROOT, check=True, timeout=300)  # a fixed command
+        subprocess.run(self.command, cwd=ROOT, check=True, timeout=300)  # fixed, or a test stub
         poll.harness.reconnect()
         downtime = time.monotonic() - began
+        server_after = poll.harness.server_started()
         self.ended_at = poll.harness.clock()
-        self.injected = True
+        restarted = server_after > server_before
+        self.injected = restarted
         self.injections.append(
             {
                 "started_at": _iso(started_at),
                 "ended_at": _iso(self.ended_at),
                 "restart_to_reconnect_s": downtime,
+                "server_started_before": _iso(server_before),
+                "server_started_after": _iso(server_after),
+                "restarted": restarted,
             }
         )
 
@@ -1135,6 +1197,9 @@ def run_named(name: str, args: argparse.Namespace, url: str) -> list[tuple[dict[
     run_id = uuid.uuid4().hex[:12]
     cell = Cell(Profile.INVOICE, args.invoices, args.batch, args.workers)
     written = []
+    if name == "d3b":
+        with connect_verified(url) as admin:
+            check_restart_target(admin)
     for number in range(2 if name == "d4" else 1):
         schema = run_schema_name(run_id, f"{name.replace('-', '')}j{number}")
         with connect_verified(url) as admin:
@@ -1167,6 +1232,13 @@ def run_named(name: str, args: argparse.Namespace, url: str) -> list[tuple[dict[
     return written
 
 
+def _first_line(exc: BaseException) -> str:
+    """The first non-empty line of ``exc``: a libpq error can span several lines."""
+    return next(
+        (line.strip() for line in str(exc).splitlines() if line.strip()), type(exc).__name__
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m benchmarks.drills", description=__doc__)
     parser.add_argument("drill", choices=DRILLS)
@@ -1186,7 +1258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.drill == "d3b":
             check_restart_allowed(args.allow_db_restart, os.environ)
-        if args.victims > args.workers:
+        if args.drill == "d1" and args.victims > args.workers:
             msg = "--victims cannot exceed --workers"
             raise ValueError(msg)
         refuse_dirty(args.allow_dirty)
@@ -1194,6 +1266,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         written = run_named(args.drill, args, url)
     except (RestartRefusedError, ValueError, DirtyTreeError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    except psycopg.OperationalError as exc:
+        print(
+            f"refused: could not reach the benchmark database: {_first_line(exc)}", file=sys.stderr
+        )
         return 1
     for record, path in written:
         print(f"{record['status']} {record['drill']['name']} {path}")
