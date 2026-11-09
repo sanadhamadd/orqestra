@@ -10,8 +10,18 @@ never creates, drops or resets a database.
 
 Safety properties, each covered by integration tests:
 
-- A transaction-level advisory lock serialises concurrent runners. Commit or
-  rollback releases it, so it cannot outlive a crashed runner.
+- Locks serialise concurrent runners whatever the session's default isolation.
+  Each migration transaction starts with ``LOCK TABLE schema_migrations IN
+  SHARE ROW EXCLUSIVE MODE``, which takes no snapshot and conflicts with
+  itself, then takes the advisory lock older runners use, and only then reads
+  the history: under REPEATABLE READ or SERIALIZABLE the snapshot is therefore
+  taken after both locks and sees every runner that committed before. Every
+  lock is transaction-scoped, so commit or rollback releases it, it cannot
+  outlive a crashed runner, and a transaction-mode pooler is no obstacle.
+  A first run, finding no history table, takes the advisory lock and creates
+  the table in its first migration's transaction, so a failed first migration
+  leaves nothing behind; a runner that loses that race rolls back and locks
+  the table instead.
 - Migration SQL runs through PL/pgSQL ``EXECUTE`` inside a function call. In
   that context PostgreSQL itself rejects transaction control (``BEGIN``,
   ``COMMIT``, ``ROLLBACK``, ``SAVEPOINT``, ``PREPARE TRANSACTION``, and
@@ -44,12 +54,14 @@ logger = logging.getLogger(__name__)
 _FILENAME = re.compile(r"(?P<version>\d{4})_(?P<name>[a-z0-9]+(?:_[a-z0-9]+)*)\.sql")
 
 # Key for pg_advisory_xact_lock: a fixed 64-bit value derived from a readable label.
+# Runners of every version take it, so they exclude each other; this one takes it
+# after the history table's lock, because the advisory SELECT takes the snapshot.
 LOCK_KEY = int.from_bytes(
     hashlib.sha256(b"orqestra.schema_migrations").digest()[:8], "big", signed=True
 )
 
 _CREATE_HISTORY = """
-CREATE TABLE IF NOT EXISTS {} (
+CREATE TABLE {} (
     version    integer     PRIMARY KEY,
     name       text        NOT NULL,
     checksum   text        NOT NULL,
@@ -130,41 +142,52 @@ def migrate(conninfo: str, migrations: Sequence[Migration] | None = None) -> tup
 
     History is kept in ``schema_migrations`` in the connection's current
     schema. Connection failures propagate as ``psycopg`` errors; everything
-    else is a ``MigrationError``. Neither carries the connection string.
+    else is a ``MigrationError``. Neither carries the connection string. A
+    runner of an older version takes the two locks in the other order, so if it
+    races this one PostgreSQL may abort one of them as a deadlock (``40P01``):
+    a ``MigrationError`` here, after which the migration can be run again.
     """
     migrations = load_migrations() if migrations is None else tuple(migrations)
     _check_sequence(migrations)
     applied: list[Migration] = []
     with psycopg.connect(conninfo, autocommit=True) as conn:
-        history = sql.Identifier(_current_schema(conn), "schema_migrations")
+        schema = _current_schema(conn)
+        history = sql.Identifier(schema, "schema_migrations")
+        raced = False
         while True:
-            with conn.transaction():
-                conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
-                conn.execute(sql.SQL(_CREATE_HISTORY).format(history))
-                rows = conn.execute(
-                    sql.SQL("SELECT version, name, checksum FROM {} ORDER BY version").format(
-                        history
-                    )
-                ).fetchall()
-                recorded = [
-                    (int(version), str(name), str(digest)) for version, name, digest in rows
-                ]
-                _verify_history(recorded, migrations)
-                if len(recorded) == len(migrations):
-                    break
-                migration = migrations[len(recorded)]
-                _apply(conn, migration)
-                conn.execute(
-                    sql.SQL("INSERT INTO {} (version, name, checksum) VALUES (%s, %s, %s)").format(
-                        history
-                    ),
-                    (migration.version, migration.name, migration.checksum),
-                )
+            first = not _history_table(conn, schema)  # its own statement: no snapshot kept
+            try:
+                with conn.transaction():
+                    if first:
+                        _create_history(conn, history)
+                        recorded: list[tuple[int, str, str]] = []
+                    else:
+                        _lock(conn, history)
+                        recorded = _read_history(conn, history)
+                    _verify_history(recorded, migrations)
+                    if len(recorded) == len(migrations):
+                        break
+                    migration = migrations[len(recorded)]
+                    _apply(conn, migration)
+                    _record(conn, history, migration)
+            except _CreatedElsewhereError:
+                # Rolled back; the next pass finds the table and locks it. A second lost
+                # race means the name is taken by something this check cannot see.
+                if raced:
+                    msg = f"the history table {schema}.schema_migrations could not be created"
+                    raise MigrationError(msg) from None
+                raced = True
+                continue
             applied.append(migration)
             logger.info("applied migration %s", migration.label)
     return tuple(applied)
 
 
+_HISTORY_KIND = (
+    "SELECT c.relkind FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = %s AND c.relname = 'schema_migrations'"
+)
 _HISTORY_EXISTS = (
     "SELECT EXISTS (SELECT FROM pg_catalog.pg_class c "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
@@ -242,6 +265,91 @@ def _current_schema(conn: psycopg.Connection[TupleRow]) -> str:
         msg = "no schema is selected for migration history; check search_path"
         raise MigrationError(msg)
     return str(row[0])
+
+
+class _CreatedElsewhereError(Exception):
+    """Another runner created the history table first."""
+
+
+def _history_table(conn: psycopg.Connection[TupleRow], schema: str) -> bool:
+    """Whether ``schema`` has the history table; ``MigrationError`` if the name is something else.
+
+    A view, sequence or any other relation named ``schema_migrations`` would make
+    ``CREATE TABLE`` fail on every pass, so it is refused here instead.
+    """
+    row = conn.execute(_HISTORY_KIND, (schema,)).fetchone()
+    if row is None:
+        return False
+    if row[0] not in ("r", "p"):
+        msg = (
+            f"{schema}.schema_migrations exists but is not a table (relkind {row[0]!r}); "
+            "rename or drop it, or migrate another schema"
+        )
+        raise MigrationError(msg)
+    return True
+
+
+def _create_history(conn: psycopg.Connection[TupleRow], history: sql.Identifier) -> None:
+    """Create the history table in the first run's transaction, under the advisory lock.
+
+    So a failed first migration leaves nothing behind. A runner that found no
+    table but waited here while another created it gets a duplicate-name error
+    from ``CREATE TABLE`` (``42P07``, or ``23505`` from the catalog's unique
+    index): it rolls back and takes the table's lock on its next pass.
+    """
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
+    try:
+        conn.execute(sql.SQL(_CREATE_HISTORY).format(history))
+    except (psycopg.errors.DuplicateTable, psycopg.errors.UniqueViolation):
+        raise _CreatedElsewhereError from None
+
+
+def _read_history(
+    conn: psycopg.Connection[TupleRow], history: sql.Identifier
+) -> list[tuple[int, str, str]]:
+    rows = conn.execute(
+        sql.SQL("SELECT version, name, checksum FROM {} ORDER BY version").format(history)
+    ).fetchall()
+    return [(int(version), str(name), str(digest)) for version, name, digest in rows]
+
+
+def _refused(exc: psycopg.Error, message: str) -> MigrationError | None:
+    """``exc`` as a ``MigrationError``, or ``None`` for a connection failure (no SQLSTATE)."""
+    if exc.sqlstate is None:
+        return None
+    detail = exc.diag.message_primary or type(exc).__name__
+    return MigrationError(f"{message}: [{exc.sqlstate}] {detail}", sqlstate=exc.sqlstate)
+
+
+def _lock(conn: psycopg.Connection[TupleRow], history: sql.Identifier) -> None:
+    """Take the history table's lock, then the advisory lock, before anything reads.
+
+    ``LOCK TABLE`` takes no snapshot, so this transaction's snapshot, even under
+    REPEATABLE READ or SERIALIZABLE, comes from the history read after both.
+    """
+    try:
+        conn.execute(sql.SQL("LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE").format(history))
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
+    except psycopg.Error as exc:
+        refused = _refused(exc, "the migration lock could not be taken")
+        if refused is None:
+            raise
+        raise refused from exc
+
+
+def _record(
+    conn: psycopg.Connection[TupleRow], history: sql.Identifier, migration: Migration
+) -> None:
+    try:
+        conn.execute(
+            sql.SQL("INSERT INTO {} (version, name, checksum) VALUES (%s, %s, %s)").format(history),
+            (migration.version, migration.name, migration.checksum),
+        )
+    except psycopg.Error as exc:
+        refused = _refused(exc, f"{migration.label} could not be recorded and was rolled back")
+        if refused is None:
+            raise
+        raise refused from exc
 
 
 def _apply(conn: psycopg.Connection[TupleRow], migration: Migration) -> None:

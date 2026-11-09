@@ -426,14 +426,26 @@ def claim_next_attempt(
     claimed or cancelled elsewhere are skipped. The order is therefore a
     preference, not strict FIFO, and ``None`` means "nothing of these kinds
     claimable right now", which includes queued tasks that are all locked by
-    others.
+    others. If the database clock steps back between discovery and the claim,
+    so the task it locked is not yet eligible at the claim instant, nothing is
+    claimed and the result is ``None`` too (``start_attempt`` raises instead).
     """
     supported = check_job_kinds(kinds)
     with owned_transaction(conn, "claim_next_attempt") as cur:
         row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES, supported)).fetchone()
         if row is None:
             return None
-        attempt = _claim(cur, task_from_row(row), worker_id, policy)
+        task = task_from_row(row)
+        try:
+            attempt = _claim(cur, task, worker_id, policy)
+        except TaskNotEligibleError:
+            # Discovery found the locked task eligible, so only a backward step of the
+            # database clock between the two statements refuses it here; nothing changed.
+            logger.warning(
+                "claim skipped: the database clock is behind the discovery that found the task",
+                extra={"task_id": str(task.id)},
+            )
+            return None
     _log_started(attempt)
     return attempt
 
