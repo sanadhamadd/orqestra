@@ -430,22 +430,41 @@ def _one(conn: Conn, query: str, *params: object) -> tuple[Any, ...]:
 
 
 class KillDrill(Drill):
-    """D1: SIGKILL ``victims`` workers, each holding a running attempt."""
+    """D1: SIGKILL ``victims`` workers, each holding a running attempt.
+
+    With ``at_call_boundary``, a victim whose attempt has a provider call between
+    its intent and its result is continued and chosen again on a later poll, so
+    the kill never leaves an unanswered intent: recovery then closes the attempt
+    ``complete`` and the usage report can read ``closed``. The count is read
+    after ``freeze_victims`` has stopped every worker and waited for the server
+    to go quiet, so it is final. Drill d1 keeps the default and kills mid-call too.
+    """
 
     name = "d1"
 
-    def __init__(self, victims: int) -> None:
+    def __init__(self, victims: int, *, at_call_boundary: bool = False) -> None:
         super().__init__()
         if victims < 1:
             msg = "d1 needs at least one victim"
             raise ValueError(msg)
         self.victims = victims
+        self.at_call_boundary = at_call_boundary
 
     def step(self, poll: Poll) -> None:
         if self.injected or not poll.reached():
             return
         taken = {entry["pid"] for entry in self.injections}
         for victim in freeze_victims(poll, self.victims - len(self.injections), taken):
+            if self.at_call_boundary:
+                try:
+                    in_flight = _one(poll.conn, _UNRESOLVED, victim.attempt_id)[0]
+                except BaseException:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(victim.pid, signal.SIGCONT)
+                    raise
+                if in_flight:  # a call is between its intent and its result: try again later
+                    os.kill(victim.pid, signal.SIGCONT)
+                    continue
             os.kill(victim.pid, signal.SIGKILL)
             self.killed.add(victim.pid)
             handle = poll.fleet.handle(victim.pid)
