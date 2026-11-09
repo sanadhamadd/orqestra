@@ -531,12 +531,22 @@ def test_an_unrepresentable_amount_leaves_the_call_unresolved_and_the_task_succe
 # --- heartbeats come first --------------------------------------------------------------------
 
 
+# Test values only: the suite's settings with a 1 s database bound. This test is about
+# the ownership fence keeping its cadence while records are written, not about stalls;
+# a 0.5 s bound on each usage write was exceeded once on a slow CI runner, where the
+# operation guard (not the fence) expired. 2 s >= 2 x 1 s, and 2 + 1 + 1 < 6.
+CADENCE = WorkerSettings(
+    _env_file=None,
+    **{**SETTINGS.model_dump(), "db_operation_timeout": timedelta(seconds=1)},
+)
+
+
 def test_heartbeats_keep_their_cadence_while_records_are_written(
     schema_url: str, checked: Conn
 ) -> None:
     metered = Metered(schema_url, stop=threading.Event())
     (task,) = submit(checked, KIND, {"calls": MAX_CALL_SEQ})
-    with metered_worker(schema_url, metered) as probe:
+    with metered_worker(schema_url, metered, CADENCE) as probe:
         leases: list[Any] = []
         made: list[int] = []
 

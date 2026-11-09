@@ -29,8 +29,15 @@ watchdog only ever checks the deadlines armed now.
 
 Neither guard can stop a handler that holds the GIL in native code (the
 watchdog thread then cannot run), or processes a handler started and detached.
+
+Ending the process never depends on stderr: the last log line is written by a
+short-lived writer, and the process ends after at most ``_LINE_WRITE_BOUND``
+even if that write never returns (a pipe nobody reads). The watchdog thread's
+own wait is cut to ``_LONGEST_WAIT``, so no deadline, however distant, can end
+that thread (DEC-045 notes).
 """
 
+import _thread
 import json
 import math
 import os
@@ -82,14 +89,26 @@ class Expiry:
     context: Mapping[str, str]
 
 
+# How long the process waits for its last log line before it ends anyway.
+_LINE_WRITE_BOUND = 0.1
+
+
 def end_process(code: ExitCode, event: str, message: str, context: Mapping[str, str]) -> NoReturn:
     """Write one JSON log line to stderr, best effort, and end the process at once with ``code``.
 
     ``os._exit`` ends every thread, including a handler that is still running;
-    nothing else runs first. The line is written with ``os.write`` so that no
-    lock another thread might hold is needed. The exit is in ``finally``: a
-    failed write (stderr closed, a broken pipe) or anything else raised while
-    writing can never prevent it.
+    nothing else runs first. The exit is in ``finally``: a failed write (stderr
+    closed, a broken pipe) or anything else raised while writing can never
+    prevent it.
+
+    The line is written with ``os.write`` by a writer started with
+    ``_thread.start_new_thread``, and the process waits at most
+    ``_LINE_WRITE_BOUND`` for it: a blocking write to a full pipe nobody reads
+    must not keep a fence from ending the process. The writer is started
+    without the ``threading`` module, so ending the process depends on none of
+    its locks or bookkeeping: this function also runs in a signal handler on
+    the main thread, which may be inside ``threading``'s own code (for example
+    ``Thread.start``) when the signal arrives.
     """
     try:
         line = {
@@ -101,7 +120,20 @@ def end_process(code: ExitCode, event: str, message: str, context: Mapping[str, 
             "exit_code": int(code),
             **context,
         }
-        os.write(2, (json.dumps(line) + "\n").encode())
+        data = (json.dumps(line) + "\n").encode()
+        written = _thread.allocate_lock()
+        written.acquire()
+
+        def write() -> None:
+            try:
+                os.write(2, data)
+            except OSError:
+                pass  # stderr closed or a broken pipe: the line is lost, the exit is not
+            finally:
+                written.release()
+
+        _thread.start_new_thread(write, ())
+        written.acquire(timeout=_LINE_WRITE_BOUND)
     finally:
         os._exit(int(code))
 
@@ -132,6 +164,12 @@ def local_deadline(*, anchor: float, started_at: datetime, instant: datetime) ->
         msg = "local_deadline needs timezone-aware database instants"
         raise TypeError(msg)
     return anchor + (instant.astimezone(UTC) - started_at.astimezone(UTC)).total_seconds()
+
+
+# The longest the watchdog thread waits before it checks again. threading refuses a
+# timeout above threading.TIMEOUT_MAX (about 292 years), and a lease, execution
+# timeout or drain can be longer; an hour keeps every wait far inside that limit.
+_LONGEST_WAIT = 3600.0
 
 
 @dataclass(slots=True)
@@ -277,5 +315,8 @@ class Watchdog:
             while not self._stopping:
                 self._check()
                 deadlines = [armed.deadline for armed in self._armed.values()]
-                timeout = None if not deadlines else max(0.0, min(deadlines) - self._clock())
+                if not deadlines:
+                    timeout = None
+                else:
+                    timeout = min(max(0.0, min(deadlines) - self._clock()), _LONGEST_WAIT)
                 self._condition.wait(timeout)

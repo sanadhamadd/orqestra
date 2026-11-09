@@ -231,6 +231,131 @@ def test_sweeps_never_delay_a_heartbeat_and_always_progress() -> None:
     assert min(sweeps_between[1:]) >= 1
 
 
+def test_records_still_progress_when_each_heartbeat_takes_its_whole_bound() -> None:
+    # DEC-070. A 4 s interval is shorter than 2 x the 3 s bound, so after a heartbeat that
+    # takes its full 3 s only 1 s is left before the next one: no step fits there. The
+    # 10 s lease and 1 s margin leave room for a step and a heartbeat after it before the
+    # fence. Every heartbeat takes its full bound, and the handler posts its next usage
+    # record as soon as the last one is written.
+    interval, reserve, lease, margin = 4.0, 3.0, 10.0, 1.0
+    now, heartbeat_due, usage_due = 0.0, interval, 0.0
+    fence = lease - margin  # armed from the claim at 0.0
+    ended: float | None = None
+    usages_between: list[int] = []
+    usages = 0
+    while now < 1_000.0:
+        step, seconds = next_step(
+            timing(
+                now=now,
+                running=True,
+                heartbeat_due=heartbeat_due,
+                sweep_due=10_000.0,
+                sweep_reserve=reserve,
+                usage_due=usage_due,
+                fence_due=fence,
+                heartbeat_ended=ended,
+            )
+        )
+        if step is Step.HEARTBEAT:
+            sent = now
+            now += reserve
+            assert now <= fence  # confirmed before the fence, however late it was sent
+            ended = now
+            usages_between.append(usages)
+            usages = 0
+            heartbeat_due = sent + interval
+            fence = sent + lease - margin  # the lease it renewed, from no later than its send
+        elif step is Step.USAGE:
+            usages += 1
+            now += reserve
+            usage_due = now  # the next record
+        else:
+            assert step is Step.WAIT
+            assert 0.0 < seconds < float("inf")
+            now += seconds
+    assert len(usages_between) > 50
+    assert min(usages_between[1:]) >= 1  # before DEC-070: none after the first heartbeat
+
+
+def test_only_a_step_due_before_the_last_heartbeat_ended_uses_the_fence_window() -> None:
+    # One second to the next heartbeat, less than the 2 s a step may take; the last
+    # heartbeat ended at 99.0.
+    held = {
+        "now": 100.0,
+        "running": True,
+        "heartbeat_due": 101.0,
+        "sweep_reserve": 2.0,
+        "heartbeat_ended": 99.0,
+    }
+    # Due before it ended, and it and a heartbeat fit before the fence: start now.
+    assert next_step(timing(**held, usage_due=98.0, fence_due=104.0)) == (Step.USAGE, 0.0)
+    assert next_step(timing(**held, sweep_due=99.0, fence_due=104.0)) == (Step.SWEEP, 0.0)
+    # Otherwise wait for the heartbeat, as before DEC-070.
+    assert next_step(timing(**held, usage_due=99.5, fence_due=104.0)) == (Step.WAIT, 1.0)
+    assert next_step(timing(**held, usage_due=98.0, fence_due=103.9)) == (Step.WAIT, 1.0)
+    assert next_step(timing(**held, usage_due=98.0, fence_due=None)) == (Step.WAIT, 1.0)
+    no_heartbeat_yet = {**held, "heartbeat_ended": None}
+    assert next_step(timing(**no_heartbeat_yet, usage_due=98.0, fence_due=104.0)) == (
+        Step.WAIT,
+        1.0,
+    )
+
+
+# --- the wake pipe's wait ----------------------------------------------------------------
+
+
+class RecordingPoll:
+    """Stands in for ``select.poll``: records each timeout and reports nothing ready."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[int] = []
+
+    def poll(self, timeout: int) -> list[tuple[int, int]]:
+        self.timeouts.append(timeout)
+        return []
+
+
+@pytest.mark.parametrize(
+    ("seconds", "timeout"),
+    [
+        (0.0001, 1),  # rounded up to whole milliseconds
+        (1.5, 1500),
+        (2_147_483.0, 2_147_483_000),  # just under the limit: unchanged
+        (2_147_484.0, 2**31 - 1),  # just over: clamped
+        (30 * 24 * 3600.0, 2**31 - 1),
+        (timedelta.max.total_seconds(), 2**31 - 1),
+        (-0.0001, 0),  # a negative timeout would make poll wait forever
+        (-1.0, 0),
+    ],
+)
+def test_a_wait_always_passes_poll_a_timeout_it_accepts(
+    monkeypatch: pytest.MonkeyPatch, seconds: float, timeout: int
+) -> None:
+    wake = runtime._Wake()
+    recorder = RecordingPoll()
+    monkeypatch.setattr(wake, "_poll", recorder)
+    wake.wait(seconds)
+    assert recorder.timeouts == [timeout]
+
+
+def test_a_wait_longer_than_poll_accepts_still_ends_when_woken() -> None:
+    wake = runtime._Wake()
+    raised: list[BaseException] = []
+
+    def wait() -> None:
+        try:
+            wake.wait(30 * 24 * 3600.0)  # 2,592,000,000 ms: more than poll accepts
+        except BaseException as exc:  # reported to the test
+            raised.append(exc)
+
+    thread = threading.Thread(target=wait, daemon=True)
+    thread.start()
+    wake.notify()
+    thread.join(10)
+    assert not thread.is_alive(), "the wait did not end when woken"
+    assert raised == []  # before the clamp: OverflowError from the real poll
+
+
 # --- errors and connection settings ---------------------------------------------------------
 
 
@@ -492,6 +617,37 @@ def test_a_failed_connect_is_an_unconfirmed_heartbeat(harness: Harness) -> None:
     harness.worker._heartbeat(running)
     assert harness.deadline() == 127.0
     assert running.heartbeat_due == 102.0
+
+
+def test_a_renewed_fence_is_early_by_the_claims_latency(harness: Harness) -> None:
+    # Settings the check accepts, at its edge (DEC-044 note): heartbeat 5 s + database
+    # 2 s + margin 3 s = 10 s, under a 10.5 s lease.
+    tight = WorkerSettings(
+        _env_file=None, **{**SETTINGS.model_dump(), "lease": timedelta(seconds=10.5)}
+    )
+    harness.worker._settings = tight
+    # The claim was sent at local 100.0 and reached the database 1 s later: its
+    # instant T0 is really local 101.0, but every deadline is mapped from 100.0.
+    harness.worker._start(attempt(lease_seconds=10.5), 100.0, {"worker_id": "worker-1"}, {}, "k")
+    running = running_of(harness.worker)
+    assert harness.deadline() == 100.0 + 10.5 - 3.0
+    assert running.heartbeat_due == 105.0  # same clock read as the fence: the latency cancels
+
+    # Sent at 105.0 and answered at once: renewed at T0 + 4 s, lease to T0 + 14.5 s.
+    harness.clock.now = 105.0
+    harness.renew(lambda *a, **k: attempt(lease_seconds=14.5))
+    harness.worker._heartbeat(running)
+    assert running.heartbeat_due == 110.0
+    # The real lease ends at local 115.5 (margin from 112.5); the fence is 1 s earlier.
+    assert harness.deadline() == 100.0 + 14.5 - 3.0
+
+    # The next heartbeat, sent on time at 110.0 and taking its full 2 s, would be
+    # confirmed at 112.0: inside the real lease, but after the fence.
+    harness.clock.now = 111.5
+    expiry = harness.watchdog.check()
+    assert expiry is not None
+    assert expiry.guard is Guard.OWNERSHIP
+    assert harness.expiries == [expiry]
 
 
 def test_the_handler_thread_disarms_and_a_later_renewal_cannot_rearm(harness: Harness) -> None:
@@ -771,6 +927,44 @@ def test_a_claim_whose_task_cannot_be_read_is_held_until_its_lease_ends(harness:
     assert harness.worker._schedule.claim_due == 100.0 + 30.0
 
 
+class ClaimedTask:
+    payload: JsonValue = None
+    job_id = uuid.UUID(int=3)
+
+
+class ClaimedJob:
+    kind = "k"
+
+
+def answered_late(harness: Harness) -> Callable[..., Attempt]:
+    """A claim committed at once whose answer arrives 2 s after it was sent at 100.0."""
+
+    def claim(*args: Any, **kwargs: Any) -> Attempt:
+        harness.clock.now = 102.0
+        return attempt()
+
+    return claim
+
+
+def test_the_fence_is_armed_from_the_clock_read_before_the_claim(harness: Harness) -> None:
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", answered_late(harness))
+    harness.monkeypatch.setattr(runtime, "get_task", lambda *a, **k: ClaimedTask)
+    harness.monkeypatch.setattr(runtime, "get_job", lambda *a, **k: ClaimedJob)
+    harness.worker._claim()
+    assert harness.worker._schedule.running is not None
+    # Never later than the real lease end: from 100.0, not from the answer at 102.0.
+    assert harness.deadline() == 100.0 + 30.0 - 3.0
+
+
+def test_an_unstarted_claim_is_held_from_the_clock_read_after_its_answer(harness: Harness) -> None:
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", answered_late(harness))
+    harness.monkeypatch.setattr(runtime, "get_task", raising(psycopg.OperationalError("lost")))
+    harness.worker._claim()
+    assert harness.worker._schedule.running is None
+    # At least until the real lease end: from the answer at 102.0, not from 100.0.
+    assert harness.worker._schedule.claim_due == 102.0 + 30.0
+
+
 NEW_YORK = ZoneInfo("America/New_York")
 # 15 s before a clock change, so a 30 s lease ends after it (DEC-067).
 AUTUMN = datetime(2026, 11, 1, 5, 59, 45, tzinfo=UTC)  # 01:59:45 EDT; +30 s is 01:00:15 EST
@@ -843,11 +1037,13 @@ def test_a_sweep_revokes_up_to_its_batch_limit_then_waits_for_the_interval(
 
     harness.monkeypatch.setattr(runtime, "revoke_next_expired", revoke)
     sweep = harness.worker._schedule.sweep
-    for left in (2, 1):  # the batch limit is 3
+    for left, after in ((2, 102.0), (1, 104.0)):  # the batch limit is 3
         harness.worker._sweep()
-        assert (sweep.left, sweep.due) == (left, 100.0)  # continues at once
+        assert (sweep.left, sweep.due) == (left, harness.clock.now)  # continues at once
+        harness.clock.now = after  # each step takes time
     harness.worker._sweep()
-    assert (sweep.left, sweep.due) == (0, 110.0)  # the next sweep, one interval after this one
+    # The next sweep is one interval after this batch's first step (100.0), not its last.
+    assert (sweep.left, sweep.due) == (0, 110.0)
     assert policies == [SETTINGS.retry_policy] * 3  # every recovery requeues by this policy
 
 
@@ -856,6 +1052,39 @@ def test_a_failed_sweep_ends_until_the_next_interval(harness: Harness) -> None:
     harness.worker._sweep()
     sweep = harness.worker._schedule.sweep
     assert (sweep.left, sweep.due) == (0, 110.0)
+
+
+def test_a_sweep_failing_midway_ends_one_interval_after_its_first_step(harness: Harness) -> None:
+    class Revocation:
+        attempt = attempt(worker="dead")
+
+    answers: list[Any] = [Revocation, errors.QueryCanceled()]
+
+    def revoke(conn: Any, *, retry_policy: Any) -> Any:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", revoke)
+    sweep = harness.worker._schedule.sweep
+    harness.worker._sweep()  # the batch's first step, at 100.0
+    assert (sweep.left, sweep.due) == (2, 100.0)
+    harness.clock.now = 103.0
+    harness.worker._sweep()  # fails: the batch ends
+    assert (sweep.left, sweep.due) == (0, 110.0)
+
+
+def test_a_retry_time_recovery_cannot_represent_ends_the_process_as_a_defect(
+    harness: Harness,
+) -> None:
+    # revoke_next_expired raises ValueError, its transaction rolled back, when the
+    # requeued task's retry time is not a representable timestamp.
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", raising(ValueError("too late")))
+    with pytest.raises(Terminated) as info:
+        harness.worker._sweep()
+    assert (info.value.code, info.value.event) == (ExitCode.DEFECT, "sweep_refused")
+    assert harness.watchdog.deadline(Guard.OPERATION) is None  # the call's guard was disarmed
 
 
 def test_a_supervisor_failing_while_a_handler_runs_ends_the_process(harness: Harness) -> None:

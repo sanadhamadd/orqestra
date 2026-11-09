@@ -11,16 +11,36 @@ The worker is single-slot: one task at a time per process. The existing
 
 Checked here are the relationships a healthy worker needs: the lease rules of
 ``LeasePolicy``; a database call that ends before the next heartbeat is due;
-a heartbeat that, sent on time and taking its full database time, is
-confirmed before the local fencing margin is reached; and a lock wait that
-PostgreSQL ends before the database call's own bound, compared in the whole
-milliseconds PostgreSQL uses (DEC-050); and a retry policy whose base delay
-does not exceed its maximum (DEC-053). Nothing here bounds how
-quickly expired attempts are recovered. The database connection itself is the
-existing ``ORQESTRA_DATABASE_URL`` (``Settings.database_url``).
+``heartbeat_interval + db_operation_timeout + fence_margin < lease``, so that a
+heartbeat sent on time and taking its full database time is confirmed while
+more than ``fence_margin`` of the lease it renews really remains; room for a
+usage record or sweep step between heartbeats that take their full database
+time: ``heartbeat_interval >= 2 * db_operation_timeout`` or
+``lease >= 3 * db_operation_timeout + fence_margin`` (DEC-070); a lock wait
+that PostgreSQL ends before the database call's own bound, compared in the
+whole milliseconds PostgreSQL uses (DEC-050); a retry policy whose base delay
+does not exceed its maximum (DEC-053); and an ``execution_timeout`` and a
+``retry_max_delay`` that leave every deadline and retry time representable for
+at least a century from now. Nothing here bounds how quickly expired attempts
+are recovered.
+
+The worker's local fence comes earlier than the lease by the attempt's claim
+latency: the time from the local clock read just before the claim was sent to
+the claim's database instant, which the operation guard keeps to about
+``db_operation_timeout``. Every ownership deadline is mapped from the claim
+(``local_deadline``). The first heartbeat is scheduled from the same clock
+read, so the latency cancels out; each later one is scheduled from when the
+previous one was sent, so it does not, and the checks above leave it out.
+Settings they accept can therefore fence a healthy worker (exit 3) whose claim
+took longer than ``lease - (heartbeat_interval + db_operation_timeout +
+fence_margin)``. ``heartbeat_interval + 2 * db_operation_timeout +
+fence_margin < lease`` leaves room for any claim the operation guard lets
+through; it is not checked (DEC-044 note). A fence that comes early never lets
+a handler outlive its lease. The database connection itself is the existing
+``ORQESTRA_DATABASE_URL`` (``Settings.database_url``).
 """
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Self
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -33,6 +53,20 @@ from orqestra.domain.retry import RetryPolicy
 # disables them.
 _SHORTEST_DATABASE_TIMEOUT = timedelta(milliseconds=1)
 _MILLISECOND = timedelta(milliseconds=1)
+# How long a deadline or retry time computed from a setting must stay representable.
+_REPRESENTABLE_FOR = timedelta(days=36525)  # a century
+
+
+def _representable_for_a_century(name: str, value: timedelta, what: str) -> None:
+    """Raise unless ``now + value`` stays a representable timestamp for a century."""
+    try:
+        datetime.now(UTC) + value + _REPRESENTABLE_FOR
+    except OverflowError:
+        msg = (
+            f"{name} {value} is too long: it must leave every {what} representable for at "
+            "least a century from now"
+        )
+        raise ValueError(msg) from None
 
 
 def server_milliseconds(value: timedelta) -> int:
@@ -129,9 +163,21 @@ class WorkerSettings(BaseSettings):
             msg = (
                 f"heartbeat_interval + db_operation_timeout + fence_margin ({needed}) must be "
                 f"shorter than lease {self.lease}: a heartbeat sent on time must be confirmed "
-                "before the worker's fencing margin is reached"
+                "while more than fence_margin of the lease it renews remains"
             )
             raise ValueError(msg)
+        bound = self.db_operation_timeout
+        if self.heartbeat_interval < 2 * bound and self.lease < 3 * bound + self.fence_margin:
+            msg = (
+                f"heartbeat_interval {self.heartbeat_interval} is shorter than "
+                f"2 x db_operation_timeout and lease {self.lease} is shorter than "
+                f"3 x db_operation_timeout + fence_margin ({3 * bound + self.fence_margin}): "
+                "no usage record or sweep step could start between heartbeats that take "
+                "their full database time (DEC-070)"
+            )
+            raise ValueError(msg)
+        _representable_for_a_century("execution_timeout", self.execution_timeout, "deadline")
+        _representable_for_a_century("retry_max_delay", self.retry_max_delay, "retry time")
         lock, statement = (
             server_milliseconds(self.lock_timeout),
             server_milliseconds(self.db_operation_timeout),
