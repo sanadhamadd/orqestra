@@ -25,7 +25,6 @@ Nothing here catches or reclassifies database errors: they happen when the
 worker records the outcome, after this boundary.
 """
 
-import dataclasses
 import inspect
 import json
 import math
@@ -44,6 +43,7 @@ from orqestra.domain.jobs import (
     JsonValue,
 )
 from orqestra.domain.kinds import check_job_kinds
+from orqestra.domain.policy import FailureKind, classify_failure
 
 
 class CancellationSignal:
@@ -216,7 +216,11 @@ def run_handler(handler: Handler, context: TaskContext, payload: JsonValue) -> H
         result = handler(context, payload)
     except BaseException as raised:  # control-plane signals become ControlPlaneSignal
         return outcome_of_exception(raised, cancellation_observed=context.cancellation.is_set())
-    return outcome_of_result(result)
+    try:
+        return outcome_of_result(result)
+    except Exception as unchecked:  # a backstop: the result's own code raised while checked
+        reason = f"result could not be checked ({type(unchecked).__name__})"
+        return _failure(InvalidHandlerResult(reason))
 
 
 def outcome_of_result(result: object) -> AttemptOutcome:
@@ -271,12 +275,24 @@ def storable_text(text: str) -> str:
 
 
 def _failure(exc: Exception) -> AttemptFailed:
-    failure = AttemptFailed.from_exception(exc)
-    message = failure.error_message
-    return dataclasses.replace(
-        failure,
-        error_type=storable_text(failure.error_type),
-        error_message=None if message is None else storable_text(message),
+    """``exc`` as a stored failure, built so that the exception's own code cannot break it.
+
+    ``AttemptFailed.from_exception`` calls ``str(exc)``, which runs the exception's
+    ``__str__``. If that raises, the message is a fixed text naming only the type of
+    what it raised; if classifying raises, the failure is unclassified.
+    """
+    try:
+        kind = classify_failure(exc)
+    except Exception:
+        kind = FailureKind.UNCLASSIFIED
+    try:
+        message = str(exc) or None
+    except Exception as unreadable:
+        message = f"the exception's message could not be read ({type(unreadable).__name__})"
+    return AttemptFailed(
+        kind,
+        storable_text(_qualified_name(type(exc))),
+        None if message is None else storable_text(message),
     )
 
 
@@ -319,7 +335,8 @@ def _snapshot(value: object, path: str, containers: set[int]) -> JsonValue:
             entries: dict[str, JsonValue] = {}
             for key, item in list(cast(dict[object, object], value).items()):
                 if type(key) is not str:
-                    msg = f"{path} has a {type(key).__name__} key {key!r}; JSON keys are strings"
+                    # Named by its type only: a key's repr is its own code, and can raise.
+                    msg = f"{path} has a {type(key).__name__} key; JSON keys are strings"
                     raise InvalidHandlerResult(msg)
                 _check_text(key, f"a key of {path}")
                 entries[key] = _snapshot(item, f"{path}[{key!r}]", containers)

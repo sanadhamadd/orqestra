@@ -37,7 +37,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
@@ -318,12 +318,17 @@ class OpenRouterProvider:
     def _model_for(self, request: ProviderRequest) -> str:
         """The route's model; ``UNSUPPORTED_REQUEST`` for anything this adapter cannot ask."""
         # Typed as unchecked: a caller may build a request that breaks its annotations.
+        # The route is checked first: an unhashable one cannot even be looked up.
+        route_id: object = request.route_id
+        capability: object = request.capability
+        if not isinstance(route_id, str) or not isinstance(capability, str):
+            raise ProviderPermanentError(PermanentCode.UNSUPPORTED_REQUEST)
         fields: tuple[object, object, object] = (request.field_kind, request.raw, request.timeout)
         field_kind, raw, timeout = fields
-        model = self._config.route_models.get(request.route_id)
+        model = self._config.route_models.get(route_id)
         if (
             model is None
-            or request.capability != REQUIRED_CAPABILITY
+            or capability != REQUIRED_CAPABILITY
             or not isinstance(field_kind, FieldKind)
             or not isinstance(raw, str)
             or not isinstance(timeout, timedelta)
@@ -445,7 +450,9 @@ def _decode(raw: bytes) -> dict[str, object]:
             parse_constant=_reject_constant,
             object_pairs_hook=_unique_object,
         )
-    except (ValueError, RecursionError):  # UnicodeDecodeError and JSONDecodeError included
+    # UnicodeDecodeError and JSONDecodeError are ValueErrors. DecimalException: Decimal
+    # refuses a number whose exponent is outside its range, such as 1e9999999999999999999.
+    except (ValueError, RecursionError, DecimalException):
         malformed = True
     if malformed or not isinstance(document, dict):
         raise _Defect(ResponseDefect.MALFORMED_JSON)

@@ -160,9 +160,70 @@ def test_migrate_reports_unreachable_database_without_secrets(
     assert main(["migrate"]) == 1
     out = capsys.readouterr().out
     assert "s3cret" not in out
-    payload = json.loads(out)
-    assert payload["status"] == "error"
-    assert "connection" in payload["error"]
+    assert json.loads(out) == {"status": "error", "error": MIGRATE_DRIVER_ERROR}
+
+
+MIGRATE_DRIVER_ERROR = "the database could not be reached or migrated (OperationalError)"
+
+
+@pytest.mark.parametrize("command", ["health", "migrate"])
+def test_health_and_migrate_never_echo_an_invalid_setting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    # A .env line missing its newline: the log level swallows the next assignment.
+    monkeypatch.setenv(
+        "ORQESTRA_LOG_LEVEL", f"INFO ORQESTRA_DATABASE_URL=postgresql://u:{SECRET}@db/orq"
+    )
+    assert main([command]) == 1
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out + captured.err
+    errors = json.loads(captured.out)["errors"]
+    assert [tuple(error["loc"]) for error in errors] == [("log_level",)]
+    assert all(set(error) == {"type", "loc", "msg"} for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("dsn", "driver_message"),
+    [
+        # libpq ends the user info at the first '@': host 'ss@127.0.0.1', password 'pa'.
+        ("postgresql://u:pa@ss@127.0.0.1:1/orq", "failed to resolve host 'ss@127.0.0.1'"),
+        # ... and the authority at the first '/': host 'app', port 'ab'.
+        (
+            "postgresql://app:ab/cd@127.0.0.1:5432/orq",
+            'invalid integer value "ab" for connection option "port"',
+        ),
+    ],
+)
+def test_migrate_reports_a_driver_error_by_type_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dsn: str,
+    driver_message: str,
+) -> None:
+    def failing(url: str) -> NoReturn:
+        raise psycopg.OperationalError(driver_message)
+
+    monkeypatch.setattr(cli, "migrate", failing)
+    monkeypatch.setenv("ORQESTRA_DATABASE_URL", dsn)
+    assert main(["migrate"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"status": "error", "error": MIGRATE_DRIVER_ERROR}
+    assert captured.err == ""
+
+
+def test_migrate_reports_a_migration_error_in_its_own_words(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def failing(url: str) -> NoReturn:
+        msg = "migration 0002_attempt_leases was edited after it was applied"
+        raise MigrationError(msg)
+
+    monkeypatch.setattr(cli, "migrate", failing)
+    monkeypatch.setenv("ORQESTRA_DATABASE_URL", URL)
+    assert main(["migrate"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == (
+        "migration 0002_attempt_leases was edited after it was applied"
+    )
 
 
 def test_unknown_command_exits_with_usage_error() -> None:
@@ -827,6 +888,27 @@ def test_job_submit_checks_a_deeply_nested_payload_without_recursion(
     assert submit_refused(capsys, tasks_file(tmp_path, content)) == (
         "task 0: payload holds a string or key that cannot be encoded as UTF-8"
     )
+
+
+def test_job_submit_reports_a_payload_too_deep_to_encode_in_one_line(
+    job_env: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # psycopg re-encodes the payload on a deeper stack than the parser used.
+    Database(job_env)
+
+    def too_deep(conn: object, submission: JobSubmission) -> SubmissionResult:
+        msg = "maximum recursion depth exceeded while encoding a JSON object"
+        raise RecursionError(msg)
+
+    job_env.setattr(cli, "submit_job", too_deep)
+    argv = ["job", "submit", "--kind", "k", "--max-attempts", "1", tasks_file(tmp_path, TASKS)]
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "status": "error",
+        "error": "a value is nested too deeply to send to the database",
+    }
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize("option", ["--kind", "--idempotency-key"])

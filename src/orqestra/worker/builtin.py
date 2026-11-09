@@ -11,11 +11,13 @@ nothing is imported dynamically.
   the attempt's read-only cancellation signal, then returns
   ``{"waited_seconds": n}``, or raises ``HandlerCancelled`` once told of a
   committed cancellation request. ``n`` must be a finite, non-negative number,
-  not a boolean, and no longer than the worker's ``execution_timeout``; any
-  other payload is a permanent failure.
+  not a boolean, and no longer than the worker's ``execution_timeout`` or the
+  longest wait the platform supports (``threading.TIMEOUT_MAX``); any other
+  payload is a permanent failure.
 """
 
 import math
+import threading
 from collections.abc import Mapping
 from datetime import timedelta
 from types import MappingProxyType
@@ -37,8 +39,9 @@ def echo(context: TaskContext, payload: JsonValue) -> JsonValue:
 
 
 def waiting(limit: timedelta) -> Handler:
-    """``diagnostic.wait``, refusing any request longer than ``limit``."""
-    bound = limit.total_seconds()
+    """``diagnostic.wait``, refusing any request longer than ``limit`` or than it can wait."""
+    # Event.wait raises OverflowError beyond TIMEOUT_MAX, which execution_timeout may exceed.
+    bound = min(limit.total_seconds(), threading.TIMEOUT_MAX)
 
     def wait(context: TaskContext, payload: JsonValue) -> JsonValue:
         seconds = _seconds(payload, bound)
@@ -63,7 +66,10 @@ def _seconds(payload: JsonValue, bound: float) -> int | float:
         msg = "seconds must be finite and not negative"
         raise PermanentError(msg)
     if seconds > bound:
-        msg = f"seconds must not exceed the worker's execution_timeout ({bound} s)"
+        msg = (
+            f"seconds must not exceed {bound} s (the worker's execution_timeout, "
+            "or the longest wait this platform supports)"
+        )
         raise PermanentError(msg)
     return seconds
 
