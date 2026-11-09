@@ -1,6 +1,8 @@
 """The drills' D3b checks and command-line refusals, without a database or Docker."""
 
+import signal
 import subprocess
+import time
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -14,13 +16,18 @@ from benchmarks.database import BENCH_DATABASE_URL_ENV, UnsafeBenchDatabaseError
 from benchmarks.drills import (
     IDENTITY_COMMAND,
     RESTART_COMMAND,
+    Drill,
     DrillFleet,
+    FreezeDrill,
     Harness,
     Poll,
     RestartDrill,
     RestartRefusedError,
+    Victim,
     check_restart_target,
+    wait_over,
 )
+from orqestra.domain.states import TaskState
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
@@ -277,3 +284,69 @@ class FakeAdmin(FakeConn):
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+
+# --- D2: the freeze ends in the drill's own step, and says how long it lasted ----------------
+
+
+@pytest.fixture
+def signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Each signal the drills would send; none is sent."""
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr("benchmarks.drills.os.kill", lambda pid, sig: sent.append((pid, sig)))
+    return sent
+
+
+def _frozen(seconds: float, frozen_for: float) -> FreezeDrill:
+    """A D2 drill whose victim was frozen ``frozen_for`` seconds ago."""
+    drill = FreezeDrill(seconds)
+    drill.victim = Victim(4242, uuid.uuid4())
+    drill.frozen_at = time.monotonic() - frozen_for
+    drill.thaw_at = drill.frozen_at + seconds
+    drill.injections.append({"pid": 4242, "frozen_at": "t0", "seconds": seconds})
+    return drill
+
+
+def test_a_freeze_is_pending_until_the_drill_thaws_it(signals: list[tuple[int, int]]) -> None:
+    drill = _frozen(seconds=12.0, frozen_for=12.5)
+    assert drill.pending()
+
+    drill.step(_poll(FakeHarness()))
+
+    assert not drill.pending()
+    assert drill.injected is True
+    [injection] = drill.injections
+    assert injection["thawed_by"] == "drill"
+    assert injection["frozen_s"] >= 12.5
+    assert injection["thawed_at"] == (BOOT + timedelta(hours=1)).isoformat()
+    assert signals == [(4242, signal.SIGCONT)]
+
+
+def test_a_thaw_by_cleanup_is_not_an_injection(signals: list[tuple[int, int]]) -> None:
+    drill = _frozen(seconds=12.0, frozen_for=9.0)  # the job ended first
+
+    drill.release()
+
+    assert drill.injected is False
+    [injection] = drill.injections
+    assert injection["thawed_by"] == "cleanup"
+    assert 9.0 <= injection["frozen_s"] < 12.0  # the real time, not the planned 12 s
+    assert injection["thawed_at"] is None
+    assert signals == [(4242, signal.SIGCONT)]
+    [check] = Drill.checks(drill, cast(Any, None), uuid.uuid4(), cast(DrillFleet, None))
+    assert (check["name"], check["passed"]) == ("injected", False)
+
+
+FINISHED = dict.fromkeys(TaskState, 0) | {TaskState.SUCCEEDED: 20}
+RUNNING = FINISHED | {TaskState.RUNNING: 1}
+
+
+def test_the_wait_outlasts_a_finished_job_while_a_freeze_is_pending(
+    signals: list[tuple[int, int]],
+) -> None:
+    assert wait_over(FINISHED, Drill())
+    assert not wait_over(RUNNING, Drill())
+    frozen = _frozen(seconds=12.0, frozen_for=1.0)
+    assert not wait_over(FINISHED, frozen)
+    frozen.release()
+    assert wait_over(FINISHED, frozen)

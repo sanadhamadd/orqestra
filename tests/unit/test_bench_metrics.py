@@ -154,10 +154,91 @@ def test_contention_keeps_the_largest_and_mean_count() -> None:
     )
     assert summary == {
         "samples": 2,
+        "window_s": None,
         "by_state": {
             "active/none": {"max": 4, "mean": 3.0},
             "idle/Client": {"max": 1, "mean": 0.5},
         },
+    }
+
+
+def test_no_contention_sample_gives_no_states() -> None:
+    assert metrics.summarize_contention([], 0.5) == {
+        "samples": 0,
+        "window_s": 0.5,
+        "by_state": {},
+    }
+    assert metrics.summarize_docker([], 0.5)["window_s"] == 0.5
+
+
+class _Recorder:
+    """A connection that records its statements and the transactions they ran in."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+        self.rolled_back: list[bool] = []
+        self.depth = 0
+
+    def execute(self, query: str, params: object = None) -> list[tuple[str, str, int]]:
+        self.calls.append((query, params))
+        return [("active", "Lock", 1)]
+
+    def transaction(self, *, force_rollback: bool = False) -> "_Recorder":
+        self.rolled_back.append(force_rollback)
+        return self
+
+    def __enter__(self) -> "_Recorder":
+        self.depth += 1
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.depth -= 1
+
+
+def test_the_contention_sample_leaves_out_its_own_and_the_harness_backend() -> None:
+    conn = _Recorder()
+    assert metrics.contention_sample(cast(Any, conn), exclude=[4242]) == {"active/Lock": 1}
+    [(query, params)] = conn.calls
+    assert "pid <> pg_backend_pid()" in query
+    assert "pid <> ALL(%s)" in query
+    assert params == ([4242],)
+
+
+def test_the_harness_reads_in_a_transaction_that_rolls_back() -> None:
+    conn = _Recorder()
+    inside: list[int] = []
+
+    def read(c: Any) -> str:
+        inside.append(c.depth)
+        return "read"
+
+    assert metrics.read_only(cast(Any, conn), read) == "read"
+    assert conn.rolled_back == [True]
+    assert inside == [1]
+
+
+def test_job_commits_subtract_the_idle_claims_outside_the_job() -> None:
+    commits = metrics.job_commits(1_000.0, 40.0, 2.5)
+    assert commits["job_commits"] == 900.0  # 1,000 - 40/s x 2.5 s
+    assert (commits["xact_commit_delta"], commits["idle_rate_per_s"]) == (1_000.0, 40.0)
+    assert commits["idle_seconds"] == 2.5
+    assert commits["method"] == metrics.JOB_COMMITS_METHOD
+
+
+def test_job_commits_are_not_measured_without_an_idle_rate() -> None:
+    commits = metrics.job_commits(1_000.0, None, 2.5)
+    assert commits["job_commits"] is None
+    assert commits["method"].startswith("not measured")
+
+
+def test_the_harness_usage_of_a_cell_is_a_delta() -> None:
+    start = {"user_s": 10.0, "sys_s": 2.0, "maxrss_bytes": 100}
+    end = {"user_s": 10.5, "sys_s": 2.25, "maxrss_bytes": 300}
+    assert metrics.harness_delta(start, end) == {
+        "scope": "cell",
+        "user_s": 0.5,
+        "sys_s": 0.25,
+        "process_maxrss_bytes": 300,
     }
 
 

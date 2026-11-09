@@ -50,6 +50,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import IO, Any
 
@@ -631,22 +632,28 @@ def run_cell(
         psycopg.connect(url, autocommit=True) as sampling,
     ):
         record_environment = environment(conn, container=container, note=note)
-        contention = metrics.Sampler(lambda: metrics.contention_sample(sampling)).start()
-        docker = (
-            metrics.Sampler(lambda: metrics.docker_stats_sample(container)).start()
-            if container
-            else None
-        )
+        harness_start = metrics.harness_usage()
+        own = [conn.info.backend_pid]  # the harness's polling backend, left out of contention
+        contention: metrics.Sampler | None = None
+        docker: metrics.Sampler | None = None
         try:
             for _ in range(cell.workers):
                 fleet.start()
             fleet.wait_started()
-            before = metrics.database_counters(conn)
+            before = metrics.read_only(conn, metrics.database_counters)
+            counted = time.monotonic()
             job_id, submission = submit(url, KIND_OF[cell.profile], workload.tasks, raw_dir)
+            # The samplers cover the job alone: from the submission to the end of the wait.
+            contention = metrics.Sampler(
+                lambda: metrics.read_only(sampling, partial(metrics.contention_sample, exclude=own))
+            ).start()
+            if container:
+                docker = metrics.Sampler(lambda: metrics.docker_stats_sample(container)).start()
             began = time.monotonic()
+            before_job = began - counted
             wait_ended = WaitEnded.STOP_AFTER
             while time.monotonic() - began < stop_after:
-                progress = get_job_progress(conn, job_id)
+                progress = metrics.read_only(conn, partial(get_job_progress, job_id=job_id))
                 assert progress is not None
                 counts = progress.task_counts
                 if counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0:
@@ -658,18 +665,43 @@ def run_cell(
                     wait_ended = WaitEnded.NO_WORKERS
                     break
                 time.sleep(POLL)
-            waited = time.monotonic() - began
+            ended = time.monotonic()
+            waited = ended - began
+            contention_samples = contention.stop()
+            contention_window = time.monotonic() - began
+            # A docker stats reading takes about a second, so its window is its own.
+            docker_samples = docker.stop() if docker else None
+            docker_window = time.monotonic() - began
             time.sleep(STATS_SETTLE)
-            after = metrics.database_counters(conn)
-            idle_began = time.monotonic()
-            time.sleep(idle_window)
-            idle_after = metrics.database_counters(conn)
-            idle_seconds = time.monotonic() - idle_began
+            after = metrics.read_only(conn, metrics.database_counters)
+            after_job = time.monotonic() - ended
+            idle_rate: dict[str, Any] | None = None
+            if wait_ended is WaitEnded.FINISHED:  # otherwise work may still be running
+                idle_began = time.monotonic()
+                time.sleep(idle_window)
+                idle_after = metrics.read_only(conn, metrics.database_counters)
+                idle_seconds = time.monotonic() - idle_began
+                idle_commits = (
+                    idle_after["database"]["xact_commit"] - after["database"]["xact_commit"]
+                )
+                idle_rate = {
+                    "commits": idle_commits,
+                    "window_s": idle_seconds,
+                    "per_s": metrics.rate(idle_commits, idle_seconds),
+                    "formula": (
+                        "pg_stat_database xact_commit delta over an idle window after the "
+                        "finished job; the harness's reads roll back and never commit"
+                    ),
+                }
         finally:
             shutdown = _shutdown_seconds(worker_settings)
             reaped = fleet.stop(timeout=shutdown + 10.0)
-            contention_samples = contention.stop()
-            docker_samples = docker.stop() if docker else None
+            for sampler in (contention, docker):
+                if sampler is not None:
+                    sampler.stop()  # idempotent; only an exception reaches here running
+        harness = metrics.harness_delta(harness_start, metrics.harness_usage())
+        assert contention is not None  # the wait ran, so its sampler did
+        contention_errors = contention.errors
         exit_codes = [worker["exit_code"] for worker in reaped]
         times = metrics.read_stored_times(conn, job_id)
         figures = metrics.timing_figures(times)
@@ -681,10 +713,15 @@ def run_cell(
     status = cell_status(wait_ended, gate)
     database_stats = metrics.delta(before, after)
     tasks = len(workload.tasks)
-    database_stats["commits_per_task"] = metrics.rate(
-        database_stats["database"]["xact_commit"], tasks
+    commits = metrics.job_commits(
+        database_stats["database"]["xact_commit"],
+        None if idle_rate is None else idle_rate["per_s"],
+        before_job + after_job,
     )
-    idle_commits = idle_after["database"]["xact_commit"] - after["database"]["xact_commit"]
+    database_stats["commits"] = commits
+    database_stats["commits_per_task"] = (
+        None if commits["job_commits"] is None else metrics.rate(commits["job_commits"], tasks)
+    )
     makespan = figures["timing"]["makespan_s"]
     record: dict[str, Any] = {
         "format": 1,
@@ -712,12 +749,7 @@ def run_cell(
         "throughput": figures["throughput"] if status is Status.COMPLETE else None,
         "latency": figures["latency"],
         "claim_gap": figures["claim_gap"],
-        "idle_claim_rate": {
-            "commits": idle_commits,
-            "window_s": idle_seconds,
-            "per_s": metrics.rate(idle_commits, idle_seconds),
-            "formula": "pg_stat_database xact_commit delta over an idle window after the job",
-        },
+        "idle_claim_rate": idle_rate,
         "resources": {
             "workers": [
                 {
@@ -726,17 +758,17 @@ def run_cell(
                 }
                 for worker in reaped
             ],
-            "harness": metrics.harness_usage(),
+            "harness": harness,
             "database": (
-                metrics.summarize_docker(docker_samples)
+                metrics.summarize_docker(docker_samples, docker_window)
                 if docker_samples is not None
                 else metrics.NOT_MEASURED
             ),
         },
         "database_stats": database_stats,
         "contention": {
-            **metrics.summarize_contention(contention_samples),
-            "sample_errors": contention.errors,
+            **metrics.summarize_contention(contention_samples, contention_window),
+            "sample_errors": contention_errors,
         },
         "failures": failures,
         "usage": usage,

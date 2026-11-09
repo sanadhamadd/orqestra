@@ -374,6 +374,13 @@ class Drill:
     def step(self, poll: Poll) -> None:
         """Called on every poll while the job runs; never blocks for long."""
 
+    def pending(self) -> bool:
+        """Whether an injection is still in force that the drill itself must undo.
+
+        While it is, the wait does not end on a finished job (``wait_over``).
+        """
+        return False
+
     def release(self) -> None:
         """Undo any injection still in force, before the workers are stopped."""
 
@@ -558,6 +565,7 @@ class FreezeDrill(Drill):
         super().__init__()
         self.seconds = seconds
         self.victim: Victim | None = None
+        self.frozen_at = 0.0
         self.thaw_at = 0.0
         self.thawed = False
 
@@ -568,7 +576,8 @@ class FreezeDrill(Drill):
                 self.victim = victims[0] if victims else None
                 if self.victim is not None:
                     self.recorded.add(self.victim.pid)
-                    self.thaw_at = time.monotonic() + self.seconds
+                    self.frozen_at = time.monotonic()
+                    self.thaw_at = self.frozen_at + self.seconds
                     self.injections.append(
                         {
                             "pid": self.victim.pid,
@@ -578,14 +587,27 @@ class FreezeDrill(Drill):
                         }
                     )
         elif not self.thawed and time.monotonic() >= self.thaw_at:
-            self.release()
+            self._thaw("drill")
             self.injections[-1]["thawed_at"] = _iso(poll.harness.clock())
+            self.injected = True  # frozen for the planned time, and thawed by the drill
+
+    def pending(self) -> bool:
+        return self.victim is not None and not self.thawed
 
     def release(self) -> None:
+        """Continue a victim still frozen. A thaw here is cleanup: the drill is not injected."""
         if self.victim is not None and not self.thawed:
-            os.kill(self.victim.pid, signal.SIGCONT)
-            self.thawed = True
-            self.injected = True
+            self._thaw("cleanup")
+            self.injections[-1]["thawed_at"] = None  # the database clock is not read here
+
+    def _thaw(self, by: str) -> None:
+        assert self.victim is not None
+        os.kill(self.victim.pid, signal.SIGCONT)
+        self.thawed = True
+        self.injections[-1] |= {
+            "frozen_s": time.monotonic() - self.frozen_at,
+            "thawed_by": by,
+        }
 
     def _attempt(self, conn: Conn) -> tuple[Any, ...] | None:
         if self.victim is None:
@@ -1033,6 +1055,15 @@ def _supervise(fleet: DrillFleet, seen: set[int], due: list[float], exits: list[
         fleet.start()
 
 
+def wait_over(counts: Mapping[TaskState, int], drill: Drill) -> bool:
+    """Whether the drill's wait ends: the job has finished and no injection is pending.
+
+    A drill's own step must undo its injection (D2 thaws its victim), so a job that
+    finishes first does not end the wait while the drill is still pending.
+    """
+    return counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0 and not drill.pending()
+
+
 def run_drill(
     url: str,
     cell: Cell,
@@ -1063,6 +1094,7 @@ def run_drill(
     due: list[float] = []
     exits: list[dict[str, Any]] = []
     finished = False
+    harness_start = metrics.harness_usage()
     try:
         record_environment = environment(harness.conn, note=note)
         # Submitted before any worker starts, so polling begins before the job does.
@@ -1072,7 +1104,7 @@ def run_drill(
         began = time.monotonic()
         while time.monotonic() - began < stop_after:
             counts = harness.progress(job_id).task_counts
-            if counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0:
+            if wait_over(counts, drill):
                 finished = True
                 break
             poll = Poll(
@@ -1142,7 +1174,10 @@ def run_drill(
         "latency": figures["latency"],
         "claim_gap": figures["claim_gap"],
         "idle_claim_rate": None,
-        "resources": {"workers": reaped, "harness": metrics.harness_usage()},
+        "resources": {
+            "workers": reaped,
+            "harness": metrics.harness_delta(harness_start, metrics.harness_usage()),
+        },
         "database_stats": None,
         "contention": None,
         "failures": failures,
