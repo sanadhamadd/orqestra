@@ -98,6 +98,7 @@ undecided too (DEC-040), and so are operational retry delays (DEC-053).
 - **WHAT:** Machine-local tool configuration and session files are git-ignored (patterns in `.gitignore`); general contributor guidance is tracked in `docs/development.md`.
 - **WHY:** Owner decision: local tool configuration and session records are specific to one machine, may hold private notes, and are not part of the product; tracked documentation should describe the software. Deviates from the initial planning layout, which proposed a tracked tool-specific instruction file.
 - **RUNNER-UP:** Track a tool-specific instruction file — visible to contributors, but mixes machine-local material into the public record.
+- **Note (2026-11-09):** the patterns moved from `.gitignore` to each developer's `.git/info/exclude`, so that the repository names no tool; `docs/development.md` says so.
 
 ### DEC-014 — Deferred at the start (explicitly not chosen)
 - **Status:** Proposed, superseded in part: Docker Compose (`compose.yaml`, PR #33) and the architecture document (`docs/architecture.md`, PR #38) now exist; the other seven deferrals stand. The `LICENSE` is deferred until publication (owner, 2026-11-08): until then Orqestra is not licensed and all rights are reserved.
