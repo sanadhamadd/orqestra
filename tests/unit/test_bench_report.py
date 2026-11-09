@@ -266,6 +266,23 @@ def test_an_incomplete_reason_names_the_failures_a_timeout_does_not_explain(
     assert "also failed" not in report.reason(plain)
 
 
+def test_an_invoice_cell_stopped_at_its_limit_is_not_charged_with_its_job_totals() -> None:
+    # Summary and usage compare job totals with the oracle: unfinished tasks fail them.
+    stopped = cell_record(
+        ladder="scale",
+        profile="invoice",
+        batch=100,
+        status="incomplete",
+        failed_checks=("terminal", "nothing_running", "summary", "usage"),
+        wait=("stop_after", 0.0),
+    )
+    assert report.reason(stopped) == "incomplete: stopped at the limit after 0.0 s"
+    stopped["gate"].append({"name": "no_double_running", "passed": False, "detail": None})
+    assert report.reason(stopped) == (
+        "incomplete: stopped at the limit after 0.0 s; also failed: no_double_running"
+    )
+
+
 def _with(record: dict[str, Any], **environment: Any) -> dict[str, Any]:
     record["environment"] |= environment
     return record

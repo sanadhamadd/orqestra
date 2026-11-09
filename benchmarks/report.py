@@ -250,8 +250,10 @@ def clean(record: Mapping[str, Any]) -> bool:
     return record["status"] == Status.COMPLETE and record["environment"]["git_dirty"] is False
 
 
-# The gate checks a job stopped at its limit fails by being stopped.
-TIMEOUT_CHECKS = frozenset({"terminal", "nothing_running", "worker_exits"})
+# The gate checks a job stopped at its limit fails by being stopped: its tasks are not
+# all ended, and an invoice job's summary and usage compare job totals with the oracle.
+# The attempt-history checks look only at what did end, so a timeout explains none of them.
+TIMEOUT_CHECKS = frozenset({"terminal", "nothing_running", "worker_exits", "summary", "usage"})
 
 
 def reason(record: Mapping[str, Any]) -> str:

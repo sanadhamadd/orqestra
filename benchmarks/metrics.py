@@ -18,12 +18,14 @@ what the database cannot see: the submission command and the idle window.
   ``pg_stat_user_tables`` for the job tables, from just before the submission
   to a moment after the job ended. A backend publishes its counters at most
   once a second, so that second reading waits a little (``run.STATS_SETTLE``).
-- **Commits per task** counts the workers' commits for the job (``job_commits``):
-  the ``xact_commit`` delta, less the idle claims the workers made while the
+- **Commits per task** counts the job's commits (``job_commits``): the
+  ``xact_commit`` delta, less the idle claims the workers made while the
   submission ran and during that wait, estimated as the idle claim rate times
-  those seconds. Each end of the window can still be off by up to about one
-  second of idle claims, because counters are published at most once a second,
-  so it is an estimate. It is measured only for a job that finished, because
+  those seconds. It includes the few commits of the ``orqestra job submit``
+  process itself (its schema check and the one submission transaction), a fixed
+  number per job whatever its size. Each end of the window can still be off by
+  up to about one second of idle claims, because counters are published at most
+  once a second, so it is an estimate. It is measured only for a job that finished, because
   only then is the idle claim rate measured.
 - **Idle claim rate** is the ``xact_commit`` delta across an idle window after a
   finished job, divided by the window's length on the harness clock: the
@@ -498,7 +500,9 @@ def harness_delta(start: Mapping[str, Any], end: Mapping[str, Any]) -> dict[str,
 JOB_COMMITS_METHOD = (
     "xact_commit delta from just before the submission to STATS_SETTLE after the wait, "
     "less idle_rate_per_s x idle_seconds (the submission and the settle); the harness's "
-    "reads roll back and never commit; each end may be off by up to about 1 s of idle "
+    "reads roll back and never commit; it includes the submit command's own few commits "
+    "(its schema check and the submission), fixed per job; each end may be off by up to "
+    "about 1 s of idle "
     "claims, because counters are published at most once a second"
 )
 
@@ -506,7 +510,7 @@ JOB_COMMITS_METHOD = (
 def job_commits(
     xact_commit_delta: float, idle_rate_per_s: float | None, idle_seconds: float
 ) -> dict[str, Any]:
-    """The workers' commits for the job; ``job_commits`` is ``None`` without an idle rate."""
+    """The job's commits, the submit command's included; ``None`` without an idle rate."""
     if idle_rate_per_s is None:
         commits = None
         method = "not measured: the job did not finish, so no idle claim rate was measured"
