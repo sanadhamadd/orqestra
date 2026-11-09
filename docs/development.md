@@ -223,7 +223,8 @@ them in a reviewed change. Skip trivial edits.
 
 No credentials in the repository; `.env.example` holds placeholders only. Use least
 privilege. Do not run destructive commands, irreversible migrations, paid infrastructure or
-billable API calls without maintainer authorization.
+billable API calls without maintainer authorization. Keep personal tooling and session files
+out of git by listing them in your clone's `.git/info/exclude`, not in `.gitignore`.
 
 ## Definition of done
 
