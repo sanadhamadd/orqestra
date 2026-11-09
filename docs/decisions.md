@@ -1679,3 +1679,30 @@ recorded on PR #17.
     - reverting `local_deadline` to a plain subtraction;
     - reverting the hold to a plain subtraction;
     - a new lifecycle read outside `owned_transaction` that applies a lease rule.
+
+## Claim index
+
+### DEC-069 — The claim scan dominates the engine's per-task cost at 10,000 queued tasks, so a partial claim index is proposed as its own task
+- **Status:** Proposed (owner gate: a migration is a schema change) · decides OD-7 on the measurement campaign's data (`docs/performance.md`) · nothing is implemented by this entry
+- **WHAT:**
+  - The condition OD-7 set for a claim index holds: claim latency grows with queue depth enough to dominate `echo`'s per-task overhead at 10,000 tasks.
+  - Migration 0006, a partial index that serves the claim's discovery statement (DEC-033), is proposed as a separate task. That task designs the index and measures it.
+  - No index is added by this entry, and nothing changes until the owner accepts it.
+- **WHY:**
+  - **Claim latency grows with depth.** Measured: the claim's p50 is 1.875 ms at 1,000 queued tasks, 6.403 ms at 10,000, 28.497 ms at 50,000 and 54.677 ms at 100,000, all eligible. Every depth and variant scans `tasks` sequentially, sorts, then takes `LockRows`, on a table of the same size for every variant at each depth. Source: `benchmarks/results/claims/20261109T011052Z-c410ac6-claims.json`.
+  - **At 10,000 tasks it is as large as the engine's whole per-task overhead.** Derived: `echo`'s per-task overhead at one worker is 0.006 s (makespan × W ÷ tasks − service time p50). The claim alone costs 6.403 ms at that depth. Source: `benchmarks/results/*-c410ac6-echo-10000-b0-w{1,2,4,8}-r{1,2,3}.json`.
+  - **The `echo` ladder shows the scan at work.** Measured, in the same files (medians by worker count):
+    - 1.02 to 1.04 sequential scans of `tasks` per task;
+    - database CPU p50 rising from 42.2 % at one worker to 287.8 % at eight, sampled over the job only, while the mean worker uses 0.15 to 0.32 of a core;
+    - an efficiency of 0.52 at eight workers (derived).
+  - **Invoice batches do not show it, because they are few tasks.** A 10,000-invoice job at batch 100 is only 100 tasks, so the scan is short there.
+- **RUNNER-UP:**
+  - (a) No index in this foundation; record the curve (OD-7's default).
+  - Making the index part of the campaign's task.
+- **WHY NOT:**
+  - (a) is OD-7's choice only if the condition does not hold, and it holds.
+  - The campaign task changes no schema. DEC-062 also adds an index only after *repeated* measurements show the scan-and-sort cost matters and the index's write overhead is acceptable. This campaign measured the claim curve once and measured no index's write cost.
+- **TRADE-OFF:**
+  - Until an index lands, claim cost grows with the size of `tasks`, because the plan scans the whole table. The curve was measured with queued tasks only. On this machine, 50,000 to 100,000 queued tasks cost 28.497 to 54.677 ms per claim (p50).
+  - The proposed task must re-measure the curve, with and without the index. It must also measure the index's cost on submission and on each task state change, as DEC-062 asks, before the index is accepted.
+- **VERIFICATION:** the measurement campaign's result files named above, generated into `docs/performance.md` by `python -m benchmarks.report`. The proposed task verifies the index itself.
