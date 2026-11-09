@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 import pytest
 from psycopg import errors, sql
+from psycopg.conninfo import make_conninfo
 from psycopg.pq import TransactionStatus
 from psycopg.rows import TupleRow, dict_row
 
@@ -3388,6 +3389,45 @@ def test_an_unrepresentable_retry_time_refuses_a_revocation_and_changes_nothing(
     revocation = revoke_next_expired(checked, retry_policy=HOUR)
     assert revocation is not None
     assert revocation.task.state is TaskState.QUEUED
+
+
+# The database clock, stood in for: a VOLATILE statement_timestamp() in the test schema
+# returns the real one less the seconds in clock_step. Only a session whose search_path
+# names pg_catalog after the schema resolves lifecycle's unqualified calls to it.
+_STAND_IN_CLOCK = """
+    CREATE TABLE clock_step (seconds float8 NOT NULL);
+    INSERT INTO clock_step VALUES (0);
+    CREATE FUNCTION statement_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE AS $$
+        SELECT pg_catalog.statement_timestamp()
+            - make_interval(secs => (SELECT seconds FROM clock_step))
+    $$;
+"""
+
+
+def test_a_claim_after_the_clock_stepped_back_since_discovery_claims_nothing(
+    schema_url: str, checked: Conn, gate: Callable[[str, str], Callable[[], None]]
+) -> None:
+    task = new_task(checked)  # eligible at once
+    checked.execute(_STAND_IN_CLOCK)
+    row = checked.execute("SELECT current_schema()").fetchone()
+    assert row is not None
+    stepped = make_conninfo(schema_url, options=f"-c search_path={row[0]},pg_catalog")
+    release = gate("UPDATE", "tasks")  # the claim's UPDATE waits; discovery is a SELECT
+    with connect(stepped) as claimant, ThreadPoolExecutor(1) as pool:
+        claim = pool.submit(claim_next_attempt, claimant, "w", policy=POLICY, kinds=KINDS)
+        wait_for_lock(checked, claimant, "advisory")  # past discovery, at the claim's UPDATE
+        checked.execute("UPDATE clock_step SET seconds = 3600")  # the clock steps back an hour
+        release()
+        assert claim.result(timeout=20) is None
+        assert task_now(checked, task.id).state is TaskState.QUEUED
+        assert task_now(checked, task.id).attempt_count == 0
+        assert checked.execute(
+            "SELECT count(*) FROM attempts WHERE task_id = %s", (task.id,)
+        ).fetchone() == (0,)
+        checked.execute("UPDATE clock_step SET seconds = 0")  # nothing was left locked
+        attempt = claim_next_attempt(claimant, "w", policy=POLICY, kinds=KINDS)
+    assert attempt is not None
+    assert attempt.task_id == task.id
 
 
 # --- 24. session time zone: instants are decoded in UTC (DEC-067) -----------------
