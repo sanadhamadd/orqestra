@@ -216,6 +216,7 @@ def test_a_database_call_must_end_before_the_next_heartbeat() -> None:
 
 def test_a_heartbeat_must_be_confirmed_before_the_fencing_margin() -> None:
     # 5 s interval + 2 s database time + 3 s margin = 10 s, which the lease must exceed.
+    # The claim's latency is deliberately not included (DEC-044 fencing correction note).
     needed = timedelta(seconds=10)
     assert settings(lease=needed + US).lease == needed + US
     for lease in (needed, needed - US):
@@ -223,6 +224,39 @@ def test_a_heartbeat_must_be_confirmed_before_the_fencing_margin() -> None:
             settings(lease=lease)
     with pytest.raises(ValidationError, match="must be shorter than lease"):
         settings(fence_margin=VALID["lease"])  # a margin as long as the lease
+
+
+def test_a_step_must_fit_between_heartbeats_that_take_their_whole_bound() -> None:
+    # DEC-070: a 4 s interval is shorter than 2 x the 3 s bound, so a step after a
+    # full-bound heartbeat must fit before the fence instead: lease >= 3 x 3 s + 1 s.
+    tight = {
+        "heartbeat_interval": timedelta(seconds=4),
+        "db_operation_timeout": timedelta(seconds=3),
+        "fence_margin": timedelta(seconds=1),
+    }
+    assert settings(**tight, lease=timedelta(seconds=10)).lease == timedelta(seconds=10)
+    with pytest.raises(ValidationError, match="no usage record or sweep step could start"):
+        settings(**tight, lease=timedelta(seconds=10) - US)  # 4 + 3 + 1 < lease still holds
+    # An interval of 2 x the bound needs nothing from the lease.
+    roomy = settings(
+        heartbeat_interval=timedelta(seconds=6),
+        **{"db_operation_timeout": timedelta(seconds=3), "fence_margin": timedelta(seconds=1)},
+        lease=timedelta(seconds=10) + US,
+    )
+    assert roomy.heartbeat_interval == timedelta(seconds=6)
+
+
+@pytest.mark.parametrize(
+    ("name", "what"),
+    [("execution_timeout", "deadline"), ("retry_max_delay", "retry time")],
+)
+def test_a_deadline_or_retry_time_must_stay_representable_for_a_century(
+    name: str, what: str
+) -> None:
+    century = timedelta(days=36525)
+    assert getattr(settings(**{name: century}), name) == century
+    with pytest.raises(ValidationError, match=f"must leave every {what} representable"):
+        settings(**{name: timedelta(days=365 * 8000)})  # a representable duration
 
 
 def test_a_relationship_is_reported_once_its_fields_are_valid() -> None:
