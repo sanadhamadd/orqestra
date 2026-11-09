@@ -33,6 +33,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, Accepted); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
 | Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Accepted); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Accepted); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Accepted) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
 | Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Accepted); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Accepted); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Accepted); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Accepted) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
+| Benchmarks | An unpackaged harness in `benchmarks/` ([Running the benchmarks](#running-the-benchmarks)): seeded synthetic workloads, a guarded `orqestra_bench` database, single cells and named ladders with a correctness gate, claim cost against queue depth, failure drills d1–d4 and a generator for the tables of `docs/performance.md`; no result is committed yet | — |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | Docker Compose for PostgreSQL, local development and integration tests only ([guide](docs/development.md#local-postgresql-with-docker-compose)) | — |
 
@@ -54,8 +55,10 @@ uv run orqestra version
 uv run orqestra health              # loads configuration, prints JSON; secrets are redacted
 ```
 
-Configuration is read from `ORQESTRA_*` environment variables and, in development,
-from a local `.env` file. See `.env.example` for every setting.
+Configuration is read from `ORQESTRA_*` environment variables and from a `.env` file in
+the current directory, if one exists. The file is read in every environment, production
+included; a variable set in the environment takes precedence over it. `.env.example` lists
+every setting.
 
 ### Database
 
@@ -70,6 +73,10 @@ uv run orqestra migrate
 # {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace", "0004_task_availability", "0005_provider_usage"]}
 uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 ```
+
+Without a PostgreSQL server on the host, use the Docker Compose server instead
+([guide](docs/development.md#local-postgresql-with-docker-compose)): `docker compose up -d --wait`,
+then `export ORQESTRA_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_local`.
 
 ### Submitting jobs
 
@@ -251,6 +258,7 @@ one job, in contiguous batches of `batch_size`:
 ```python
 from orqestra.domain.jobs import JobSubmission
 from orqestra.domain.partitioning import partition
+from orqestra.persistence.jobs import submit_job
 
 tasks = partition(items, batch_size=100, max_attempts=3)  # 100 is an example, not advice
 result = submit_job(conn, JobSubmission("invoice_verification", tasks, idempotency_key="run-42"))
@@ -271,7 +279,8 @@ result = submit_job(conn, JobSubmission("invoice_verification", tasks, idempoten
   not an integer of at least 1 (`True` and `2.0` included) raise `ValueError` or
   `TypeError`. `max_attempts` is passed through; the database enforces 1–100.
 - **Not decided yet.** There is no production batch size, and no limit on the number of
-  items, the batch size or a payload's size; these wait for measurement (BS-05). A job's
+  items, the batch size or a payload's size; these wait for measurement with the benchmark
+  harness ([Running the benchmarks](#running-the-benchmarks), BS-05). A job's
   batches are claimed in no particular order (DEC-033).
 
 ### Running attempts
@@ -380,9 +389,11 @@ def run(conn: psycopg.Connection[Any], task: Task) -> None:
   end one grace period after the request, never past the deadline. This can shorten a
   long lease or lengthen one about to expire. From then on heartbeats are refused. Within
   the grace period the attempt may still complete: a success stands, and a transient
-  failure cancels instead of requeueing. Once the grace period has run out, recovery
-  revokes the attempt and cancels the task. A repeated request changes nothing and does
-  not extend the grace period.
+  failure cancels instead of requeueing while attempts remain, and fails the task on its
+  last attempt. Once the grace period has run out, recovery revokes the attempt and
+  cancels the task; if the deadline came first, the revocation is `deadline_exceeded` and
+  follows the transient-failure rule instead (DEC-040). A repeated request changes nothing
+  and does not extend the grace period.
 - A succeeded task's result may be JSON `null`; check `task.state` before reading
   `task.result`.
 - Job status is derived from task states: `queued` (every task queued), `running`,
@@ -554,8 +565,11 @@ any thread.
 
   A handler that sees it and raises `HandlerCancelled` ends the attempt and the task as
   cancelled. Within the grace period a success still stands, a transient failure cancels
-  the task, and a permanent failure fails it (DEC-020). A handler that ignores the signal
-  is fenced at the end of the grace period, and recovery then cancels the task. Nothing
+  the task while attempts remain and fails it on the last attempt, and a permanent failure
+  fails it (DEC-020, DEC-038). A handler that ignores the signal is fenced at the end of
+  the grace period, and recovery then cancels the task; when the deadline falls inside the
+  grace period, recovery records `deadline_exceeded` instead, and a task with no attempts
+  left fails (DEC-040). Nothing
   else sets the event: not an unconfirmed heartbeat, a lost connection, or lost
   ownership. A `HandlerCancelled` raised without a confirmed request remains an
   unclassified failure.
@@ -688,8 +702,9 @@ the exit codes above.
   Every worker sharing a database must use the same two retry values; nothing checks this.
 - **Startup checks, in order.** Each refusal prints one JSON line on stdout and exits 1,
   before any worker exists, so nothing is claimed:
-  1. the settings validate (errors list each field's location and message, never its
-     input);
+  1. the settings validate (errors list each field's location, message and type, without
+     pydantic's `input` field; a validator's message can still name the parsed value it
+     checks);
   2. every `--kind` is a built-in handler, and none is `diagnostic.*` when
      `ORQESTRA_ENVIRONMENT=production`;
   3. `ORQESTRA_DATABASE_URL` is set and parses (a malformed one is reported
@@ -859,8 +874,9 @@ backward compatible. No command registers the handler, so only direct callers ch
 
 A job's status says nothing about its invoices: a job in which every invoice was rejected
 is still `succeeded`. `summarize_invoice_job` reads the stored item results and reports
-what happened to each item (DEC-056, Accepted). It is a Python interface for now, with no
-command, API, table or migration.
+what happened to each item (DEC-056, Accepted). It is a Python interface, and
+`orqestra job summary` prints it as one JSON line (DEC-066, see
+[Submitting jobs](#submitting-jobs)). It adds no API, table or migration.
 
 ```python
 import psycopg
@@ -973,9 +989,11 @@ print(capture_of(usage))  # open, closed, lower_bound or not_captured
   a closure cannot see the calls it holds. Map a kind to T3, or close its attempts as
   `complete`, only if every handler of that kind records every call through a durable
   recorder: the worker's `UsageSink` (DEC-059) is the only one. Otherwise either would
-  claim `complete(0)` for calls that were made. `invoice_verification` is registered with
-  no worker and no sink, so it stays unmapped; its attempts read `not_captured`, or
-  `lower_bound` with an `incomplete` closure, never `closed`.
+  claim `complete(0)` for calls that were made. No packaged worker registers
+  `invoice_verification`; only the unpackaged benchmark workers (`benchmarks/worker.py`,
+  `benchmarks/faults.py`) run it, behind a `UsageSink` that maps it to T3. Anywhere else it
+  stays unmapped; its attempts read `not_captured`, or `lower_bound` with an `incomplete`
+  closure, never `closed`.
 
 | Situation | What happens |
 |---|---|
@@ -1193,8 +1211,10 @@ breaks the contract.
 
 `report_job_usage` reads an invoice job's provider usage ledger (migration 0005) and reports
 what providers said they used, next to the unchanged summary (DEC-061, Accepted). It is a
-Python interface, with no command, API, table or migration. It reports provider-declared
-figures only: there are no prices, currencies or cost.
+Python interface, and `orqestra job usage` prints it as one JSON line, with the call budget
+check on request (DEC-066, see [Submitting jobs](#submitting-jobs)). It adds no API, table
+or migration. It reports provider-declared figures only: there are no prices, currencies or
+cost.
 
 ```python
 import psycopg
@@ -1273,6 +1293,71 @@ make verify     # full lane: + PostgreSQL integration tests, >=80% combined cove
 `make check` alone does not verify persistence. `make verify` is required for persistence
 changes and fails if the test database is not configured. Integration tests only run
 against a local database named `orqestra_test` and work in throwaway schemas inside it.
+With the Docker Compose server, create the test database with
+`docker compose exec postgres createdb -U orqestra_local orqestra_test` and set
+`ORQESTRA_TEST_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_test`
+([guide](docs/development.md#local-postgresql-with-docker-compose)).
+
+### Running the benchmarks
+
+`benchmarks/` is a measurement harness kept beside the package: it is not part of `orqestra`
+and not in its wheel, so it runs only from a clone, as `uv run python -m benchmarks.<module>`.
+This README quotes none of its results.
+
+| Module | What it does |
+| --- | --- |
+| `benchmarks.run` | One cell: a profile (`echo`, `wait` or `invoice`), a size, a batch size and a worker count. It starts real worker processes, submits the job with `orqestra job submit`, waits, applies the correctness gate and writes one result file |
+| `benchmarks.ladder` | A named ladder of cells (`warm-up`, `scale`, `overhead`, `handler-bound`, `batch`, `large`), run in interleaved order with stop rules |
+| `benchmarks.claims` | The cost of one claim against the depth of the queue (DEC-033, DEC-062) |
+| `benchmarks.drills` | Failure drills `d1` to `d4`: killed, frozen and cut-off workers, a database restart, and poison inputs |
+| `benchmarks.report` | The generated tables of `docs/performance.md`, rendered from the committed result files |
+
+- **The database.** Every module refuses to run unless `ORQESTRA_BENCH_DATABASE_URL` names a
+  local database called `orqestra_bench`, reached over a Unix socket or the loopback network
+  and checked against the server's own answer (`benchmarks/database.py`). The variable is
+  read from the process environment only, not from `.env`. Each run works in a throwaway
+  schema (`orq_bench_…`) that it drops at the end, unless `--keep-schema` is given. On a
+  local server:
+
+  ```sh
+  createdb orqestra_bench
+  export ORQESTRA_BENCH_DATABASE_URL=postgresql:///orqestra_bench
+  ```
+
+- **A clean tree.** A result must name the commit it measured, so `run`, `ladder`, `claims`
+  and `drills` refuse a working tree with uncommitted changes (`benchmarks/results/` is left
+  out of that check). `--allow-dirty` runs anyway: its results are marked `dirty_allowed`,
+  must never be committed, and stay out of the report's tables.
+- **Output.** Result files go to `benchmarks/results/` (drills to
+  `benchmarks/results/drills/`); raw per-task rows and worker logs go to
+  `build/bench/<run_id>/`, which git ignores.
+- **The `invoice` profile** runs the unpackaged `python -m benchmarks.worker`: invoice
+  verification behind a `UsageSink`, answered by the offline `SeparatorReader` double, which
+  makes no network call.
+- **The database restart drill, `d3b`,** runs `docker compose -p orqestra-bench restart
+  postgres`. It is refused unless `--allow-db-restart` is given, `COMPOSE_PROJECT_NAME` is
+  `orqestra-bench`, and that project's container is the server the URL reaches (the same
+  `system_identifier`). Run the benchmark database in that Compose project for it:
+
+  ```sh
+  export COMPOSE_PROJECT_NAME=orqestra-bench
+  docker compose up -d --wait         # the compose.yaml server, as its own project and volume
+  docker compose exec postgres createdb -U orqestra_local orqestra_bench
+  export ORQESTRA_BENCH_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_bench
+  uv run python -m benchmarks.drills d3b --allow-db-restart
+  ```
+
+  It binds the same host port as the development server (`compose.yaml`), so only one of the
+  two can run at a time.
+- **The report.** `uv run python -m benchmarks.report --write` replaces the text between the
+  two markers of `docs/performance.md` and never creates that file; `--check` exits 1 when
+  the tables are out of date, and `--print`, the default, writes them to standard output.
+- **BS-05.** Some decision entries and `partition`'s docstring call this large-scale
+  measurement BS-05: the batch size, size limits and operating values wait for it. The
+  `batch` and `large` ladders run it; no value has been decided from them.
+- **In CI.** `tests/integration/test_bench_smoke_pg.py` is part of `make verify`: it runs
+  small `invoice` and `echo` cells and the `d1` and `d3a` drills on a throwaway schema of the
+  integration database, and asserts the correctness gate only, never a timing.
 
 ### Known limitations
 
@@ -1292,9 +1377,12 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   worker passes a closure and a tier map only for the kinds of its `UsageSink` (DEC-059).
 - The OpenRouter adapter is not wired in; its own limits are listed in
   [OpenRouter adapter](#openrouter-adapter-not-wired-in).
-- Invoice verification has no live provider and is registered with no worker, so its
-  calls are not yet written to the usage ledger; with `InMemoryCallRecorder` they stay in
-  memory. The worker's `UsageSink` is durable, but nothing checks that a sink kind's
+- Invoice verification has no live provider and no packaged worker: `orqestra worker run`
+  builds its worker without a `UsageSink`. Only unpackaged workers wire the ledger: the
+  benchmark workers (`benchmarks/worker.py`, `benchmarks/faults.py`) register invoice
+  verification behind a `UsageSink` at tier T3, and the process tests' worker
+  (`tests/integration/worker_process.py`) does so for its `metered` test kind. With
+  `InMemoryCallRecorder` calls stay in memory. The worker's `UsageSink` is durable, but nothing checks that a sink kind's
   handlers record every call through it (the T3 contract), or that every worker of a fleet
   uses the same tier map. The ledger, and so the usage report, holds only what is
   recorded through `orqestra.persistence.provider_usage`. The stored `routing` shows only
@@ -1376,7 +1464,8 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
     ends, by a live worker. Handlers are not told about shutdown.
 - Partitioning (DEC-052) has no production batch size and no size limits: a whole job,
   however many batches, is still one submission transaction, and replaying it compares
-  every task. Bounds wait for the large-scale benchmark (BS-05).
+  every task. Bounds wait for the large-scale benchmark (BS-05, see
+  [Running the benchmarks](#running-the-benchmarks)).
 - There are no default or maximum lease values: callers choose them. Operational bounds
   and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing
   value and has no defaults.
@@ -1415,6 +1504,10 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   does not depend on the error (for example, a rate limit's `Retry-After`). A database
   outage longer than the lease still revokes every live attempt when it returns; their
   retries are spread by the jitter only.
+- There is no rate limiting or backpressure: nothing limits how fast workers claim tasks or
+  call a provider, or slows submission under load. A provider's `429` is the transient
+  `rate_limited` code (DEC-055), so its batch is retried after the ordinary retry delay,
+  which ignores `Retry-After`.
 - A task whose job kind no claimant supports stays `queued` indefinitely: nothing reports
   or expires it yet. Each claim now also reads the job of the queued tasks it considers;
   how PostgreSQL plans that, and what unsupported backlogs cost, has not been measured.
@@ -1439,9 +1532,12 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
   guaranteed. Neither execution nor external effects are exactly-once: a handler may run
   again after recovery.
 - Migration 0002 needs a quiescent database: stop workers and claimers, let running
-  attempts finish, migrate, then deploy. It refuses while any task or attempt is running
-  or any session is using those tables. Code from before 0002 cannot run against the new
-  schema: it cannot read revoked attempts, and its claims are rejected.
+  attempts finish, migrate, then deploy. It refuses while any task or attempt is running,
+  and fails at once while another transaction holds any lock on `attempts`, or a lock on
+  `tasks` stronger than a plain read's (a write, or `SELECT … FOR UPDATE` or `FOR SHARE`);
+  a transaction that has only read `tasks` does not stop it. Code from before 0002 cannot
+  run against the new schema: it cannot read revoked attempts, and its claims are
+  rejected.
 - Migration 0003 is additive and may run while attempts are running, but it fails at once
   while any session uses `attempts`. Code from before 0003 must not run once the new code
   can write `cancellation_grace_expired`: it cannot read that reason, and its heartbeats
@@ -1480,3 +1576,8 @@ against a local database named `orqestra_test` and work in throwaway schemas ins
 - Short-lived branches, Conventional Commits, one scoped issue per feature, and the
   pull request template's verification section filled with commands actually run.
 - Contributor guidance, scope and engineering standards: [`docs/development.md`](docs/development.md).
+
+## Licence
+
+Orqestra is not licensed: all rights reserved. A licence is deferred until publication
+(DEC-014).

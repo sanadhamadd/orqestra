@@ -9,7 +9,8 @@ Orqestra is a general-purpose distributed task execution engine. Up to 50,000 *s
 invoice and purchase-order records are used only as an evidence target; do not claim the
 target was met without a complete, reproducible benchmark. Out of scope unless explicitly
 approved: production OCR, ERP integrations, customer billing, multi-tenant security,
-autonomous agent swarms, a polished dashboard.
+autonomous agent swarms, a polished dashboard. The benchmark harness and how to run it are in
+the README, [Running the benchmarks](../README.md#running-the-benchmarks).
 
 ## Workflow
 
@@ -86,7 +87,9 @@ and the test database has to be created again.
 - Upgrading to 0002 is a quiescent operation: stop every worker and claimer, let running
   attempts finish, run `orqestra migrate`, then deploy the new code. The migration refuses
   (SQLSTATE `55000`) while any task or attempt is running, fails at once (`55P03`) while
-  any session uses the tables, and requires READ COMMITTED. Attempts left running by dead
+  another transaction holds any lock on `attempts` or a lock on `tasks` stronger than a plain
+  read's (a write, or `SELECT … FOR UPDATE` or `FOR SHARE`; a transaction that has only read
+  `tasks` does not stop it), and requires READ COMMITTED. Attempts left running by dead
   workers must be resolved by the maintainer before upgrading; the migration never expires
   or reassigns them.
 - Upgrading to 0003 is additive at the database: it takes only `attempts`, with `NOWAIT`
@@ -113,8 +116,9 @@ and the test database has to be created again.
 - Model Job, Task and Attempt with explicit state transitions.
 - Prefer at-least-once delivery with idempotent visible effects; never claim exactly-once.
 - Design and test atomic claiming, ownership and leases, stale writes, expiry and crash
-  recovery, bounded retry with backoff and jitter, timeouts, cancellation, rate limits and
-  backpressure.
+  recovery, bounded retry with backoff and jitter, timeouts and cancellation. Rate limits and
+  backpressure are not implemented (README, Known limitations); design and test them in the
+  change that adds them.
 - Worker process count, concurrent task slots and host count are separate measures.
 - Concurrent stress tests assert invariants for all valid schedules. Specific race
   outcomes require deterministic synchronization tests. Do not use a minimum random

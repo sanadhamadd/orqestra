@@ -2,10 +2,13 @@
 
 The task and attempt state diagrams, and the transition tables under them, must
 list exactly the moves of ``TASK_TRANSITIONS`` and ``ATTEMPT_TRANSITIONS``: a move
-added to or removed from either side fails here. Every relative link must
-resolve, anchors included, and the page keeps to the repository's wording.
+added to or removed from either side fails here. The component table's ``cli`` row
+must name every ``job`` subcommand that ``cli.py`` registers, and the failure table
+every worker exit code of ``ExitCode``. Every relative link must resolve, anchors
+included, and the page keeps to the repository's wording.
 """
 
+import argparse
 import re
 from collections.abc import Mapping
 from enum import StrEnum
@@ -13,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from orqestra import cli
 from orqestra.domain.states import (
     ATTEMPT_TRANSITIONS,
     TASK_TRANSITIONS,
@@ -21,6 +25,7 @@ from orqestra.domain.states import (
     AttemptState,
     TaskState,
 )
+from orqestra.worker.fence import ExitCode
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
@@ -188,6 +193,67 @@ def test_a_missing_move_in_the_code_would_be_noticed() -> None:
 def test_the_page_has_the_data_path_the_two_state_diagrams_and_the_ownership_sequence() -> None:
     kinds = [block.splitlines()[0].split()[0] for block in mermaid_blocks(doc_text())]
     assert kinds == ["flowchart", "stateDiagram-v2", "stateDiagram-v2", "sequenceDiagram"]
+
+
+# --- the component table against cli.py --------------------------------------------
+
+
+def subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    """The subcommands registered on ``parser``, by name."""
+    groups = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    assert len(groups) == 1, "expected one set of subcommands"
+    return dict(groups[0].choices)
+
+
+def job_subcommands() -> list[str]:
+    """Every subcommand registered under ``orqestra job`` by ``cli._build_parser``."""
+    return sorted(subcommands(subcommands(cli._build_parser())["job"]))
+
+
+def cli_row(text: str) -> str:
+    """The component table's row for the ``cli`` package."""
+    rows = [line for line in text.splitlines() if line.startswith("| [`cli`]")]
+    assert len(rows) == 1, "expected one cli row in the component table"
+    return rows[0]
+
+
+def missing_from(row: str, names: list[str]) -> list[str]:
+    """The names that ``row`` does not mention as `` `job <name>` ``."""
+    return [name for name in names if f"`job {name}`" not in row]
+
+
+def test_the_cli_row_names_every_job_subcommand() -> None:
+    names = job_subcommands()
+    assert {"submit", "status"} <= set(names), "the parser walk found the job subcommands"
+    assert missing_from(cli_row(doc_text()), names) == []
+
+
+def test_a_job_subcommand_missing_from_the_cli_row_is_noticed() -> None:
+    row = cli_row(doc_text())
+    names = job_subcommands()
+
+    assert missing_from(row.replace("`job usage`", "`job`"), names) == ["usage"]
+    assert missing_from(row, [*names, "cancel"]) == ["cancel"]
+
+
+# --- the failure table against fence.py ---------------------------------------------
+
+
+def exit_codes_named(text: str) -> set[int]:
+    """The worker exit codes written as ``exit N`` in ``text``."""
+    return {int(code) for code in re.findall(r"\bexit (\d+)\b", text)}
+
+
+def test_the_failure_table_names_every_worker_exit_code() -> None:
+    table = section(doc_text(), "## Failure model")
+    assert exit_codes_named(table) == {code.value for code in ExitCode}
+
+
+def test_an_exit_code_missing_from_the_failure_table_is_noticed() -> None:
+    table = section(doc_text(), "## Failure model")
+    without_6 = "\n".join(line for line in table.splitlines() if "(exit 6)" not in line)
+
+    assert exit_codes_named(without_6) == {code.value for code in ExitCode} - {6}
 
 
 # --- links and wording -------------------------------------------------------------
