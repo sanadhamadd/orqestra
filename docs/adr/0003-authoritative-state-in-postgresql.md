@@ -87,8 +87,9 @@ detect this: after `running → queued → running`, the state matches again.
   deadline ends the process (DEC-047).
 - Implemented and verified locally and in GitHub CI (PR #12): cooperative cancellation. A
   heartbeat that confirms a committed request moves the fence to the end of the grace
-  period (earlier or later; DEC-048, DEC-068) and then tells the handler through its read-only signal; a handler that
-  cooperates ends the attempt cancelled. Notice is only as timely as heartbeats (DEC-048).
+  period (earlier or later; DEC-048, DEC-068) and then tells the handler through its
+  read-only signal; a handler that cooperates ends the attempt cancelled. Notice is only
+  as timely as heartbeats (DEC-048).
 - Implemented and verified locally and in GitHub CI (PR #13): graceful, bounded shutdown. A
   stop request (SIGTERM or SIGINT) is latched by the supervisor, which then claims and
   starts nothing; the task it holds is drained and settled through PostgreSQL, or a drain

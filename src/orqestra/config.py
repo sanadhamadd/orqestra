@@ -1,8 +1,9 @@
 """Runtime configuration.
 
-Settings come from the process environment (prefix ``ORQESTRA_``) and, in
-development, from a local ``.env`` file. Every value is validated once at
-startup so bad configuration fails fast instead of surfacing mid-job.
+Settings come from the process environment (prefix ``ORQESTRA_``) and from a
+``.env`` file in the current directory, if one exists, in every environment; a
+variable set in the environment takes precedence. Every value is validated once
+at startup so bad configuration fails fast instead of surfacing mid-job.
 Secrets are ``SecretStr`` so they never leak through ``repr`` or logs.
 """
 

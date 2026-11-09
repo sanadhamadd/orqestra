@@ -48,7 +48,10 @@ tests, from the same `postgres:16.15` image digest that CI uses. It is not for p
 like CI's service container, it accepts the local-only user `orqestra_local` without a
 password, and it has no backups, tuning or restart policy. The port is bound to
 `127.0.0.1` only, on 5433 so that a server already using 5432 is not in the way, and the
-data lives in the named volume `orqestra_postgres-data`.
+data lives in the named volume `orqestra_postgres-data`. `compose.yaml` names the Compose project `orqestra` and binds host port 5433, so a second
+checkout's `docker compose` commands reach the same project and its volume: `down -v` there
+deletes this checkout's databases. Stop the other checkout's server first, or give each
+checkout its own project with `COMPOSE_PROJECT_NAME` and its own port.
 
 ```sh
 docker compose up -d --wait         # starts the server and waits for its health check
