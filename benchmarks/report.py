@@ -35,6 +35,15 @@ paths) is written, so the same files always render the same text.
 ``docs/performance.md``; the prose around them is written by hand. ``--write``
 replaces the text between the markers and never creates the file; ``--check``
 exits 1 if it differs from what the result files render.
+
+**The README.** ``--readme README.md`` makes the README the document instead:
+between its own pair of markers it holds a short Performance block rendered
+from the same loaded records (``render_readme``): the ``scale`` and ``large``
+ladders with four of the columns above, then the measured limits (the largest
+complete rung, every 50,000-invoice record and the claim cost by depth). Every
+figure in it is a cell string of ``docs/performance.md`` too; the README is
+never read for figures. Each document is written or checked by its own call,
+so the README can be rendered while ``docs/performance.md`` does not exist.
 """
 
 import argparse
@@ -59,6 +68,12 @@ WARM_UP = "warm-up"
 LADDER_ORDER = ("scale", "overhead", "handler-bound", "batch", "large")
 DASH = "—"
 NO_RESULTS = "_No results._"
+README = ROOT / "README.md"
+README_BEGIN = "<!-- BEGIN GENERATED: python -m benchmarks.report --readme -->"
+README_END = "<!-- END GENERATED README -->"  # neither marker pair contains the other
+README_LADDERS = ("scale", "large")
+README_COLUMNS = (0, 1, 5, 6)  # of COLUMNS: makespan, items/s (makespan), service p50, e2e p95
+LARGE_SIZE = 50_000
 
 
 class ReportError(ValueError):
@@ -545,20 +560,146 @@ def render(root: Path = RESULTS_DIR) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --- the README block ----------------------------------------------------------------------
+
+
+def readme_table(loaded: Sequence[Loaded]) -> list[str]:
+    """The ``scale`` and ``large`` ladders, one table per commit, machine and server."""
+    groups = _groups(loaded)
+    lines: list[str] = []
+    for key in sorted(groups, key=lambda k: (_ladder_order(k[0]), k[1:])):
+        ladder, *environment = key
+        if ladder not in README_LADDERS:
+            continue
+        cells = _by_cell(groups[key])
+        columns = [COLUMNS[index] for index in README_COLUMNS]
+        rows = [
+            [
+                cell_label(cell),
+                len(cells[cell]),
+                *(
+                    summary([read(item.record) for item in cells[cell]], digits)
+                    for _, read, digits in columns
+                ),
+            ]
+            for cell in sorted(cells)
+        ]
+        lines += [f"Ladder `{ladder}`. {_environment_line(*environment)}", ""]
+        lines += _table(["Cell", "n", *(column[0] for column in columns)], rows)
+        lines.append("")
+    return lines
+
+
+def measured_limits(cells: Sequence[Loaded], claim_results: Sequence[Loaded]) -> list[str]:
+    """The ``Measured limits`` bullets: every one generated from the records."""
+    complete = [
+        i
+        for i in cells
+        if clean(i.record)
+        and i.record["ladder"] != WARM_UP
+        and i.record["cell"]["profile"] == "invoice"
+    ]
+    lines = ["### Measured limits", ""]
+    if complete:
+        largest = max(int(i.record["cell"]["size"]) for i in complete)
+        at_largest = sorted(
+            {
+                (str(i.record["ladder"]), cell_label(cell_key(i.record)))
+                for i in complete
+                if int(i.record["cell"]["size"]) == largest
+            }
+        )
+        shas = sorted({str(i.record["environment"]["git_sha"])[:12] for i in complete})
+        where = ", ".join(f"{label} (`{ladder}`)" for ladder, label in at_largest)
+        commits = ", ".join(f"`{sha}`" for sha in shas)
+        lines.append(
+            f"- **Largest rung completed:** {largest:,} invoices: {where}; commit {commits}."
+        )
+    else:
+        lines.append("- **Largest rung completed:** _None recorded._")
+    large = sorted(
+        (i for i in cells if int(i.record["cell"]["size"]) == LARGE_SIZE), key=lambda i: i.name
+    )
+    if large:
+        lines.append(f"- **{LARGE_SIZE:,} invoices:** {len(large)} record(s):")
+        for item in large:
+            why = "counts in the tables" if clean(item.record) else reason(item.record)
+            lines.append(f"  - `{item.name}`: {item.record['status']}; {why}.")
+    else:
+        lines.append(
+            f"- **{LARGE_SIZE:,} invoices:** no result is recorded. The `large` rung runs only "
+            "when its gate passes (`benchmarks/ladder.py`)."
+        )
+    lines.append("")
+    clean_claims = [i for i in claim_results if i.record["environment"]["git_dirty"] is False]
+    if not clean_claims:
+        lines += ["Claim cost by depth: _None recorded._", ""]
+    for item in clean_claims:
+        by_depth: dict[int, dict[str, Mapping[str, Any]]] = defaultdict(dict)
+        for m in item.record["measurements"]:
+            by_depth[int(m["depth"])][str(m["variant"])] = m
+        rows = []
+        for depth in sorted(by_depth):
+            variants = by_depth[depth]
+            rows.append(
+                [
+                    depth,
+                    *(
+                        fixed(_number(variants[name], "latency_ms", "p50"), 3)
+                        if name in variants
+                        else DASH
+                        for name in ("ready", "waiting", "unsupported")
+                    ),
+                    " > ".join(str(node) for node in variants["ready"]["explain"]["plan_nodes"])
+                    if "ready" in variants
+                    else DASH,
+                ]
+            )
+        environment = claims_environment(item.record)
+        lines += [f"Claim cost by depth, `{item.name}`. {_environment_line(*environment)}", ""]
+        header = [
+            "Depth",
+            "ready p50 ms",
+            "waiting p50 ms",
+            "unsupported p50 ms",
+            "Plan (ready)",
+        ]
+        lines += _table(header, rows)
+        lines.append("")
+    return lines
+
+
+def render_readme(root: Path = RESULTS_DIR) -> str:
+    """The README's generated Performance block for the result files under ``root``."""
+    cells = _load(root, None, _validate_cell)
+    claim_results = _load(root, CLAIMS_DIR, claims.validate_result)
+    tables = [i for i in cells if clean(i.record)]
+    lines = [
+        "Generated by `python -m benchmarks.report --write --readme README.md` from the result "
+        "files under `benchmarks/results/`. Do not edit by hand.",
+        "",
+    ]
+    lines += readme_table(tables) or [NO_RESULTS, ""]
+    lines += measured_limits(cells, claim_results)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
 # --- the document --------------------------------------------------------------------------
 
 
-def split_document(text: str) -> tuple[str, str, str]:
+def split_document(text: str, begin: str = BEGIN, end: str = END) -> tuple[str, str, str]:
     """The text before, between and after the markers; exactly one pair is required."""
-    if text.count(BEGIN) != 1 or text.count(END) != 1:
+    if text.count(begin) != 1 or text.count(end) != 1:
         msg = "the document must hold exactly one pair of generated-section markers"
         raise ReportError(msg)
-    start = text.index(BEGIN) + len(BEGIN)
-    end = text.index(END)
-    if end < start:
+    start = text.index(begin) + len(begin)
+    stop = text.index(end)
+    if stop < start:
         msg = "the end marker comes before the begin marker"
         raise ReportError(msg)
-    return text[:start], text[start:end], text[end:]
+    return text[:start], text[start:stop], text[stop:]
 
 
 def section(body: str) -> str:
@@ -566,13 +707,13 @@ def section(body: str) -> str:
     return "\n" + body
 
 
-def write_document(doc: Path, body: str) -> None:
-    before, _, after = split_document(_read_document(doc))
+def write_document(doc: Path, body: str, *, begin: str = BEGIN, end: str = END) -> None:
+    before, _, after = split_document(_read_document(doc), begin, end)
     doc.write_text(before + section(body) + after, encoding="utf-8")
 
 
-def check_document(doc: Path, body: str) -> bool:
-    _, between, _ = split_document(_read_document(doc))
+def check_document(doc: Path, body: str, *, begin: str = BEGIN, end: str = END) -> bool:
+    _, between, _ = split_document(_read_document(doc), begin, end)
     return between == section(body)
 
 
@@ -592,14 +733,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode.add_argument("--print", dest="mode", action="store_const", const="print")
     mode.add_argument("--write", dest="mode", action="store_const", const="write")
     mode.add_argument("--check", dest="mode", action="store_const", const="check")
+    parser.add_argument(
+        "--readme",
+        type=Path,
+        metavar="PATH",
+        help="write, check or print the README's Performance block instead of the document",
+    )
     args = parser.parse_args(argv)
+    doc, markers = args.doc, {"begin": BEGIN, "end": END}
+    if args.readme is not None:
+        doc, markers = args.readme, {"begin": README_BEGIN, "end": README_END}
     try:
-        body = render(args.results)
+        body = render(args.results) if args.readme is None else render_readme(args.results)
         if args.mode == "write":
-            write_document(args.doc, body)
+            write_document(doc, body, **markers)
         elif args.mode == "check":
-            if not check_document(args.doc, body):
-                print(f"{args.doc}: the generated section is out of date", file=sys.stderr)
+            if not check_document(doc, body, **markers):
+                print(f"{doc}: the generated section is out of date", file=sys.stderr)
                 return 1
         else:
             sys.stdout.write(body)

@@ -20,6 +20,7 @@ from benchmarks.drills import (
     DrillFleet,
     FreezeDrill,
     Harness,
+    KillDrill,
     Poll,
     RestartDrill,
     RestartRefusedError,
@@ -350,3 +351,49 @@ def test_the_wait_outlasts_a_finished_job_while_a_freeze_is_pending(
     assert not wait_over(FINISHED, frozen)
     frozen.release()
     assert wait_over(FINISHED, frozen)
+
+
+# --- D1 at a call boundary: the demo never kills between a call's intent and result ---------
+
+
+class ConnOnly:
+    """A harness with a connection that is never used: ``_one`` is replaced."""
+
+    conn = None
+
+
+@pytest.fixture
+def one_victim(monkeypatch: pytest.MonkeyPatch) -> Victim:
+    victim = Victim(4242, uuid.uuid4())
+    monkeypatch.setattr(benchmarks.drills, "freeze_victims", lambda poll, count, taken: [victim])
+    return victim
+
+
+def test_a_victim_with_a_call_in_flight_is_continued_not_killed(
+    signals: list[tuple[int, int]], one_victim: Victim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(benchmarks.drills, "_one", lambda conn, query, *params: (1,))
+    drill = KillDrill(1, at_call_boundary=True)
+
+    drill.step(_poll(cast(FakeHarness, ConnOnly())))
+
+    assert signals == [(4242, signal.SIGCONT)]
+    assert drill.injected is False
+    assert drill.killed == set()
+    assert drill.injections == []
+
+
+def test_a_failed_in_flight_read_continues_the_victim_and_raises(
+    signals: list[tuple[int, int]], one_victim: Victim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(conn: object, query: str, *params: object) -> NoReturn:
+        raise psycopg.OperationalError("the connection was lost")
+
+    monkeypatch.setattr(benchmarks.drills, "_one", broken)
+    drill = KillDrill(1, at_call_boundary=True)
+
+    with pytest.raises(psycopg.OperationalError):
+        drill.step(_poll(cast(FakeHarness, ConnOnly())))
+
+    assert signals == [(4242, signal.SIGCONT)]
+    assert drill.killed == set()

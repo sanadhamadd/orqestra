@@ -18,8 +18,9 @@ the Python `submit_job` interface or `orqestra job submit`. `orqestra worker run
 built-in diagnostic handlers only. The synthetic invoice workload has a batch handler, a job
 summary and a provider usage ledger, but no shipped command registers the invoice kind, and
 no test makes a live provider call (DEC-062). There is no service, deployment or production
-workload. No measurement campaign has been run, so this README states no throughput or
-latency figures. The history of each change is in Git and in the
+workload. Measured throughput, latency and limits are in [Performance](#performance),
+generated from the committed result files, with every table in
+[docs/performance.md](docs/performance.md). The history of each change is in Git and in the
 [decision log](docs/decisions.md). The planned column lists work that is not
 implemented; do not read it as a claim about shipped behaviour.
 
@@ -33,7 +34,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, Accepted); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
 | Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Accepted); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Accepted); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Accepted) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
 | Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Accepted); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Accepted); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Accepted); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Accepted) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
-| Benchmarks | An unpackaged harness in `benchmarks/` ([Running the benchmarks](#running-the-benchmarks)): seeded synthetic workloads, a guarded `orqestra_bench` database, single cells and named ladders with a correctness gate, claim cost against queue depth, failure drills d1–d4 and a generator for the tables of `docs/performance.md`; no result is committed yet | — |
+| Benchmarks | An unpackaged harness in `benchmarks/` ([Running the benchmarks](#running-the-benchmarks)): seeded synthetic workloads, a guarded `orqestra_bench` database, single cells and named ladders with a correctness gate, claim cost against queue depth, failure drills d1–d4, a generator for the tables of `docs/performance.md` and of [Performance](#performance), and an end-to-end demonstration ([Demonstration](#demonstration)) | — |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
 | Containers | Docker Compose for PostgreSQL, local development and integration tests only ([guide](docs/development.md#local-postgresql-with-docker-compose)) | — |
 
@@ -42,6 +43,49 @@ implemented; do not read it as a claim about shipped behaviour.
 [docs/architecture.md](docs/architecture.md) shows how jobs, tasks, attempts, workers and
 the usage ledger fit together around PostgreSQL. The reasons behind each rule are in the
 [decision log](docs/decisions.md) and the [ADRs](docs/adr/).
+
+## Demonstration
+
+`python -m benchmarks.demo` runs one synthetic invoice job end to end through the shipped
+commands: migration, an idempotent submission, four workers sharing PostgreSQL as the queue,
+one of them killed with SIGKILL partway through and recovered by another, and the job's
+status, summary and provider usage checked against what the job must report. It exits 0
+only when every check passes, and it prints its timings as "this machine, this run" without
+checking them.
+
+```sh
+docker compose up -d --wait
+docker compose exec postgres createdb -U orqestra_local orqestra_bench   # once per volume
+export ORQESTRA_BENCH_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_bench
+uv run python -m benchmarks.demo
+```
+
+The workers run `python -m benchmarks.worker`, because invoice verification is not
+registered with `orqestra worker run` (DEC-062), and the provider is the offline
+`SeparatorReader` double. [docs/demo.md](docs/demo.md) explains every printed line and the
+claim it supports.
+
+## Performance
+
+The block below is generated by `python -m benchmarks.report --write --readme README.md` from
+the same committed result files as [docs/performance.md](docs/performance.md), which holds
+every table, the method and the analysis. Each figure is the median over a cell's
+repetitions with the minimum and maximum in brackets, and each table names its commit,
+machine and PostgreSQL server. The invoice cells use the offline provider double, so no
+figure says anything about a real provider.
+
+<!-- BEGIN GENERATED: python -m benchmarks.report --readme -->
+Generated by `python -m benchmarks.report --write --readme README.md` from the result files under `benchmarks/results/`. Do not edit by hand.
+
+_No results._
+
+### Measured limits
+
+- **Largest rung completed:** _None recorded._
+- **50,000 invoices:** no result is recorded. The `large` rung runs only when its gate passes (`benchmarks/ladder.py`).
+
+Claim cost by depth: _None recorded._
+<!-- END GENERATED README -->
 
 ## Quickstart
 
@@ -1302,7 +1346,8 @@ With the Docker Compose server, create the test database with
 
 `benchmarks/` is a measurement harness kept beside the package: it is not part of `orqestra`
 and not in its wheel, so it runs only from a clone, as `uv run python -m benchmarks.<module>`.
-This README quotes none of its results.
+[Performance](#performance) shows its committed results, and
+[docs/performance.md](docs/performance.md) all of them.
 
 | Module | What it does |
 | --- | --- |
@@ -1310,7 +1355,8 @@ This README quotes none of its results.
 | `benchmarks.ladder` | A named ladder of cells (`warm-up`, `scale`, `overhead`, `handler-bound`, `batch`, `large`), run in interleaved order with stop rules |
 | `benchmarks.claims` | The cost of one claim against the depth of the queue (DEC-033, DEC-062) |
 | `benchmarks.drills` | Failure drills `d1` to `d4`: killed, frozen and cut-off workers, a database restart, and poison inputs |
-| `benchmarks.report` | The generated tables of `docs/performance.md`, rendered from the committed result files |
+| `benchmarks.report` | The generated tables of `docs/performance.md` and of [Performance](#performance), rendered from the committed result files |
+| `benchmarks.demo` | The end-to-end demonstration ([docs/demo.md](docs/demo.md)) |
 
 - **The database.** Every module refuses to run unless `ORQESTRA_BENCH_DATABASE_URL` names a
   local database called `orqestra_bench`, reached over a Unix socket or the loopback network
@@ -1352,6 +1398,8 @@ This README quotes none of its results.
 - **The report.** `uv run python -m benchmarks.report --write` replaces the text between the
   two markers of `docs/performance.md` and never creates that file; `--check` exits 1 when
   the tables are out of date, and `--print`, the default, writes them to standard output.
+  With `--readme README.md`, each of the three does the same for the README's Performance
+  block, between its own markers.
 - **BS-05.** Some decision entries and `partition`'s docstring call this large-scale
   measurement BS-05: the batch size, size limits and operating values wait for it. The
   `batch` and `large` ladders run it; no value has been decided from them.
@@ -1420,6 +1468,9 @@ This README quotes none of its results.
 - The offline provider double for benchmarks, `SeparatorReader` (`benchmarks/provider.py`),
   answers at once and makes no network call, so nothing here measures a real provider's
   latency, cost or reliability.
+- The demonstration's timings (`python -m benchmarks.demo`) describe one machine and one
+  run; they are printed and recorded, never checked, and never enter the performance
+  tables.
 - There is no purchase-order matching: the invoice rules check each invoice on its own
   (`src/orqestra/workloads/invoice/verify.py`).
 - Usage is totalled per exact unit that a provider reports, such as `tokens`, with no
@@ -1495,7 +1546,9 @@ This README quotes none of its results.
   when a live worker supporting its kind next polls after that time, and behind any
   backlog. A retried task keeps its original `created_at`, so once eligible it is claimed
   ahead of newer tasks. Each claim scans and sorts the queued tasks, including those still
-  waiting out a delay; there is no index for it yet (deferred until it is measured).
+  waiting out a delay; there is no index for it yet. The claim index is proposed in
+  DEC-069, not yet decided; the claim cost measured by depth is under
+  [Measured limits](#measured-limits).
   `None` from `claim_next_attempt` or `revoke_next_expired` means only that nothing was
   claimed or revoked by that call.
 - Retry policy consistency is not enforced: each process uses its own settings, and a
