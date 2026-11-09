@@ -74,6 +74,10 @@ def test_0006_fails_at_once_while_a_transaction_has_written_to_tasks(
             migrate(schema_url, UP_TO_0006)
         writer.rollback()
     assert info.value.sqlstate == "55P03"
+    # 0006's own text names only a writing transaction; migrate adds the general cause.
+    assert "an open transaction has written to it" in str(info.value)
+    assert "a conflicting lock on a table this migration locks" in str(info.value)
+    assert "autovacuum" in str(info.value)
     assert _index(at_0005) is None
     assert _versions(at_0005) == [1, 2, 3, 4, 5]
 
