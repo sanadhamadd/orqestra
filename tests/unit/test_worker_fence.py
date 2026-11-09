@@ -242,19 +242,21 @@ def test_the_thread_fires_while_another_thread_is_blocked() -> None:
 
 
 def test_the_thread_honours_extension_and_never_fires_an_obsolete_deadline() -> None:
-    dog, recorder = watchdog()
+    # The thread runs on a fake clock that moves only when the test moves it, so no
+    # pause of this thread can let a deadline pass between the calls below.
+    clock = FakeClock(0.0)
+    dog, recorder = watchdog(clock)
     dog.start()
     try:
-        start = time.monotonic()
-        first = dog.arm(Guard.OWNERSHIP, start + 0.2, CONTEXT)
+        first = dog.arm(Guard.OWNERSHIP, 0.2, CONTEXT)
         dog.disarm(first)  # the protected execution ended
-        second = dog.arm(Guard.OWNERSHIP, start + 0.3, CONTEXT)
-        assert dog.extend(second, start + 0.6)  # a confirmed renewal
+        second = dog.arm(Guard.OWNERSHIP, 0.3, CONTEXT)
+        assert dog.extend(second, 0.6)  # a confirmed renewal
+        clock.now = 0.6  # past both earlier deadlines too; the thread sees it within its wait
         assert recorder.fired.wait(10)
         # Only the newest arming, at its extended deadline, ever fired.
         (expiry,) = recorder.expiries
-        assert expiry.deadline == start + 0.6
-        assert expiry.now >= start + 0.6
+        assert (expiry.guard, expiry.deadline, expiry.now) == (Guard.OWNERSHIP, 0.6, 0.6)
     finally:
         dog.stop(5)
 
