@@ -15,7 +15,7 @@ import uuid
 import warnings
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Generator, Iterator
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -407,10 +407,10 @@ def nested(depth: int) -> list[Any]:
         (Colour.RED, "result is a Colour"),
         (OrderedDict(a=1), "result is a OrderedDict"),
         ([(1, 2)], r"result\[0\] is a tuple"),
-        ({1: "a"}, "has a int key 1"),
-        ({None: "a"}, "has a NoneType key None"),
-        ({True: "a"}, "has a bool key True"),
-        ({"a": [{"b": {2.5: 0}}]}, "has a float key 2.5"),
+        ({1: "a"}, "has a int key; JSON keys"),
+        ({None: "a"}, "has a NoneType key; JSON keys"),
+        ({True: "a"}, "has a bool key; JSON keys"),
+        ({"a": [{"b": {2.5: 0}}]}, "has a float key; JSON keys"),
         (cyclic_list(), "contains itself"),
         (cyclic_dict(), "contains itself"),
         (nested(5_000), "nested too deeply"),
@@ -655,6 +655,71 @@ def test_run_handler_reports_an_invalid_result_as_a_failure() -> None:
         return float("nan")
 
     assert "result is nan" in invalid(run_handler(handler, context(), {}))
+
+
+class UnsetMessageError(Exception):
+    """An exception whose ``__str__`` reads an attribute ``__init__`` never set."""
+
+    def __str__(self) -> str:
+        return str(self.msg)  # type: ignore[attr-defined]
+
+
+class NotTextError(Exception):
+    def __str__(self) -> str:
+        return 1  # type: ignore[return-value]
+
+
+class UnsetPermanentError(PermanentError):
+    def __str__(self) -> str:
+        return str(self.msg)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("exc", "kind", "reason"),
+    [
+        (UnsetMessageError(), FailureKind.UNCLASSIFIED, "AttributeError"),
+        (NotTextError(), FailureKind.UNCLASSIFIED, "TypeError"),
+        (UnsetPermanentError(), FailureKind.PERMANENT, "AttributeError"),
+    ],
+    ids=["unset-attribute", "not-a-str", "permanent-keeps-its-class"],
+)
+def test_run_handler_records_an_exception_whose_message_cannot_be_read(
+    exc: Exception, kind: FailureKind, reason: str
+) -> None:
+    def handler(ctx: TaskContext, payload: JsonValue) -> JsonValue:
+        raise exc
+
+    outcome = run_handler(handler, context(), {})
+    assert outcome == AttemptFailed(
+        kind,
+        f"{__name__}.{type(exc).__qualname__}",
+        f"the exception's message could not be read ({reason})",
+    )
+
+
+class Key:
+    def __repr__(self) -> str:
+        msg = "a repr that fails"
+        raise RuntimeError(msg)
+
+
+def test_a_non_string_key_is_named_by_its_type_without_its_repr() -> None:
+    outcome = run_handler(lambda ctx, payload: cast(Any, {Key(): 1}), context(), {})
+    assert invalid(outcome) == "result has a Key key; JSON keys are strings"
+
+
+class Unexaminable:
+    """Passes the exact-type checks, then breaks ``isinstance``'s ``__class__`` fallback."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        msg = "no class"
+        raise RuntimeError(msg)
+
+
+def test_run_handler_records_a_result_that_cannot_be_checked() -> None:
+    outcome = run_handler(lambda ctx, payload: cast(Any, Unexaminable()), context(), {})
+    assert invalid(outcome) == "result could not be checked (RuntimeError)"
 
 
 @pytest.mark.parametrize(

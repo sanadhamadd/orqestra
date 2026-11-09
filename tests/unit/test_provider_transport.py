@@ -1,14 +1,17 @@
 """The stdlib HTTPS transport over a stand-in for ``http.client.HTTPSConnection``.
 
-No socket is opened: ``no_network`` is on, and the connection class the transport
-looks up is replaced by either a scripted fake set as ``http.client.HTTPSConnection``
-(to check the order of steps, the timeouts and the failure mapping) or a subclass of
-the real class whose socket is a stand-in, reached through a copy of ``http.client``
-set as the transport module's ``http`` name (so the real header checks and request
-framing run).
+No socket is opened: ``no_network`` is on. The connect step's name lookup and
+sockets are a scripted stand-in for the transport module's ``socket`` name, and its
+TLS context is a stand-in whose handshake is scripted too. The connection class the
+transport looks up is replaced by either a scripted fake set as
+``http.client.HTTPSConnection`` (to check the order of steps, the timeouts and the
+failure mapping) or a subclass of the real class, reached through a copy of
+``http.client`` set as the transport module's ``http`` name (so the real header
+checks and request framing run).
 """
 
 import http.client
+import socket
 import ssl
 import traceback
 from collections.abc import Callable, Mapping
@@ -46,7 +49,8 @@ HEADERS = {
     "Accept": "application/json",
 }
 BODY = b'{"model":"vendor/model","stream":false}'
-CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+IPV6 = ("2001:db8::1", 443, 0, 0)  # documentation addresses: never reached
+IPV4 = ("192.0.2.1", 443)
 
 
 class FakeClock:
@@ -69,6 +73,9 @@ class Script:
         self.status = 200
         self.chunks = [b'{"ok":', b"true}"]
         self.socket = True
+        self.addresses: list[tuple[Any, ...]] = [IPV4]
+        self.blackholed: set[object] = set()  # connect waits out its whole timeout
+        self.refused: set[object] = set()  # connect fails at once
 
     def note(self, name: str, detail: object = None) -> None:
         self.log.append((name, detail))
@@ -97,6 +104,74 @@ class FakeSocket:
 
     def close(self) -> None:
         self.script.note("socket.close")
+
+
+class FakeRawSocket:
+    """A TCP socket before the handshake."""
+
+    def __init__(self, script: Script) -> None:
+        self.script = script
+        self.timeout: float | None = None
+
+    def settimeout(self, value: float) -> None:
+        self.timeout = value
+        self.script.note("raw.settimeout", value)
+
+    def setsockopt(self, *args: object) -> None:
+        pass
+
+    def connect(self, address: object) -> None:
+        if address in self.script.refused:
+            self.script.note("connect", address)
+            raise ConnectionRefusedError(SENTINEL)
+        if address in self.script.blackholed:
+            assert self.timeout is not None
+            self.script.clock.now += self.timeout
+            self.script.note("connect", address)
+            raise TimeoutError(SENTINEL)
+        self.script.block("connect", address)
+
+    def close(self) -> None:
+        self.script.note("raw.close")
+
+
+class FakeContext:
+    """A TLS context whose handshake is a scripted blocking step."""
+
+    def wrap_socket(self, sock: FakeRawSocket, *, server_hostname: str) -> object:
+        script = sock.script
+        script.note("handshake.timeout", sock.timeout)
+        script.block("handshake", server_hostname)
+        return FakeSocket(script) if script.socket else object()
+
+
+CONTEXT: Any = FakeContext()
+
+
+def fake_network(monkeypatch: pytest.MonkeyPatch, script: Script) -> None:
+    """Replace the transport module's ``socket`` name: name lookup and TCP sockets."""
+
+    def getaddrinfo(host: str, port: int, *args: object, **kwargs: object) -> list[object]:
+        script.note("getaddrinfo", (host, port))
+        return [
+            (
+                socket.AF_INET6 if len(address) == 4 else socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                address,
+            )
+            for address in script.addresses
+        ]
+
+    fake = SimpleNamespace(
+        getaddrinfo=getaddrinfo,
+        socket=lambda *args: FakeRawSocket(script),
+        SOCK_STREAM=socket.SOCK_STREAM,
+        IPPROTO_TCP=socket.IPPROTO_TCP,
+        TCP_NODELAY=socket.TCP_NODELAY,
+    )
+    monkeypatch.setattr(stdlib_transport, "socket", fake, raising=False)
 
 
 class FakeResponse:
@@ -159,6 +234,7 @@ def script(monkeypatch: pytest.MonkeyPatch) -> Script:
         return conn
 
     monkeypatch.setattr(http.client, "HTTPSConnection", connection)
+    fake_network(monkeypatch, made)
     return made
 
 
@@ -202,7 +278,12 @@ def test_every_blocking_step_is_bounded_by_the_time_left(script: Script) -> None
     exchange.close()
     assert script.names() == [
         "init",
+        "getaddrinfo",
+        "raw.settimeout",
         "connect",
+        "raw.settimeout",
+        "handshake.timeout",
+        "handshake",
         "settimeout",
         "putrequest",
         "putheader",
@@ -223,7 +304,11 @@ def test_every_blocking_step_is_bounded_by_the_time_left(script: Script) -> None
     ]
     # Each blocking step takes 0.5 s, so the time left shrinks before each one.
     assert script.details("init") == [(HOST, PORT, 10.0)]
-    assert script.details("settimeout") == [9.5, 9.0, 8.5, 8.0, 7.5]
+    assert script.details("getaddrinfo") == [(HOST, PORT)]
+    assert script.details("raw.settimeout") == [10.0, 9.5]
+    assert script.details("handshake") == [HOST]
+    assert script.details("handshake.timeout") == [9.5]
+    assert script.details("settimeout") == [9.0, 8.5, 8.0, 7.5, 7.0]
     assert script.details("read1") == [100, 100, 100]
 
 
@@ -267,11 +352,8 @@ def test_a_redirect_is_only_a_status(script: Script) -> None:
     assert len(script.connections) == 1
 
 
-def test_the_default_context_verifies_certificates_and_host_names(script: Script) -> None:
-    deadline = Deadline(script.clock, timedelta(seconds=10))
-    transport = HttpsTransport()
-    transport.post(path=CHAT_COMPLETIONS_PATH, headers=HEADERS, body=BODY, deadline=deadline)
-    context = script.connections[0].context
+def test_the_default_context_verifies_certificates_and_host_names() -> None:
+    context = HttpsTransport()._context
     assert isinstance(context, ssl.SSLContext)
     assert context.verify_mode is ssl.CERT_REQUIRED
     assert context.check_hostname is True
@@ -295,21 +377,66 @@ def test_no_time_left_means_no_connection(script: Script) -> None:
 
 
 def test_a_deadline_spent_midway_stops_before_the_next_step_and_closes(script: Script) -> None:
-    script.step_seconds = 6.0  # connecting takes 6 s and sending 6 more: past 10 s
+    script.step_seconds = 6.0  # connecting takes 6 s and the handshake 6 more: past 10 s
     exc = raised(lambda: post(script))
     assert type(exc) is TransportTimeout
-    assert script.details("settimeout") == [4.0]
-    assert "getresponse" not in script.names()
+    assert script.details("raw.settimeout") == [10.0, 4.0]
+    assert script.details("handshake.timeout") == [4.0]
+    assert script.details("settimeout") == []
+    assert "putrequest" not in script.names()
     assert script.names()[-1] == "close"
 
 
 def test_a_read_after_the_deadline_never_reaches_the_socket(script: Script) -> None:
-    exchange, deadline = post(script, budget=2.0)  # 1.5 s used: 0.5 s left
+    exchange, deadline = post(script, budget=2.5)  # 2.0 s used: 0.5 s left
     assert exchange.read(100, deadline) == b'{"ok":'  # ends at 2.0 s: no time left
     exc = raised(lambda: exchange.read(100, deadline))
     assert type(exc) is TransportTimeout
     assert script.details("read1") == [100]
     exchange.close()
+
+
+# --- the connect step shares the deadline ------------------------------------------------
+
+
+def test_an_address_that_never_answers_spends_the_budget_once(script: Script) -> None:
+    # IPv6 silently dropped: each address would otherwise get the whole budget again.
+    script.addresses = [IPV6, IPV4]
+    script.blackholed = {IPV6, IPV4}
+    started = script.clock.now
+    exc = raised(lambda: post(script))
+    assert type(exc) is TransportTimeout
+    assert script.details("connect") == [IPV6]  # the second address is never tried
+    assert script.details("raw.settimeout") == [10.0]
+    assert script.clock.now - started == 10.0
+    assert "handshake" not in script.names()
+    assert "raw.close" in script.names()
+
+
+def test_the_next_address_and_the_handshake_get_only_the_time_left(script: Script) -> None:
+    script.step_seconds = 3.0
+    script.addresses = [IPV6, IPV4]
+    script.refused = {IPV6}
+    exchange, _ = post(script)
+    exchange.close()
+    assert script.details("connect") == [IPV6, IPV4]
+    assert script.details("raw.settimeout") == [10.0, 10.0, 7.0]
+    assert script.details("handshake.timeout") == [7.0]  # not the 10 s the call began with
+    assert script.details("settimeout")[0] == 4.0
+
+
+def test_a_handshake_that_times_out_is_a_timeout_and_closes_its_socket(script: Script) -> None:
+    script.failures["handshake"] = TimeoutError(SENTINEL)
+    exc = raised(lambda: post(script))
+    assert type(exc) is TransportTimeout
+    assert script.names()[-2:] == ["raw.close", "close"]
+
+
+def test_a_name_with_no_address_is_a_failure(script: Script) -> None:
+    script.addresses = []
+    exc = raised(lambda: post(script))
+    assert type(exc) is TransportFailure
+    assert "connect" not in script.names()
 
 
 # --- failures ---------------------------------------------------------------------------
@@ -331,7 +458,9 @@ FAILURES: list[tuple[Callable[[], Exception], type[Exception]]] = [
 ]
 
 
-@pytest.mark.parametrize("step", ["connect", "putheader", "endheaders", "getresponse"])
+@pytest.mark.parametrize(
+    "step", ["getaddrinfo", "connect", "handshake", "putheader", "endheaders", "getresponse"]
+)
 @pytest.mark.parametrize(("make", "expected"), FAILURES)
 def test_a_failed_post_has_a_closed_kind_no_chain_and_a_closed_connection(
     script: Script, step: str, make: Callable[[], Exception], expected: type[Exception]
@@ -383,9 +512,6 @@ class SocketlessConnection(http.client.HTTPSConnection):
         self.sent: list[bytes] = []
         self.made.append(self)
 
-    def connect(self) -> None:
-        self.sock = cast(Any, FakeSocket(Script()))
-
     def send(self, data: Any) -> None:
         self.sent.append(bytes(data))
 
@@ -396,6 +522,7 @@ class SocketlessConnection(http.client.HTTPSConnection):
 @pytest.fixture
 def socketless(monkeypatch: pytest.MonkeyPatch) -> list[SocketlessConnection]:
     monkeypatch.setattr(SocketlessConnection, "made", [])
+    fake_network(monkeypatch, Script())
     # The stdlib global stays real: ``HTTPSConnection.__init__`` names it in ``super``.
     client = SimpleNamespace(**{**vars(http.client), "HTTPSConnection": SocketlessConnection})
     monkeypatch.setattr(stdlib_transport, "http", SimpleNamespace(client=client))

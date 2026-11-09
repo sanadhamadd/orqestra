@@ -138,11 +138,26 @@ def _connection_string(settings: Settings) -> tuple[str, str | None]:
     return dsn, None if password is None else str(password)
 
 
+def _settings_errors(exc: ValidationError) -> list[Any]:
+    """Each invalid setting's type, location and message, never its input (DEC-051).
+
+    A value can hold a secret even where the field is not one: a ``.env`` line
+    missing its newline gives one setting the text of the next.
+    """
+    return list(exc.errors(include_url=False, include_context=False, include_input=False))
+
+
+def _driver_detail(exc: psycopg.Error) -> str:
+    """A driver error's type and SQLSTATE: its message can carry connection details."""
+    code = f", SQLSTATE {exc.sqlstate}" if exc.sqlstate else ""
+    return f"{type(exc).__name__}{code}"
+
+
 def _health() -> int:
     try:
         settings = Settings()
     except ValidationError as exc:
-        print(json.dumps({"status": "error", "errors": exc.errors()}, default=str))
+        print(json.dumps({"status": "error", "errors": _settings_errors(exc)}, default=str))
         return 1
     configure_logging(settings.log_level)
     print(json.dumps({"status": "ok", "version": __version__, "settings": settings.redacted()}))
@@ -153,21 +168,21 @@ def _migrate() -> int:
     try:
         settings = Settings()
     except ValidationError as exc:
-        print(json.dumps({"status": "error", "errors": exc.errors()}, default=str))
+        print(json.dumps({"status": "error", "errors": _settings_errors(exc)}, default=str))
         return 1
     configure_logging(settings.log_level)
     try:
-        dsn, password = _connection_string(settings)
+        dsn, _ = _connection_string(settings)
     except _Refused as exc:
         return _error(str(exc))
-    # Other errors have the password redacted.
+    # A migration error's text is written by the runner. A driver's message can quote
+    # parts of a URL libpq parsed differently from what was meant, password included.
     try:
         applied = migrate(dsn)
-    except (MigrationError, psycopg.Error) as exc:
-        message = str(exc)
-        if password:
-            message = message.replace(password, "***")
-        return _error(message)
+    except MigrationError as exc:
+        return _error(str(exc))
+    except psycopg.Error as exc:
+        return _error(f"the database could not be reached or migrated ({_driver_detail(exc)})")
     print(json.dumps({"status": "ok", "applied": [migration.label for migration in applied]}))
     return 0
 
@@ -206,8 +221,7 @@ def _preflight(dsn: str, worker_settings: WorkerSettings) -> None:
         msg = f"the database schema is not current: {exc}"
         raise _Refused(msg) from None
     except psycopg.Error as exc:
-        code = f", SQLSTATE {exc.sqlstate}" if exc.sqlstate else ""
-        msg = f"the database could not be reached or read ({type(exc).__name__}{code})"
+        msg = f"the database could not be reached or read ({_driver_detail(exc)})"
         raise _Refused(msg) from None
 
 
@@ -222,8 +236,7 @@ def _worker_run(kinds: Sequence[str]) -> int:
         settings = Settings()
         worker_settings = WorkerSettings()
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        print(json.dumps({"status": "error", "errors": errors}, default=str))
+        print(json.dumps({"status": "error", "errors": _settings_errors(exc)}, default=str))
         return 1
     configure_logging(settings.log_level)
     try:
@@ -616,6 +629,12 @@ def _on_current_schema(
         # A backstop: every string is checked before this point.
         msg = "a value cannot be encoded as UTF-8 for the database"
         raise _Refused(msg) from None
+    except RecursionError:
+        # The parser's depth limit is the only one, and psycopg encodes the payload
+        # again on a deeper stack, so a payload just inside that limit can fail here.
+        # Nothing was stored: the submission's one transaction never reached the server.
+        msg = "a value is nested too deeply to send to the database"
+        raise _Refused(msg) from None
 
 
 def _job(args: argparse.Namespace) -> int:
@@ -623,8 +642,7 @@ def _job(args: argparse.Namespace) -> int:
     try:
         settings = Settings()
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        print(json.dumps({"status": "error", "errors": errors}, default=str))
+        print(json.dumps({"status": "error", "errors": _settings_errors(exc)}, default=str))
         return 1
     configure_logging(settings.log_level)
     try:

@@ -6,10 +6,12 @@
   (``/api/v1/chat/completions``) are constants. Redirects are not followed (a 3xx is
   just a status), no proxy setting is read from the environment, and the HTTP debug
   level stays 0, so nothing is printed.
-- **Deadline before every blocking step.** The connection is made with the time left
-  as its timeout, then the socket's timeout is set to the time left before the request
-  is sent, before the response head is read, and before each body read. With no time
-  left, ``TransportTimeout`` is raised before the step starts.
+- **Deadline before every blocking step.** The name is resolved, then each address is
+  tried in turn with the time left as its timeout, and no further address is tried once
+  the time is spent. The TLS handshake gets the time left after connecting. The
+  socket's timeout is then set to the time left before the request is sent, before the
+  response head is read, and before each body read. With no time left,
+  ``TransportTimeout`` is raised before the step starts.
 - **Closed failures.** A ``TimeoutError`` becomes ``TransportTimeout``; an ``OSError``
   (``ssl.SSLError`` included), an ``http.client.HTTPException``, a ``ValueError`` or an
   ``OverflowError`` becomes ``TransportFailure``. Only the kind is kept: the new error is
@@ -23,9 +25,12 @@
   response is closed by its exchange's ``close``.
 
 Limits (see the README): the standard library has no timeout for name lookup
-(``getaddrinfo``). Every other blocking step (connecting, including the TLS handshake;
-sending; reading the response head; each body read) is given the time left when that
-step starts, and the time is checked again only before the next step. Reading the
+(``getaddrinfo``). Every other blocking step (connecting to each address in turn; the
+TLS handshake; sending; reading the response head; each body read) is given the time
+left when that step starts, and the time is checked again only before the next step.
+``http.client`` would give every address the whole timeout and leave it on the socket
+for the handshake, so the transport connects the socket itself and hands it to the
+connection. Reading the
 response head (the status line, up to 100 header lines, and any ``100 Continue``
 responses) and reading one body chunk can each wait on the socket several times, and
 sending writes the head and the body separately. So a slow server can make one call
@@ -34,6 +39,7 @@ overrun its budget by more than one wait.
 
 import contextlib
 import http.client
+import socket
 import ssl
 from collections.abc import Mapping
 from enum import Enum
@@ -110,6 +116,44 @@ class _HttpsExchange:
         _close_quietly(self._connection)
 
 
+def _connect(context: ssl.SSLContext, deadline: Deadline) -> ssl.SSLSocket:
+    """A TLS socket to ``HOST``, every step within the time ``deadline`` has left.
+
+    Each resolved address is tried in turn, given the time left; once none is left,
+    ``TransportTimeout`` ends the attempt. The handshake gets the time left after
+    connecting. A socket that is not returned is closed.
+    """
+    addresses = socket.getaddrinfo(HOST, PORT, type=socket.SOCK_STREAM)
+    failure: OSError = OSError("the name resolved to no address")
+    for family, kind, proto, _, address in addresses:
+        remaining = deadline.remaining()  # raises TransportTimeout with no time left
+        raw = socket.socket(family, kind, proto)
+        try:
+            raw.settimeout(remaining)
+            raw.connect(address)
+        except OSError as exc:  # TimeoutError included: try the next address
+            _close_socket(raw)
+            failure = exc
+            continue
+        except BaseException:
+            _close_socket(raw)
+            raise
+        try:
+            with contextlib.suppress(OSError):  # as http.client does; only a latency hint
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            raw.settimeout(deadline.remaining())
+            return context.wrap_socket(raw, server_hostname=HOST)
+        except BaseException:
+            _close_socket(raw)
+            raise
+    raise failure
+
+
+def _close_socket(sock: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        sock.close()
+
+
 def _set_timeout(sock: object, deadline: Deadline) -> None:
     remaining = deadline.remaining()  # raises TransportTimeout with no time left
     settimeout = getattr(sock, "settimeout", None)
@@ -137,8 +181,8 @@ class HttpsTransport:
                 HOST, PORT, timeout=deadline.remaining(), context=self._context
             )
             connection = opened
-            opened.connect()
-            sock = opened.sock
+            sock = _connect(self._context, deadline)
+            opened.sock = sock  # an open socket: http.client sends on it, never reconnects
             _set_timeout(sock, deadline)
             # Host and Content-Length are the only headers added, for framing.
             opened.putrequest("POST", path, skip_accept_encoding=True)
