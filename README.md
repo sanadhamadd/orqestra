@@ -134,8 +134,10 @@ the current directory, if one exists. The file is read in every environment, pro
 included; a variable set in the environment takes precedence over it. `.env.example` lists
 every setting.
 
-Each command prints its result as one JSON line on standard output, and its logs as JSON lines
-on standard error; the expected outputs shown in this README leave the logs out.
+Each command except `version` and `worker run` prints its result as one JSON line on standard
+output (`version` prints the bare version; `worker run` prints a JSON line only when it refuses
+to start). Logs go to standard error as JSON lines, and the expected outputs shown in this
+README leave them out.
 
 ### Database
 
