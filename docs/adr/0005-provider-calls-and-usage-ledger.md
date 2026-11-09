@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (owner, 2026-11-07; was Proposed)
 - **Date:** 2026-11-07
-- **Ledger entries:** DEC-055, DEC-057 … DEC-062
+- **Ledger entries:** DEC-055, DEC-057 … DEC-062; applied by DEC-065 and DEC-066
 
 ## Context
 
@@ -65,7 +65,9 @@ crash cannot hide it, and what a report of those calls can honestly claim.
   verification workload and routing (PR #19), the per-attempt cap and call recorder
   (PR #25), the usage ledger (PR #24) and its closures (PR #26), the usage report (PR #27),
   the OpenRouter adapter (PR #29), the worker's usage sink (PR #30) and the boundaries for
-  live use (PR #31).
+  live use (PR #31). Two later entries apply them: the call budget check over the usage
+  report (DEC-065, PR #37) and the `orqestra job summary` and `orqestra job usage` commands
+  (DEC-066, PR #39).
 - A provider can never change a status by itself: a wrong reply is either refused or checked
   by the same arithmetic as everything else.
 - Calls per attempt are bounded by the cap, and calls per task by the cap times the task's

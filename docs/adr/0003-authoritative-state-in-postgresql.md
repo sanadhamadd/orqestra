@@ -1,8 +1,6 @@
 # ADR-0003: Authoritative execution state in PostgreSQL with generation fencing
 
-- **Status:** Proposed — owner-approved direction (2026-10-24), recorded after an
-  architecture audit and an independent review; awaiting the owner's acceptance of this
-  implementation in a reviewed change.
+- **Status:** Accepted (owner, 2026-11-08; was Proposed) · owner-approved direction (2026-10-24)
 - **Date:** 2026-10-24
 - **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-051 and DEC-053
 
@@ -21,8 +19,9 @@ detect this: after `running → queued → running`, the state matches again.
 - PostgreSQL is the authoritative store for jobs, tasks and attempts. Any future queue
   delivers work; it does not own state.
 - A task is the unit of work; an attempt is one execution of it by one worker. Attempts
-  have their own lifecycle (`running → succeeded | failed | cancelled`); failed attempts
-  record a `FailureKind` and error details.
+  have their own lifecycle (`running → succeeded | failed | cancelled | revoked`, where only
+  recovery writes `revoked`, DEC-037, DEC-038); failed attempts record a `FailureKind` and
+  error details.
 - `tasks.attempt_count` is the task's ownership generation. Claiming a task
   (`queued → running`) advances it by exactly one and creates attempt *N = attempt_count*.
   The database rejects any other change to it (trigger `tasks_attempt_count_fencing`).
@@ -106,7 +105,7 @@ detect this: after `running → queued → running`, the state matches again.
   a worker for explicitly named built-in kinds after a read-only check that the schema's
   migration history equals the packaged one exactly; it never migrates and refuses to
   start against any other history (DEC-051).
-- Implemented and verified locally only, not yet in GitHub CI: durable retry
+- Implemented and verified locally and in GitHub CI (PR #17): durable retry
   eligibility. Every task stores `available_at`, the database time from which it may be
   claimed (migration 0004). A requeue after a transient failure, or after a
   `lease_expired` or `deadline_exceeded` revocation, sets it to the database clock at the
