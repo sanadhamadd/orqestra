@@ -366,10 +366,36 @@ def test_end_process_exits_even_when_stderr_cannot_be_written(
     assert codes == [3]
 
 
+# Makes fd 2 a pipe that nobody reads and that is full: a writer thread blocks on
+# a write far larger than any pipe holds (a pipe may grow for a blocking write, so
+# a nonblocking fill is not enough), and fd 2 then no longer reports room. A line
+# padded with PAD is longer than any pipe writes at once, so writing it blocks.
+_FULL_PIPE = textwrap.dedent(
+    """
+    import os, select, threading, time
+
+    PAD = "x" * 8192
+
+    def fill_full_pipe():
+        global kept_read_end  # held open, never read
+        kept_read_end, write_end = os.pipe()
+        os.dup2(write_end, 2)
+        threading.Thread(target=os.write, args=(2, b"x" * (1 << 22)), daemon=True).start()
+        room = select.poll()
+        room.register(2, select.POLLOUT)
+        for _ in range(1000):
+            if not room.poll(0):
+                return
+            time.sleep(0.01)
+        raise SystemExit("the pipe never filled")
+    """
+)
+
 # The production watchdog in a real process whose main thread is blocked, as
 # in a stalled database call; stderr is made unusable first. Exit code 3 means
 # the watchdog ended the process; 0 with "still running" means it did not.
-_BLOCKED_PROCESS = textwrap.dedent(
+
+_BLOCKED_PROCESS = _FULL_PIPE + textwrap.dedent(
     """
     import os, sys, threading, time
     from orqestra.worker.fence import Guard, Watchdog
@@ -380,16 +406,20 @@ _BLOCKED_PROCESS = textwrap.dedent(
         read_end, write_end = os.pipe()
         os.dup2(write_end, 2)
         os.close(read_end)
+    context = {"worker_id": "test"}
+    if sys.argv[1] == "full":
+        fill_full_pipe()
+        context["pad"] = PAD  # the line it logs is in the context
     watchdog = Watchdog()
     watchdog.start()
-    watchdog.arm(Guard.OWNERSHIP, time.monotonic() + 0.2, {"worker_id": "test"})
+    watchdog.arm(Guard.OWNERSHIP, time.monotonic() + 0.2, context)
     threading.Event().wait(10)
     print("still running", flush=True)
     """
 )
 
 
-@pytest.mark.parametrize("stderr", ["writable", "closed", "broken-pipe"])
+@pytest.mark.parametrize("stderr", ["writable", "closed", "broken-pipe", "full"])
 def test_the_watchdog_ends_a_real_process_whatever_state_stderr_is_in(stderr: str) -> None:
     started = time.monotonic()
     # subprocess.run kills the child if the outer timeout expires.
@@ -406,6 +436,94 @@ def test_the_watchdog_ends_a_real_process_whatever_state_stderr_is_in(stderr: st
     if stderr == "writable":
         line = json.loads(result.stderr.strip().splitlines()[-1])
         assert line["event"] == "ownership_deadline_passed"
+
+
+# end_process from a signal handler: the main thread may be inside threading's
+# Thread.start, holding its lock, when the second signal arrives (DEC-049). On
+# Python 3.12 that lock is reentrant, so a threading.Thread writer would not hang
+# here either; the test pins that the exit still comes within the bound.
+_SIGNALLED_PROCESS = _FULL_PIPE + textwrap.dedent(
+    """
+    import threading
+    from orqestra.worker.fence import ExitCode, end_process
+
+    fill_full_pipe()
+    with threading._active_limbo_lock:
+        end_process(ExitCode.SHUTDOWN, "shutdown_forced", "signal", {"worker_id": "t", "pad": PAD})
+    """
+)
+
+
+def test_end_process_ends_even_inside_thread_start_with_stderr_full() -> None:
+    started = time.monotonic()
+    # subprocess.run kills the child if it hangs; a hang fails the test.
+    result = subprocess.run(
+        [sys.executable, "-c", _SIGNALLED_PROCESS],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == ExitCode.SHUTDOWN
+    assert time.monotonic() - started < 10
+
+
+class CountingClock(FakeClock):
+    """A fake clock that tells the test once the watchdog thread has read it twice.
+
+    The thread reads the clock to check, then to compute its wait, both under the
+    watchdog's lock; whatever the test does under that lock next happens while the
+    thread waits.
+    """
+
+    def __init__(self, now: float) -> None:
+        super().__init__(now)
+        self.reads = 0
+        self.waiting = threading.Event()
+
+    def __call__(self) -> float:
+        self.reads += 1
+        if self.reads >= 2:
+            self.waiting.set()
+        return self.now
+
+
+def test_a_deadline_beyond_what_threading_can_wait_for_never_stops_the_thread() -> None:
+    clock = CountingClock(0.0)
+    dog, recorder = watchdog(clock)
+    dog.arm(Guard.OWNERSHIP, 1e10, CONTEXT)  # past threading.TIMEOUT_MAX
+    dog.start()
+    try:
+        assert clock.waiting.wait(10)
+        clock.now = 0.5
+        dog.arm(Guard.OPERATION, 0.5, CONTEXT)  # wakes the thread, if it still runs
+        assert recorder.fired.wait(10)  # before the clamp: the thread died of OverflowError
+        (expiry,) = recorder.expiries
+        assert (expiry.guard, expiry.deadline) == (Guard.OPERATION, 0.5)
+    finally:
+        dog.stop(5)
+
+
+@pytest.mark.parametrize("change", ["move_to", "restrict", "arm-operation"])
+def test_a_sooner_deadline_wakes_a_thread_sleeping_on_a_later_one(change: str) -> None:
+    clock = CountingClock(0.0)
+    dog, recorder = watchdog(clock)
+    token = dog.arm(Guard.OWNERSHIP, 3600.0, CONTEXT)
+    dog.start()
+    try:
+        assert clock.waiting.wait(10)  # the thread sleeps until 3600.0
+        clock.now = 0.2
+        if change == "move_to":
+            assert dog.move_to(token, 0.2)  # a confirmed cancellation's grace end (DEC-068)
+        elif change == "restrict":
+            assert dog.restrict(token, 0.2)
+        else:
+            dog.arm(Guard.OPERATION, 0.2, CONTEXT)
+        assert recorder.fired.wait(10)  # not an hour later
+        (expiry,) = recorder.expiries
+        assert (expiry.deadline, expiry.now) == (0.2, 0.2)
+    finally:
+        dog.stop(5)
 
 
 def test_a_confirmed_renewal_after_the_old_deadline_but_before_the_check_does_not_expire() -> None:

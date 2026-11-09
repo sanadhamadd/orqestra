@@ -182,6 +182,10 @@ class Timing:
     sweep_reserve: float  # the time one database step may take (db_operation_timeout)
     # When the usage record a running handler waits on is due; None: none waits (DEC-059).
     usage_due: float | None = None
+    # The armed ownership deadline while a handler runs; None: none is armed (DEC-070).
+    fence_due: float | None = None
+    # When the running attempt's last heartbeat call returned; None: none yet (DEC-070).
+    heartbeat_ended: float | None = None
 
 
 def next_step(timing: Timing) -> tuple[Step, float]:
@@ -193,10 +197,18 @@ def next_step(timing: Timing) -> tuple[Step, float]:
     then, only when idle, a stop or a claim. While a handler runs, a usage
     write and a sweep step start only if they can take their full
     ``sweep_reserve`` and still end before the next heartbeat is due (always,
-    once renewals have stopped), so neither ever delays a heartbeat. A usage
-    record is written while a stopping worker drains; a stopping worker starts
-    no sweep and no claim (DEC-049). Every wait is finite and positive, and the
-    supervisor's wake pipe can end it sooner.
+    once renewals have stopped). A step that was already due when the last
+    heartbeat ended, and still does not fit that way, may also start if it and
+    a heartbeat after it can both take their full ``sweep_reserve`` and still
+    end before the ownership fence (DEC-070). The first never delays a
+    heartbeat; the second delays one by at most one ``sweep_reserve`` and never
+    past the point where it could still be confirmed, so a heartbeat that takes
+    nearly its whole bound cannot hold every other step back, and a step that
+    falls due between heartbeats still waits for the next one as before. A
+    usage record is written while a stopping worker
+    drains; a stopping worker starts no sweep and no claim (DEC-049). Every
+    wait is finite and positive, and the supervisor's wake pipe can end it
+    sooner.
     """
     t = timing
     if t.drain_due is not None and t.now >= t.drain_due:
@@ -209,12 +221,22 @@ def next_step(timing: Timing) -> tuple[Step, float]:
         heartbeat = t.heartbeat_due
         if heartbeat is not None and t.now >= heartbeat:
             return Step.HEARTBEAT, 0.0
-        clear = heartbeat is None or heartbeat - t.now >= t.sweep_reserve
+        # The latest due time a step may have and still start now.
+        if heartbeat is None or heartbeat - t.now >= t.sweep_reserve:
+            due_by = math.inf  # it ends before the next heartbeat is due
+        elif (
+            t.fence_due is not None
+            and t.heartbeat_ended is not None
+            and t.fence_due - t.now >= 2 * t.sweep_reserve
+        ):
+            due_by = t.heartbeat_ended  # it and a heartbeat after it end before the fence
+        else:
+            due_by = -math.inf
         usage = t.usage_due
-        if usage is not None and t.now >= usage and clear:
+        if usage is not None and t.now >= usage and usage <= due_by:
             return Step.USAGE, 0.0
         sweeping = not t.stopping
-        if sweeping and t.now >= t.sweep_due and clear:
+        if sweeping and t.now >= t.sweep_due and t.sweep_due <= due_by:
             return Step.SWEEP, 0.0
         # Work held back for the heartbeat waits for it; otherwise wake for whichever is due.
         wakes = [] if heartbeat is None else [heartbeat]
@@ -370,6 +392,7 @@ class _Running:
     cancel: threading.Event
     heartbeat_due: float | None
     completion_due: float = 0.0
+    heartbeat_ended: float | None = None  # when the last heartbeat call returned (DEC-070)
     # An earlier write of this outcome may have committed: read the evidence
     # before writing again (DEC-047).
     uncertain: bool = False
@@ -394,6 +417,10 @@ class _Held:
 def _close_pipe(*fds: int) -> None:
     for fd in fds:
         os.close(fd)
+
+
+# The longest timeout select.poll accepts: a C int of milliseconds, about 24.8 days.
+_LONGEST_POLL_MS = 2**31 - 1
 
 
 class _Wake:
@@ -431,8 +458,15 @@ class _Wake:
                 pass
 
     def wait(self, seconds: float) -> None:
-        """Wait up to ``seconds`` (rounded up to whole milliseconds), or until woken."""
-        self._poll.poll(math.ceil(seconds * 1000))
+        """Wait up to ``seconds`` (rounded up to whole milliseconds), or until woken.
+
+        ``poll`` takes a C ``int`` of milliseconds, so a longer wait is cut to
+        ``_LONGEST_POLL_MS`` (about 24.8 days) and returns early; the supervisor
+        then reads its schedule again and waits for the rest. A negative timeout
+        would make ``poll`` wait forever, so one below zero is a check that does
+        not wait.
+        """
+        self._poll.poll(max(0, min(math.ceil(seconds * 1000), _LONGEST_POLL_MS)))
 
 
 @dataclass(slots=True)
@@ -554,7 +588,9 @@ class Worker:
                         self._require_running().context,
                     )
                 elif step is Step.HEARTBEAT:
-                    self._heartbeat(self._require_running())
+                    held = self._require_running()
+                    self._heartbeat(held)
+                    held.heartbeat_ended = self._clock()
                 elif step is Step.COMPLETE:
                     self._complete(self._require_running())
                 elif step is Step.USAGE:
@@ -654,6 +690,8 @@ class Worker:
             claim_due=self._schedule.claim_due,
             sweep_reserve=self._bound(),
             usage_due=None if request is None else request.due,
+            fence_due=self._watchdog.deadline(Guard.OWNERSHIP) if busy else None,
+            heartbeat_ended=running.heartbeat_ended if busy and running is not None else None,
         )
 
     def _waiting_usage(self) -> UsageRequest | None:
@@ -1246,6 +1284,16 @@ class Worker:
         except (psycopg.Error, ConnectionUnavailable) as exc:
             self._event(logging.WARNING, "sweep_failed", type(exc).__name__)
             revocation, sweep.left = None, 1  # end this sweep
+        except ValueError as exc:
+            # A retry time recovery cannot represent; the transaction rolled back, so
+            # the attempt stays overdue for every worker. The settings refuse a delay
+            # that can reach this (DEC-070); this is the backstop, as for completions.
+            self._terminate(
+                ExitCode.DEFECT,
+                "sweep_refused",
+                f"the recovery sweep was refused: {type(exc).__name__}",
+                self._base_context(),
+            )
         if revocation is not None:
             revoked = revocation.attempt
             self._event(
