@@ -1,6 +1,6 @@
 # ADR-0001: Record architecture decisions
 
-- **Status:** Proposed
+- **Status:** Accepted (owner, 2026-11-08; was Proposed)
 - **Date:** 2026-10-22
 
 ## Context

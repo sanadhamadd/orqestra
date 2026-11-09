@@ -51,12 +51,14 @@ undecided too (DEC-040), and so are operational retry delays (DEC-053).
 - **WHY:** Maps directly to the charter's test gates and keeps PR CI fast and deterministic.
 - **RUNNER-UP:** Separate test directories only — works, but cannot express "slow" per test.
 - **Persistence foundation note:** where the coverage threshold is enforced is revisited by DEC-023.
+- **Note (2026-11-08):** no test carries the `e2e` marker yet, and both lanes exclude it; the full submit, process and aggregate path is exercised by integration tests instead (`tests/integration/test_bench_smoke_pg.py`).
 
 ### DEC-007 — pydantic-settings for configuration
 - **Status:** Accepted (owner, 2026-11-07; was Proposed)
 - **WHAT:** `Settings(BaseSettings)` with `ORQESTRA_` prefix, `.env` in development, `SecretStr` for the DSN, validated ranges.
 - **WHY:** Fails fast on bad values; secrets cannot leak through `repr`. It is used for settings only: job and task records are frozen standard-library dataclasses (DEC-026).
 - **RUNNER-UP:** Hand-rolled `os.environ` parsing — zero dependencies, no validation, silent bad values.
+- **Note (2026-11-08):** `.env` is read from the current directory in every environment, not only in development: `Settings` and `WorkerSettings` set `env_file=".env"` with no condition (`config.py`, `worker/settings.py`), and a variable set in the environment takes precedence.
 
 ### DEC-008 — Explicit immutable transition table for task states
 - **Status:** Accepted (owner, 2026-11-07; was Proposed)
@@ -98,7 +100,7 @@ undecided too (DEC-040), and so are operational retry delays (DEC-053).
 - **RUNNER-UP:** Track a tool-specific instruction file — visible to contributors, but mixes machine-local material into the public record.
 
 ### DEC-014 — Deferred at the start (explicitly not chosen)
-- **Status:** Proposed, superseded in part: Docker Compose (`compose.yaml`, PR #33) and the architecture document (`docs/architecture.md`, PR #38) now exist; the other seven deferrals stand.
+- **Status:** Proposed, superseded in part: Docker Compose (`compose.yaml`, PR #33) and the architecture document (`docs/architecture.md`, PR #38) now exist; the other seven deferrals stand. The `LICENSE` is deferred until publication (owner, 2026-11-08): until then Orqestra is not licensed and all rights are reserved.
 - **WHAT:** Docker Compose, Dockerfile, pre-commit, security scanners, Dependabot, issue templates, architecture doc, `LICENSE`, `CHANGELOG`.
 - **WHY:** None supports an immediate engineering objective; Docker could not be verified locally today (daemon not running) and unverified config is not committed.
 - **RUNNER-UP:** Ship them all at the start — fuller skeleton, more unverified surface.
@@ -450,6 +452,7 @@ is not stopped (left to the worker runtime).
   - A test for every new constraint and for the trigger, in `test_schema_constraints.py`; the domain/schema drift test now includes revocation reasons.
   - Locally, removing `NOWAIT` made a test fail after 10 s instead of refusing, and removing the refusal, the isolation check, the trigger or `attempts_lease_required` each failed tests.
 - **Cancellation grace note:** migration 0003 follows the same locking rule, `NOWAIT` before any change, but needs neither the running-work refusal nor the isolation check, because it changes no data-dependent state (DEC-041).
+- **Note (2026-11-08):** the TRADE-OFF's "any session using the tables, even an idle reader" is wider than the locks in step 2. `EXCLUSIVE` on `tasks` does not conflict with a plain read's `ACCESS SHARE`, so a transaction that has only read `tasks` does not stop the upgrade; any lock on `attempts`, or a write or `FOR UPDATE`/`FOR SHARE` on `tasks`, does. 0002 changes nothing in `tasks`.
 
 ## Bounded cancellation grace period
 
@@ -1162,6 +1165,7 @@ merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (ru
     - **cancellation:** a committed request cancels a running wait, and the worker carries on;
     - **signals:** SIGTERM or SIGINT while idle exits 0; a busy worker that settles within the drain exits 0, and one that cannot exits 9;
     - **a lost database while busy** exits 3.
+- **Note (2026-11-08):** "never its input" means pydantic's `input` field, which `exc.errors(include_input=False)` leaves out; a validator's message can still name the parsed value it checks, such as the durations a relationship compares (`worker/settings.py`, `domain/leases.py`).
 
 ## Deterministic task partitioning
 
@@ -1219,6 +1223,7 @@ accepted it on 2026-11-07. It was merged in PR #16
     - accepting a `bool` batch size;
     - accepting empty input;
     - accepting a NUL prefix.
+- **Note (2026-11-08):** BS-05 names the large-scale benchmark that the batch size, size limits and operating values wait for; DEC-054 and DEC-056 use the same label. The harness that runs it is described in the README, "Running the benchmarks".
 
 ## Durable retry scheduling
 
@@ -1313,6 +1318,7 @@ recorded on PR #17.
   - The schema is tiny and synthetic. A different schema changes only `model.py` and `checks.py`.
   - There is no cap on provider calls per invoice; it would be an invented policy and remains undecided. *Amended by DEC-057:* there is still no per-invoice cap, but the caller must now set a per-attempt cap.
 - **VERIFICATION:** Unit tests cover normalization, both rules, routing (including an exhaustive small-space comparison and permutation invariance), the provider contract and mock, every path of verification, the handler through `run_handler`, a golden replay, the persisted-result shape, an import scan and a runtime network guard. One integration test runs partition, submit, claim, handler and completion against PostgreSQL and reads the retry time after a transient provider error. The results of the fixed test profile are recorded on the pull request, not here.
+- **Note (2026-11-08):** a `ProviderRequest` also carries a content-derived `request_id` and the call's `timeout` (`calls/provider.py`), as ADR-0005 states; neither adds invoice data.
 
 ## Invoice job summary
 
@@ -1340,6 +1346,7 @@ recorded on PR #17.
   - A `complete` summary is stable only if the engine's contracts hold (`SUCCEEDED` has no outgoing transition and only a completion writes a result). The schema does not enforce that, so a manual edit could change it. A summary that is not complete is a point-in-time observation.
   - A batch with `items: []` is valid but is never `complete`. Batch size and limits stay undecided (BS-05).
 - **VERIFICATION:** Unit tests (`tests/unit/test_invoice_summary.py`) cover absolute-index mapping at offsets 0, 3 and 100 with the offset-added and relative-index regressions, every anomaly code and every batch-rejection condition, the partition rules, a conservation check of `processed + unprocessed + missing + invalid == expected` and order independence over every combination of up to three tasks drawn from twelve shapes, `complete` in each negative case, the deterministic sample bound, frozen and zero-filled output, payload-shape parity with the handler, and that no value from the data reaches a summary. Integration tests (`tests/integration/test_invoice_summary_pg.py`, real PostgreSQL) run the real lifecycle for happy paths and use raw SQL only for corrupt fixtures: payloads `5`, `"x"`, JSON `null`, `[1]`, `{"invoice_id": "INV-1"}`, `{"offset": 1.5, "items": []}` and `{"offset": 0, "items": "x"}` are first shown to fail an unguarded projection and are then reported without a database error; the projection is compared with the Python description of each payload; a completion committed after the job row is read is invisible to the stream, and a companion test asserts that weakening the isolation level to `READ COMMITTED` makes it visible, so the first test is sensitive to the level; partial jobs and nine kinds of corrupt result; a write inside the snapshot fails; table contents are unchanged by a read; the connection ends outside a transaction after success, an error and an abandoned stream, in autocommit and manual-commit mode; a caller-open transaction is refused; and fetch sizes 1, 2 and 1,000 give identical summaries. Three tests marked `performance` (never in a default lane) seed with raw SQL and record time, `tracemalloc` peak and RSS at 50,000 invoices for batch sizes 1, 10, 100 and 1,000, the ordering and fetch-size cost, and reads made while tasks complete, asserting correctness only. The results of the fixed test profile are recorded on the pull request, not here.
+- **Note (2026-11-08):** the README's invoice examples now submit DEC-052 batches only; the projection must still be total because `submit_job` and `orqestra job submit` accept any JSON payload for any kind. DEC-066 later added `orqestra job summary`, which prints this summary.
 
 ## Provider call recording
 
@@ -1529,6 +1536,7 @@ recorded on PR #17.
   - Invoice verification stays unavailable from `orqestra worker run` until every registration condition is met.
   - Until the measurements justify an index, each claim keeps scanning and sorting the queued tasks.
 - **VERIFICATION:** This entry changes documentation only, with no code, schema or test changes. Each condition is verified by tests in the change that implements it. The registration change shows each condition refusing registration when unmet. The claim-index choice rests on recorded measurements, not on a fixed threshold.
+- **Note (2026-11-08):** the CLI now also submits jobs and reads their status, summary and usage (`orqestra job`, DEC-064, DEC-066); there is still no inbound API.
 
 ## Provider call package name
 

@@ -9,22 +9,27 @@ not repeat them.
 
 ## Components
 
-| Package | Role | Talks to the database |
+| Code | Role | Talks to the database |
 | --- | --- | --- |
 | [`domain`](../src/orqestra/domain/) | Pure rules: job and task records, the state tables, leases, retry policy, partitioning, job kinds | No |
 | [`persistence`](../src/orqestra/persistence/) | Migrations, submission, the attempt lifecycle, the provider usage ledger and consistent snapshots | Yes, one short transaction per operation |
 | [`worker`](../src/orqestra/worker/) | The single-slot worker: supervisor, handler thread, watchdog, usage sink, graceful shutdown | Through the supervisor only |
 | [`calls`](../src/orqestra/calls/) and [`providers`](../src/orqestra/providers/) | The provider-neutral call contract, call recording and route selection; an OpenRouter adapter that is not wired in | No |
 | [`workloads/invoice`](../src/orqestra/workloads/invoice/) | Synthetic invoice verification: deterministic checks first, a provider only for an ambiguous amount, and the job summary | No |
-| [`aggregation`](../src/orqestra/aggregation/) | `summarize_invoice_job` and `report_job_usage`, each from one snapshot | Read only |
-| [`cli`](../src/orqestra/cli.py) | `orqestra migrate`, `job submit`, `job status` and `worker run` | Yes |
+| [`aggregation`](../src/orqestra/aggregation/) | `summarize_invoice_job`, `report_job_usage` and the call budget check (`read_job_call_budget`, DEC-065), each from one snapshot | Read only |
+| [`cli`](../src/orqestra/cli.py) | `orqestra version`, `health`, `migrate`, `worker run`, `job submit`, `job status`, `job summary` and `job usage` | Yes, except `version` and `health` |
+| [`config`](../src/orqestra/config.py) | `Settings`: validated `ORQESTRA_*` settings with secrets redacted | No |
+| [`logging`](../src/orqestra/logging.py) | One JSON object per log line, with job, task and attempt IDs when a call supplies them | No |
+| [`benchmarks`](../benchmarks/) (not packaged) | The measurement harness: cells, ladders, claim cost, failure drills and the report tables | Only the dedicated `orqestra_bench` database |
 
 ## Data path
 
 Everything a job does is a row. Submission writes the job and all of its tasks at once. A worker
 claims a task, which writes an attempt; while the handler runs, the supervisor writes the
-attempt's lease renewals and, through the `UsageSink`, each provider call before and after it is
-made. Reports never write: they read one `REPEATABLE READ, READ ONLY` snapshot.
+attempt's lease renewals and, in a worker built with a `UsageSink`, each provider call before and
+after it is made. `orqestra worker run` builds its worker without one (it runs only the diagnostic
+handlers); only the unpackaged benchmark workers and the process tests' worker wire it. Reports
+never write: they read one `REPEATABLE READ, READ ONLY` snapshot.
 
 ```mermaid
 flowchart LR
@@ -42,11 +47,13 @@ flowchart LR
 
     tasks -- "claim_next_attempt<br/>FOR UPDATE SKIP LOCKED" --> supervisor
     supervisor -- "claim, renew, complete,<br/>revoke expired" --> attempts[(attempts)]
-    supervisor -- "UsageSink: intent, result, closure" --> ledger[("provider_calls<br/>provider_call_results<br/>attempt_usage_closures")]
+    supervisor -- "UsageSink, if wired:<br/>intent, result, closure" --> ledger[("provider_calls<br/>provider_call_results<br/>attempt_usage_closures")]
 
     jobs & tasks & attempts & ledger --> snapshot["job_batch_snapshot<br/>REPEATABLE READ, READ ONLY"]
     snapshot --> summary["summarize_invoice_job"]
     snapshot --> usage["report_job_usage"]
+    summary --> clisummary["orqestra job summary"]
+    usage --> cliusage["orqestra job usage"]
 ```
 
 - **Submission** ([`persistence/jobs.py`](../src/orqestra/persistence/jobs.py)): one READ
@@ -59,7 +66,8 @@ flowchart LR
   [`worker/fence.py`](../src/orqestra/worker/fence.py)): the supervisor alone uses the
   database; the handler runs on its own thread; the watchdog ends the process when an armed
   deadline passes (DEC-045).
-- **Usage** ([`worker/usage.py`](../src/orqestra/worker/usage.py)): an intent row commits before
+- **Usage** ([`worker/usage.py`](../src/orqestra/worker/usage.py)): in a worker with a
+  `UsageSink`, an intent row commits before
   each provider call and a result row after it; the attempt's capture is closed in the
   transaction that ends it (DEC-057 to DEC-059).
 - **Reports** ([`persistence/snapshots.py`](../src/orqestra/persistence/snapshots.py)): every
@@ -70,8 +78,10 @@ flowchart LR
 
 Both lifecycles are explicit, immutable tables in
 [`domain/states.py`](../src/orqestra/domain/states.py) (`TASK_TRANSITIONS` and
-`ATTEMPT_TRANSITIONS`), the single source of legal moves. Conditional writes derive their
-`WHERE state = ANY(...)` guards from them (`allowed_sources`). The diagrams and tables below are
+`ATTEMPT_TRANSITIONS`), the single source of legal moves. The claim's discovery query takes its
+`WHERE state = ANY(...)` filter from `TASK_TRANSITIONS` (`allowed_sources(TaskState.RUNNING)`);
+every other lifecycle write locks its rows and then decides with `can_transition`, `transition`
+and `transition_attempt` (DEC-028). The diagrams and tables below are
 checked against those tables by
 [`tests/unit/test_architecture_doc.py`](../tests/unit/test_architecture_doc.py): adding or
 removing a move on either side fails it.
@@ -85,7 +95,7 @@ stateDiagram-v2
     queued --> running: claimed
     queued --> cancelled: cancellation requested
     running --> succeeded: completed
-    running --> failed: permanent error or retries exhausted
+    running --> failed: permanent or unclassified error, or retries exhausted
     running --> queued: retry, lease expiry or requeue
     running --> cancelled: cancelled
     succeeded --> [*]
@@ -98,7 +108,7 @@ stateDiagram-v2
 | queued | running | a worker claims it |
 | queued | cancelled | cancellation is requested while it waits for a claim |
 | running | succeeded | the current attempt completes with a result |
-| running | failed | a permanent error, or the last allowed attempt failed or was revoked |
+| running | failed | a permanent or unclassified failure, or the last allowed attempt failed or was revoked |
 | running | queued | a transient failure or a revoked attempt with attempts left; it waits until `available_at` |
 | running | cancelled | the attempt completes as cancelled, or recovery revokes it after a cancellation request |
 
@@ -180,8 +190,10 @@ sequenceDiagram
   current running generation; any other write is rejected with a typed error and changes
   nothing.
 - **Revocation** (DEC-037, DEC-038): one expired attempt per transaction, re-checked after its
-  locks. The task follows the transient-failure rule, unless cancellation was requested: then
-  it is cancelled whatever retry budget is left (DEC-040).
+  locks. A `cancellation_grace_expired` revocation cancels the task whatever retry budget is
+  left (DEC-040). The other reasons follow the transient-failure rule: requeued while attempts
+  remain, cancelled instead if a request is pending, and failed once the budget is used up,
+  request or not (DEC-038).
 
 ## Invariants
 
@@ -205,7 +217,10 @@ per attempt, and only for the current generation.
 | A worker process dies | Its lease expires; any live worker's sweep revokes the attempt and the task is retried by its policy |
 | A supervisor database call stalls | The watchdog's operation guard ends the process (exit 4) |
 | Ownership cannot be confirmed while a handler runs | The ownership guard or the supervisor ends the process (exit 3) |
-| A completion's answer is lost | The supervisor reconciles it from one read; the handler never runs again (DEC-047) |
+| A handler raises a `BaseException` that is not an `Exception` (a control-plane signal) | Nothing is recorded and the process ends (exit 5); recovery takes the attempt after its lease (DEC-009) |
+| A completion's answer is lost | The supervisor reconciles it from one read; the handler never runs again (DEC-047); if it is still unresolved at the attempt's deadline, the process ends (exit 6) |
+| An outcome cannot be recorded before the attempt's deadline | The process ends (exit 8); recovery takes the attempt after its lease (DEC-046) |
+| An invariant breaks, or the database rejects a valid outcome | The process ends as a defect (exit 7, DEC-046) |
 | A worker is stopping | It claims nothing new and drains the task it holds, or ends at `shutdown_timeout` (exit 9, DEC-049) |
 | A provider call record cannot be written | The fence ends the process first; exit 8 is the backstop (DEC-059) |
 | A stale worker completes late | The write is refused with a typed error and changes nothing |
