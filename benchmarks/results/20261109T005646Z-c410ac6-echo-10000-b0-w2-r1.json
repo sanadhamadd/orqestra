@@ -1,0 +1,309 @@
+{
+  "cell": {
+    "batch": null,
+    "profile": "echo",
+    "repetition": 1,
+    "seed": 20261107,
+    "size": 10000,
+    "workers": 2
+  },
+  "claim_gap": {
+    "max": 0.029299020767211914,
+    "n": 9998,
+    "p50": 0.0068399906158447266,
+    "p95": 0.0107269287109375,
+    "p99": 0.01313018798828125
+  },
+  "contention": {
+    "by_state": {
+      "active/Client": {
+        "max": 1,
+        "mean": 0.06382978723404255
+      },
+      "active/IO": {
+        "max": 1,
+        "mean": 0.0425531914893617
+      },
+      "active/LWLock": {
+        "max": 1,
+        "mean": 0.02127659574468085
+      },
+      "active/none": {
+        "max": 2,
+        "mean": 0.5106382978723404
+      },
+      "idle in transaction/Client": {
+        "max": 2,
+        "mean": 0.8297872340425532
+      },
+      "idle in transaction/IO": {
+        "max": 1,
+        "mean": 0.02127659574468085
+      },
+      "idle in transaction/none": {
+        "max": 1,
+        "mean": 0.0425531914893617
+      },
+      "idle/Client": {
+        "max": 3,
+        "mean": 1.446808510638298
+      },
+      "idle/none": {
+        "max": 1,
+        "mean": 0.02127659574468085
+      }
+    },
+    "sample_errors": 0,
+    "samples": 47,
+    "window_s": 46.940245833975496
+  },
+  "database_stats": {
+    "commits": {
+      "idle_rate_per_s": 26.264002077887035,
+      "idle_seconds": 2.8852930830034893,
+      "job_commits": 40093.22065647268,
+      "method": "xact_commit delta from just before the submission to STATS_SETTLE after the wait, less idle_rate_per_s x idle_seconds (the submission and the settle); the harness's reads roll back and never commit; it includes the submit command's own few commits (its schema check and the submission), fixed per job; each end may be off by up to about 1 s of idle claims, because counters are published at most once a second",
+      "xact_commit_delta": 40169.0
+    },
+    "commits_per_task": 4.009322065647268,
+    "database": {
+      "blks_hit": 2941712.0,
+      "blks_read": 2.0,
+      "deadlocks": 0.0,
+      "temp_bytes": 0.0,
+      "tup_fetched": 716386.0,
+      "tup_inserted": 20031.0,
+      "tup_updated": 30096.0,
+      "xact_commit": 40169.0,
+      "xact_rollback": 271.0
+    },
+    "tables": {
+      "attempts": {
+        "idx_scan": 30054.0,
+        "n_dead_tup": 7945.0,
+        "n_tup_upd": 10000.0,
+        "seq_scan": 0.0
+      },
+      "provider_calls": {
+        "idx_scan": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_upd": 0.0,
+        "seq_scan": 0.0
+      },
+      "tasks": {
+        "idx_scan": 50063.0,
+        "n_dead_tup": 1999.0,
+        "n_tup_upd": 20000.0,
+        "seq_scan": 10244.0
+      }
+    }
+  },
+  "drill": null,
+  "environment": {
+    "compose_project": "orqestra-bench",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": {
+      "container": "orqestra-bench-postgres-1",
+      "image": "postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97",
+      "image_id": "sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97",
+      "vm_cpus": 8,
+      "vm_memory_bytes": 4108828672
+    },
+    "git_dirty": false,
+    "git_sha": "c410ac6141c4bb16602618f1549ede7d72bfe49e",
+    "memory_bytes": 8589934592,
+    "note": "",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "failures": {
+    "attempts_by_state": {
+      "succeeded": 10000
+    },
+    "extra_attempts_per_task": 0.0,
+    "failed_tasks": 0,
+    "worker_exit_codes": [
+      0,
+      0
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "succeeded",
+        "unfinished_tasks": 0
+      },
+      "name": "terminal",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 0
+      },
+      "name": "nothing_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "failed": []
+      },
+      "name": "failed_tasks",
+      "passed": true
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          0,
+          0
+        ]
+      },
+      "name": "worker_exits",
+      "passed": true
+    },
+    {
+      "detail": {
+        "mismatches": 0
+      },
+      "name": "results_exact",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": {
+    "commits": 53.0,
+    "formula": "pg_stat_database xact_commit delta over an idle window after the finished job; the harness's reads roll back and never commit",
+    "per_s": 26.264002077887035,
+    "window_s": 2.017971207998926
+  },
+  "ladder": "overhead",
+  "latency": {
+    "end_to_end_s": {
+      "max": 47.04432702064514,
+      "n": 10000,
+      "p50": 27.1506290435791,
+      "p95": 45.44046998023987,
+      "p99": 46.741514921188354
+    },
+    "queue_wait_s": {
+      "max": 47.04300904273987,
+      "n": 10000,
+      "p50": 27.148891925811768,
+      "p95": 45.43887901306152,
+      "p99": 46.73933696746826
+    },
+    "service_s": {
+      "max": 0.021959781646728516,
+      "n": 10000,
+      "p50": 0.0018820762634277344,
+      "p95": 0.0038390159606933594,
+      "p99": 0.005352973937988281
+    }
+  },
+  "provider": null,
+  "recorded_at": "20261109T005646Z",
+  "resources": {
+    "database": {
+      "cpu_percent": {
+        "max": 116.05,
+        "n": 24,
+        "p50": 74.97,
+        "p95": 110.7,
+        "p99": 116.05
+      },
+      "memory_bytes_max": 135790592.0,
+      "samples": 24,
+      "window_s": 47.17872112497571
+    },
+    "harness": {
+      "process_maxrss_bytes": 64602112,
+      "scope": "cell",
+      "sys_s": 0.07483100000000001,
+      "user_s": 0.09565400000000002
+    },
+    "workers": [
+      {
+        "cpu_utilization": 0.21128562420795133,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 66158592,
+        "pid": 46100,
+        "sys_s": 3.026891,
+        "user_s": 6.912899
+      },
+      {
+        "cpu_utilization": 0.21802008126291073,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 67059712,
+        "pid": 46101,
+        "sys_s": 3.133929,
+        "user_s": 7.122679
+      }
+    ]
+  },
+  "run_id": "8e066f5d392b",
+  "status": "complete",
+  "throughput": {
+    "makespan_items_per_s": 212.56548096886488,
+    "makespan_tasks_per_s": 212.56548096886488,
+    "processing_items_per_s": 213.81216282707175,
+    "steady": {
+      "completions": 8000,
+      "items_per_s": 214.14981730820222,
+      "seconds": 37.352355003356934
+    }
+  },
+  "timing": {
+    "items": 10000,
+    "makespan_s": 47.04432702064514,
+    "processing_s": 46.770024061203,
+    "stop_after_s": 3600.0,
+    "submission": {
+      "file_bytes": 658892,
+      "seconds": 0.6239238329872023,
+      "tasks": 10000
+    },
+    "tasks": 10000,
+    "wait_ended": "finished",
+    "waited_s": 46.94004141699406
+  },
+  "usage": null,
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT2M",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}
