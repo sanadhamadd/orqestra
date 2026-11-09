@@ -1,4 +1,5 @@
 import json
+import math
 import subprocess
 import sys
 import textwrap
@@ -121,6 +122,45 @@ def test_extend_only_moves_later_and_restrict_only_earlier() -> None:
     assert dog.deadline(Guard.OWNERSHIP) == 115.0
 
 
+def test_move_to_sets_a_confirmed_deadline_earlier_or_later() -> None:
+    clock = FakeClock()
+    dog, recorder = watchdog(clock)
+    token = dog.arm(Guard.OWNERSHIP, 110.0, CONTEXT)
+    assert dog.move_to(token, 130.0)  # later: a grace longer than the lease (DEC-068)
+    assert dog.deadline(Guard.OWNERSHIP) == 130.0
+    assert dog.move_to(token, 115.0)  # earlier: a shorter one
+    assert dog.deadline(Guard.OWNERSHIP) == 115.0
+    assert dog.disarm(token)
+
+    token = dog.arm(Guard.OWNERSHIP, 110.0, CONTEXT)
+    clock.now = 112.0  # past the deadline, which the watchdog has not checked yet
+    assert dog.move_to(token, 140.0)
+    assert dog.check() is None
+    assert recorder.expiries == []
+    clock.now = 140.0
+    expiry = dog.check()
+    assert expiry is not None
+    assert (expiry.guard, expiry.deadline) == (Guard.OWNERSHIP, 140.0)
+
+
+@pytest.mark.parametrize("guard", [Guard.OPERATION, Guard.DRAIN])
+def test_move_to_refuses_the_operation_and_drain_guards(guard: Guard) -> None:
+    dog, _ = watchdog(FakeClock())
+    token = dog.arm(guard, 110.0, CONTEXT)
+    with pytest.raises(RuntimeError, match="cannot be moved"):
+        dog.move_to(token, 500.0)
+    assert dog.deadline(guard) == 110.0  # they only ever end the process sooner
+
+
+@pytest.mark.parametrize("deadline", [math.inf, -math.inf, math.nan])
+def test_move_to_refuses_a_non_finite_deadline(deadline: float) -> None:
+    dog, _ = watchdog(FakeClock())
+    token = dog.arm(Guard.OWNERSHIP, 110.0, CONTEXT)
+    with pytest.raises(ValueError, match="finite"):
+        dog.move_to(token, deadline)
+    assert dog.deadline(Guard.OWNERSHIP) == 110.0
+
+
 def test_an_obsolete_token_cannot_touch_a_newer_arming() -> None:
     clock = FakeClock()
     dog, recorder = watchdog(clock)
@@ -131,6 +171,7 @@ def test_an_obsolete_token_cannot_touch_a_newer_arming() -> None:
     assert new != old
     assert not dog.extend(old, 500.0)
     assert not dog.restrict(old, 101.0)
+    assert not dog.move_to(old, 101.0)
     assert not dog.disarm(old)
     assert dog.deadline(Guard.OWNERSHIP) == 150.0
     clock.now = 120.0  # past the old deadline: nothing fires

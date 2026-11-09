@@ -545,9 +545,10 @@ any thread.
 - **Local fence.** A watchdog thread ends the process (`os._exit`) when either guard
   expires:
   - **ownership:** the attempt's lease, mapped to the local clock from the claim so it
-    is never later than the real lease end, minus `fence_margin`. It moves later only
-    after a *confirmed* renewal, earlier when a cancellation request shortens the lease,
-    and is disarmed by the handler thread when the handler's work ends.
+    is never later than the real lease end, minus `fence_margin`. It moves only on a
+    *confirmed* heartbeat answer: later after a renewal, and to the end of the grace
+    period, earlier or later, after a confirmed cancellation request (DEC-068). It is
+    disarmed by the handler thread when the handler's work ends.
   - **operation:** each supervisor database call must end within
     `db_operation_timeout`. A stalled call (a frozen server or network still answers
     TCP, so `statement_timeout` never fires) ends the process instead of hanging it.
@@ -560,7 +561,7 @@ any thread.
   `context.cancellation` (`is_set()`, `wait(timeout)`). When a heartbeat raises
   `CancellationRequestedError`, which means a request has *committed*, the supervisor:
   1. stops renewing;
-  2. moves the fence to the end of the grace period;
+  2. moves the fence to the end of the grace period (earlier or later than the lease);
   3. only then sets the event.
 
   A handler that sees it and raises `HandlerCancelled` ends the attempt and the task as

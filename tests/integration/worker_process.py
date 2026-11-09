@@ -12,7 +12,8 @@ test through their own connection to ``ORQESTRA_TEST_HANDLER_URL``:
   the handler;
 - ``abort``: records the run, then raises ``SystemExit`` (a control-plane signal);
 - ``cooperative``: records the run, then waits for its cancellation signal and
-  raises ``HandlerCancelled`` once told (DEC-048);
+  raises ``HandlerCancelled`` once told (DEC-048); with a ``gate`` in its payload it
+  first winds down until the test releases that advisory lock;
 - ``flaky``: records the run, then raises ``TransientError`` (DEC-053);
 - ``metered``: makes provider calls through ``ProviderCalls`` and the worker's
   ``UsageSink`` (DEC-059): ``payload["first_attempt_calls"]`` calls in the first
@@ -90,9 +91,12 @@ def abort(context: TaskContext, payload: JsonValue) -> JsonValue:
 
 def cooperative(context: TaskContext, payload: JsonValue) -> JsonValue:
     _record_run(context).close()
-    if context.cancellation.wait(60):
-        raise HandlerCancelled
-    return {"never": "told"}
+    if not context.cancellation.wait(60):
+        return {"never": "told"}
+    if isinstance(payload, dict) and "gate" in payload:  # winds down until the test releases it
+        with psycopg.connect(os.environ["ORQESTRA_TEST_HANDLER_URL"], autocommit=True) as conn:
+            conn.execute("SELECT pg_advisory_lock_shared(%s)", (payload["gate"],))
+    raise HandlerCancelled
 
 
 def flaky(context: TaskContext, payload: JsonValue) -> JsonValue:
