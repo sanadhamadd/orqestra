@@ -1,0 +1,319 @@
+{
+  "cell": {
+    "batch": 100,
+    "profile": "invoice",
+    "repetition": 1,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 4
+  },
+  "claim_gap": {
+    "max": 0.5066840648651123,
+    "n": 17,
+    "p50": 0.02034592628479004,
+    "p95": 0.5066840648651123,
+    "p99": 0.5066840648651123
+  },
+  "contention": null,
+  "database_stats": null,
+  "drill": {
+    "exits_while_running": [],
+    "injected": true,
+    "injections": [
+      {
+        "ended_at": "2026-11-09T01:12:41.299411+00:00",
+        "started_at": "2026-11-09T01:12:36.287219+00:00"
+      }
+    ],
+    "measured": {
+      "next_completion_after_outage_s": 1.078343
+    },
+    "name": "d3a",
+    "restarts": 0
+  },
+  "environment": {
+    "compose_project": "orqestra-bench",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "c410ac6141c4bb16602618f1549ede7d72bfe49e",
+    "memory_bytes": 8589934592,
+    "note": "",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "failures": {
+    "attempts_by_state": {
+      "revoked/lease_expired": 1,
+      "succeeded": 20
+    },
+    "extra_attempts_per_task": 0.05,
+    "failed_tasks": 0,
+    "worker_exit_codes": [
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "succeeded",
+        "unfinished_tasks": 0
+      },
+      "name": "terminal",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 0
+      },
+      "name": "nothing_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "failed": []
+      },
+      "name": "failed_tasks",
+      "passed": true
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "name": "worker_exits",
+      "passed": true
+    },
+    {
+      "detail": {
+        "anomalies": {},
+        "complete": true,
+        "oracle": {
+          "malformed": 10,
+          "needs_review": 0,
+          "provider_assisted_items": 100,
+          "rejected": 60,
+          "verified": 1930
+        },
+        "outcome": {
+          "malformed": 10,
+          "needs_review": 0,
+          "provider_assisted_items": 100,
+          "rejected": 60,
+          "verified": 1930
+        }
+      },
+      "name": "summary",
+      "passed": true
+    },
+    {
+      "detail": {
+        "budget_bound": 960,
+        "budget_verdict": "within",
+        "calls": 100,
+        "finality": "closed",
+        "oracle_calls": 100,
+        "oracle_tokens": 810,
+        "succeeded_calls": 100,
+        "succeeded_tokens": "810",
+        "tokens": "810"
+      },
+      "name": "usage",
+      "passed": true
+    },
+    {
+      "detail": {
+        "injections": 1
+      },
+      "name": "injected",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": null,
+  "ladder": "drill",
+  "latency": {
+    "end_to_end_s": {
+      "max": 11.209898948669434,
+      "n": 20,
+      "p50": 6.621299982070923,
+      "p95": 6.7488930225372314,
+      "p99": 11.209898948669434
+    },
+    "queue_wait_s": {
+      "max": 6.728943824768066,
+      "n": 20,
+      "p50": 0.5229589939117432,
+      "p95": 6.728937864303589,
+      "p99": 6.728943824768066
+    },
+    "service_s": {
+      "max": 6.099207878112793,
+      "n": 20,
+      "p50": 0.034851789474487305,
+      "p95": 6.09834098815918,
+      "p99": 6.099207878112793
+    }
+  },
+  "provider": {
+    "call_timeout": "PT0.1S",
+    "cap": 16,
+    "route": "route-a"
+  },
+  "recorded_at": "20261109T011247Z",
+  "resources": {
+    "harness": {
+      "process_maxrss_bytes": 64995328,
+      "scope": "cell",
+      "sys_s": 0.316817,
+      "user_s": 0.22234199999999993
+    },
+    "workers": [
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 64667648,
+        "pid": 48714,
+        "sys_s": 0.107501,
+        "user_s": 0.47227199999999997
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 62619648,
+        "pid": 48715,
+        "sys_s": 0.11209,
+        "user_s": 0.469342
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 61767680,
+        "pid": 48716,
+        "sys_s": 0.10471699999999999,
+        "user_s": 0.474889
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 61046784,
+        "pid": 48717,
+        "sys_s": 0.07664699999999999,
+        "user_s": 0.386803
+      }
+    ]
+  },
+  "run_id": "70845db79dbe",
+  "status": "complete",
+  "throughput": null,
+  "timing": {
+    "items": 2000,
+    "makespan_s": 11.209898948669434,
+    "processing_s": 10.80829405784607,
+    "stop_after_s": 1800.0,
+    "submission": {
+      "file_bytes": 412834,
+      "seconds": 0.38057533299434,
+      "tasks": 20
+    },
+    "tasks": 20
+  },
+  "usage": {
+    "by_attempt_state": {
+      "cancelled": {
+        "answered": 0,
+        "attempts": 0,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "failed": {
+        "answered": 0,
+        "attempts": 0,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "revoked": {
+        "answered": 0,
+        "attempts": 1,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "running": {
+        "answered": 0,
+        "attempts": 0,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "succeeded": {
+        "answered": 100,
+        "attempts": 20,
+        "calls": 100,
+        "failed": 0,
+        "unresolved": 0
+      }
+    },
+    "call_budget": {
+      "bound": 960,
+      "cap": 16,
+      "cap_source": "operator",
+      "verdict": "within"
+    },
+    "calls": 100,
+    "finality": "closed",
+    "reported_totals": {
+      "tokens": {
+        "amount": "810",
+        "calls": 100
+      }
+    }
+  },
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT2M",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}

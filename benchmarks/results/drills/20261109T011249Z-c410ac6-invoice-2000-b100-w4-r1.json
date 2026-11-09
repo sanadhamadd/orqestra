@@ -1,0 +1,333 @@
+{
+  "cell": {
+    "batch": 100,
+    "profile": "invoice",
+    "repetition": 1,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 4
+  },
+  "claim_gap": {
+    "max": 0.017570018768310547,
+    "n": 17,
+    "p50": 0.011605978012084961,
+    "p95": 0.017570018768310547,
+    "p99": 0.017570018768310547
+  },
+  "contention": null,
+  "database_stats": null,
+  "drill": {
+    "exits_while_running": [],
+    "injected": true,
+    "injections": [],
+    "measured": {},
+    "name": "d4-payload",
+    "restarts": 0
+  },
+  "environment": {
+    "compose_project": "orqestra-bench",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "c410ac6141c4bb16602618f1549ede7d72bfe49e",
+    "memory_bytes": 8589934592,
+    "note": "",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "failures": {
+    "attempts_by_state": {
+      "failed": 1,
+      "succeeded": 20
+    },
+    "extra_attempts_per_task": 0.0,
+    "failed_tasks": 1,
+    "worker_exit_codes": [
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "failed",
+        "unfinished_tasks": 0
+      },
+      "name": "terminal",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 0
+      },
+      "name": "nothing_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "failed": [
+          "poison-0"
+        ]
+      },
+      "name": "failed_tasks",
+      "passed": true
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "name": "worker_exits",
+      "passed": true
+    },
+    {
+      "detail": {
+        "anomalies": {
+          "payload_invalid": 1
+        },
+        "oracle": {
+          "malformed": 10,
+          "needs_review": 0,
+          "provider_assisted_items": 100,
+          "rejected": 60,
+          "verified": 1930
+        },
+        "outcome": {
+          "malformed": 10,
+          "needs_review": 0,
+          "provider_assisted_items": 100,
+          "rejected": 60,
+          "verified": 1930
+        }
+      },
+      "name": "summary",
+      "passed": true
+    },
+    {
+      "detail": {
+        "budget_bound": 1008,
+        "budget_verdict": "within",
+        "calls": 100,
+        "finality": "closed",
+        "oracle_calls": 100,
+        "oracle_tokens": 810,
+        "succeeded_calls": 100,
+        "succeeded_tokens": "810",
+        "tokens": "810"
+      },
+      "name": "usage",
+      "passed": true
+    },
+    {
+      "detail": {
+        "injections": 0
+      },
+      "name": "injected",
+      "passed": true
+    },
+    {
+      "detail": {
+        "attempts": [
+          [
+            "failed",
+            "permanent",
+            "batch_payload_invalid"
+          ]
+        ]
+      },
+      "name": "poison_payload_fails_once",
+      "passed": true
+    },
+    {
+      "detail": 10,
+      "name": "malformed_items_present",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": null,
+  "ladder": "drill",
+  "latency": {
+    "end_to_end_s": {
+      "max": 0.6499881744384766,
+      "n": 21,
+      "p50": 0.5350241661071777,
+      "p95": 0.6360599994659424,
+      "p99": 0.6499881744384766
+    },
+    "queue_wait_s": {
+      "max": 0.6145040988922119,
+      "n": 21,
+      "p50": 0.5083580017089844,
+      "p95": 0.6073381900787354,
+      "p99": 0.6145040988922119
+    },
+    "service_s": {
+      "max": 0.05058693885803223,
+      "n": 20,
+      "p50": 0.03121209144592285,
+      "p95": 0.04947614669799805,
+      "p99": 0.05058693885803223
+    }
+  },
+  "provider": {
+    "call_timeout": "PT0.1S",
+    "cap": 16,
+    "route": "route-a"
+  },
+  "recorded_at": "20261109T011249Z",
+  "resources": {
+    "harness": {
+      "process_maxrss_bytes": 71221248,
+      "scope": "cell",
+      "sys_s": 0.017430999999999995,
+      "user_s": 0.03637699999999999
+    },
+    "workers": [
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 63143936,
+        "pid": 48763,
+        "sys_s": 0.037696,
+        "user_s": 0.351151
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 72450048,
+        "pid": 48764,
+        "sys_s": 0.038368,
+        "user_s": 0.354738
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 69173248,
+        "pid": 48765,
+        "sys_s": 0.03692,
+        "user_s": 0.35039
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 66142208,
+        "pid": 48766,
+        "sys_s": 0.03686,
+        "user_s": 0.35201099999999996
+      }
+    ]
+  },
+  "run_id": "96cb96766efb",
+  "status": "complete",
+  "throughput": null,
+  "timing": {
+    "items": 2000,
+    "makespan_s": 0.6499881744384766,
+    "processing_s": 0.24988508224487305,
+    "stop_after_s": 1800.0,
+    "submission": {
+      "file_bytes": 412903,
+      "seconds": 0.38274999998975545,
+      "tasks": 21
+    },
+    "tasks": 21
+  },
+  "usage": {
+    "by_attempt_state": {
+      "cancelled": {
+        "answered": 0,
+        "attempts": 0,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "failed": {
+        "answered": 0,
+        "attempts": 1,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "revoked": {
+        "answered": 0,
+        "attempts": 0,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "running": {
+        "answered": 0,
+        "attempts": 0,
+        "calls": 0,
+        "failed": 0,
+        "unresolved": 0
+      },
+      "succeeded": {
+        "answered": 100,
+        "attempts": 20,
+        "calls": 100,
+        "failed": 0,
+        "unresolved": 0
+      }
+    },
+    "call_budget": {
+      "bound": 1008,
+      "cap": 16,
+      "cap_source": "operator",
+      "verdict": "within"
+    },
+    "calls": 100,
+    "finality": "closed",
+    "reported_totals": {
+      "tokens": {
+        "amount": "810",
+        "calls": 100
+      }
+    }
+  },
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT2M",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}
