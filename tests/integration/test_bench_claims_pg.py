@@ -23,6 +23,7 @@ from benchmarks.claims import (
     distribution,
     explain_claims,
     fill,
+    heap_pages,
     main,
     measure_depth,
     validate_result,
@@ -95,6 +96,17 @@ def test_a_depth_100_run_records_real_claims_and_a_plan(
         assert scalar(db, held, UNSUPPORTED_KIND) == DEPTH // 2
 
 
+def test_the_waiting_variant_is_measured_on_a_heap_of_its_live_rows(worker_conn: Conn) -> None:
+    """Its UPDATE leaves no dead versions for the claim's sequential scan to read (DEC-033).
+
+    Rewriting the heap again shrinks it only if it still held dead versions.
+    """
+    fill(worker_conn, 2_000, Variant.WAITING)
+    measured = heap_pages(worker_conn)
+    worker_conn.execute("VACUUM FULL tasks")
+    assert heap_pages(worker_conn) == measured > 0
+
+
 def test_claims_never_exceed_the_claimable_tasks(db: Conn, schema_url: str) -> None:
     measured = measure_depth(schema_url, depth=10, variant=Variant.WAITING, claims=50, explains=1)
     assert (measured["ready"], measured["claims"]) == (5, 5)
@@ -142,6 +154,7 @@ def test_a_malformed_record_is_refused() -> None:
         "variant": "ready",
         "depth": 10,
         "ready": 10,
+        "heap_pages": 1,
         "claims": 1,
         "latency_ms": distribution([1.0]),
         "explain": {
@@ -157,6 +170,8 @@ def test_a_malformed_record_is_refused() -> None:
         {**good, "claims": 11},
         {**good, "latency_ms": distribution([1.0, 2.0])},
         {**good, "explain": {**good["explain"], "plan_nodes": []}},
+        {**good, "heap_pages": -1},
+        {key: value for key, value in good.items() if key != "heap_pages"},
     ):
         with pytest.raises(ValueError, match="must"):
             validate_result(record_of([broken]))

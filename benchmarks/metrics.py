@@ -10,22 +10,42 @@ what the database cannot see: the submission command and the idle window.
 - **Steady throughput** counts the middle 80 % of completions by
   ``finished_at``: the first and last 10 % are dropped, and the items of the
   completions after the window's first one are divided by the window's length.
+- **The harness never commits.** Its progress polls, contention samples and
+  counter reads each run in a transaction that always rolls back
+  (``read_only``), so they count in ``xact_rollback`` and never in
+  ``xact_commit``.
 - **Database load** is the delta of the ``pg_stat_database`` counters, and of
   ``pg_stat_user_tables`` for the job tables, from just before the submission
   to a moment after the job ended. A backend publishes its counters at most
-  once a second, so that second reading waits a little (``run.STATS_SETTLE``)
-  and includes the idle claims made meanwhile. The figures are approximate.
-- **Idle claim rate** is the ``xact_commit`` delta across an idle window that
-  follows, divided by the window's length on the harness clock. Every idle
-  claim is one committed transaction; the publication delay is about the same
-  at both ends of the window, and the harness's own reads also commit, so it is
-  an estimate. It is recorded, never asserted.
+  once a second, so that second reading waits a little (``run.STATS_SETTLE``).
+- **Commits per task** counts the job's commits (``job_commits``): the
+  ``xact_commit`` delta, less the idle claims the workers made while the
+  submission ran and during that wait, estimated as the idle claim rate times
+  those seconds. It includes the few commits of the ``orqestra job submit``
+  process itself (its schema check and the one submission transaction), a fixed
+  number per job whatever its size. Each end of the window can still be off by
+  up to about one second of idle claims, because counters are published at most
+  once a second, so it is an estimate. It is measured only for a job that finished, because
+  only then is the idle claim rate measured.
+- **Idle claim rate** is the ``xact_commit`` delta across an idle window after a
+  finished job, divided by the window's length on the harness clock: the
+  workers' idle claims and recovery sweeps, since nothing else commits then.
+  The publication delay is about the same at both ends of the window. It is
+  recorded, never asserted, and not measured for a job that did not finish.
+- **Database CPU and contention** are sampled from the moment the submission
+  returned until the wait for the job ended, never during worker start-up, the
+  settle, the idle window or the shutdown. Each summary records the seconds it
+  covers (``window_s``) and its sample count; a short job has few samples. The
+  contention sample leaves out its own backend and the harness's polling one.
 - **Worker CPU and memory** come from ``os.wait4`` once a worker has exited:
   ``ru_maxrss`` is in bytes on macOS and in KiB on Linux, normalised to bytes.
   CPU covers the whole process, start-up and idle tail included, so its
   utilization over the makespan can exceed 1 for a short cell.
 - **Database CPU and memory** come from ``docker stats`` only when the server
   is a named container; otherwise they are ``not_measured``.
+- **Harness CPU** is the delta of this process's CPU times over one cell or
+  drill. Its peak RSS cannot be split per cell, so it is recorded as the
+  process's peak (``process_maxrss_bytes``).
 """
 
 import itertools
@@ -267,22 +287,46 @@ def database_counters(conn: Conn) -> dict[str, Any]:
     return {"database": {k: float(v or 0) for k, v in database.items()}, "tables": tables}
 
 
-def contention_sample(conn: Conn) -> dict[str, int]:
-    """Backends of this database by ``state/wait_event_type``."""
+def read_only[T](conn: Conn, read: Callable[[Conn], T]) -> T:
+    """``read(conn)`` inside a transaction that always rolls back.
+
+    The harness's own reads then count in ``xact_rollback``, never in
+    ``xact_commit``, so they never inflate the commits a cell measures.
+    """
+    with conn.transaction(force_rollback=True):
+        return read(conn)
+
+
+_CONTENTION = (
+    "SELECT coalesce(state, 'none'), coalesce(wait_event_type, 'none'), count(*) "
+    "FROM pg_stat_activity WHERE datname = current_database() "
+    "AND pid <> pg_backend_pid() AND pid <> ALL(%s) GROUP BY 1, 2"
+)
+
+
+def contention_sample(conn: Conn, exclude: Sequence[int] = ()) -> dict[str, int]:
+    """Backends of this database by ``state/wait_event_type``.
+
+    Leaves out the sampling backend itself and the backends in ``exclude`` (the
+    harness's own), so an idle phase shows no active backend.
+    """
     counts: dict[str, int] = {}
-    for state, wait, count in conn.execute(
-        "SELECT coalesce(state, 'none'), coalesce(wait_event_type, 'none'), count(*) "
-        "FROM pg_stat_activity WHERE datname = current_database() GROUP BY 1, 2"
-    ):
+    for state, wait, count in conn.execute(_CONTENTION, (list(exclude),)):
         counts[f"{state}/{wait}"] = int(count)
     return counts
 
 
-def summarize_contention(samples: Sequence[Mapping[str, int]]) -> dict[str, Any]:
-    """The largest and mean count of each ``state/wait_event_type`` over the samples."""
+def summarize_contention(
+    samples: Sequence[Mapping[str, int]], window_s: float | None = None
+) -> dict[str, Any]:
+    """The largest and mean count of each ``state/wait_event_type`` over the samples.
+
+    ``window_s`` is how many seconds the samples cover; no sample gives no states.
+    """
     keys = sorted({key for sample in samples for key in sample})
     return {
         "samples": len(samples),
+        "window_s": window_s,
         "by_state": {
             key: {
                 "max": max(sample.get(key, 0) for sample in samples),
@@ -335,11 +379,14 @@ def docker_stats_sample(container: str) -> dict[str, float | None]:
     return {"cpu_percent": cpu_percent, "memory_bytes": parse_size(memory)}
 
 
-def summarize_docker(samples: Sequence[Mapping[str, float | None]]) -> dict[str, Any]:
+def summarize_docker(
+    samples: Sequence[Mapping[str, float | None]], window_s: float | None = None
+) -> dict[str, Any]:
     cpu = [s["cpu_percent"] for s in samples if s.get("cpu_percent") is not None]
     memory = [s["memory_bytes"] for s in samples if s.get("memory_bytes") is not None]
     return {
         "samples": len(samples),
+        "window_s": window_s,
         "cpu_percent": percentiles([float(v) for v in cpu if v is not None]),
         "memory_bytes_max": max((float(v) for v in memory if v is not None), default=None),
     }
@@ -427,10 +474,53 @@ def _accounting(
 
 
 def harness_usage() -> dict[str, Any]:
-    """This process's own CPU times and peak RSS."""
+    """A snapshot of this process's own CPU times and peak RSS, since it started."""
     usage = resource.getrusage(resource.RUSAGE_SELF)
     return {
         "user_s": usage.ru_utime,
         "sys_s": usage.ru_stime,
         "maxrss_bytes": maxrss_bytes(usage.ru_maxrss),
+    }
+
+
+def harness_delta(start: Mapping[str, Any], end: Mapping[str, Any]) -> dict[str, Any]:
+    """The harness's CPU over one cell, from two ``harness_usage`` snapshots.
+
+    A ladder runs many cells in one process, so only the delta is the cell's own.
+    The peak RSS cannot be split per cell: it is the process's peak so far.
+    """
+    return {
+        "scope": "cell",
+        "user_s": end["user_s"] - start["user_s"],
+        "sys_s": end["sys_s"] - start["sys_s"],
+        "process_maxrss_bytes": end["maxrss_bytes"],
+    }
+
+
+JOB_COMMITS_METHOD = (
+    "xact_commit delta from just before the submission to STATS_SETTLE after the wait, "
+    "less idle_rate_per_s x idle_seconds (the submission and the settle); the harness's "
+    "reads roll back and never commit; it includes the submit command's own few commits "
+    "(its schema check and the submission), fixed per job; each end may be off by up to "
+    "about 1 s of idle "
+    "claims, because counters are published at most once a second"
+)
+
+
+def job_commits(
+    xact_commit_delta: float, idle_rate_per_s: float | None, idle_seconds: float
+) -> dict[str, Any]:
+    """The job's commits, the submit command's included; ``None`` without an idle rate."""
+    if idle_rate_per_s is None:
+        commits = None
+        method = "not measured: the job did not finish, so no idle claim rate was measured"
+    else:
+        commits = xact_commit_delta - idle_rate_per_s * idle_seconds
+        method = JOB_COMMITS_METHOD
+    return {
+        "xact_commit_delta": xact_commit_delta,
+        "idle_rate_per_s": idle_rate_per_s,
+        "idle_seconds": idle_seconds,
+        "job_commits": commits,
+        "method": method,
     }

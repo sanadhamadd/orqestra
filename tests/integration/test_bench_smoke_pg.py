@@ -38,7 +38,14 @@ from benchmarks.drills import (
 from benchmarks.faults import Fault, FaultingReader, create_fault_table, poison_total
 from benchmarks.generate import generate_invoices
 from benchmarks.result import ROOT, Status, validate_result, write_result
-from benchmarks.run import Cell, Profile, process_environment, run_cell, worker_command
+from benchmarks.run import (
+    STATS_SETTLE,
+    Cell,
+    Profile,
+    process_environment,
+    run_cell,
+    worker_command,
+)
 from orqestra.calls.provider import FieldKind, ProviderTransientError, make_request
 from tests.integration.test_worker_process import ENVIRONMENT
 
@@ -93,6 +100,7 @@ def test_an_invoice_cell_passes_its_gate(
     assert usage["budget_verdict"] == "within"
     assert record["provider"] == {"call_timeout": "PT0.1S", "cap": 16, "route": "route-a"}
     assert len(record["resources"]["workers"]) == 2
+    _records_the_job_alone(record)
     stored = _written(record, tmp_path / "results")
     assert stored["cell"] == {
         "profile": "invoice",
@@ -119,7 +127,46 @@ def test_an_echo_cell_passes_its_gate(
     _passes_gate(record, ECHO_CHECKS)
     assert record["usage"] is None
     assert record["provider"] is None
+    _records_the_job_alone(record)
     _written(record, tmp_path / "results")
+
+
+def _records_the_job_alone(record: dict[str, Any]) -> None:
+    """What a finished cell records covers its own job, by the identities of the metrics module."""
+    timing = record["timing"]
+    commits = record["database_stats"]["commits"]
+    # The idle claims of the submission and the settle are subtracted at the idle rate.
+    assert commits["idle_rate_per_s"] == record["idle_claim_rate"]["per_s"]
+    assert commits["idle_seconds"] >= timing["submission"]["seconds"] + STATS_SETTLE
+    expected = commits["xact_commit_delta"] - commits["idle_rate_per_s"] * commits["idle_seconds"]
+    assert commits["job_commits"] == pytest.approx(expected)
+    assert record["database_stats"]["commits_per_task"] == pytest.approx(
+        commits["job_commits"] / timing["tasks"]
+    )
+    # The contention sampler ran from the submission to the end of the wait, no longer.
+    contention = record["contention"]
+    assert timing["waited_s"] <= contention["window_s"] <= timing["waited_s"] + 1.0
+    assert contention["samples"] <= contention["window_s"] + 2
+    assert record["resources"]["harness"]["scope"] == "cell"
+
+
+def test_a_cell_stopped_at_its_limit_measures_no_idle_rate(
+    db: psycopg.Connection[TupleRow], schema_url: str, tmp_path: Path
+) -> None:
+    record = run_cell(
+        schema_url,
+        Cell(Profile.ECHO, size=50, batch=None, workers=1),
+        worker_settings=ENVIRONMENT,
+        raw_dir=tmp_path / "raw",
+        stop_after=0.0,  # the wait ends at once, whatever the job's state
+        idle_window=0.5,
+    )
+
+    assert record["timing"]["wait_ended"] == "stop_after"
+    assert record["status"] == Status.INCOMPLETE
+    assert record["idle_claim_rate"] is None  # work may still have been running
+    assert record["database_stats"]["commits_per_task"] is None
+    assert record["database_stats"]["commits"]["method"].startswith("not measured")
 
 
 # --- drills (plan 2.10: D1 with one worker, and D3a) --------------------------------------
