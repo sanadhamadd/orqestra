@@ -317,27 +317,30 @@ def test_a_busy_worker_recovers_another_workers_expired_attempt(
     gate = Gate()
     (own,) = submit(checked, "gated", {})
     (orphan,) = submit(checked, "orphaned", {})  # a kind this worker does not run
-    dead = start_attempt(
-        checked,
-        orphan.id,
-        "dead-worker",
-        policy=LeasePolicy(
-            lease=timedelta(milliseconds=300), execution_timeout=timedelta(minutes=1)
-        ),
-    )
     with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        eventually(lambda: len(gate.runs) == 1, "the own handler")
+        # Started only now, so its lease can only expire while this worker is busy.
+        dead = start_attempt(
+            checked,
+            orphan.id,
+            "dead-worker",
+            policy=LeasePolicy(
+                lease=timedelta(milliseconds=300), execution_timeout=timedelta(minutes=1)
+            ),
+        )
         both = eventually(
             lambda: rows(
                 checked,
-                "SELECT d.state, d.revoked_reason, o.state FROM attempts d, attempts o "
+                "SELECT d.state, d.revoked_reason, o.state, d.finished_at > o.started_at "
+                "FROM attempts d, attempts o "
                 "WHERE d.id = %s AND o.task_id = %s AND d.state = 'revoked'",
                 dead.id,
                 own.id,
             ),
             "the expired attempt to be revoked",
         )
-        # Revoked by this worker while its own handler was still running.
-        assert both == [("revoked", "lease_expired", "running")]
+        # Revoked by this worker after its own handler started, while it still ran.
+        assert both == [("revoked", "lease_expired", "running", True)]
         assert len(gate.runs) == 1
         assert task_states(checked, [orphan]) == [("queued", 1)]
         gate.release.set()
@@ -419,6 +422,10 @@ def test_a_lost_supervisor_connection_is_not_a_handler_failure(
     gate = Gate()
     (task,) = submit(checked, "gated", {})
     with running_worker(schema_url, {"gated": gate.handler}) as probe:
+        # The claim's row alone is no proof: the worker still reads the task and its job
+        # on this connection before the handler starts. Wait for the handler and its fence.
+        eventually(lambda: len(gate.runs) == 1, "the handler")
+        eventually(probe.ownership_deadline, "the fence")
         first = eventually(lambda: running_attempt(checked, task), "the task to run")
         conn = probe.worker._conn
         assert conn is not None
@@ -489,12 +496,16 @@ def test_a_retryable_completion_error_is_retried_without_rerunning_the_handler(
     checked.execute("DROP TRIGGER deadlock_once ON attempts")
 
 
-def test_unconfirmed_heartbeats_never_extend_the_fence(schema_url: str, checked: Conn) -> None:
+def test_unconfirmed_heartbeats_never_extend_the_fence(
+    schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="orqestra.worker")
     gate = Gate()
     (task,) = submit(checked, "gated", {})
     with running_worker(schema_url, {"gated": gate.handler}) as probe:
         eventually(lambda: running_attempt(checked, task), "the task to run")
         armed = eventually(probe.ownership_deadline, "the fence")
+        refused = events(caplog).count("heartbeat_unconfirmed")
         # From now on every renewal is rejected by the server: no heartbeat is confirmed.
         checked.execute("""
             CREATE FUNCTION refuse_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -503,7 +514,13 @@ def test_unconfirmed_heartbeats_never_extend_the_fence(schema_url: str, checked:
                 WHEN (NEW.lease_expires_at > OLD.lease_expires_at)
                 EXECUTE FUNCTION refuse_renewal();
         """)
-        frozen = eventually(probe.ownership_deadline, "the fence")
+        # A renewal that committed before the trigger moves the fence only once its answer
+        # arrives. Heartbeats run one at a time, so once one is refused, that has happened.
+        eventually(
+            lambda: events(caplog).count("heartbeat_unconfirmed") > refused, "a refused heartbeat"
+        )
+        frozen = probe.ownership_deadline()
+        assert frozen is not None
         assert frozen >= armed
         expiry = eventually(
             lambda: probe.expiries,
