@@ -153,8 +153,9 @@ def migrate(conninfo: str, migrations: Sequence[Migration] | None = None) -> tup
     with psycopg.connect(conninfo, autocommit=True) as conn:
         schema = _current_schema(conn)
         history = sql.Identifier(schema, "schema_migrations")
+        raced = False
         while True:
-            first = not _history_exists(conn, schema)  # its own statement: no snapshot kept
+            first = not _history_table(conn, schema)  # its own statement: no snapshot kept
             try:
                 with conn.transaction():
                     if first:
@@ -170,12 +171,23 @@ def migrate(conninfo: str, migrations: Sequence[Migration] | None = None) -> tup
                     _apply(conn, migration)
                     _record(conn, history, migration)
             except _CreatedElsewhereError:
-                continue  # rolled back; the next pass finds the table and locks it
+                # Rolled back; the next pass finds the table and locks it. A second lost
+                # race means the name is taken by something this check cannot see.
+                if raced:
+                    msg = f"the history table {schema}.schema_migrations could not be created"
+                    raise MigrationError(msg) from None
+                raced = True
+                continue
             applied.append(migration)
             logger.info("applied migration %s", migration.label)
     return tuple(applied)
 
 
+_HISTORY_KIND = (
+    "SELECT c.relkind FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = %s AND c.relname = 'schema_migrations'"
+)
 _HISTORY_EXISTS = (
     "SELECT EXISTS (SELECT FROM pg_catalog.pg_class c "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
@@ -259,9 +271,22 @@ class _CreatedElsewhereError(Exception):
     """Another runner created the history table first."""
 
 
-def _history_exists(conn: psycopg.Connection[TupleRow], schema: str) -> bool:
-    row = conn.execute(_HISTORY_EXISTS, (schema,)).fetchone()
-    return bool(row is not None and row[0])
+def _history_table(conn: psycopg.Connection[TupleRow], schema: str) -> bool:
+    """Whether ``schema`` has the history table; ``MigrationError`` if the name is something else.
+
+    A view, sequence or any other relation named ``schema_migrations`` would make
+    ``CREATE TABLE`` fail on every pass, so it is refused here instead.
+    """
+    row = conn.execute(_HISTORY_KIND, (schema,)).fetchone()
+    if row is None:
+        return False
+    if row[0] not in ("r", "p"):
+        msg = (
+            f"{schema}.schema_migrations exists but is not a table (relkind {row[0]!r}); "
+            "rename or drop it, or migrate another schema"
+        )
+        raise MigrationError(msg)
+    return True
 
 
 def _create_history(conn: psycopg.Connection[TupleRow], history: sql.Identifier) -> None:

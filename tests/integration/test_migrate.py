@@ -170,3 +170,39 @@ def test_concurrent_first_runs_apply_each_migration_once_at_repeatable_read(
             results = list(pool.map(run, [f"runner-{n}" for n in range(runners)]))
         assert sorted(label for result in results for label in result) == _labels(migrations)
         assert _versions(url) == [m.version for m in migrations]
+
+
+@pytest.mark.parametrize(
+    "create",
+    [
+        "CREATE VIEW schema_migrations AS SELECT 1 AS version",
+        "CREATE SEQUENCE schema_migrations",
+    ],
+    ids=["view", "sequence"],
+)
+def test_a_relation_named_like_the_history_that_is_not_a_table_is_refused(
+    schema_url: str, tmp_path: Path, create: str
+) -> None:
+    migrations = _write(tmp_path, {"0001_first.sql": "CREATE TABLE first (id int);"})
+    with psycopg.connect(schema_url, autocommit=True) as conn:
+        conn.execute(create)
+    outcome: list[BaseException | tuple[Migration, ...]] = []
+
+    def run() -> None:
+        try:
+            outcome.append(migrate(schema_url, migrations))
+        except BaseException as exc:  # recorded for the assertion below
+            outcome.append(exc)
+
+    # A daemon thread, so a runner that never returns cannot hold up the test run.
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    runner.join(timeout=20)
+    assert not runner.is_alive(), "migrate kept retrying instead of refusing"
+    [result] = outcome
+    assert isinstance(result, MigrationError)
+    assert "schema_migrations" in str(result)
+    assert "not a table" in str(result)
+    with psycopg.connect(schema_url) as conn:
+        row = conn.execute("SELECT to_regclass('first') IS NULL").fetchone()
+    assert row == (True,)  # nothing was applied
