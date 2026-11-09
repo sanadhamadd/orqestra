@@ -354,6 +354,9 @@ def test_an_unsupported_request_touches_no_transport(overrides: dict[str, Any]) 
         ("field_kind", "total"),
         ("raw", 12),
         ("timeout", 10),
+        ("route_id", ["primary"]),
+        ("route_id", {"r": 1}),
+        ("capability", ["interpret_amount"]),
     ],
 )
 def test_a_request_that_breaks_its_types_touches_no_transport(field: str, value: object) -> None:
@@ -461,6 +464,8 @@ OBJECT_DEPTH = 40_000  # five bytes a level, so the body stays under the size ca
         pytest.param(b"[" * ARRAY_DEPTH + b"]" * ARRAY_DEPTH, id="deep-array"),
         pytest.param(b'{"a":' * OBJECT_DEPTH + b"1" + b"}" * OBJECT_DEPTH, id="deep-object"),
         pytest.param(b'{"id": ' + b"7" * 5000 + b"}", id="int-over-digit-limit"),
+        pytest.param(b'{"id": 1e9999999999999999999}', id="exponent-over-range"),
+        pytest.param(b'{"id": 1e-9999999999999999999}', id="exponent-under-range"),
     ],
 )
 def test_a_body_that_is_not_one_strict_json_object_is_malformed(body: bytes) -> None:

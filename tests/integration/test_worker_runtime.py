@@ -973,6 +973,36 @@ def test_a_repeated_request_neither_extends_the_grace_nor_runs_the_handler_again
     assert probe.terminations == []
 
 
+@pytest.mark.parametrize(
+    ("then", "state"),
+    [("cancel", "cancelled"), ("succeed", "succeeded")],  # a success may still win (DEC-020)
+    ids=["cancelled", "success-stands"],
+)
+def test_a_grace_longer_than_the_lease_lets_a_cooperative_handler_wind_down(
+    schema_url: str, checked: Conn, then: str, state: str
+) -> None:
+    """The grace (30 s) outlasts the 5 s lease: the fence moves to its end (DEC-068)."""
+    cooperative = Cooperative(then, hold=True)
+    (task,) = submit(checked, "cooperative", {})
+    lease = SETTINGS.lease.total_seconds()
+    with running_worker(schema_url, {"cooperative": cooperative.handler}) as probe:
+        eventually(lambda: len(cooperative.runs) == 1, "the handler")
+        sent = time.monotonic()
+        request_cancellation(checked, task.id, grace=GRACE)
+        assert cooperative.observed.wait(WAIT)  # told at the next heartbeat
+        # A fence restricted to the lease would end by sent + lease - margin.
+        deadline = probe.ownership_deadline()
+        assert deadline is not None
+        assert deadline > sent + lease
+        eventually(lambda: time.monotonic() > sent + lease + 0.5, "the old lease to pass")
+        assert probe.expiries == []
+        cooperative.proceed.set()
+        eventually(lambda: task_states(checked, [task]) == [(state, 1)], "the outcome")
+    assert attempt_rows(checked, task) == [(1, state, None, None)]  # not revoked
+    assert probe.terminations == []
+    assert probe.expiries == []
+
+
 def test_a_cancelled_outcome_whose_answer_was_lost_is_reconciled(
     schema_url: str, checked: Conn, caplog: pytest.LogCaptureFixture
 ) -> None:

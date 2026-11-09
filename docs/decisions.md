@@ -725,6 +725,7 @@ runs a worker yet.
 - **Recovery correction note (DEC-050):** the supervisor's session also carries `lock_timeout` and `idle_in_transaction_session_timeout`. Neither changes what the watchdog guards; together they keep a frozen worker's open transaction from blocking recovery, and keep a recovering worker from being ended by its own operation guard while it waits for that lock.
 - **Provider usage note (DEC-059):** the schedule gains a `USAGE` step after the heartbeat: while a handler runs, the supervisor writes the provider usage record the handler waits on, under the same rule as a sweep step, so it never delays a heartbeat.
 - **Session time zone note:** `local_deadline` subtracts in UTC and refuses naive instants, and the hold of a claimed but unstarted attempt (DEC-049) uses it, so the fence and the hold measure elapsed time in any session TimeZone (DEC-067).
+- **Grace fence note (DEC-068):** a confirmed cancellation request now moves the ownership fence to the end of the grace period exactly, earlier or later than the lease last confirmed (`Watchdog.move_to`). The "Moves earlier" bullet, the mutation "a cancellation not shortening the fence" and the cooperative cancellation note's "restricts the fence" describe the shortening case only; renewals still move it later only.
 
 ### DEC-046 — Outcome policy: database errors are never handler failures; an ambiguous completion ends the process
 - **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); the ambiguous case is reconciled by DEC-047
@@ -931,6 +932,7 @@ not part of it.
     - telling it on an unconfirmed heartbeat;
     - telling it on lost ownership;
     - one event shared by every attempt.
+- **Grace fence note (DEC-068):** step 2 moves the ownership fence to the end of the grace period, earlier or later than the lease, where it said "restricts". The verification bullets "a confirmed request restricts the fence" and "the fence is restricted even if setting the event fails", and the mutation "telling it before restricting the fence", read as "moves". The fence-first test is now `test_the_fence_is_moved_even_if_telling_the_handler_fails`, with a lengthening case; DEC-068 adds the in-process and subprocess tests of a grace longer than the lease.
 
 ## Graceful shutdown
 
@@ -1679,6 +1681,45 @@ recorded on PR #17.
     - reverting `local_deadline` to a plain subtraction;
     - reverting the hold to a plain subtraction;
     - a new lifecycle read outside `owned_transaction` that applies a lease rule.
+
+## Cancellation grace fence
+
+### DEC-068 — A confirmed cancellation request moves the ownership fence to the grace end, earlier or later
+- **Status:** Accepted (owner full-auto rule, 2026-11-08) · implemented (`Watchdog.move_to`, the cancellation branch of the worker's heartbeat) · amends DEC-045 and DEC-048 through their notes
+- **WHAT:**
+  - `Watchdog.move_to(token, deadline)` sets the ownership guard's deadline to exactly `deadline`, earlier or later, in one update under the watchdog's lock. It refuses a non-finite deadline and the drain and operation guards, and returns `False`, changing nothing, for a token no longer armed.
+  - When a heartbeat raises `CancellationRequestedError`, the supervisor stops renewing, moves the fence to the request's lease end (the grace end) mapped to the local clock, less `fence_margin`, and only then sets the handler's cancellation event (DEC-048's order). It was `restrict`, which kept the earlier of the two.
+  - Renewals still use `extend`, so an unconfirmed or older answer never moves the fence later. The `cancellation_requested` event carries `grace_end`.
+- **WHY:**
+  - DEC-040 says a request "may shorten or lengthen" the lease, and rejected a grace equal to the remaining lease because a request near a lease's end would leave almost no time to wind down. Restricting the fence brought that rejected option back on the worker's side: a grace longer than the remaining lease was cut to the lease.
+  - Ending the process early gains nothing: the database holds the lease until the grace ends, so recovery cannot cancel the task any sooner.
+  - DEC-048's own WHY, its trade-off and its responsive bound already describe a fence that ends with the grace period, as do the README, ADR 0004 and the runtime's docstring.
+  - It is safe: `renew_lease` reads the grace end under the attempt's row lock, after it found the lease unexpired; the value is final (no more renewals, and a repeated request writes nothing); it is capped at `deadline_at` by `cancellation_lease` and by `attempts_lease_within_deadline`; and it is mapped by the same conservative `local_deadline` as confirmed renewals.
+- **RUNNER-UP:**
+  - Correct the documents to say the fence only moves earlier.
+  - `restrict`, then `extend`.
+  - An exact-set `confirm` replacing `extend` and `restrict`, with new defect exits.
+  - A trigger that freezes the lease once a request has committed.
+- **WHY NOT:**
+  - Correcting the documents would reinstate DEC-040's rejected runner-up.
+  - Two calls are not atomic: each wakes the watchdog thread, which can expire the fence at the old deadline in between.
+  - An exact-set `confirm` changes the renewal path, which has no defect, and adds ways to end a healthy worker.
+  - The trigger would read `tasks` from an `attempts` trigger, which breaks DEC-036's lock order.
+- **TRADE-OFF:**
+  - A handler that ignores the signal now runs until the end of the grace period, capped at the attempt's deadline, not until its last lease.
+  - Clock-rate drift accumulates over that window, with `fence_margin` its only absorber (DEC-045).
+  - During a drain, the drain guard (exit 9) may now end the process before the ownership guard, as DEC-049 allows.
+- **VERIFICATION:**
+  - `tests/unit/test_worker_fence.py`: `move_to` sets a deadline earlier and later, and keeps a worker whose old deadline passed unchecked; it refuses the drain and operation guards and a non-finite deadline; an obsolete token cannot move a newer arming.
+  - `tests/unit/test_worker_runtime.py`: a confirmed request fences at the grace end when the grace is shorter than the lease, longer, and capped at the deadline; the fence moves before the handler is told, even if telling it fails; a request confirmed after the old deadline but before the watchdog checked keeps the worker.
+  - `tests/integration/test_worker_runtime.py`: with a grace longer than the lease, a cooperative handler winds down past the old lease end and records its cancellation, or its success (DEC-020), without a fence expiry.
+  - `tests/integration/test_worker_process.py`: a handler that ignores the signal is fenced at the end of a grace longer than the lease, not at the old lease end, and recovery then cancels the task; a cooperative handler winding down past its lease is not fenced; the existing test of a grace shorter than the lease still fences at the grace end.
+  - Mutation checks: locally, each of these failed tests:
+    - restricting instead of moving;
+    - only extending;
+    - `move_to` accepting the drain or operation guard;
+    - telling the handler before moving the fence;
+    - restricting and then extending, with the watchdog checking in between.
 
 ## Claim index
 
