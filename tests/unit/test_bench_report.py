@@ -463,3 +463,137 @@ def test_print_writes_the_rendered_section(
     _fill(tmp_path, [1])
     assert report.main(["--results", str(tmp_path)]) == 0
     assert capsys.readouterr().out == report.render(tmp_path)
+
+
+# --- the README block ----------------------------------------------------------------------
+
+
+def _scale(root: Path) -> None:
+    for workers in (1, 2):
+        for rep in (1, 2):
+            write(
+                root,
+                cell_record(
+                    ladder="scale",
+                    profile="invoice",
+                    size=1000,
+                    batch=100,
+                    workers=workers,
+                    rep=rep,
+                    makespan=float(rep + workers),
+                ),
+            )
+
+
+def test_every_readme_cell_string_is_in_the_performance_document(tmp_path: Path) -> None:
+    _scale(tmp_path)
+    write(tmp_path, cell_record(ladder="overhead"))  # not a README ladder
+    readme = report.render_readme(tmp_path)
+    document = report.render(tmp_path)
+    readme_rows = rows(readme, "invoice 1000 b100 w2")
+    assert len(readme_rows) == 1
+    for cell in readme_rows[0][2:]:
+        assert cell in document
+    assert f"Commit `{SHA[:12]}`" in readme
+    assert "Synthetic CPU" in readme
+    assert "`overhead`" not in readme
+
+
+def test_measured_limits_without_results(tmp_path: Path) -> None:
+    text = report.render_readme(tmp_path / "missing")
+    assert report.NO_RESULTS in text
+    assert "### Measured limits" in text
+    assert "**Largest rung completed:** _None recorded._" in text
+    assert "**50,000 invoices:** no result is recorded" in text
+    assert "Claim cost by depth: _None recorded._" in text
+
+
+def test_measured_limits_name_the_largest_rung_and_every_large_record(tmp_path: Path) -> None:
+    _scale(tmp_path)
+    write(
+        tmp_path,
+        cell_record(
+            ladder="large",
+            profile="invoice",
+            size=50_000,
+            batch=100,
+            workers=4,
+            status="incomplete",
+            wait=("stop_after", 7200.0),
+        ),
+    )
+    text = report.render_readme(tmp_path)
+    assert "**Largest rung completed:** 1,000 invoices:" in text
+    assert "invoice 1000 b100 w1 (`scale`)" in text
+    assert "**50,000 invoices:** 1 record(s):" in text
+    assert "incomplete; incomplete: stopped at the limit after 7200.0 s." in text
+
+
+def test_measured_limits_show_the_claim_plan_by_depth(tmp_path: Path) -> None:
+    write_claims(tmp_path, "claims.json", claims_record())
+    text = report.render_readme(tmp_path)
+    assert rows(text, "100")[0][1:] == [
+        "1.000",
+        "1.000",
+        "—",
+        "LockRows > Sort > Seq Scan on tasks",
+    ]
+    assert rows(text, "1000")[0][1:] == ["10.000", "—", "—", "LockRows > Sort > Seq Scan on tasks"]
+
+
+def _readme(path: Path) -> Path:
+    block = f"{report.README_BEGIN}\nold\n{report.README_END}"
+    path.write_text(f"# Project\n\n## Performance\n\n{block}\n\n## Next\n")
+    return path
+
+
+def test_the_readme_block_is_written_and_checked_on_its_own(tmp_path: Path) -> None:
+    _scale(tmp_path / "results")
+    readme = _readme(tmp_path / "README.md")
+    doc = tmp_path / "performance.md"  # never created: the README call does not need it
+    args = ["--results", str(tmp_path / "results"), "--doc", str(doc), "--readme", str(readme)]
+    assert report.main([*args, "--check"]) == 1
+    assert report.main([*args, "--write"]) == 0
+    text = readme.read_text()
+    assert text.startswith("# Project\n\n## Performance\n\n")
+    assert text.endswith(f"{report.README_END}\n\n## Next\n")
+    assert report.main([*args, "--check"]) == 0
+    assert not doc.exists()
+    readme.write_text(text.replace("Commit `", "Commit  `", 1))
+    assert report.main([*args, "--check"]) == 1
+
+
+def test_the_performance_document_calls_never_touch_the_readme(tmp_path: Path) -> None:
+    _fill(tmp_path / "results", [1])
+    doc = _document(tmp_path / "performance.md")
+    readme = _readme(tmp_path / "README.md")
+    before = readme.read_text()
+    assert report.main(["--results", str(tmp_path / "results"), "--doc", str(doc), "--write"]) == 0
+    assert readme.read_text() == before
+
+
+def test_neither_marker_pair_contains_the_other() -> None:
+    for marker in (report.BEGIN, report.END):
+        assert marker not in report.README_BEGIN
+        assert marker not in report.README_END
+    for marker in (report.README_BEGIN, report.README_END):
+        assert marker not in report.BEGIN
+        assert marker not in report.END
+
+
+def test_the_readme_block_is_byte_identical_whatever_the_write_order(tmp_path: Path) -> None:
+    _fill(tmp_path / "a", [1, 2, 3])
+    _fill(tmp_path / "b", [3, 1, 2])
+    _scale(tmp_path / "a")
+    _scale(tmp_path / "b")
+    first = report.render_readme(tmp_path / "a")
+    assert first.encode() == report.render_readme(tmp_path / "b").encode()
+    assert str(tmp_path) not in first
+
+
+def test_print_with_readme_prints_the_readme_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _scale(tmp_path)
+    assert report.main(["--results", str(tmp_path), "--readme", "README.md"]) == 0
+    assert capsys.readouterr().out == report.render_readme(tmp_path)
