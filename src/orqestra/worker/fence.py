@@ -12,18 +12,19 @@ It holds at most one deadline per ``Guard``; the earliest expiry ends the proces
 
 - ``OWNERSHIP``: armed while a handler runs. Its deadline is the attempt's
   lease, mapped to the local clock so that it is never later than the lease
-  really ends (``local_deadline``), minus the fencing margin. It moves later
-  only when the supervisor has a confirmed renewal, earlier when a
-  cancellation request shortens the lease, and is disarmed by the handler
-  thread the moment the handler's work has ended.
+  really ends (``local_deadline``), minus the fencing margin. It moves only on
+  a confirmed heartbeat answer: later to a renewed lease, or to the end of the
+  grace period a confirmed cancellation request set, which may be earlier or
+  later (DEC-040, DEC-048, DEC-068). It is disarmed by the handler thread the
+  moment the handler's work has ended.
 - ``OPERATION``: armed around each supervisor database call, so a stalled call
   ends the process instead of hanging it. It says nothing about ownership.
 - ``DRAIN``: armed once, when a stopping worker still holds a task: the end of
   the time ``shutdown_timeout`` gives it to settle that task (DEC-049). It can
   only end the process sooner, never extend a lease or another guard.
 
-Each arming returns a token; only the current token can extend, restrict or
-disarm its guard, so an old arming can never touch a newer one, and the
+Each arming returns a token; only the current token can extend, restrict, move
+or disarm its guard, so an old arming can never touch a newer one, and the
 watchdog only ever checks the deadlines armed now.
 
 Neither guard can stop a handler that holds the GIL in native code (the
@@ -31,6 +32,7 @@ watchdog thread then cannot run), or processes a handler started and detached.
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -202,6 +204,30 @@ class Watchdog:
     def restrict(self, token: int, deadline: float) -> bool:
         """Move the deadline of ``token``'s guard earlier, never later."""
         return self._move(token, lambda current: min(current, deadline))
+
+    def move_to(self, token: int, deadline: float) -> bool:
+        """Move the ownership deadline of ``token`` to exactly ``deadline``, earlier or later.
+
+        Only for a deadline the database confirmed and will not change again: the
+        end of a cancellation's grace period (DEC-040, DEC-048, DEC-068). One update
+        under the lock, so the watchdog never acts on a deadline in between.
+        Returns ``False``, changing nothing, if ``token`` is no longer armed. The
+        drain and operation guards never move this way: they only end the process
+        sooner.
+        """
+        if not math.isfinite(deadline):
+            msg = f"a fence deadline must be finite, not {deadline!r}"
+            raise ValueError(msg)
+        with self._condition:
+            for guard, armed in self._armed.items():
+                if armed.token == token:
+                    if guard is not Guard.OWNERSHIP:
+                        msg = f"the {guard.value} guard cannot be moved to a deadline"
+                        raise RuntimeError(msg)
+                    armed.deadline = deadline
+                    self._condition.notify_all()
+                    return True
+            return False
 
     def disarm(self, token: int) -> bool:
         """Disarm ``token``'s guard; ``False`` if it was not armed (already disarmed or expired)."""

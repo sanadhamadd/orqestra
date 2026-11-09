@@ -219,6 +219,17 @@ def before_lease_end(db: Conn, task: Task) -> bool:
     return bool(ended_in_time)
 
 
+def past(db: Conn, task: Task, delta: timedelta) -> bool:
+    """Whether the database clock is more than ``delta`` past the task's cancellation request."""
+    ((passed,),) = rows(
+        db,
+        "SELECT clock_timestamp() > cancel_requested_at + %s FROM tasks WHERE id = %s",
+        delta,
+        task.id,
+    )
+    return bool(passed)
+
+
 def no_failure_recorded(db: Conn, task: Task) -> bool:
     return rows(
         db, "SELECT count(*) FROM attempts WHERE task_id = %s AND failure_kind IS NOT NULL", task.id
@@ -295,6 +306,30 @@ def test_a_cancellation_request_fences_the_process_at_the_end_of_its_grace(
     assert task_states(handler_db, [task]) == [("cancelled", 1)]
 
 
+def test_a_grace_longer_than_the_lease_fences_the_process_at_the_grace_end_not_the_lease(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})  # ignores the signal
+    worker = start()
+    eventually(lambda: renewed(handler_db, task), "a renewal")
+    request_cancellation(handler_db, task.id, grace=timedelta(seconds=12))
+    # Any lease held at the request has ended by now; a fence restricted to it would
+    # have ended the process (DEC-068).
+    eventually(lambda: past(handler_db, task, LEASE + timedelta(milliseconds=500)), "the old lease")
+    assert worker.process.poll() is None
+    code, lines = worker.exit()
+    assert code == ExitCode.FENCED
+    assert lines[-1]["event"] == "ownership_deadline_passed"
+    assert any(line.get("event") == "cancellation_requested" for line in lines)
+    assert before_lease_end(handler_db, task)  # still before the grace's lease end
+    revocation = eventually(
+        lambda: revoke_next_expired(handler_db, retry_policy=RETRY), "the grace to run out"
+    )
+    assert revocation.attempt.revoked_reason is not None
+    assert revocation.attempt.revoked_reason.value == "cancellation_grace_expired"
+    assert task_states(handler_db, [task]) == [("cancelled", 1)]
+
+
 def test_a_control_plane_signal_ends_the_process_without_recording_anything(
     handler_db: Conn, start: Any
 ) -> None:
@@ -362,6 +397,26 @@ def test_a_cooperative_handler_is_cancelled_and_the_process_carries_on(
     assert worker.process.poll() is None  # no exit: the worker carries on
     assert no_failure_recorded(handler_db, task)
     assert runs(handler_db) == 1
+
+
+def test_a_cooperative_handler_winding_down_past_its_lease_is_not_fenced(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    (task,) = submit(handler_db, "cooperative", {"gate": gate.key})  # winds down until released
+    worker = start()
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    request_cancellation(handler_db, task.id, grace=timedelta(seconds=30))
+    eventually(lambda: past(handler_db, task, LEASE + timedelta(milliseconds=500)), "the old lease")
+    assert worker.process.poll() is None  # still winding down within its grace (DEC-068)
+    gate.release()
+    eventually(lambda: task_states(handler_db, [task]) == [("cancelled", 1)], "the cancellation")
+    assert rows(
+        handler_db, "SELECT state, revoked_reason FROM attempts WHERE task_id = %s", task.id
+    ) == [("cancelled", None)]  # recorded by the worker, not revoked by recovery
+    assert no_failure_recorded(handler_db, task)
+    assert worker.process.poll() is None  # no exit: the worker carries on
+    worker.pump()
+    assert '"ownership_deadline_passed"' not in worker._read
 
 
 def test_a_lost_connection_is_never_mistaken_for_a_cancellation(

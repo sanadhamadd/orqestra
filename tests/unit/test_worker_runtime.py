@@ -537,19 +537,46 @@ def test_lost_ownership_after_the_handler_ended_leaves_it_to_the_completion(
     assert running.heartbeat_due is None
 
 
+# The claim was sent at local 100.0 with a 30 s lease, so the fence starts at 127.0. A
+# grace end at T0 + L maps to 100.0 + L - 3.0, earlier or later than that (DEC-068);
+# the attempt's deadline (T0 + 10 min) caps the grace, so 600 s is the latest.
+GRACE_ENDS = pytest.mark.parametrize(
+    ("grace_seconds", "fence"),
+    [(12.0, 109.0), (60.0, 157.0), (600.0, 697.0)],
+    ids=["grace-shortens", "grace-lengthens", "grace-capped-at-deadline"],
+)
+
+
+@GRACE_ENDS
 def test_a_cancellation_request_stops_renewals_and_fences_at_the_grace_end(
-    harness: Harness,
+    harness: Harness, grace_seconds: float, fence: float
 ) -> None:
     running = harness.start()
-    grace_end = T0 + timedelta(seconds=12)
+    grace_end = T0 + timedelta(seconds=grace_seconds)
     harness.renew(raising(CancellationRequestedError(uuid.UUID(int=1), T0, grace_end)))
     harness.worker._heartbeat(running)
     assert running.heartbeat_due is None
-    assert harness.deadline() == 100.0 + 12.0 - 3.0  # shortened, never lengthened
-    harness.clock.now = 109.0
+    assert harness.deadline() == fence  # the grace end, less the margin, earlier or later
+    if fence > 127.0:
+        harness.clock.now = 130.0  # past the lease the claim confirmed
+        assert harness.watchdog.check() is None
+    harness.clock.now = fence
     expiry = harness.watchdog.check()
     assert expiry is not None
     assert expiry.guard is Guard.OWNERSHIP
+
+
+def test_a_request_confirmed_after_the_old_deadline_but_before_the_check_keeps_the_worker(
+    harness: Harness,
+) -> None:
+    running = harness.start()
+    harness.clock.now = 128.0  # past the old fence (127.0); the watchdog has not checked yet
+    grace_end = T0 + timedelta(seconds=60)
+    harness.renew(raising(CancellationRequestedError(uuid.UUID(int=1), T0, grace_end)))
+    harness.worker._heartbeat(running)
+    assert harness.deadline() == 157.0
+    assert harness.watchdog.check() is None  # not expired by the superseded deadline
+    assert harness.expiries == []
 
 
 def completed(
@@ -1076,17 +1103,27 @@ def test_a_handler_starts_with_an_unset_signal_over_its_attempts_own_event(
     assert not hasattr(ctx.cancellation, "set")  # the handler can only read it
 
 
-def test_a_confirmed_request_fences_first_then_tells_the_handler(harness: Harness) -> None:
+@GRACE_ENDS
+def test_a_confirmed_request_fences_first_then_tells_the_handler(
+    harness: Harness, grace_seconds: float, fence: float
+) -> None:
     running = harness.start()
     ctx = started(harness, 1)
-    harness.renew(raising(request()))
+    harness.renew(raising(request(grace_seconds)))
     harness.worker._heartbeat(running)
     assert ctx.cancellation.is_set()
     assert running.heartbeat_due is None  # no more renewals, so no repeated notice
-    assert harness.deadline() == 100.0 + 12.0 - 3.0  # the grace end, less the margin
+    assert harness.deadline() == fence  # the grace end, less the margin
 
 
-def test_the_fence_is_restricted_even_if_telling_the_handler_fails(harness: Harness) -> None:
+@pytest.mark.parametrize(
+    ("grace_seconds", "fence"),
+    [(12.0, 109.0), (60.0, 157.0)],
+    ids=["grace-shortens", "grace-lengthens"],
+)
+def test_the_fence_is_moved_even_if_telling_the_handler_fails(
+    harness: Harness, grace_seconds: float, fence: float
+) -> None:
     running = harness.start()
 
     class Broken:
@@ -1094,10 +1131,10 @@ def test_the_fence_is_restricted_even_if_telling_the_handler_fails(harness: Harn
             raise RuntimeError("cannot set")
 
     running.cancel = Broken()  # type: ignore[assignment]
-    harness.renew(raising(request()))
+    harness.renew(raising(request(grace_seconds)))
     with pytest.raises(RuntimeError, match="cannot set"):
         harness.worker._heartbeat(running)
-    assert harness.deadline() == 100.0 + 12.0 - 3.0  # fencing already holds
+    assert harness.deadline() == fence  # fencing already holds
     assert running.heartbeat_due is None
 
 
