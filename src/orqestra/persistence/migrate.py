@@ -183,6 +183,19 @@ def migrate(conninfo: str, migrations: Sequence[Migration] | None = None) -> tup
     return tuple(applied)
 
 
+# NOWAIT lock failures (0002 to 0006): the general cause, added to the migration's own text.
+_LOCK_NOT_AVAILABLE = "55P03"
+_LOCK_NOT_AVAILABLE_CAUSE = (
+    "Another session holds a conflicting lock on a table this migration locks (a writing "
+    "transaction, a row lock or autovacuum); run it again once that lock is released"
+)
+# A type with no relation of its own (a domain, enum, range or base type) blocks the
+# history table's name too, since a table's row type takes the same name.
+_HISTORY_TYPE = (
+    "SELECT t.typtype FROM pg_catalog.pg_type t "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace "
+    "WHERE n.nspname = %s AND t.typname = 'schema_migrations' AND t.typrelid = 0"
+)
 _HISTORY_KIND = (
     "SELECT c.relkind FROM pg_catalog.pg_class c "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
@@ -274,11 +287,19 @@ class _CreatedElsewhereError(Exception):
 def _history_table(conn: psycopg.Connection[TupleRow], schema: str) -> bool:
     """Whether ``schema`` has the history table; ``MigrationError`` if the name is something else.
 
-    A view, sequence or any other relation named ``schema_migrations`` would make
-    ``CREATE TABLE`` fail on every pass, so it is refused here instead.
+    A view, sequence or any other relation named ``schema_migrations``, or a type
+    of that name with no relation (a domain or enum, for example), would make
+    ``CREATE TABLE`` fail, so each is refused here instead.
     """
     row = conn.execute(_HISTORY_KIND, (schema,)).fetchone()
     if row is None:
+        kind = conn.execute(_HISTORY_TYPE, (schema,)).fetchone()
+        if kind is not None:
+            msg = (
+                f"{schema}.schema_migrations is a type (typtype {kind[0]!r}), not a table; "
+                "rename or drop it, or migrate another schema"
+            )
+            raise MigrationError(msg)
         return False
     if row[0] not in ("r", "p"):
         msg = (
@@ -359,4 +380,8 @@ def _apply(conn: psycopg.Connection[TupleRow], migration: Migration) -> None:
     except psycopg.Error as exc:
         detail = exc.diag.message_primary or type(exc).__name__
         msg = f"{migration.label} failed and was rolled back: [{exc.sqlstate}] {detail}"
+        if exc.sqlstate == _LOCK_NOT_AVAILABLE:
+            # A migration's own text can name one cause only (0006's names a writing
+            # transaction, and it is checksummed); this names every cause.
+            msg += f". {_LOCK_NOT_AVAILABLE_CAUSE}"
         raise MigrationError(msg, sqlstate=exc.sqlstate) from exc
