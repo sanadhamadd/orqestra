@@ -83,6 +83,28 @@ def test_wait_refuses_a_malformed_or_unbounded_request_as_permanent(
     assert reason in (outcome.error_message or "")
 
 
+CENTURIES = timedelta(days=400 * 365)  # longer than threading.TIMEOUT_MAX
+
+
+def test_wait_refuses_a_wait_longer_than_the_platform_supports_as_permanent() -> None:
+    assert CENTURIES.total_seconds() > 1e10 > threading.TIMEOUT_MAX
+    started = time.monotonic()
+    outcome = run_handler(builtin.waiting(CENTURIES), context(), {"seconds": 1e10})
+    assert time.monotonic() - started < 1.0
+    assert isinstance(outcome, AttemptFailed)
+    assert outcome.kind is FailureKind.PERMANENT
+    assert "longest wait this platform supports" in (outcome.error_message or "")
+
+
+def test_wait_accepts_the_longest_wait_the_platform_supports() -> None:
+    cancel = threading.Event()
+    cancel.set()  # a set event returns at once, whatever the timeout
+    outcome = run_handler(
+        builtin.waiting(CENTURIES), context(cancel), {"seconds": threading.TIMEOUT_MAX}
+    )
+    assert outcome == AttemptCancelled()
+
+
 def test_wait_ends_early_and_cancelled_once_told() -> None:
     cancel = threading.Event()
     outcomes: list[Any] = []

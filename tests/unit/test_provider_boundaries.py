@@ -130,18 +130,36 @@ def test_the_scan_catches_what_it_is_meant_to_catch(
     assert violations(source, network=network) == expected
 
 
-def imports_providers(source: str) -> bool:
+def imports_providers(source: str, module: str) -> bool:
+    """Whether ``source``, the code of the dotted ``module``, imports ``orqestra.providers``.
+
+    A relative import is resolved against the module's package, as Python does; one
+    that climbs above the top package cannot be resolved, so it counts as an import.
+    A package's ``__init__`` is named with it, for example ``orqestra.__init__``.
+    """
+    package = module.split(".")[:-1]
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            names = [module, *(f"{module}.{alias.name}" for alias in node.names)]
+            base = node.module or ""
+            if node.level:
+                kept = len(package) - (node.level - 1)
+                if kept < 1:
+                    return True  # above the top package: Python would refuse it
+                parts = package[:kept]
+                base = ".".join([*parts, *([node.module] if node.module else [])])
+            names = [base, *(f"{base}.{alias.name}" for alias in node.names)]
         else:
             continue
         if any(name.split(".")[:2] == ["orqestra", "providers"] for name in names):
             return True
     return False
+
+
+def module_name(path: Path, src: Path) -> str:
+    """The dotted module of ``path`` under ``src``'s parent, ``__init__`` included."""
+    return ".".join(path.relative_to(src.parent).with_suffix("").parts)
 
 
 def test_no_module_outside_the_package_imports_it() -> None:
@@ -150,23 +168,41 @@ def test_no_module_outside_the_package_imports_it() -> None:
     users = [
         path.relative_to(src).as_posix()
         for path in sorted(src.rglob("*.py"))
-        if providers not in path.parents and imports_providers(path.read_text(encoding="utf-8"))
+        if providers not in path.parents
+        and imports_providers(path.read_text(encoding="utf-8"), module_name(path, src))
     ]
     assert users == []
 
 
 @pytest.mark.parametrize(
-    ("source", "expected"),
+    ("source", "module", "expected"),
     [
-        ("import orqestra.providers.openrouter", True),
-        ("from orqestra.providers import openrouter", True),
-        ("from orqestra import providers", True),
-        ("from orqestra.calls import provider", False),
-        ("import orqestra.persistence", False),
+        ("import orqestra.providers.openrouter", "orqestra.worker.builtin", True),
+        ("from orqestra.providers import openrouter", "orqestra.worker.builtin", True),
+        ("from orqestra import providers", "orqestra.worker.builtin", True),
+        ("from orqestra.calls import provider", "orqestra.worker.builtin", False),
+        ("import orqestra.persistence", "orqestra.worker.builtin", False),
+        ("from ..providers import openrouter", "orqestra.worker.builtin", True),
+        ("from .. import providers", "orqestra.worker.builtin", True),
+        ("from ..providers.openrouter import OpenRouterProvider", "orqestra.worker.builtin", True),
+        ("from . import runtime", "orqestra.worker.builtin", False),
+        ("from ..calls import provider", "orqestra.worker.builtin", False),
+        ("from ...x import y", "orqestra.worker.builtin", True),
+        ("from .providers import openrouter", "orqestra.cli", True),
+        ("from . import providers", "orqestra.__init__", True),
+        ("from .. import providers", "orqestra.__init__", True),
     ],
 )
-def test_the_unwired_check_sees_every_form_of_import(source: str, expected: bool) -> None:
-    assert imports_providers(source) is expected
+def test_the_unwired_check_sees_every_form_of_import(
+    source: str, module: str, expected: bool
+) -> None:
+    assert imports_providers(source, module) is expected
+
+
+def test_the_scan_names_each_file_as_python_does() -> None:
+    src = Path(orqestra.__file__ or "").parent
+    assert module_name(src / "__init__.py", src) == "orqestra.__init__"
+    assert module_name(src / "worker" / "builtin.py", src) == "orqestra.worker.builtin"
 
 
 def test_the_adapter_loads_no_network_module() -> None:
