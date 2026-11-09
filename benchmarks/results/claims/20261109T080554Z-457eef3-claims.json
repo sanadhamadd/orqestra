@@ -1,0 +1,507 @@
+{
+  "environment": {
+    "cpu_count": 8,
+    "git_dirty": false,
+    "git_sha": "457eef305deb5541fd8a17944a264a79ede3ed5d",
+    "machine": "arm64",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12"
+  },
+  "format": 1,
+  "kind": "claim_cost",
+  "measurements": [
+    {
+      "claims": 200,
+      "depth": 1000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 0.521,
+          "n": 20,
+          "p50": 0.483,
+          "p95": 0.514
+        },
+        "last_shared_hit_blocks": 19,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.152,
+          "n": 20,
+          "p50": 0.035,
+          "p95": 0.059
+        },
+        "runs": 20
+      },
+      "heap_pages": 17,
+      "latency_ms": {
+        "max": 4.7839579929132015,
+        "n": 200,
+        "p50": 1.994082995224744,
+        "p95": 3.48287500673905
+      },
+      "ready": 1000,
+      "variant": "ready"
+    },
+    {
+      "claims": 200,
+      "depth": 10000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 5.985,
+          "n": 20,
+          "p50": 5.263,
+          "p95": 5.503
+        },
+        "last_shared_hit_blocks": 166,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.148,
+          "n": 20,
+          "p50": 0.048,
+          "p95": 0.072
+        },
+        "runs": 20
+      },
+      "heap_pages": 164,
+      "latency_ms": {
+        "max": 24.27904200158082,
+        "n": 200,
+        "p50": 6.651582982158288,
+        "p95": 9.268833004171029
+      },
+      "ready": 10000,
+      "variant": "ready"
+    },
+    {
+      "claims": 200,
+      "depth": 50000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 64.931,
+          "n": 20,
+          "p50": 38.359,
+          "p95": 51.897
+        },
+        "last_shared_hit_blocks": 822,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.22,
+          "n": 20,
+          "p50": 0.088,
+          "p95": 0.118
+        },
+        "runs": 20
+      },
+      "heap_pages": 820,
+      "latency_ms": {
+        "max": 59.81370800873265,
+        "n": 200,
+        "p50": 29.285999975400046,
+        "p95": 39.30904099252075
+      },
+      "ready": 50000,
+      "variant": "ready"
+    },
+    {
+      "claims": 200,
+      "depth": 100000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 66.108,
+          "n": 20,
+          "p50": 60.539,
+          "p95": 65.104
+        },
+        "last_shared_hit_blocks": 1642,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.213,
+          "n": 20,
+          "p50": 0.073,
+          "p95": 0.104
+        },
+        "runs": 20
+      },
+      "heap_pages": 1640,
+      "latency_ms": {
+        "max": 292.4010420101695,
+        "n": 200,
+        "p50": 57.352792005985975,
+        "p95": 88.93333401647396
+      },
+      "ready": 100000,
+      "variant": "ready"
+    },
+    {
+      "claims": 200,
+      "depth": 1000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 0.295,
+          "n": 20,
+          "p50": 0.273,
+          "p95": 0.292
+        },
+        "last_shared_hit_blocks": 19,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.742,
+          "n": 20,
+          "p50": 0.027,
+          "p95": 0.04
+        },
+        "runs": 20
+      },
+      "heap_pages": 17,
+      "latency_ms": {
+        "max": 5.334707995643839,
+        "n": 200,
+        "p50": 1.6933330043684691,
+        "p95": 2.6884170074481517
+      },
+      "ready": 500,
+      "variant": "waiting"
+    },
+    {
+      "claims": 200,
+      "depth": 10000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 3.023,
+          "n": 20,
+          "p50": 2.944,
+          "p95": 3.014
+        },
+        "last_shared_hit_blocks": 166,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.12,
+          "n": 20,
+          "p50": 0.027,
+          "p95": 0.049
+        },
+        "runs": 20
+      },
+      "heap_pages": 164,
+      "latency_ms": {
+        "max": 18.226707994472235,
+        "n": 200,
+        "p50": 4.598082974553108,
+        "p95": 5.612709006527439
+      },
+      "ready": 5000,
+      "variant": "waiting"
+    },
+    {
+      "claims": 200,
+      "depth": 50000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 15.696,
+          "n": 20,
+          "p50": 15.141,
+          "p95": 15.467
+        },
+        "last_shared_hit_blocks": 822,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 0.173,
+          "n": 20,
+          "p50": 0.029,
+          "p95": 0.055
+        },
+        "runs": 20
+      },
+      "heap_pages": 820,
+      "latency_ms": {
+        "max": 36.44158301176503,
+        "n": 200,
+        "p50": 16.002082993509248,
+        "p95": 18.86245800415054
+      },
+      "ready": 25000,
+      "variant": "waiting"
+    },
+    {
+      "claims": 200,
+      "depth": 100000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 63.001,
+          "n": 20,
+          "p50": 39.153,
+          "p95": 55.865
+        },
+        "last_shared_hit_blocks": 1642,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Nested Loop",
+          "Seq Scan on jobs",
+          "Seq Scan on tasks"
+        ],
+        "planning_ms": {
+          "max": 1.772,
+          "n": 20,
+          "p50": 0.084,
+          "p95": 0.29
+        },
+        "runs": 20
+      },
+      "heap_pages": 1640,
+      "latency_ms": {
+        "max": 136.7079579795245,
+        "n": 200,
+        "p50": 34.80391699122265,
+        "p95": 45.87750000064261
+      },
+      "ready": 50000,
+      "variant": "waiting"
+    },
+    {
+      "claims": 200,
+      "depth": 1000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 0.342,
+          "n": 20,
+          "p50": 0.331,
+          "p95": 0.338
+        },
+        "last_shared_hit_blocks": 19,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Hash Join",
+          "Seq Scan on tasks",
+          "Hash",
+          "Seq Scan on jobs"
+        ],
+        "planning_ms": {
+          "max": 0.14,
+          "n": 20,
+          "p50": 0.033,
+          "p95": 0.053
+        },
+        "runs": 20
+      },
+      "heap_pages": 17,
+      "latency_ms": {
+        "max": 10.791332984808832,
+        "n": 200,
+        "p50": 2.165166981285438,
+        "p95": 3.7379580026026815
+      },
+      "ready": 500,
+      "variant": "unsupported"
+    },
+    {
+      "claims": 200,
+      "depth": 10000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 5.175,
+          "n": 20,
+          "p50": 3.44,
+          "p95": 3.664
+        },
+        "last_shared_hit_blocks": 166,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Hash Join",
+          "Seq Scan on tasks",
+          "Hash",
+          "Seq Scan on jobs"
+        ],
+        "planning_ms": {
+          "max": 0.174,
+          "n": 20,
+          "p50": 0.052,
+          "p95": 0.126
+        },
+        "runs": 20
+      },
+      "heap_pages": 164,
+      "latency_ms": {
+        "max": 15.541125001618639,
+        "n": 200,
+        "p50": 5.031791981309652,
+        "p95": 6.9018329959362745
+      },
+      "ready": 5000,
+      "variant": "unsupported"
+    },
+    {
+      "claims": 200,
+      "depth": 50000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 30.604,
+          "n": 20,
+          "p50": 19.287,
+          "p95": 26.557
+        },
+        "last_shared_hit_blocks": 822,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Hash Join",
+          "Seq Scan on tasks",
+          "Hash",
+          "Seq Scan on jobs"
+        ],
+        "planning_ms": {
+          "max": 0.378,
+          "n": 20,
+          "p50": 0.104,
+          "p95": 0.189
+        },
+        "runs": 20
+      },
+      "heap_pages": 820,
+      "latency_ms": {
+        "max": 34.09579198341817,
+        "n": 200,
+        "p50": 17.958791984710842,
+        "p95": 21.27541700610891
+      },
+      "ready": 25000,
+      "variant": "unsupported"
+    },
+    {
+      "claims": 200,
+      "depth": 100000,
+      "explain": {
+        "consistent_shape": true,
+        "execution_ms": {
+          "max": 108.278,
+          "n": 20,
+          "p50": 41.477,
+          "p95": 55.468
+        },
+        "last_shared_hit_blocks": 1642,
+        "last_shared_read_blocks": 0,
+        "plan_nodes": [
+          "Limit",
+          "LockRows",
+          "Sort",
+          "Hash Join",
+          "Seq Scan on tasks",
+          "Hash",
+          "Seq Scan on jobs"
+        ],
+        "planning_ms": {
+          "max": 0.28,
+          "n": 20,
+          "p50": 0.091,
+          "p95": 0.185
+        },
+        "runs": 20
+      },
+      "heap_pages": 1640,
+      "latency_ms": {
+        "max": 69.23324998933822,
+        "n": 200,
+        "p50": 37.66400000313297,
+        "p95": 45.77974998392165
+      },
+      "ready": 50000,
+      "variant": "unsupported"
+    }
+  ],
+  "recorded_at": "2026-11-09T08:07:18+00:00",
+  "settings": {
+    "claimed_kind": "diagnostic.echo",
+    "claims": 200,
+    "depths": [
+      1000,
+      10000,
+      50000,
+      100000
+    ],
+    "explains": 20,
+    "lease": 600.0
+  }
+}

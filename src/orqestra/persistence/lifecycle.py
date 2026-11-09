@@ -138,13 +138,17 @@ _LOCK_CURRENT_ATTEMPT = (
 # A queued task may be claimed once the database clock reaches its available_at,
 # inclusively (DEC-053). Both claim paths test it at the statement that decides.
 _ELIGIBLE = "available_at <= {now}"
+# The one state a claim moves from, taken from the transition table; unpacking fails
+# at import if the table ever allows another. It is written into the statement as a
+# literal, not passed as a parameter, so the planner can prove the partial index
+# tasks_claim_order (migration 0006, DEC-069) even for a prepared, generic plan.
+(_CLAIMABLE_STATE,) = allowed_sources(TaskState.RUNNING)
 _LOCK_NEXT_CLAIMABLE_TASK = (
-    f"SELECT {TASK_COLUMNS} FROM tasks WHERE state = ANY(%s) "
+    f"SELECT {TASK_COLUMNS} FROM tasks WHERE state = '{_CLAIMABLE_STATE.value}' "
     f"AND {_ELIGIBLE.format(now='statement_timestamp()')} "
     "AND EXISTS (SELECT FROM jobs WHERE jobs.id = tasks.job_id AND jobs.kind = ANY(%s)) "
     "ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"
 )
-_CLAIMABLE_STATES = [state.value for state in allowed_sources(TaskState.RUNNING)]
 
 # The database clock at the start of the current statement. Operations read it
 # after taking the locks a decision depends on, so it is never older than the
@@ -432,7 +436,7 @@ def claim_next_attempt(
     """
     supported = check_job_kinds(kinds)
     with owned_transaction(conn, "claim_next_attempt") as cur:
-        row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (_CLAIMABLE_STATES, supported)).fetchone()
+        row = cur.execute(_LOCK_NEXT_CLAIMABLE_TASK, (supported,)).fetchone()
         if row is None:
             return None
         task = task_from_row(row)

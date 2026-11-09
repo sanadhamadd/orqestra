@@ -1730,7 +1730,7 @@ recorded on PR #17.
 ## Claim index
 
 ### DEC-069 — The claim scan dominates the engine's per-task cost at 10,000 queued tasks, so a partial claim index is proposed as its own task
-- **Status:** Proposed (owner gate: a migration is a schema change) · decides OD-7 on the measurement campaign's data (`docs/performance.md`) · nothing is implemented by this entry
+- **Status:** Accepted (owner, 2026-11-09; was Proposed) · decides OD-7 on the measurement campaign's data (`docs/performance.md`) · implemented by migration 0006 (note below)
 - **WHAT:**
   - The condition OD-7 set for a claim index holds: claim latency grows with queue depth enough to dominate `echo`'s per-task overhead at 10,000 tasks.
   - Migration 0006, a partial index that serves the claim's discovery statement (DEC-033), is proposed as a separate task. That task designs the index and measures it.
@@ -1753,6 +1753,12 @@ recorded on PR #17.
   - Until an index lands, claim cost grows with the size of `tasks`, because the plan scans the whole table. The curve was measured with queued tasks only. On this machine, 50,000 to 100,000 queued tasks cost 28.497 to 54.677 ms per claim (p50).
   - The proposed task must re-measure the curve, with and without the index. It must also measure the index's cost on submission and on each task state change, as DEC-062 asks, before the index is accepted.
 - **VERIFICATION:** the measurement campaign's result files named above, generated into `docs/performance.md` by `python -m benchmarks.report`. The proposed task verifies the index itself.
+- **Note (2026-11-09):** implemented by migration 0006, `tasks_claim_order ON tasks (created_at, id) WHERE state = 'queued'`.
+  - It is built under `LOCK TABLE tasks IN SHARE MODE NOWAIT`: it fails at once while an open transaction has written to `tasks`, and task writes wait while it builds.
+  - The discovery statement names `state = 'queued'` as a literal taken from `TASK_TRANSITIONS`, so a prepared, generic plan uses the index too. `tests/integration/test_migration_0006.py` checks both plans at 10,000 queued tasks after `ANALYZE`.
+  - **Claim cost, measured in one session on a fresh server:** with the index, against main just before it (`457eef3`), the claim's p50 with every task eligible is 1.361 ms at 100,000 queued tasks instead of 57.353 ms, and every variant plans an index scan. Tasks waiting on a delay, or of a kind the worker does not run, are still stepped over: 10.420 and 14.199 ms at 100,000 when half of the queue is one of those.
+  - **Write cost, measured as this entry required:** on the `echo` ladder (10,000 tasks), submission is not slower (0.593 to 0.623 s with, 0.659 to 0.740 s without), and commits per task are unchanged. Makespan is shorter at one and two workers but 10.8 % and 7.9 % longer at four and eight (derived from the medians), with higher database CPU and more dead tuples.
+  - Files: `benchmarks/results/claims/20261109T080554Z-457eef3-claims.json`, `benchmarks/results/claims/20261109T080719Z-eac0c04-claims.json`, and the `457eef3` and `eac0c04` `echo` files. Analysis: `docs/performance.md`, "The claim index: with and without".
 
 
 ## Supervisor step window
