@@ -1,3 +1,7 @@
+# Files the README's examples write in the working tree
+/tasks.json
+/echo-tasks.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -20,7 +20,7 @@ not repeat them.
 | [`cli`](../src/orqestra/cli.py) | `orqestra version`, `health`, `migrate`, `worker run`, `job submit`, `job status`, `job summary` and `job usage` | Yes, except `version` and `health` |
 | [`config`](../src/orqestra/config.py) | `Settings`: validated `ORQESTRA_*` settings with secrets redacted | No |
 | [`logging`](../src/orqestra/logging.py) | One JSON object per log line, with job, task and attempt IDs when a call supplies them | No |
-| [`benchmarks`](../benchmarks/) (not packaged) | The measurement harness: cells, ladders, claim cost, failure drills and the report tables | Only the dedicated `orqestra_bench` database |
+| [`benchmarks`](../benchmarks/) (not packaged) | The measurement harness: cells, ladders, claim cost, failure drills and the report tables | The dedicated `orqestra_bench` database; in CI, throwaway schemas of the integration database (`tests/integration/test_bench_smoke_pg.py`) |
 
 ## Data path
 
