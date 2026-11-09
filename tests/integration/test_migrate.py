@@ -173,15 +173,21 @@ def test_concurrent_first_runs_apply_each_migration_once_at_repeatable_read(
 
 
 @pytest.mark.parametrize(
-    "create",
+    ("create", "says"),
     [
-        "CREATE VIEW schema_migrations AS SELECT 1 AS version",
-        "CREATE SEQUENCE schema_migrations",
+        ("CREATE VIEW schema_migrations AS SELECT 1 AS version", "not a table"),
+        ("CREATE SEQUENCE schema_migrations", "not a table"),
+        (
+            "CREATE TYPE schema_migrations AS (a int)",
+            "not a table",
+        ),  # a composite has a pg_class row
+        ("CREATE DOMAIN schema_migrations AS int", "is a type"),  # type-only: no pg_class row
+        ("CREATE TYPE schema_migrations AS ENUM ('a')", "is a type"),
     ],
-    ids=["view", "sequence"],
+    ids=["view", "sequence", "composite-type", "domain", "enum"],
 )
 def test_a_relation_named_like_the_history_that_is_not_a_table_is_refused(
-    schema_url: str, tmp_path: Path, create: str
+    schema_url: str, tmp_path: Path, create: str, says: str
 ) -> None:
     migrations = _write(tmp_path, {"0001_first.sql": "CREATE TABLE first (id int);"})
     with psycopg.connect(schema_url, autocommit=True) as conn:
@@ -202,7 +208,7 @@ def test_a_relation_named_like_the_history_that_is_not_a_table_is_refused(
     [result] = outcome
     assert isinstance(result, MigrationError)
     assert "schema_migrations" in str(result)
-    assert "not a table" in str(result)
+    assert says in str(result)
     with psycopg.connect(schema_url) as conn:
         row = conn.execute("SELECT to_regclass('first') IS NULL").fetchone()
     assert row == (True,)  # nothing was applied

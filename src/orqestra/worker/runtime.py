@@ -714,6 +714,13 @@ class Worker:
                 ),
                 {},
             )
+        # No ValueError is caught here, on purpose. The claim's only ValueError sources are
+        # initial_lease, which the settings rule out (DEC-070's century rule: now +
+        # execution_timeout stays representable for a century, so only a database clock
+        # a century ahead of this one could reach it), and check_job_kinds, which the
+        # registry's kinds have already passed. Were one ever raised, it would not be
+        # skipped: _claim runs only while the worker is idle, and a supervisor failing
+        # while idle just raises, so run() ends loudly with the traceback.
         except (psycopg.Error, ConnectionUnavailable) as exc:
             if classify_completion_error(exc, connection_closed=self._conn is None) is (
                 CompletionError.AMBIGUOUS
