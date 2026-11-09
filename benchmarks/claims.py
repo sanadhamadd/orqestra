@@ -66,9 +66,8 @@ from orqestra.domain.leases import LeasePolicy
 from orqestra.domain.retry import RetryPolicy
 from orqestra.persistence.jobs import submit_job
 
-# The discovery statement and its state list, exactly as claim_next_attempt sends them.
+# The discovery statement, exactly as claim_next_attempt sends it.
 from orqestra.persistence.lifecycle import (
-    _CLAIMABLE_STATES,
     _LOCK_NEXT_CLAIMABLE_TASK,
     claim_next_attempt,
     complete_attempt,
@@ -179,7 +178,7 @@ def explain_claims(conn: Conn, runs: int) -> dict[str, Any]:
     hit = read = 0
     for _ in range(runs):
         with conn.transaction(force_rollback=True):
-            row = conn.execute(_EXPLAIN, (_CLAIMABLE_STATES, [CLAIMED_KIND])).fetchone()
+            row = conn.execute(_EXPLAIN, ([CLAIMED_KIND],)).fetchone()
         if row is None:
             msg = "EXPLAIN returned no plan"
             raise RuntimeError(msg)

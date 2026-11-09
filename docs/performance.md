@@ -24,8 +24,18 @@ each result file too.
 
 Each ladder interleaves its repetitions by worker count. Every figure in the tables is the
 median of three repetitions, with the minimum and maximum. The warm-up and the 50,000-invoice
-rung ran once each, the second by the owner's ruling (OD-2). Every result was measured on commit
-`c410ac6` from a clean tree. Every cell and drill ended `complete`; none was re-run.
+rung ran once each, the second by the owner's ruling (OD-2). The campaign's results were measured
+on commit `c410ac6` from a clean tree. Every cell and drill ended `complete`; none was re-run.
+
+**The claim index (DEC-069), measured later.** On 2026-11-09, in one session on a fresh
+`orqestra-bench` server, the claim cost and the `overhead` ladder were measured twice:
+- on `457eef3`, main just before the index (a clean checkout, the baseline);
+- on `eac0c04`, the same code plus migration 0006 and the literal discovery statement.
+
+The order was the baseline's claim cost, then `eac0c04`'s, then the baseline's ladder, then
+`eac0c04`'s. Each run used a clean tree, and every cell ended `complete`. These two commits
+are compared with each other only. The campaign's `c410ac6` files are an older commit, kept as
+context. The analysis is in [The claim index: with and without](#the-claim-index-with-and-without).
 
 What each figure covers:
 - **Database CPU and lock waits** are sampled from the submission to the end of the wait for the
@@ -98,6 +108,26 @@ _Derived, not measured. S(W) = median items/s (makespan) at W workers / the medi
 
 ### Ladder `overhead`
 
+Commit `457eef305deb` · machine: Apple M3, 8 cores, 8.0 GiB memory · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB) · Docker VM: 8 CPUs, 3.8 GiB
+
+| Cell | n | Makespan s | Items/s (makespan) | Items/s (processing) | Items/s (steady) | Queue wait p95 s | Service p50 s | End-to-end p95 s | Claim gap p50 s | Worker CPU | Commits/task | Files |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| echo 10000 w1 | 3 | 85.879 [84.171, 91.469] | 116.4 [109.3, 118.8] | 116.8 [109.6, 119.2] | 116.0 [109.8, 119.6] | 83.350 [81.444, 88.734] | 0.002 [0.002, 0.002] | 83.352 [81.446, 88.736] | 0.007 [0.006, 0.007] | 0.30 [0.26, 0.31] | 4.01 [4.01, 4.01] | `20261109T080940Z-457eef3-echo-10000-b0-w1-r1.json`, `20261109T081322Z-457eef3-echo-10000-b0-w1-r2.json`, `20261109T081649Z-457eef3-echo-10000-b0-w1-r3.json` |
+| echo 10000 w2 | 3 | 44.834 [44.409, 45.363] | 223.0 [220.4, 225.2] | 224.1 [221.8, 226.4] | 226.2 [223.6, 229.2] | 43.273 [42.952, 43.345] | 0.002 [0.002, 0.002] | 43.275 [42.956, 43.347] | 0.007 [0.006, 0.007] | 0.19 [0.19, 0.20] | 4.01 [4.01, 4.02] | `20261109T081032Z-457eef3-echo-10000-b0-w2-r1.json`, `20261109T081414Z-457eef3-echo-10000-b0-w2-r2.json`, `20261109T081742Z-457eef3-echo-10000-b0-w2-r3.json` |
+| echo 10000 w4 | 3 | 29.266 [28.767, 33.738] | 341.7 [296.4, 347.6] | 345.4 [299.5, 350.6] | 350.7 [301.6, 353.4] | 28.178 [27.716, 32.677] | 0.003 [0.002, 0.003] | 28.181 [27.718, 32.680] | 0.009 [0.008, 0.010] | 0.17 [0.16, 0.18] | 4.01 [4.00, 4.01] | `20261109T081114Z-457eef3-echo-10000-b0-w4-r1.json`, `20261109T081450Z-457eef3-echo-10000-b0-w4-r2.json`, `20261109T081818Z-457eef3-echo-10000-b0-w4-r3.json` |
+| echo 10000 w8 | 3 | 23.545 [19.596, 26.595] | 424.7 [376.0, 510.3] | 430.0 [380.3, 515.2] | 427.9 [378.7, 518.9] | 22.767 [18.868, 25.811] | 0.004 [0.004, 0.004] | 22.769 [18.871, 25.814] | 0.013 [0.011, 0.016] | 0.14 [0.13, 0.16] | 4.01 [4.00, 4.01] | `20261109T081149Z-457eef3-echo-10000-b0-w8-r1.json`, `20261109T081517Z-457eef3-echo-10000-b0-w8-r2.json`, `20261109T081850Z-457eef3-echo-10000-b0-w8-r3.json` |
+
+_Derived, not measured. S(W) = median items/s (makespan) at W workers / the median at 1 worker, for the same profile, size and batch; efficiency = S(W) / W; engine overhead per task = median makespan x W / tasks - the median of the repetitions' service time p50._
+
+| Cell | S(W) | Efficiency | Engine overhead per task s | Files |
+| --- | --- | --- | --- | --- |
+| echo 10000 w1 | 1.00 | 1.00 | 0.007 | `20261109T080940Z-457eef3-echo-10000-b0-w1-r1.json`, `20261109T081322Z-457eef3-echo-10000-b0-w1-r2.json`, `20261109T081649Z-457eef3-echo-10000-b0-w1-r3.json` |
+| echo 10000 w2 | 1.92 | 0.96 | 0.007 | `20261109T080940Z-457eef3-echo-10000-b0-w1-r1.json`, `20261109T081032Z-457eef3-echo-10000-b0-w2-r1.json`, `20261109T081322Z-457eef3-echo-10000-b0-w1-r2.json`, `20261109T081414Z-457eef3-echo-10000-b0-w2-r2.json`, `20261109T081649Z-457eef3-echo-10000-b0-w1-r3.json`, `20261109T081742Z-457eef3-echo-10000-b0-w2-r3.json` |
+| echo 10000 w4 | 2.93 | 0.73 | 0.009 | `20261109T080940Z-457eef3-echo-10000-b0-w1-r1.json`, `20261109T081114Z-457eef3-echo-10000-b0-w4-r1.json`, `20261109T081322Z-457eef3-echo-10000-b0-w1-r2.json`, `20261109T081450Z-457eef3-echo-10000-b0-w4-r2.json`, `20261109T081649Z-457eef3-echo-10000-b0-w1-r3.json`, `20261109T081818Z-457eef3-echo-10000-b0-w4-r3.json` |
+| echo 10000 w8 | 3.65 | 0.46 | 0.015 | `20261109T080940Z-457eef3-echo-10000-b0-w1-r1.json`, `20261109T081149Z-457eef3-echo-10000-b0-w8-r1.json`, `20261109T081322Z-457eef3-echo-10000-b0-w1-r2.json`, `20261109T081517Z-457eef3-echo-10000-b0-w8-r2.json`, `20261109T081649Z-457eef3-echo-10000-b0-w1-r3.json`, `20261109T081850Z-457eef3-echo-10000-b0-w8-r3.json` |
+
+### Ladder `overhead`
+
 Commit `c410ac6141c4` · machine: Apple M3, 8 cores, 8.0 GiB memory · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB) · Docker VM: 8 CPUs, 3.8 GiB
 
 | Cell | n | Makespan s | Items/s (makespan) | Items/s (processing) | Items/s (steady) | Queue wait p95 s | Service p50 s | End-to-end p95 s | Claim gap p50 s | Worker CPU | Commits/task | Files |
@@ -115,6 +145,26 @@ _Derived, not measured. S(W) = median items/s (makespan) at W workers / the medi
 | echo 10000 w2 | 1.82 | 0.91 | 0.008 | `20261109T005552Z-c410ac6-echo-10000-b0-w1-r1.json`, `20261109T005646Z-c410ac6-echo-10000-b0-w2-r1.json`, `20261109T005923Z-c410ac6-echo-10000-b0-w1-r2.json`, `20261109T010018Z-c410ac6-echo-10000-b0-w2-r2.json`, `20261109T010255Z-c410ac6-echo-10000-b0-w1-r3.json`, `20261109T010347Z-c410ac6-echo-10000-b0-w2-r3.json` |
 | echo 10000 w4 | 2.87 | 0.72 | 0.009 | `20261109T005552Z-c410ac6-echo-10000-b0-w1-r1.json`, `20261109T005722Z-c410ac6-echo-10000-b0-w4-r1.json`, `20261109T005923Z-c410ac6-echo-10000-b0-w1-r2.json`, `20261109T010056Z-c410ac6-echo-10000-b0-w4-r2.json`, `20261109T010255Z-c410ac6-echo-10000-b0-w1-r3.json`, `20261109T010422Z-c410ac6-echo-10000-b0-w4-r3.json` |
 | echo 10000 w8 | 4.13 | 0.52 | 0.013 | `20261109T005552Z-c410ac6-echo-10000-b0-w1-r1.json`, `20261109T005750Z-c410ac6-echo-10000-b0-w8-r1.json`, `20261109T005923Z-c410ac6-echo-10000-b0-w1-r2.json`, `20261109T010124Z-c410ac6-echo-10000-b0-w8-r2.json`, `20261109T010255Z-c410ac6-echo-10000-b0-w1-r3.json`, `20261109T010450Z-c410ac6-echo-10000-b0-w8-r3.json` |
+
+### Ladder `overhead`
+
+Commit `eac0c04164ea` · machine: Apple M3, 8 cores, 8.0 GiB memory · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB) · Docker VM: 8 CPUs, 3.8 GiB
+
+| Cell | n | Makespan s | Items/s (makespan) | Items/s (processing) | Items/s (steady) | Queue wait p95 s | Service p50 s | End-to-end p95 s | Claim gap p50 s | Worker CPU | Commits/task | Files |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| echo 10000 w1 | 3 | 49.568 [33.651, 51.209] | 201.7 [195.3, 297.2] | 202.8 [196.2, 300.1] | 243.2 [231.1, 305.2] | 47.914 [32.007, 49.550] | 0.001 [0.001, 0.001] | 47.915 [32.008, 49.551] | 0.002 [0.002, 0.002] | 0.23 [0.23, 0.23] | 4.01 [4.01, 4.01] | `20261109T081933Z-eac0c04-echo-10000-b0-w1-r1.json`, `20261109T082227Z-eac0c04-echo-10000-b0-w1-r2.json`, `20261109T082525Z-eac0c04-echo-10000-b0-w1-r3.json` |
+| echo 10000 w2 | 3 | 40.720 [36.487, 42.170] | 245.6 [237.1, 274.1] | 247.6 [238.6, 276.0] | 260.1 [248.0, 296.0] | 39.477 [35.249, 40.857] | 0.002 [0.002, 0.002] | 39.479 [35.250, 40.859] | 0.004 [0.004, 0.005] | 0.18 [0.17, 0.18] | 4.01 [4.01, 4.01] | `20261109T082016Z-eac0c04-echo-10000-b0-w2-r1.json`, `20261109T082314Z-eac0c04-echo-10000-b0-w2-r2.json`, `20261109T082614Z-eac0c04-echo-10000-b0-w2-r3.json` |
+| echo 10000 w4 | 3 | 32.416 [27.854, 33.002] | 308.5 [303.0, 359.0] | 311.4 [305.9, 361.9] | 309.1 [305.9, 362.7] | 31.428 [26.837, 31.939] | 0.003 [0.003, 0.003] | 31.430 [26.842, 31.940] | 0.010 [0.008, 0.010] | 0.16 [0.16, 0.18] | 4.00 [4.00, 4.00] | `20261109T082056Z-eac0c04-echo-10000-b0-w4-r1.json`, `20261109T082354Z-eac0c04-echo-10000-b0-w4-r2.json`, `20261109T082650Z-eac0c04-echo-10000-b0-w4-r3.json` |
+| echo 10000 w8 | 3 | 25.400 [16.404, 25.438] | 393.7 [393.1, 609.6] | 399.1 [397.4, 619.6] | 394.6 [393.6, 669.5] | 24.718 [15.508, 24.727] | 0.004 [0.004, 0.004] | 24.722 [15.513, 24.730] | 0.015 [0.007, 0.016] | 0.13 [0.13, 0.18] | 4.01 [4.01, 4.02] | `20261109T082129Z-eac0c04-echo-10000-b0-w8-r1.json`, `20261109T082428Z-eac0c04-echo-10000-b0-w8-r2.json`, `20261109T082713Z-eac0c04-echo-10000-b0-w8-r3.json` |
+
+_Derived, not measured. S(W) = median items/s (makespan) at W workers / the median at 1 worker, for the same profile, size and batch; efficiency = S(W) / W; engine overhead per task = median makespan x W / tasks - the median of the repetitions' service time p50._
+
+| Cell | S(W) | Efficiency | Engine overhead per task s | Files |
+| --- | --- | --- | --- | --- |
+| echo 10000 w1 | 1.00 | 1.00 | 0.004 | `20261109T081933Z-eac0c04-echo-10000-b0-w1-r1.json`, `20261109T082227Z-eac0c04-echo-10000-b0-w1-r2.json`, `20261109T082525Z-eac0c04-echo-10000-b0-w1-r3.json` |
+| echo 10000 w2 | 1.22 | 0.61 | 0.006 | `20261109T081933Z-eac0c04-echo-10000-b0-w1-r1.json`, `20261109T082016Z-eac0c04-echo-10000-b0-w2-r1.json`, `20261109T082227Z-eac0c04-echo-10000-b0-w1-r2.json`, `20261109T082314Z-eac0c04-echo-10000-b0-w2-r2.json`, `20261109T082525Z-eac0c04-echo-10000-b0-w1-r3.json`, `20261109T082614Z-eac0c04-echo-10000-b0-w2-r3.json` |
+| echo 10000 w4 | 1.53 | 0.38 | 0.010 | `20261109T081933Z-eac0c04-echo-10000-b0-w1-r1.json`, `20261109T082056Z-eac0c04-echo-10000-b0-w4-r1.json`, `20261109T082227Z-eac0c04-echo-10000-b0-w1-r2.json`, `20261109T082354Z-eac0c04-echo-10000-b0-w4-r2.json`, `20261109T082525Z-eac0c04-echo-10000-b0-w1-r3.json`, `20261109T082650Z-eac0c04-echo-10000-b0-w4-r3.json` |
+| echo 10000 w8 | 1.95 | 0.24 | 0.016 | `20261109T081933Z-eac0c04-echo-10000-b0-w1-r1.json`, `20261109T082129Z-eac0c04-echo-10000-b0-w8-r1.json`, `20261109T082227Z-eac0c04-echo-10000-b0-w1-r2.json`, `20261109T082428Z-eac0c04-echo-10000-b0-w8-r2.json`, `20261109T082525Z-eac0c04-echo-10000-b0-w1-r3.json`, `20261109T082713Z-eac0c04-echo-10000-b0-w8-r3.json` |
 
 ### Ladder `handler-bound`
 
@@ -196,6 +246,44 @@ Commit `c410ac6141c4` · machine: macOS-26.4-arm64-arm-64bit, 8 CPUs · server: 
 | waiting | 10000 | 5000 | 200 | 4.383 | 5.545 | 6.348 | 3.051 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
 | waiting | 50000 | 25000 | 200 | 15.945 | 18.199 | 23.435 | 15.271 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
 | waiting | 100000 | 50000 | 200 | 32.218 | 34.074 | 39.209 | 33.243 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+
+### Claim cost: `claims/20261109T080554Z-457eef3-claims.json`
+
+Commit `457eef305deb` · machine: macOS-26.4-arm64-arm-64bit, 8 CPUs · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB)
+
+| Variant | Depth | Ready | Claims | Latency p50 ms | Latency p95 ms | Latency max ms | EXPLAIN execution p50 ms | Plan | Same plan every run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ready | 1000 | 1000 | 200 | 1.994 | 3.483 | 4.784 | 0.483 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| ready | 10000 | 10000 | 200 | 6.652 | 9.269 | 24.279 | 5.263 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| ready | 50000 | 50000 | 200 | 29.286 | 39.309 | 59.814 | 38.359 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| ready | 100000 | 100000 | 200 | 57.353 | 88.933 | 292.401 | 60.539 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| unsupported | 1000 | 500 | 200 | 2.165 | 3.738 | 10.791 | 0.331 | Limit > LockRows > Sort > Hash Join > Seq Scan on tasks > Hash > Seq Scan on jobs | yes |
+| unsupported | 10000 | 5000 | 200 | 5.032 | 6.902 | 15.541 | 3.440 | Limit > LockRows > Sort > Hash Join > Seq Scan on tasks > Hash > Seq Scan on jobs | yes |
+| unsupported | 50000 | 25000 | 200 | 17.959 | 21.275 | 34.096 | 19.287 | Limit > LockRows > Sort > Hash Join > Seq Scan on tasks > Hash > Seq Scan on jobs | yes |
+| unsupported | 100000 | 50000 | 200 | 37.664 | 45.780 | 69.233 | 41.477 | Limit > LockRows > Sort > Hash Join > Seq Scan on tasks > Hash > Seq Scan on jobs | yes |
+| waiting | 1000 | 500 | 200 | 1.693 | 2.688 | 5.335 | 0.273 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| waiting | 10000 | 5000 | 200 | 4.598 | 5.613 | 18.227 | 2.944 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| waiting | 50000 | 25000 | 200 | 16.002 | 18.862 | 36.442 | 15.141 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+| waiting | 100000 | 50000 | 200 | 34.804 | 45.878 | 136.708 | 39.153 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks | yes |
+
+### Claim cost: `claims/20261109T080719Z-eac0c04-claims.json`
+
+Commit `eac0c04164ea` · machine: macOS-26.4-arm64-arm-64bit, 8 CPUs · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB)
+
+| Variant | Depth | Ready | Claims | Latency p50 ms | Latency p95 ms | Latency max ms | EXPLAIN execution p50 ms | Plan | Same plan every run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ready | 1000 | 1000 | 200 | 1.200 | 2.443 | 7.826 | 0.013 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| ready | 10000 | 10000 | 200 | 1.157 | 2.649 | 16.827 | 0.011 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| ready | 50000 | 50000 | 200 | 1.307 | 3.025 | 24.331 | 0.011 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| ready | 100000 | 100000 | 200 | 1.361 | 2.631 | 4.484 | 0.012 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| unsupported | 1000 | 500 | 200 | 1.448 | 2.374 | 3.827 | 0.167 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| unsupported | 10000 | 5000 | 200 | 2.711 | 3.895 | 7.201 | 1.610 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| unsupported | 50000 | 25000 | 200 | 7.442 | 9.413 | 13.009 | 7.992 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| unsupported | 100000 | 50000 | 200 | 14.199 | 20.623 | 71.110 | 18.857 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| waiting | 1000 | 500 | 200 | 1.357 | 2.502 | 5.471 | 0.086 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| waiting | 10000 | 5000 | 200 | 2.752 | 4.954 | 22.141 | 0.777 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| waiting | 50000 | 25000 | 200 | 6.076 | 7.781 | 11.999 | 3.922 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
+| waiting | 100000 | 50000 | 200 | 10.420 | 13.590 | 20.903 | 9.554 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs | yes |
 
 ## Failure drills (never in the performance tables)
 
@@ -376,10 +464,66 @@ Every drill passed every gate check. Each ran on 2,000 invoices at batch 100 wit
 - Files: `drills/20261109T011249Z-c410ac6-invoice-2000-b100-w4-r1.json` and
   `drills/20261109T011251Z-c410ac6-invoice-2000-b100-w4-r1.json`.
 
+### The claim index: with and without
+
+The baseline is `457eef3`; the other side is `eac0c04`, which adds migration 0006
+(`tasks_claim_order ON tasks (created_at, id) WHERE state = 'queued'`) and writes the claim's
+state as a literal. Same session, same server; figures are measured unless labelled.
+
+**Claim cost.** Every variant at every depth now plans an index scan on `tasks`
+(`Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs`).
+Without the index each one plans `Seq Scan on tasks` and a sort.
+
+| Variant | Depth | Latency p50 without (ms) | Latency p50 with (ms) |
+| --- | --- | --- | --- |
+| All tasks eligible | 1,000 | 1.994 | 1.200 |
+| All tasks eligible | 10,000 | 6.652 | 1.157 |
+| All tasks eligible | 50,000 | 29.286 | 1.307 |
+| All tasks eligible | 100,000 | 57.353 | 1.361 |
+| Half waiting on a later `available_at` | 100,000 | 34.804 | 10.420 |
+| Half of a kind the claimant does not run | 100,000 | 37.664 | 14.199 |
+
+- With every task eligible, a claim no longer depends on the depth: 1.157 to 1.361 ms from
+  1,000 to 100,000 queued tasks.
+- The two half-eligible variants still grow with depth, to 10.420 and 14.199 ms at 100,000.
+  The ineligible rows come first in queue order, and the index scan steps over them.
+- Files: `claims/20261109T080554Z-457eef3-claims.json` (without) and
+  `claims/20261109T080719Z-eac0c04-claims.json` (with).
+
+**Write cost: the `echo` ladder (10,000 tasks).** The index is maintained on every submission and
+every state change of a queued task. Medians of three repetitions:
+
+| Workers | Makespan without (s) | Makespan with (s) | Submission without (s) | Submission with (s) | Database CPU p50 without | Database CPU p50 with |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 85.879 | 49.568 | 0.659 | 0.619 | 44.53 % | 21.14 % |
+| 2 | 44.834 | 40.720 | 0.671 | 0.593 | 85.27 % | 108.38 % |
+| 4 | 29.266 | 32.416 | 0.740 | 0.604 | 143.32 % | 179.71 % |
+| 8 | 23.545 | 25.400 | 0.705 | 0.623 | 298.87 % | 375.48 % |
+
+- **Submission** (`timing.submission.seconds`) is not slower with the index: 0.593 to 0.623 s,
+  against 0.659 to 0.740 s without it.
+- **Makespan.** It is faster with the index at one and two workers. Derived: −42.3 % and −9.2 %.
+  At four and eight workers it is slower. Derived: +10.8 % and +7.9 %.
+  - At one worker the repetitions spread widely with the index: 33.651 to 51.209 s.
+  - Every cell is `complete` with an exact result.
+- **Database load.**
+  - Commits per task are unchanged at 4.0.
+  - Sequential scans of `tasks` per task fall from about 1.03 to at most 0.013.
+  - Database CPU p50 is higher with the index at two to eight workers, as above.
+  - The growth of `n_dead_tup` over a cell is larger: 18,703 to 30,000 with the index, 7,008 to
+    12,578 without.
+- **Hypothesis, not tested here.** Each claim leaves the claimed row's old index entry behind
+  until vacuum. Busy workers' later claims step over those entries, which would cost most where
+  many workers claim quickly.
+- Files: `*-457eef3-echo-10000-b0-w{1,2,4,8}-r{1,2,3}.json` and
+  `*-eac0c04-echo-10000-b0-w{1,2,4,8}-r{1,2,3}.json`, under `resources.database` and
+  `database_stats`.
+
 ### Observed limits
 
-**The claim scan.** Every claim scans the whole `tasks` table, so claim cost grows with the
-number of queued rows.
+**The claim scan (at `c410ac6`, before the claim index).** Every claim scans the whole `tasks`
+table, so claim cost grows with the number of queued rows. Migration 0006 adds the index that
+DEC-069 decided on. Its effect is under [The claim index: with and without](#the-claim-index-with-and-without).
 - Measured: 6.403 ms at 10,000 tasks and 54.677 ms at 100,000.
 - Measured: in the `echo` ladder, that scan runs about once per task while database CPU rises
   with workers.

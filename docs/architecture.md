@@ -79,7 +79,8 @@ flowchart LR
 Both lifecycles are explicit, immutable tables in
 [`domain/states.py`](../src/orqestra/domain/states.py) (`TASK_TRANSITIONS` and
 `ATTEMPT_TRANSITIONS`), the single source of legal moves. The claim's discovery query takes its
-`WHERE state = ANY(...)` filter from `TASK_TRANSITIONS` (`allowed_sources(TaskState.RUNNING)`);
+`WHERE state = 'queued'` filter from `TASK_TRANSITIONS` (`allowed_sources(TaskState.RUNNING)`,
+written as a literal so the partial index of migration 0006 serves every plan, DEC-069);
 every other lifecycle write locks its rows and then decides with `can_transition`, `transition`
 and `transition_attempt` (DEC-028). The diagrams and tables below are
 checked against those tables by
