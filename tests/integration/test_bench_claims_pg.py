@@ -29,7 +29,6 @@ from benchmarks.claims import (
     validate_result,
 )
 from benchmarks.database import BENCH_DATABASE_NAME, BENCH_DATABASE_URL_ENV
-from orqestra.persistence.lifecycle import _CLAIMABLE_STATES
 
 pytestmark = pytest.mark.integration
 
@@ -120,7 +119,7 @@ def test_explain_rolls_back_and_leaves_no_lock(db: Conn, worker_conn: Conn) -> N
     # Control: EXPLAIN ANALYZE really executes the statement and locks a task, so the
     # probe below would notice a transaction that was not rolled back.
     with worker_conn.transaction(force_rollback=True):
-        worker_conn.execute(_EXPLAIN, (_CLAIMABLE_STATES, [CLAIMED_KIND]))
+        worker_conn.execute(_EXPLAIN, ([CLAIMED_KIND],))
         with pytest.raises(LockNotAvailable), db.transaction():
             db.execute("SELECT id FROM tasks FOR UPDATE NOWAIT").fetchall()
 

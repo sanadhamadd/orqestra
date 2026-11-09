@@ -1264,6 +1264,20 @@ def claim_all(db: Conn, worker_id: str = "w", kinds: tuple[str, ...] = KINDS) ->
 # --- discovery: finding and claiming -----------------------------------------
 
 
+def test_claims_keep_their_order_once_the_statement_is_prepared(checked: Conn) -> None:
+    # psycopg prepares a statement server-side after 5 runs on one connection; the
+    # discovery statement names its state as a literal, so a prepared, generic plan
+    # can use the claim index too (DEC-069). Order stays created_at, then id.
+    tasks = new_tasks(checked, *(f"t{n}" for n in range(8)))
+    expected = [task.id for task in sorted(tasks, key=lambda t: (t.created_at, t.id))]
+    claimed = []
+    while (attempt := claim_next_attempt(checked, "w", policy=POLICY, kinds=KINDS)) is not None:
+        claimed.append(attempt.task_id)
+    assert claimed == expected
+    assert "state = 'queued'" in lifecycle._LOCK_NEXT_CLAIMABLE_TASK
+    assert "ANY(%s) AND available_at" not in lifecycle._LOCK_NEXT_CLAIMABLE_TASK
+
+
 def test_a_queued_task_is_discovered_and_claimed(checked: Conn) -> None:
     # Discovery is global, so this test owns every queued task in its schema.
     task = new_task(checked)

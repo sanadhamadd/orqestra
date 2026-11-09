@@ -57,6 +57,7 @@ def test_applies_packaged_schema_to_an_empty_schema(schema_url: str) -> None:
         "0003_cancellation_grace",
         "0004_task_availability",
         "0005_provider_usage",
+        "0006_claim_index",
     ]
     assert _tables(schema_url) == {
         "schema_migrations",
@@ -67,13 +68,14 @@ def test_applies_packaged_schema_to_an_empty_schema(schema_url: str) -> None:
         "provider_call_results",
         "attempt_usage_closures",
     }
-    initial, leases, grace, availability, usage = load_migrations()
+    initial, leases, grace, availability, usage, claim_index = load_migrations()
     assert _history(schema_url) == [
         (1, "initial_schema", initial.checksum),
         (2, "attempt_leases", leases.checksum),
         (3, "cancellation_grace", grace.checksum),
         (4, "task_availability", availability.checksum),
         (5, "provider_usage", usage.checksum),
+        (6, "claim_index", claim_index.checksum),
     ]
 
 
@@ -299,8 +301,9 @@ def test_many_concurrent_runners_apply_each_migration_exactly_once(
             "0003_cancellation_grace",
             "0004_task_availability",
             "0005_provider_usage",
+            "0006_claim_index",
         ]
-        assert len(_history(url)) == 5
+        assert len(_history(url)) == 6
 
 
 def test_cli_migrate_applies_the_schema(
@@ -316,6 +319,7 @@ def test_cli_migrate_applies_the_schema(
             "0003_cancellation_grace",
             "0004_task_availability",
             "0005_provider_usage",
+            "0006_claim_index",
         ],
     }
     assert main(["migrate"]) == 0
@@ -434,11 +438,11 @@ def _changed(statement: str) -> Callable[[str], None]:
         (
             _behind,
             "is behind; pending migrations: 0003_cancellation_grace, 0004_task_availability, "
-            "0005_provider_usage",
+            "0005_provider_usage, 0006_claim_index",
         ),
         (
-            _changed("INSERT INTO schema_migrations VALUES (6, 'future', 'x', now())"),
-            "database has migrations this code does not know: 0006_future",
+            _changed("INSERT INTO schema_migrations VALUES (7, 'future', 'x', now())"),
+            "database has migrations this code does not know: 0007_future",
         ),
         (
             _changed("UPDATE schema_migrations SET name = 'renamed' WHERE version = 2"),
