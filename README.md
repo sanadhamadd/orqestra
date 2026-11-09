@@ -115,6 +115,24 @@ Claim cost by depth, `claims/20261109T011052Z-c410ac6-claims.json`. Commit `c410
 | 10000 | 6.403 | 4.383 | 4.871 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
 | 50000 | 28.497 | 15.945 | 17.198 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
 | 100000 | 54.677 | 32.218 | 34.742 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
+
+Claim cost by depth, `claims/20261109T080554Z-457eef3-claims.json`. Commit `457eef305deb` · machine: macOS-26.4-arm64-arm-64bit, 8 CPUs · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB)
+
+| Depth | ready p50 ms | waiting p50 ms | unsupported p50 ms | Plan (ready) |
+| --- | --- | --- | --- | --- |
+| 1000 | 1.994 | 1.693 | 2.165 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
+| 10000 | 6.652 | 4.598 | 5.032 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
+| 50000 | 29.286 | 16.002 | 17.959 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
+| 100000 | 57.353 | 34.804 | 37.664 | Limit > LockRows > Sort > Nested Loop > Seq Scan on jobs > Seq Scan on tasks |
+
+Claim cost by depth, `claims/20261109T080719Z-eac0c04-claims.json`. Commit `eac0c04164ea` · machine: macOS-26.4-arm64-arm-64bit, 8 CPUs · server: PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) (fsync on, max_connections 100, shared_buffers 128MB, synchronous_commit on, work_mem 4MB)
+
+| Depth | ready p50 ms | waiting p50 ms | unsupported p50 ms | Plan (ready) |
+| --- | --- | --- | --- | --- |
+| 1000 | 1.200 | 1.357 | 1.448 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs |
+| 10000 | 1.157 | 2.752 | 2.711 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs |
+| 50000 | 1.307 | 6.076 | 7.442 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs |
+| 100000 | 1.361 | 10.420 | 14.199 | Limit > LockRows > Nested Loop > Index Scan on tasks > Materialize > Seq Scan on jobs |
 <!-- END GENERATED README -->
 
 ## Quickstart
@@ -149,7 +167,7 @@ creates, drops or resets a database.
 createdb orqestra
 export ORQESTRA_DATABASE_URL=postgresql:///orqestra
 uv run orqestra migrate
-# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace", "0004_task_availability", "0005_provider_usage"]}
+# {"status": "ok", "applied": ["0001_initial_schema", "0002_attempt_leases", "0003_cancellation_grace", "0004_task_availability", "0005_provider_usage", "0006_claim_index"]}
 uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 ```
 
@@ -1586,10 +1604,12 @@ and not in its wheel, so it runs only from a clone, as `uv run python -m benchma
 - A retry delay is the earliest time a requeued task may run, not a schedule: it runs
   when a live worker supporting its kind next polls after that time, and behind any
   backlog. A retried task keeps its original `created_at`, so once eligible it is claimed
-  ahead of newer tasks. Each claim scans and sorts the queued tasks, including those still
-  waiting out a delay; there is no index for it yet. The claim index is proposed in
-  DEC-069, not yet decided; the claim cost measured by depth is under
-  [Measured limits](#measured-limits).
+  ahead of newer tasks. Each claim reads the queued tasks in order through the partial
+  index of migration 0006 (DEC-069), so with every task eligible its cost no longer grows
+  with the queue. It still steps over queued tasks that are waiting out a delay or are of a
+  kind the worker does not run, so a long run of those ahead of the eligible ones costs more,
+  and the index adds a measured write cost; both are in
+  [docs/performance.md](docs/performance.md#the-claim-index-with-and-without).
   `None` from `claim_next_attempt` or `revoke_next_expired` means only that nothing was
   claimed or revoked by that call.
 - Retry policy consistency is not enforced: each process uses its own settings, and a
