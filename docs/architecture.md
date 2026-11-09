@@ -174,8 +174,9 @@ sequenceDiagram
 - **Heartbeat** (DEC-036): `renew_lease` locks only the attempt, so it cannot form a lock cycle
   with the task-first writers. It refuses an expired lease and a cancellation request.
 - **Local fence** (DEC-045): a Python thread cannot be stopped, so the watchdog ends the whole
-  process before the lease ends, by `fence_margin`. The guard moves later only after a confirmed
-  renewal; a lost answer never extends it.
+  process before the lease ends, by `fence_margin`. The guard moves only to a lease the database
+  confirmed: a renewal, or a cancellation's grace end, earlier or later (DEC-068). A lost answer
+  never moves it later.
 - **Completion by generation** (DEC-029): `complete_attempt` takes effect only for the task's
   current running generation; any other write is rejected with a typed error and changes
   nothing.

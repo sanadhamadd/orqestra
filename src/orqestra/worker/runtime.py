@@ -854,11 +854,13 @@ class Worker:
                 running.context,
             )
         except CancellationRequestedError as exc:
-            # A committed request (renew_lease read it): the lease is not renewed
-            # again and may now end sooner. Fence at the end of the grace period
-            # first, so fencing holds whatever follows; then tell the handler.
+            # A committed request (renew_lease read it under the attempt lock): the
+            # lease now ends with the grace period, sooner or later than the lease
+            # last confirmed (DEC-040), and nothing renews it again. Move the fence
+            # exactly there first, so fencing holds whatever follows; then tell the
+            # handler. False means the handler has ended: the completion decides.
             running.heartbeat_due = None
-            self._watchdog.restrict(
+            self._watchdog.move_to(
                 running.token, running.local(exc.lease_expires_at) - self._margin()
             )
             running.cancel.set()
@@ -866,7 +868,7 @@ class Worker:
             self._event(
                 logging.WARNING,
                 "cancellation_requested",
-                "renewals stop; the handler is told",
+                f"renewals stop; the handler is told; grace_end={exc.lease_expires_at.isoformat()}",
                 running.context,
             )
             return
