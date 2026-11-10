@@ -507,7 +507,11 @@ JOB_COMMITS_METHOD = (
     "reads roll back and never commit; it includes the submit command's own few commits "
     "(its schema check and the submission), fixed per job; each end may be off by up to "
     "about 1 s of idle "
-    "claims, because counters are published at most once a second"
+    "claims, because counters are published at most once a second; that uncertainty "
+    "(uncertainty_commits) uses the larger of the measured idle rate and the rate the "
+    "settings imply (expected_idle_rate_per_s: workers x (1/poll_interval + "
+    "1/recovery_interval), an upper estimate, not a floor, since each call takes time), "
+    "and a figure is kept only at twice that uncertainty or more"
 )
 
 

@@ -13,7 +13,7 @@ from typing import Any, NoReturn, cast
 import pytest
 
 import benchmarks.worker
-from benchmarks import metrics
+from benchmarks import metrics, run
 from benchmarks.generate import expected_outcome, generate_invoices
 from benchmarks.ladder import (
     CELL_LIMIT,
@@ -244,6 +244,18 @@ def test_a_short_cells_commits_are_not_measured_within_their_uncertainty() -> No
     assert commits["method"].startswith("not measured: the job's commits")
     # Its sibling, with a positive estimate, is inside the bound too.
     assert metrics.job_commits(92.0, 18.3, 3.24, 2.0)["job_commits"] is None
+
+
+def test_the_implied_idle_rate_counts_polls_and_sweeps() -> None:
+    settings = {
+        "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+        "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    }
+    # Each idle worker: 20 claims and half a sweep step a second.
+    assert run.implied_idle_rate(2, settings) == pytest.approx(2 * (20 + 0.5))
+    # The campaign's measured idle rate at one worker, 17.4 a second, sits below it:
+    # an upper estimate, since each call takes time.
+    assert run.implied_idle_rate(1, run.BENCH_WORKER_SETTINGS) > 17.4
 
 
 def test_an_idle_window_that_counted_nothing_still_bounds_the_estimate() -> None:
