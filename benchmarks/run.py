@@ -36,6 +36,17 @@ that fails any check is ``failed_correctness`` and reports no throughput:
 
 The summary and usage reads raise ``WrongJobKindError`` for any other kind of
 job, so their checks refuse a non-invoice profile before reading anything.
+
+**The provider** (DEC-071) is the offline double unless ``--provider openrouter``
+is given, which only this command accepts (``benchmarks.ladder`` and
+``benchmarks.drills`` have no provider flag). It needs ``--model``,
+``--max-provider-calls`` and either ``--dry-run`` (canned responses, no network, no
+cost) or ``--allow-live-calls`` (real, billable calls: the owner's separate
+approval, with a dollar limit set on the key, is required first). The cell's call
+maximum is a counter file in the cell's raw directory, created before any worker
+starts; ``ORQESTRA_OPENROUTER_API_KEY`` is passed to the workers only for a live
+run. With OpenRouter the usage check compares the calls with the oracle, and the
+credits only for a dry run, whose canned usage is known.
 """
 
 import argparse
@@ -75,6 +86,20 @@ from benchmarks.generate import (
     expected_outcome,
     generate_invoices,
 )
+from benchmarks.live import (
+    API_KEY_ENV,
+    BUDGET_FILE_NAME,
+    DOUBLE,
+    DRY_RUN_LABEL,
+    ProviderChoice,
+    ProviderName,
+    canned_requests,
+    create_budget_file,
+    credential_from,
+    expected_usage,
+    provider_block,
+    read_budget_file,
+)
 from benchmarks.result import (
     RAW_DIR,
     RESULTS_DIR,
@@ -97,6 +122,8 @@ from orqestra.domain.states import AttemptState, TaskState
 from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.migrate import migrate
 from orqestra.worker.builtin import ECHO, WAIT
+from orqestra.worker.settings import WorkerSettings
+from orqestra.worker.usage import check_provider_call_budget
 from orqestra.workloads.invoice.handler import JOB_KIND
 
 MAX_ATTEMPTS = 3
@@ -198,7 +225,13 @@ def build_workload(cell: Cell) -> Workload:
 # --- worker processes --------------------------------------------------------------------
 
 
-def worker_command(profile: Profile) -> list[str]:
+def worker_command(
+    profile: Profile,
+    provider: ProviderChoice = DOUBLE,
+    budget_file: Path | None = None,
+    call_timeout: str = DEFAULT_CALL_TIMEOUT,
+) -> list[str]:
+    """A worker's argv. It never holds a credential: the key travels only in the environment."""
     if profile is Profile.INVOICE:
         return [
             sys.executable,
@@ -207,15 +240,32 @@ def worker_command(profile: Profile) -> list[str]:
             "--cap",
             str(DEFAULT_CAP),
             "--call-timeout",
-            DEFAULT_CALL_TIMEOUT,
+            call_timeout,
+            *provider.worker_arguments(budget_file),
         ]
+    if provider.openrouter:
+        msg = "--provider openrouter runs only the invoice profile"
+        raise ValueError(msg)
     return [str(ORQESTRA), "worker", "run", "--kind", KIND_OF[profile]]
 
 
-def process_environment(url: str, worker_settings: Mapping[str, str]) -> dict[str, str]:
-    """This process's environment without any ``ORQESTRA_*`` value, plus the cell's own."""
+def process_environment(
+    url: str, worker_settings: Mapping[str, str], provider: ProviderChoice = DOUBLE
+) -> dict[str, str]:
+    """This process's environment without any ``ORQESTRA_*`` value, plus the cell's own.
+
+    For a live OpenRouter run only, the key is passed on from this process's
+    environment (never from ``.env``); a dry run and the double never get it.
+    """
     env = {key: value for key, value in os.environ.items() if not key.startswith("ORQESTRA_")}
-    return env | dict(worker_settings) | {"ORQESTRA_DATABASE_URL": url}
+    env = env | dict(worker_settings) | {"ORQESTRA_DATABASE_URL": url}
+    if provider.live:
+        credential = credential_from(os.environ)
+        if credential is None:
+            msg = f"{API_KEY_ENV} is not set"
+            raise ValueError(msg)
+        env[API_KEY_ENV] = credential.get_secret_value()
+    return env
 
 
 @dataclass(slots=True)
@@ -241,6 +291,9 @@ class Fleet:
     log_dir: Path
     workers: list[WorkerHandle] = field(default_factory=list)
     started: int = 0
+    provider: ProviderChoice = DOUBLE
+    budget_file: Path | None = None
+    call_timeout: str = DEFAULT_CALL_TIMEOUT
 
     def start(self) -> WorkerHandle:
         """Start one more worker. Every worker runs from ``ROOT``, where the harness lives."""
@@ -248,7 +301,7 @@ class Fleet:
         path = self.log_dir / f"worker-{self.started}.log"
         log = path.open("wb")
         process = subprocess.Popen(  # a fixed command
-            worker_command(self.profile),
+            worker_command(self.profile, self.provider, self.budget_file, self.call_timeout),
             cwd=ROOT,
             env=self.env,
             stdin=subprocess.DEVNULL,
@@ -421,12 +474,14 @@ def usage_check(
     expected: Expected,
     *,
     clean: bool,
+    provider: ProviderChoice = DOUBLE,
 ) -> dict[str, Any]:
     """Gate item 6: the usage report and call budget against the oracle (plan 2.6).
 
     The succeeded attempts' calls and tokens are exact in every run. ``clean``
     means no task needed a second attempt, so the job totals must equal them
-    too, with ``CLOSED`` finality and a ``within`` budget verdict.
+    too, with ``CLOSED`` finality and a ``within`` budget verdict. With
+    OpenRouter the amounts are credits, compared only when known (a dry run).
     """
     _require_invoice(profile)
     read = read_job_call_budget(conn, job_id, cap=expected.cap)
@@ -434,6 +489,11 @@ def usage_check(
         return _check("usage", False, "no such job")
     report, budget = read
     succeeded = report.by_attempt_state[AttemptState.SUCCEEDED]
+    if provider.openrouter:
+        credits_passed, credits_detail = _credits_usage(
+            report, budget, succeeded, expected, provider, clean
+        )
+        return _check("usage", credits_passed, credits_detail)
     succeeded_tokens = _tokens(succeeded.reported_totals)
     detail: dict[str, Any] = {
         "succeeded_calls": succeeded.calls,
@@ -459,8 +519,50 @@ def usage_check(
 
 
 def _tokens(totals: Mapping[str, Any]) -> Decimal:
-    total = totals.get(TOKENS)
+    return _amount(totals, TOKENS)
+
+
+def _amount(totals: Mapping[str, Any], unit: str) -> Decimal:
+    total = totals.get(unit)
     return Decimal(0) if total is None else Decimal(total.amount)
+
+
+def _credits_usage(
+    report: Any,
+    budget: Any,
+    succeeded: Any,
+    expected: Expected,
+    provider: ProviderChoice,
+    clean: bool,
+) -> tuple[bool, dict[str, Any]]:
+    """The usage check for OpenRouter: calls against the oracle, credits when known."""
+    unit, oracle_amount = expected_usage(provider, expected.calls)
+    succeeded_amount = _amount(succeeded.reported_totals, unit)
+    amount = _amount(report.reported_totals, unit)
+    detail: dict[str, Any] = {
+        "unit": unit,
+        "succeeded_calls": succeeded.calls,
+        "succeeded_amount": str(succeeded_amount),
+        "oracle_calls": expected.calls,
+        "oracle_amount": None if oracle_amount is None else str(oracle_amount),
+        "calls": report.calls,
+        "amount": str(amount),
+        "finality": report.finality.value,
+        "budget_verdict": budget.verdict.value,
+        "budget_bound": budget.bound,
+    }
+    passed = succeeded.calls == expected.calls and (
+        oracle_amount is None or succeeded_amount == oracle_amount
+    )
+    if clean:
+        passed = (
+            passed
+            and report.calls == expected.calls
+            and (oracle_amount is None or amount == oracle_amount)
+            and report.finality is UsageFinality.CLOSED
+            and budget.verdict is BudgetVerdict.WITHIN
+        )
+    return passed, detail
 
 
 def run_gate(
@@ -473,6 +575,7 @@ def run_gate(
     expected_status: JobStatus = JobStatus.SUCCEEDED,
     expected_failed: Sequence[str] = (),
     expected_exit_codes: Sequence[int] | None = None,
+    provider: ProviderChoice = DOUBLE,
 ) -> list[dict[str, Any]]:
     """Every gate check of plan 2.6 that applies to ``profile``, in order."""
     progress = get_job_progress(conn, job_id)
@@ -509,7 +612,7 @@ def run_gate(
         tasks = sum(progress.task_counts.values())
         clean = attempts == tasks and not failed
         checks.append(summary_check(conn, job_id, profile, expected))
-        checks.append(usage_check(conn, job_id, profile, expected, clean=clean))
+        checks.append(usage_check(conn, job_id, profile, expected, clean=clean, provider=provider))
     else:
         wrong = _count(conn, _RESULT_MISMATCH[profile], job_id)
         checks.append(_check("results_exact", wrong == 0, {"mismatches": wrong}))
@@ -613,6 +716,8 @@ def run_cell(
     container: str | None = None,
     note: str = "",
     hook: Callable[[Running], None] | None = None,
+    provider: ProviderChoice = DOUBLE,
+    call_timeout: str = DEFAULT_CALL_TIMEOUT,
 ) -> dict[str, Any]:
     """Run ``cell`` against the migrated schema ``url`` and return its result record.
 
@@ -620,13 +725,29 @@ def run_cell(
     then makes the cell ``incomplete``. The wait also ends once every worker has
     exited; ``timing`` records which ended it and how long it lasted
     (``cell_status``). Raw files go to ``raw_dir``. ``hook``, if given, is called
-    on every poll while the job runs (drills use it).
+    on every poll while the job runs (drills use it). ``provider`` is the double
+    unless ``benchmarks.run`` was given ``--provider openrouter`` (DEC-071); then
+    the cell's call counter is created in ``raw_dir`` before any worker starts.
     """
     run_id = run_id or uuid.uuid4().hex[:12]
+    refusal = provider.refusal(os.environ)
+    if refusal is not None:
+        raise ValueError(refusal)
+    if provider.openrouter and cell.profile is not Profile.INVOICE:
+        msg = "--provider openrouter runs only the invoice profile"
+        raise ValueError(msg)
     raw_dir.mkdir(parents=True, exist_ok=True)
     workload = build_workload(cell)
-    env = process_environment(url, worker_settings)
-    fleet = Fleet(cell.profile, env, raw_dir)
+    env = process_environment(url, worker_settings, provider)
+    budget_file = create_budget_file(raw_dir / BUDGET_FILE_NAME) if provider.openrouter else None
+    fleet = Fleet(
+        cell.profile,
+        env,
+        raw_dir,
+        provider=provider,
+        budget_file=budget_file,
+        call_timeout=call_timeout,
+    )
     with (
         psycopg.connect(url, autocommit=True) as conn,
         psycopg.connect(url, autocommit=True) as sampling,
@@ -705,7 +826,9 @@ def run_cell(
         exit_codes = [worker["exit_code"] for worker in reaped]
         times = metrics.read_stored_times(conn, job_id)
         figures = metrics.timing_figures(times)
-        gate = run_gate(conn, job_id, cell.profile, workload.expected, exit_codes)
+        gate = run_gate(
+            conn, job_id, cell.profile, workload.expected, exit_codes, provider=provider
+        )
         failures = failure_figures(conn, job_id, exit_codes)
         usage = (
             usage_figures(conn, job_id, DEFAULT_CAP) if cell.profile is Profile.INVOICE else None
@@ -735,7 +858,13 @@ def run_cell(
         "environment": record_environment,
         "worker_settings": dict(worker_settings),
         "provider": (
-            {"call_timeout": DEFAULT_CALL_TIMEOUT, "cap": DEFAULT_CAP, "route": "route-a"}
+            provider_block(
+                provider,
+                call_timeout=call_timeout,
+                cap=DEFAULT_CAP,
+                route="route-a",
+                calls_made=None if usage is None else usage["calls"],
+            )
             if cell.profile is Profile.INVOICE
             else None
         ),
@@ -812,6 +941,8 @@ def run_in_bench_database(
     allow_dirty: bool = False,
     container: str | None = None,
     note: str = "",
+    provider: ProviderChoice = DOUBLE,
+    call_timeout: str = DEFAULT_CALL_TIMEOUT,
 ) -> tuple[dict[str, Any], Path]:
     """Run ``cell`` in a fresh run schema of the benchmark database; write its result file."""
     url = require_bench_database_url(os.environ)
@@ -830,6 +961,8 @@ def run_in_bench_database(
                 ladder=ladder,
                 container=container,
                 note=note,
+                provider=provider,
+                call_timeout=call_timeout,
             )
             path = write_result(record, out_dir, allow_dirty=allow_dirty)
         finally:
@@ -856,6 +989,104 @@ def refuse_dirty(allow_dirty: bool) -> None:
         raise DirtyTreeError(msg)
 
 
+def add_provider_arguments(parser: argparse.ArgumentParser) -> None:
+    """The provider flags; only this command has them (DEC-071)."""
+    parser.add_argument(
+        "--provider",
+        type=ProviderName,
+        choices=list(ProviderName),
+        default=ProviderName.DOUBLE,
+        help="what answers the invoice calls: the offline double (default) or openrouter",
+    )
+    parser.add_argument("--model", help="openrouter: the model slug")
+    parser.add_argument(
+        "--max-provider-calls", type=int, help="openrouter: the most calls the whole cell makes"
+    )
+    parser.add_argument(
+        "--allow-live-calls",
+        action="store_true",
+        help="openrouter: make real, billable calls (needs the owner's approval, DEC-071)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="openrouter: canned responses, no network, no cost"
+    )
+    parser.add_argument(
+        "--call-timeout",
+        help=f"openrouter: each call's timeout, ISO 8601 (default {DEFAULT_CALL_TIMEOUT})",
+    )
+
+
+def provider_refusal(
+    choice: ProviderChoice, cell: Cell, call_timeout: str | None, environ: Mapping[str, str]
+) -> str | None:
+    """Why this command may not run ``cell`` with ``choice``, or ``None``."""
+    refusal = choice.refusal(environ)
+    if refusal is not None:
+        return refusal
+    if not choice.openrouter:
+        return "--call-timeout applies only to --provider openrouter" if call_timeout else None
+    if cell.profile is not Profile.INVOICE:
+        return "--provider openrouter runs only the invoice profile"
+    assert choice.max_provider_calls is not None
+    if cell.workers > choice.max_provider_calls:
+        return (
+            "--workers is above --max-provider-calls: more workers than calls is almost "
+            "certainly a typo"
+        )
+    if call_timeout is not None:
+        try:
+            parse_duration(call_timeout)
+        except argparse.ArgumentTypeError as exc:
+            return f"--call-timeout: {exc}"
+    return None
+
+
+def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
+    """``worker_settings`` as the worker will read them, without touching the environment."""
+    fields = {
+        key.removeprefix("ORQESTRA_WORKER_").lower(): value
+        for key, value in worker_settings.items()
+    }
+    return WorkerSettings.model_validate(fields)  # no settings source is read
+
+
+def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
+    """What a dry run prints before its cell: the oracle's calls and the hard bounds."""
+    workload = build_workload(cell)
+    assert workload.expected is not None
+    assert choice.max_provider_calls is not None
+    calls = workload.expected.calls
+    bound = DEFAULT_CAP * MAX_ATTEMPTS * len(workload.tasks)
+    try:
+        check_provider_call_budget(
+            bench_settings(BENCH_WORKER_SETTINGS),
+            max_provider_calls_per_attempt=DEFAULT_CAP,
+            provider_call_timeout=parse_duration(call_timeout),
+        )
+        verdict = "fits"
+    except (TypeError, ValueError) as exc:
+        verdict = f"refused: {exc}"
+    lines = [
+        f"expected provider calls (oracle): {calls}",
+        f"cell call maximum (--max-provider-calls): {choice.max_provider_calls}",
+        f"call budget bound (DEC-065, cap x sum of max_attempts): {bound}",
+        f"per-attempt call budget (cap {DEFAULT_CAP}, call timeout {call_timeout}): {verdict}",
+    ]
+    if calls > choice.max_provider_calls:
+        lines.append("the call maximum would stop this run before every invoice is verified")
+    return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
+
+
+def dry_run_summary(record: Mapping[str, Any], raw_dir: Path) -> list[str]:
+    """What a dry run prints after its cell: the requests sent and the counts kept."""
+    lines = [
+        f"requests answered by the canned transport: {canned_requests(raw_dir)}",
+        f"calls in the usage ledger: {record['provider']['calls_made']}",
+        f"calls counted against the maximum: {read_budget_file(raw_dir / BUDGET_FILE_NAME)}",
+    ]
+    return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m benchmarks.run", description=__doc__)
     parser.add_argument("--profile", type=Profile, choices=list(Profile), required=True)
@@ -866,13 +1097,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--stop-after-minutes", type=float, default=60.0)
     add_common_arguments(parser)
+    add_provider_arguments(parser)
     args = parser.parse_args(argv)
+    choice = ProviderChoice(
+        name=args.provider,
+        model=args.model,
+        max_provider_calls=args.max_provider_calls,
+        allow_live_calls=args.allow_live_calls,
+        dry_run=args.dry_run,
+    )
+    call_timeout = args.call_timeout or DEFAULT_CALL_TIMEOUT
+    run_id = uuid.uuid4().hex[:12]
     try:
         cell = Cell(args.profile, args.size, args.batch, args.workers, args.repetition, args.seed)
+        refusal = provider_refusal(choice, cell, args.call_timeout, os.environ)
+        if refusal is not None:
+            raise ValueError(refusal)
         refuse_dirty(args.allow_dirty)
+        if choice.dry_run:
+            print("\n".join(dry_run_preview(cell, choice, call_timeout)))
         record, path = run_in_bench_database(
             cell,
-            run_id=uuid.uuid4().hex[:12],
+            run_id=run_id,
             ladder="single",
             stop_after=args.stop_after_minutes * 60,
             out_dir=args.out_dir,
@@ -880,6 +1126,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_dirty=args.allow_dirty,
             container=args.db_container,
             note=args.note,
+            provider=choice,
+            call_timeout=call_timeout,
         )
     except (ValueError, DirtyTreeError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
@@ -887,6 +1135,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except psycopg.OperationalError as exc:
         print(f"refused: {unreachable_message(exc)}", file=sys.stderr)
         return 1
+    if choice.dry_run:
+        print("\n".join(dry_run_summary(record, RAW_DIR / run_id / cell.name)))
     print(f"{record['status']} {path}")
     return 0 if record["status"] == Status.COMPLETE else 1
 

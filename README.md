@@ -33,7 +33,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051); `orqestra job submit` from a JSON file of tasks and `orqestra job status` (DEC-064, Accepted); `orqestra job summary` and `orqestra job usage` for an invoice job, with an optional call budget check (DEC-066, Accepted) | — |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, Accepted); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Accepted); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Accepted); an OpenRouter adapter over an injected HTTP transport, which nothing wires in (DEC-060, Accepted) | wiring a live provider into a worker; registering the invoice handler with a worker and its usage sink |
+| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Accepted); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Accepted); an OpenRouter adapter over an injected HTTP transport (DEC-060, Accepted), wired only into the benchmark worker behind an opt-in and never into `orqestra worker run` (DEC-071, Accepted) | a live provider run (it needs the owner's separate approval); wiring a provider into a packaged worker; registering the invoice handler with a worker and its usage sink |
 | Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Accepted); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Accepted); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Accepted); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Accepted) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
 | Benchmarks | An unpackaged harness in `benchmarks/` ([Running the benchmarks](#running-the-benchmarks)): seeded synthetic workloads, a guarded `orqestra_bench` database, single cells and named ladders with a correctness gate, claim cost against queue depth, failure drills d1–d4, a generator for the tables of `docs/performance.md` and of [Performance](#performance), and an end-to-end demonstration ([Demonstration](#demonstration)) | — |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -1207,12 +1207,14 @@ the SQLSTATE only: never an amount, a unit, a prompt or provider text.
   (marked `performance`) prints the per-call cost of the sink beside the in-memory
   recorder and direct ledger writes; see [the development guide](docs/development.md).
 
-### OpenRouter adapter (not wired in)
+### OpenRouter adapter (benchmark opt-in only)
 
 `orqestra.providers.openrouter.OpenRouterProvider` implements the `Provider` contract with
 one non-streaming request to OpenRouter's chat completions endpoint (DEC-060, Accepted).
-**Nothing uses it yet.** No worker, handler or command imports `orqestra.providers`, no
-test makes a live call, and live calls need separate authorization.
+**Only the benchmark worker uses it, behind an opt-in** (DEC-071; see
+[Running the benchmarks](#running-the-benchmarks)). No `src` module, packaged worker,
+handler or command imports `orqestra.providers`, no test makes a live call or constructs
+`HttpsTransport`, and every live call needs the owner's separate authorization.
 
 ```python
 from pydantic import SecretStr
@@ -1233,8 +1235,8 @@ report = provider.call(request)  # a CallReport; provider.interpret(request) is 
   it is shown as `***` in `repr`. `route_models` maps route ids (the routing rule) to model
   slugs (`[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`, a project rule); it must not be empty, and
   it is copied into an immutable mapping. `Settings` has an optional
-  `ORQESTRA_OPENROUTER_API_KEY` (`SecretStr`, `***` in `orqestra health`) that nothing
-  reads yet.
+  `ORQESTRA_OPENROUTER_API_KEY` (`SecretStr`, `***` in `orqestra health`) that no packaged
+  command reads; a live benchmark cell reads it from the process environment only.
 - **Before any I/O.** A capability other than `interpret_amount`, a route without a model,
   or a request whose fields have the wrong types is `unsupported_request`, and the
   transport is never called.
@@ -1438,6 +1440,23 @@ and not in its wheel, so it runs only from a clone, as `uv run python -m benchma
 - **The `invoice` profile** runs the unpackaged `python -m benchmarks.worker`: invoice
   verification behind a `UsageSink`, answered by the offline `SeparatorReader` double, which
   makes no network call.
+- **Provider (DEC-071).** The double is the default. `benchmarks.run`, and only it (one
+  cell; `ladder` and `drills` have no provider flag), accepts `--provider openrouter` with
+  `--model`, `--max-provider-calls N` and one of:
+  - `--dry-run`: the real adapter, workers, usage ledger and call counter, answered by
+    canned responses in memory: no network, no cost. It prints the oracle's expected calls,
+    N, the call budget bound (DEC-065) and whether `--call-timeout` fits the execution
+    timeout, then the calls actually made;
+  - `--allow-live-calls`: real, billable calls. It reads `ORQESTRA_OPENROUTER_API_KEY` from
+    the process environment (not `.env`) and passes it to the workers in their
+    environment only, never in an argument, a log or the result. It needs the owner's
+    separate approval and a dollar limit set on the key. No live run has been made.
+
+  N is a hard limit for the whole cell: every worker reserves a call from a counter file in
+  the cell's raw directory before recording its intent, and once N are reserved the next
+  call is not made and its task fails permanently (`ProviderCallBudgetExhausted`), so the
+  cell is `failed_correctness`. The ledger records OpenRouter credits
+  (`openrouter_credits`), not tokens. `--workers` above N is refused.
 - **The database restart drill, `d3b`,** runs `docker compose -p orqestra-bench restart
   postgres`. It is refused unless `--allow-db-restart` is given, `COMPOSE_PROJECT_NAME` is
   `orqestra-bench`, and that project's container is the server the URL reaches (the same
@@ -1482,8 +1501,9 @@ and not in its wheel, so it runs only from a clone, as `uv run python -m benchma
   for kinds given a tier in `usage_capture`; an unmapped kind with no recorded calls reads
   `not_captured`, never "zero", and an unrecorded call is not known to the ledger. A
   worker passes a closure and a tier map only for the kinds of its `UsageSink` (DEC-059).
-- The OpenRouter adapter is not wired in; its own limits are listed in
-  [OpenRouter adapter](#openrouter-adapter-not-wired-in).
+- The OpenRouter adapter is wired only into the benchmark worker, behind an opt-in, and
+  never into `orqestra worker run` (DEC-071); no live run has been made. Its own limits are
+  listed in [OpenRouter adapter](#openrouter-adapter-benchmark-opt-in-only).
 - Invoice verification has no live provider and no packaged worker: `orqestra worker run`
   builds its worker without a `UsageSink`. Only unpackaged workers wire the ledger: the
   benchmark workers (`benchmarks/worker.py`, `benchmarks/faults.py`) register invoice

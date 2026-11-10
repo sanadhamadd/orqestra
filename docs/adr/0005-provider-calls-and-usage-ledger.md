@@ -90,3 +90,13 @@ crash cannot hide it, and what a report of those calls can honestly claim.
 the ledger and the provider allowed to return a verdict. It needs less code in the worker, but
 a crash between a call and its record would hide the call, a price table would need its own
 versioning, and the provider would decide statuses that deterministic checks can decide.
+
+## Notes
+
+- **2026-11-10, DEC-071.** The OpenRouter adapter is now wired into one worker, the
+  unpackaged benchmark worker. Only a single `benchmarks.run` cell can select it, it is off by
+  default, and every call reserves one of the cell's calls before its intent, failing
+  closed once they are spent. Its tests and its dry run use an in-memory transport. No `src`
+  module imports the adapter, invoice verification is still not registered with
+  `orqestra worker run`, and no live provider call has been made; each one still needs the
+  owner's separate authorization (DEC-062). The text above is unchanged.

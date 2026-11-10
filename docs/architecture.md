@@ -14,13 +14,13 @@ not repeat them.
 | [`domain`](../src/orqestra/domain/) | Pure rules: job and task records, the state tables, leases, retry policy, partitioning, job kinds | No |
 | [`persistence`](../src/orqestra/persistence/) | Migrations, submission, the attempt lifecycle, the provider usage ledger and consistent snapshots | Yes, one short transaction per operation |
 | [`worker`](../src/orqestra/worker/) | The single-slot worker: supervisor, handler thread, watchdog, usage sink, graceful shutdown | Through the supervisor only |
-| [`calls`](../src/orqestra/calls/) and [`providers`](../src/orqestra/providers/) | The provider-neutral call contract, call recording and route selection; an OpenRouter adapter that is not wired in | No |
+| [`calls`](../src/orqestra/calls/) and [`providers`](../src/orqestra/providers/) | The provider-neutral call contract, call recording and route selection; an OpenRouter adapter wired only into the unpackaged benchmark worker, behind an opt-in (DEC-071) | No |
 | [`workloads/invoice`](../src/orqestra/workloads/invoice/) | Synthetic invoice verification: deterministic checks first, a provider only for an ambiguous amount, and the job summary | No |
 | [`aggregation`](../src/orqestra/aggregation/) | `summarize_invoice_job`, `report_job_usage` and the call budget check (`read_job_call_budget`, DEC-065), each from one snapshot | Read only |
 | [`cli`](../src/orqestra/cli.py) | `orqestra version`, `health`, `migrate`, `worker run`, `job submit`, `job status`, `job summary` and `job usage` | Yes, except `version` and `health` |
 | [`config`](../src/orqestra/config.py) | `Settings`: validated `ORQESTRA_*` settings with secrets redacted | No |
 | [`logging`](../src/orqestra/logging.py) | One JSON object per log line, with job, task and attempt IDs when a call supplies them | No |
-| [`benchmarks`](../benchmarks/) (not packaged) | The measurement harness: cells, ladders, claim cost, failure drills and the report tables | The dedicated `orqestra_bench` database; in CI, throwaway schemas of the integration database (`tests/integration/test_bench_smoke_pg.py`) |
+| [`benchmarks`](../benchmarks/) (not packaged) | The measurement harness: cells, ladders, claim cost, failure drills and the report tables. Its invoice worker uses the offline double, or, in a single `benchmarks.run` cell only, OpenRouter behind an opt-in with a hard call maximum (DEC-071) | The dedicated `orqestra_bench` database; in CI, throwaway schemas of the integration database (`tests/integration/test_bench_smoke_pg.py`) |
 
 ## Data path
 
