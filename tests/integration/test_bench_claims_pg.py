@@ -17,9 +17,12 @@ from psycopg.rows import TupleRow
 from benchmarks.claims import (
     _EXPLAIN,
     CLAIMED_KIND,
+    TABLE_FIELDS,
     UNSUPPORTED_KIND,
+    Condition,
     Variant,
     build_record,
+    churn_run,
     distribution,
     explain_claims,
     fill,
@@ -183,3 +186,27 @@ def test_the_distribution_uses_nearest_rank() -> None:
     assert distribution(values) == {"n": 100, "p50": 50.0, "p95": 95.0, "max": 100.0}
     assert distribution([3.0]) == {"n": 1, "p50": 3.0, "p95": 3.0, "max": 3.0}
     assert distribution([]) == {"n": 0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+
+
+# --- churn (P2: the claim index under concurrent claiming) ----------------------------
+
+
+@pytest.mark.parametrize("condition", list(Condition), ids=[c.value for c in Condition])
+def test_a_churn_run_claims_every_task_and_records_the_index_it_read(
+    db: Conn, schema_url: str, condition: Condition
+) -> None:
+    run = churn_run(schema_url, condition=condition, clients=2, depth=50, vacuum_every=10)
+    assert (run["ready"], run["claims"]) == (50, 50)  # every task claimed exactly once
+    assert run["latency_ms"]["n"] == 50
+    assert set(run["table"]) == set(TABLE_FIELDS)
+    assert run["table"]["n_tup_upd"] >= 2 * 50  # each task: claimed, then completed
+    if condition is Condition.NONE:
+        assert run["index"] is None
+        assert run["derived"]["index_entries_read_per_claim"] is None
+    else:
+        assert run["index"] is not None
+        assert run["index"]["idx_scan"] >= 50  # every claim scanned the index
+        assert run["derived"]["index_entries_read_per_claim"] is not None
+    assert (run["vacuums"] > 0) == (condition is Condition.INDEX_VACUUM)
+    with psycopg.connect(schema_url) as conn:
+        assert scalar(conn, "SELECT count(*) FROM tasks WHERE state <> 'succeeded'") == 0

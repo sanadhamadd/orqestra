@@ -75,3 +75,63 @@ def test_earlier_results_do_not_make_a_claims_run_dirty(tmp_path: Path) -> None:
     (results / "20261108T000000Z-0123456-echo-50-b0-w2-r1.json").write_text("{}\n")
     (results / "claims" / "20261108T000000Z-0123456-claims.json").write_text("{}\n")
     assert result.code_state(tmp_path)["git_dirty"] is False
+
+
+def churn_record() -> dict[str, object]:
+    run = {
+        "condition": "index",
+        "clients": 4,
+        "repetition": 1,
+        "depth": 10,
+        "ready": 10,
+        "claims": 10,
+        "elapsed_s": 1.0,
+        "latency_ms": claims.distribution([1.0] * 10),
+        "vacuums": 0,
+        "index": {"idx_scan": 10.0, "idx_tup_read": 12.0, "idx_tup_fetch": 10.0},
+        "table": dict.fromkeys(claims.TABLE_FIELDS, 0.0),
+        "derived": {},
+    }
+    return {
+        "format": claims.FORMAT,
+        "kind": claims.CHURN_KIND,
+        "environment": {"git_sha": "x", "git_dirty": False, "postgres": {}, "autovacuum": {}},
+        "runs": [run],
+    }
+
+
+def test_a_well_formed_churn_record_is_accepted() -> None:
+    claims.validate_churn(churn_record())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"condition": "other"},
+        {"claims": 11},  # more than ready
+        {"clients": 0},
+        {"elapsed_s": -1.0},
+        {"index": None},  # the index condition must record the index's counters
+        {"vacuums": 2},  # only index+vacuum vacuums
+        {"table": {}},
+    ],
+    ids=["condition", "claims", "clients", "elapsed", "index", "vacuums", "table"],
+)
+def test_a_malformed_churn_record_is_refused(change: dict[str, object]) -> None:
+    record = churn_record()
+    runs = record["runs"]
+    assert isinstance(runs, list)
+    runs[0] = {**runs[0], **change}
+    with pytest.raises(ValueError, match="must"):
+        claims.validate_churn(record)
+
+
+def test_a_churn_run_without_the_index_records_no_index_counters() -> None:
+    record = churn_record()
+    runs = record["runs"]
+    assert isinstance(runs, list)
+    runs[0] = {**runs[0], "condition": "none", "index": None}
+    claims.validate_churn(record)
+    runs[0] = {**runs[0], "index": {"idx_scan": 1.0, "idx_tup_read": 1.0, "idx_tup_fetch": 1.0}}
+    with pytest.raises(ValueError, match="exactly when the index exists"):
+        claims.validate_churn(record)

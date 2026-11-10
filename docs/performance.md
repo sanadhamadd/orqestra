@@ -514,10 +514,81 @@ every state change of a queued task. Medians of three repetitions:
     12,578 without.
 - **Hypothesis, not tested here.** Each claim leaves the claimed row's old index entry behind
   until vacuum. Busy workers' later claims step over those entries, which would cost most where
-  many workers claim quickly.
+  many workers claim quickly. Tested since: see "Why the claim index slows four and eight
+  workers" below.
 - Files: `*-457eef3-echo-10000-b0-w{1,2,4,8}-r{1,2,3}.json` and
   `*-eac0c04-echo-10000-b0-w{1,2,4,8}-r{1,2,3}.json`, under `resources.database` and
   `database_stats`.
+
+### Why the claim index slows four and eight workers
+
+**The question.** With the claim index, the `echo` ladder's makespan was 10.8 % longer at four
+workers and 7.9 % at eight (derived, above). The hypothesis above blames the claimed rows' old
+index entries, which later claims step over until vacuum removes them.
+
+**The probe.** `python -m benchmarks.claims churn` claims a ready queue of 10,000 `echo` tasks
+with 1, 4 or 8 concurrent clients. Each client calls the real `claim_next_attempt`, then
+`complete_attempt`, until the queue is empty. Three conditions:
+- `none`: the index dropped in the run's own schema;
+- `index`: migration 0006 as it is, with default autovacuum;
+- `index+vacuum`: as `index`, with `VACUUM tasks` after every 500 completed claims.
+
+Each run records the index's own counters (`pg_stat_user_indexes`) and the table's. Three
+repetitions, interleaved, on commit `738cbc7` and one fresh server.
+
+**What the probe leaves out.** Its clients are threads in one Python process, not worker
+processes. They do no idle polling between tasks (in the ladder, idle polls also scan the index)
+and run no heartbeats, sweeps or poll interval. So a result here is about the claim path under
+concurrent claiming, not about the ladder's makespan as a whole.
+
+**Verdict rule, fixed before the run.** The precondition comes first: with `index`, elapsed time
+and claim p50 at 4 and 8 clients must exceed `none`, with ranges not overlapping. If they do not,
+the slowdown is **not reproduced by the probe**. Only then would entries read per claim and the
+effect of `index+vacuum` decide between supported, refuted and inconclusive.
+
+**Result.** Medians of three runs, with the minimum and maximum in brackets. Entries read per
+claim and heap fetches per claim are derived: the counter's growth over the run divided by its
+10,000 claims.
+
+| Clients | Condition | Elapsed s | Claim p50 ms | Index entries read per claim | Heap fetches per claim |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `none` | 74.277 [73.550, 78.455] | 4.672 [4.617, 4.733] | — | — |
+| 1 | `index` | 32.649 [30.679, 32.776] | 1.209 [1.183, 1.293] | 2.005 [2.000, 2.006] | 1.000 [1.000, 1.000] |
+| 1 | `index+vacuum` | 35.423 [28.412, 41.895] | 1.323 [1.144, 1.437] | 2.000 [2.000, 2.000] | 1.000 [1.000, 1.000] |
+| 4 | `none` | 27.464 [26.504, 31.066] | 6.083 [6.040, 6.670] | — | — |
+| 4 | `index` | 18.783 [16.595, 18.864] | 2.976 [2.940, 3.246] | 3.048 [2.978, 3.166] | 1.743 [1.739, 1.777] |
+| 4 | `index+vacuum` | 21.608 [16.447, 22.433] | 3.311 [2.963, 3.667] | 3.113 [3.109, 3.333] | 1.764 [1.753, 1.853] |
+| 8 | `none` | 19.952 [17.042, 22.006] | 8.804 [7.522, 8.865] | — | — |
+| 8 | `index` | 16.324 [11.865, 17.698] | 4.772 [4.184, 4.990] | 4.739 [4.721, 4.816] | 2.829 [2.775, 2.839] |
+| 8 | `index+vacuum` | 12.103 [11.373, 17.971] | 4.120 [4.113, 5.272] | 4.694 [4.661, 4.984] | 2.748 [2.740, 2.880] |
+
+**Verdict: not reproduced by the probe.**
+- The precondition fails. With the index, the medians of elapsed time and claim p50 are lower
+  than without it at 4 and at 8 clients, not higher: elapsed 18.783 s against 27.464 s and 16.324 s
+  against 19.952 s, and p50 2.976 ms against 6.083 ms and 4.772 ms against 8.804 ms.
+- The ranges do not overlap for both p50s or for elapsed time at four clients. At eight clients
+  the elapsed ranges overlap (11.865 to 17.698 s with the index, 17.042 to 22.006 s without), so
+  there the probe shows no slowdown either way.
+- So on the claim path alone, under concurrent claiming, the index is faster. The ladder's
+  slowdown at four and eight workers must come from what the probe leaves out: worker processes,
+  idle polling, heartbeats, sweeps or the poll interval.
+
+**Also measured, not part of the verdict:**
+- Index entries read per claim rise with concurrency, from 2.005 at one client to 3.048 at four
+  and 4.739 at eight. Heap fetches per claim rise with them.
+- A `VACUUM` every 500 claims leaves both where they are (3.113 and 4.694). The extra entries are
+  therefore not old entries waiting for vacuum.
+- Hypothesis, not tested here: they are the entries of rows other clients have just locked or
+  claimed, which `FOR UPDATE SKIP LOCKED` visits and skips.
+- With the index, none of the table's updates was HOT (`n_tup_hot_upd` 0 in every `index` and
+  `index+vacuum` run), against 18,288 to 18,514 per run without it. `state` is in the index's
+  predicate, so every claim and completion writes a new version that is not HOT.
+- Hypothesis, not tested here: those updates, and the idle polls the probe does not make, may
+  carry the ladder's slowdown. A test would need index counters in the ladder's own records
+  (`benchmarks/metrics.py`).
+
+File: `claim-churn/20261110T160432Z-738cbc7-churn.json`. The server ran default autovacuum
+(`autovacuum_naptime` 60 s, scale factor 0.2, threshold 50), as recorded in the file.
 
 ### Observed limits
 
