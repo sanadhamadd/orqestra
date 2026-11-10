@@ -1,0 +1,910 @@
+{
+  "environment": {
+    "autovacuum": {
+      "autovacuum": "on",
+      "autovacuum_analyze_scale_factor": "0.1",
+      "autovacuum_analyze_threshold": "50",
+      "autovacuum_freeze_max_age": "200000000",
+      "autovacuum_max_workers": "3",
+      "autovacuum_multixact_freeze_max_age": "400000000",
+      "autovacuum_naptime": "60",
+      "autovacuum_vacuum_cost_delay": "2",
+      "autovacuum_vacuum_cost_limit": "-1",
+      "autovacuum_vacuum_insert_scale_factor": "0.2",
+      "autovacuum_vacuum_insert_threshold": "1000",
+      "autovacuum_vacuum_scale_factor": "0.2",
+      "autovacuum_vacuum_threshold": "50",
+      "autovacuum_work_mem": "-1"
+    },
+    "cpu_count": 8,
+    "git_dirty": false,
+    "git_sha": "738cbc7352598fe50ada5eb3d700a2f8408a3d59",
+    "machine": "arm64",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12"
+  },
+  "format": 1,
+  "kind": "claim_churn",
+  "recorded_at": "2026-11-10T16:19:43+00:00",
+  "runs": [
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 74.27731087501161,
+      "index": null,
+      "latency_ms": {
+        "max": 65.96074998378754,
+        "n": 10000,
+        "p50": 4.617250000592321,
+        "p95": 8.006417017895728
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 1074.0,
+        "n_tup_hot_upd": 18371.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 27.46383074996993,
+      "index": null,
+      "latency_ms": {
+        "max": 233.35904197301716,
+        "n": 10000,
+        "p50": 6.083332991693169,
+        "p95": 11.053583002649248
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 1062.0,
+        "n_tup_hot_upd": 18321.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 17.042437666968908,
+      "index": null,
+      "latency_ms": {
+        "max": 164.2475840053521,
+        "n": 10000,
+        "p50": 7.522416999563575,
+        "p95": 12.036791013088077
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 1508.0,
+        "n_tup_hot_upd": 18508.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.0,
+        "index_entries_read_per_claim": 2.0059
+      },
+      "elapsed_s": 32.649406958022155,
+      "index": {
+        "idx_scan": 10001.0,
+        "idx_tup_fetch": 10000.0,
+        "idx_tup_read": 20059.0
+      },
+      "latency_ms": {
+        "max": 115.52091699559242,
+        "n": 10000,
+        "p50": 1.2091249809600413,
+        "p95": 2.6425410178489983
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 8485.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.7394,
+        "index_entries_read_per_claim": 2.9783
+      },
+      "elapsed_s": 18.863867791951634,
+      "index": {
+        "idx_scan": 10004.0,
+        "idx_tup_fetch": 17394.0,
+        "idx_tup_read": 29783.0
+      },
+      "latency_ms": {
+        "max": 931.7154579912312,
+        "n": 10000,
+        "p50": 2.9395410092547536,
+        "p95": 5.227082991041243
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 20000.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 2.8294,
+        "index_entries_read_per_claim": 4.7395
+      },
+      "elapsed_s": 17.697759541973937,
+      "index": {
+        "idx_scan": 10008.0,
+        "idx_tup_fetch": 28294.0,
+        "idx_tup_read": 47395.0
+      },
+      "latency_ms": {
+        "max": 1770.2376249944791,
+        "n": 10000,
+        "p50": 4.772291984409094,
+        "p95": 10.805874946527183
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.0,
+        "index_entries_read_per_claim": 2.0001
+      },
+      "elapsed_s": 35.42316229199059,
+      "index": {
+        "idx_scan": 10001.0,
+        "idx_tup_fetch": 10000.0,
+        "idx_tup_read": 20001.0
+      },
+      "latency_ms": {
+        "max": 540.7553340191953,
+        "n": 10000,
+        "p50": 1.3228749739937484,
+        "p95": 2.816457999870181
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.7533,
+        "index_entries_read_per_claim": 3.1132
+      },
+      "elapsed_s": 21.608404833008535,
+      "index": {
+        "idx_scan": 10004.0,
+        "idx_tup_fetch": 17533.0,
+        "idx_tup_read": 31132.0
+      },
+      "latency_ms": {
+        "max": 1897.7079169708304,
+        "n": 10000,
+        "p50": 3.3112919772975147,
+        "p95": 6.335292011499405
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 2.7476,
+        "index_entries_read_per_claim": 4.6606
+      },
+      "elapsed_s": 12.102608209010214,
+      "index": {
+        "idx_scan": 10008.0,
+        "idx_tup_fetch": 27476.0,
+        "idx_tup_read": 46606.0
+      },
+      "latency_ms": {
+        "max": 318.0990000255406,
+        "n": 10000,
+        "p50": 4.120374971535057,
+        "p95": 6.58816599752754
+      },
+      "ready": 10000,
+      "repetition": 1,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 73.55002158298157,
+      "index": null,
+      "latency_ms": {
+        "max": 134.56924998899922,
+        "n": 10000,
+        "p50": 4.733333014883101,
+        "p95": 7.789750001393259
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 1116.0,
+        "n_tup_hot_upd": 18389.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 26.50423929200042,
+      "index": null,
+      "latency_ms": {
+        "max": 106.08212498482317,
+        "n": 10000,
+        "p50": 6.040375039447099,
+        "p95": 10.486665996722877
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 1148.0,
+        "n_tup_hot_upd": 18288.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 22.005564582999796,
+      "index": null,
+      "latency_ms": {
+        "max": 166.4961250498891,
+        "n": 10000,
+        "p50": 8.803958015050739,
+        "p95": 19.994333968497813
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 1511.0,
+        "n_tup_hot_upd": 18509.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.0,
+        "index_entries_read_per_claim": 2.0048
+      },
+      "elapsed_s": 30.679112833051477,
+      "index": {
+        "idx_scan": 10001.0,
+        "idx_tup_fetch": 10000.0,
+        "idx_tup_read": 20048.0
+      },
+      "latency_ms": {
+        "max": 52.162582986056805,
+        "n": 10000,
+        "p50": 1.1833750177174807,
+        "p95": 2.44154199026525
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 12784.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.7429,
+        "index_entries_read_per_claim": 3.0477
+      },
+      "elapsed_s": 16.59507687500445,
+      "index": {
+        "idx_scan": 10004.0,
+        "idx_tup_fetch": 17429.0,
+        "idx_tup_read": 30477.0
+      },
+      "latency_ms": {
+        "max": 20.50112502183765,
+        "n": 10000,
+        "p50": 2.976124989800155,
+        "p95": 4.587624978739768
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 20000.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 2.775,
+        "index_entries_read_per_claim": 4.7212
+      },
+      "elapsed_s": 11.865489541960414,
+      "index": {
+        "idx_scan": 10008.0,
+        "idx_tup_fetch": 27750.0,
+        "idx_tup_read": 47212.0
+      },
+      "latency_ms": {
+        "max": 59.93475002469495,
+        "n": 10000,
+        "p50": 4.183500015642494,
+        "p95": 6.412958027794957
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 20000.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.0,
+        "index_entries_read_per_claim": 1.9996
+      },
+      "elapsed_s": 41.894710000022314,
+      "index": {
+        "idx_scan": 10001.0,
+        "idx_tup_fetch": 10000.0,
+        "idx_tup_read": 19996.0
+      },
+      "latency_ms": {
+        "max": 1300.641749985516,
+        "n": 10000,
+        "p50": 1.436999998986721,
+        "p95": 3.6201250040903687
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.853,
+        "index_entries_read_per_claim": 3.3334
+      },
+      "elapsed_s": 22.43299483403098,
+      "index": {
+        "idx_scan": 10004.0,
+        "idx_tup_fetch": 18530.0,
+        "idx_tup_read": 33334.0
+      },
+      "latency_ms": {
+        "max": 245.6160410074517,
+        "n": 10000,
+        "p50": 3.6672920105047524,
+        "p95": 7.072834006976336
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 2.8802,
+        "index_entries_read_per_claim": 4.9842
+      },
+      "elapsed_s": 17.97093104198575,
+      "index": {
+        "idx_scan": 10008.0,
+        "idx_tup_fetch": 28802.0,
+        "idx_tup_read": 49842.0
+      },
+      "latency_ms": {
+        "max": 308.18229098804295,
+        "n": 10000,
+        "p50": 5.272208014503121,
+        "p95": 13.961334014311433
+      },
+      "ready": 10000,
+      "repetition": 2,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 78.45470875001047,
+      "index": null,
+      "latency_ms": {
+        "max": 233.2592909806408,
+        "n": 10000,
+        "p50": 4.6717090299353,
+        "p95": 9.036500006914139
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 1252.0,
+        "n_tup_hot_upd": 18378.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 31.065768792002928,
+      "index": null,
+      "latency_ms": {
+        "max": 432.9102080082521,
+        "n": 10000,
+        "p50": 6.670292001217604,
+        "p95": 13.593749958090484
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 1500.0,
+        "n_tup_hot_upd": 18514.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "none",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": null,
+        "index_entries_read_per_claim": null
+      },
+      "elapsed_s": 19.95200287498301,
+      "index": null,
+      "latency_ms": {
+        "max": 71.47720799548551,
+        "n": 10000,
+        "p50": 8.865332987625152,
+        "p95": 15.396000002510846
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 18508.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.0,
+        "index_entries_read_per_claim": 2.0
+      },
+      "elapsed_s": 32.77616583299823,
+      "index": {
+        "idx_scan": 10001.0,
+        "idx_tup_fetch": 10000.0,
+        "idx_tup_read": 20000.0
+      },
+      "latency_ms": {
+        "max": 69.3897909950465,
+        "n": 10000,
+        "p50": 1.2930830125696957,
+        "p95": 2.653250005096197
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 20000.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.7767,
+        "index_entries_read_per_claim": 3.1661
+      },
+      "elapsed_s": 18.782917583012022,
+      "index": {
+        "idx_scan": 10004.0,
+        "idx_tup_fetch": 17767.0,
+        "idx_tup_read": 31661.0
+      },
+      "latency_ms": {
+        "max": 30.773375008720905,
+        "n": 10000,
+        "p50": 3.2464590040035546,
+        "p95": 5.713332968298346
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 1.0,
+        "n_dead_tup": 1711.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "index",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 2.8387,
+        "index_entries_read_per_claim": 4.8157
+      },
+      "elapsed_s": 16.324308667040896,
+      "index": {
+        "idx_scan": 10008.0,
+        "idx_tup_fetch": 28387.0,
+        "idx_tup_read": 48157.0
+      },
+      "latency_ms": {
+        "max": 297.85120801534504,
+        "n": 10000,
+        "p50": 4.98999998671934,
+        "p95": 11.955708032473922
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 20000.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 0.0
+      },
+      "vacuums": 0
+    },
+    {
+      "claims": 10000,
+      "clients": 1,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.0,
+        "index_entries_read_per_claim": 2.0
+      },
+      "elapsed_s": 28.411740000010468,
+      "index": {
+        "idx_scan": 10001.0,
+        "idx_tup_fetch": 10000.0,
+        "idx_tup_read": 20000.0
+      },
+      "latency_ms": {
+        "max": 18.1005839840509,
+        "n": 10000,
+        "p50": 1.1443749535828829,
+        "p95": 2.315624966286123
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 4,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 1.7641,
+        "index_entries_read_per_claim": 3.109
+      },
+      "elapsed_s": 16.446859999967273,
+      "index": {
+        "idx_scan": 10004.0,
+        "idx_tup_fetch": 17641.0,
+        "idx_tup_read": 31090.0
+      },
+      "latency_ms": {
+        "max": 28.55583402561024,
+        "n": 10000,
+        "p50": 2.963083970826119,
+        "p95": 4.56516700796783
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 120.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    },
+    {
+      "claims": 10000,
+      "clients": 8,
+      "condition": "index+vacuum",
+      "depth": 10000,
+      "derived": {
+        "formula": "per claim: the index counter's growth over the run / claims",
+        "heap_fetches_per_claim": 2.7405,
+        "index_entries_read_per_claim": 4.694
+      },
+      "elapsed_s": 11.372556957998313,
+      "index": {
+        "idx_scan": 10008.0,
+        "idx_tup_fetch": 27405.0,
+        "idx_tup_read": 46940.0
+      },
+      "latency_ms": {
+        "max": 21.093833027407527,
+        "n": 10000,
+        "p50": 4.11316700046882,
+        "p95": 6.0526669840328395
+      },
+      "ready": 10000,
+      "repetition": 3,
+      "table": {
+        "autovacuum_count": 0.0,
+        "n_dead_tup": 0.0,
+        "n_tup_hot_upd": 0.0,
+        "n_tup_upd": 20000.0,
+        "vacuum_count": 20.0
+      },
+      "vacuums": 20
+    }
+  ],
+  "settings": {
+    "claimed_kind": "diagnostic.echo",
+    "clients": [
+      1,
+      4,
+      8
+    ],
+    "conditions": [
+      "none",
+      "index",
+      "index+vacuum"
+    ],
+    "depth": 10000,
+    "repetitions": 3,
+    "vacuum_every": 500
+  }
+}
