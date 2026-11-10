@@ -2,9 +2,10 @@
 
 Every claim runs one discovery statement that filters the queued tasks by
 state, ``available_at`` and job kind, sorts them by ``created_at, id`` and
-locks the first with ``FOR UPDATE SKIP LOCKED``. No index serves it yet, so its
-cost may grow with the queue. This module measures that, for three shapes of
-queue at each depth:
+locks the first with ``FOR UPDATE SKIP LOCKED``. Since migration 0006 the partial
+index ``tasks_claim_order`` serves it (DEC-069); without it, the cost grows with
+the queue. This module measures that cost, for three shapes of queue at each
+depth:
 
 - ``ready``: every queued task is claimable;
 - ``waiting``: the half that sorts first waits on an ``available_at`` one day
@@ -31,6 +32,19 @@ asserted, and only a measurement campaign may cite them. Run against the
 benchmark database (``benchmarks.database``)::
 
     uv run python -m benchmarks.claims --out build/bench/claims.json
+
+``churn`` (a subcommand) instead claims a whole ready queue with several
+concurrent clients, each a thread with its own connection that runs the real
+``claim_next_attempt`` and then ``complete_attempt``, and records what the
+claim index (migration 0006) reads while it does: the index's own counters
+(``pg_stat_user_indexes``), so the index entries each claim reads, and the
+table's update, dead-tuple and vacuum counters. It compares three conditions:
+``none`` (the index dropped in the run's own schema), ``index``, and
+``index+vacuum`` (a separate connection runs ``VACUUM tasks`` every so many
+completed claims). It has no worker processes, idle polling, heartbeats or
+sweeps; it measures the claim path alone::
+
+    uv run python -m benchmarks.claims churn --out build/bench/churn.json
 """
 
 import argparse
@@ -39,6 +53,7 @@ import math
 import os
 import platform
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -322,6 +337,302 @@ def validate_result(record: object) -> None:
             raise ValueError(msg)
 
 
+# --- churn: the claim index under concurrent claiming ---------------------------------
+
+CHURN_KIND = "claim_churn"
+CHURN_DEPTH = 10_000
+CHURN_CLIENTS = (1, 4, 8)
+CHURN_REPETITIONS = 3
+CHURN_VACUUM_EVERY = 500
+# Counters are published at most once a second, and when a session ends.
+STATS_SETTLE = 2.0
+INDEX = "tasks_claim_order"
+
+
+class Condition(StrEnum):
+    """What serves the claim during a churn run."""
+
+    NONE = "none"  # the index dropped in the run's own schema: a scan and a sort
+    INDEX = "index"  # migration 0006, default autovacuum
+    INDEX_VACUUM = "index+vacuum"  # 0006, and VACUUM tasks every vacuum_every claims
+
+
+_INDEX_COUNTERS = (
+    "SELECT idx_scan::float8, idx_tup_read::float8, idx_tup_fetch::float8 "
+    "FROM pg_stat_user_indexes WHERE schemaname = current_schema() AND indexrelname = %s"
+)
+_TABLE_COUNTERS = (
+    "SELECT n_tup_upd::float8, n_tup_hot_upd::float8, n_dead_tup::float8, "
+    "vacuum_count::float8, autovacuum_count::float8 "
+    "FROM pg_stat_user_tables WHERE schemaname = current_schema() AND relname = 'tasks'"
+)
+INDEX_FIELDS = ("idx_scan", "idx_tup_read", "idx_tup_fetch")
+TABLE_FIELDS = ("n_tup_upd", "n_tup_hot_upd", "n_dead_tup", "vacuum_count", "autovacuum_count")
+
+
+def churn_counters(conn: Conn) -> tuple[dict[str, float] | None, dict[str, float]]:
+    """The claim index's counters (``None`` without the index) and ``tasks``'s, as published."""
+    index = conn.execute(_INDEX_COUNTERS, (INDEX,)).fetchone()
+    table = conn.execute(_TABLE_COUNTERS).fetchone()
+    if table is None:
+        msg = "no statistics for tasks in this schema"
+        raise RuntimeError(msg)
+    return (
+        None if index is None else dict(zip(INDEX_FIELDS, index, strict=True)),
+        dict(zip(TABLE_FIELDS, table, strict=True)),
+    )
+
+
+def _delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    return {name: after[name] - before[name] for name in before}
+
+
+def churn_run(
+    url: str, *, condition: Condition, clients: int, depth: int, vacuum_every: int
+) -> dict[str, Any]:
+    """Claim and complete a ready queue of ``depth`` tasks with ``clients`` concurrent clients."""
+    if clients < 1 or depth < 1 or vacuum_every < 1:
+        msg = "clients, depth and vacuum_every must be positive"
+        raise ValueError(msg)
+    with psycopg.connect(url, autocommit=True) as conn:
+        if condition is Condition.NONE:
+            conn.execute(f"DROP INDEX {INDEX}")
+        ready = fill(conn, depth, Variant.READY)
+        time.sleep(STATS_SETTLE)
+        index_before, table_before = churn_counters(conn)
+
+        lock = threading.Lock()
+        done = [0]
+        latencies: list[list[float]] = [[] for _ in range(clients)]
+        failures: list[BaseException] = []
+        vacuum_due = threading.Event()
+        finished = threading.Event()
+        vacuums = [0]
+
+        def claim_all(own: list[float]) -> None:
+            try:
+                with psycopg.connect(url, autocommit=True) as client:
+                    while True:
+                        started = time.perf_counter()
+                        attempt = claim_next_attempt(
+                            client, WORKER_ID, kinds=[CLAIMED_KIND], policy=LEASE
+                        )
+                        if attempt is None:
+                            return
+                        own.append((time.perf_counter() - started) * 1000)
+                        complete_attempt(
+                            client,
+                            attempt.id,
+                            generation=attempt.attempt_number,
+                            outcome=AttemptSucceeded({}),
+                            retry_policy=RETRY,
+                        )
+                        with lock:
+                            done[0] += 1
+                            if done[0] % vacuum_every == 0:
+                                vacuum_due.set()
+            except BaseException as exc:  # reported after every client has ended
+                failures.append(exc)
+
+        def vacuum_periodically() -> None:
+            try:
+                with psycopg.connect(url, autocommit=True) as vacuumer:
+                    while not finished.is_set():
+                        if vacuum_due.wait(0.05):
+                            vacuum_due.clear()
+                            vacuumer.execute("VACUUM tasks")
+                            vacuums[0] += 1
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=claim_all, args=(own,), name=f"churn-client-{n}")
+            for n, own in enumerate(latencies)
+        ]
+        vacuumer = (
+            threading.Thread(target=vacuum_periodically, name="churn-vacuum")
+            if condition is Condition.INDEX_VACUUM
+            else None
+        )
+        if vacuumer is not None:
+            vacuumer.start()
+        began = time.perf_counter()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        elapsed = time.perf_counter() - began
+        finished.set()
+        if vacuumer is not None:
+            vacuumer.join()
+        if failures:
+            raise failures[0]
+        time.sleep(STATS_SETTLE)  # the clients' sessions ended, which publishes their counters
+        index_after, table_after = churn_counters(conn)
+
+    claims = sum(len(own) for own in latencies)
+    index = (
+        None if index_before is None or index_after is None else _delta(index_before, index_after)
+    )
+    return {
+        "condition": condition.value,
+        "clients": clients,
+        "depth": depth,
+        "ready": ready,
+        "claims": claims,
+        "elapsed_s": elapsed,
+        "latency_ms": distribution([value for own in latencies for value in own]),
+        "vacuums": vacuums[0],
+        "index": index,
+        "table": _delta(table_before, table_after),
+        "derived": {
+            "formula": "per claim: the index counter's growth over the run / claims",
+            "index_entries_read_per_claim": (
+                None if index is None or not claims else index["idx_tup_read"] / claims
+            ),
+            "heap_fetches_per_claim": (
+                None if index is None or not claims else index["idx_tup_fetch"] / claims
+            ),
+        },
+    }
+
+
+_AUTOVACUUM_SETTINGS = (
+    "SELECT name, setting FROM pg_settings WHERE name LIKE 'autovacuum%' ORDER BY name"
+)
+
+
+def validate_churn(record: object) -> None:
+    """Raise ``ValueError`` unless ``record`` is a well-formed churn result."""
+    if not isinstance(record, dict):
+        msg = "a result must be an object"
+        raise ValueError(msg)
+    if record.get("format") != FORMAT or record.get("kind") != CHURN_KIND:
+        msg = f"a result must have format {FORMAT} and kind {CHURN_KIND!r}"
+        raise ValueError(msg)
+    environment = record.get("environment")
+    if not isinstance(environment, dict) or not {
+        "git_sha",
+        "git_dirty",
+        "postgres",
+        "autovacuum",
+    } <= set(environment):
+        msg = "the environment must name the commit, its state, the server and autovacuum"
+        raise ValueError(msg)
+    runs = record.get("runs")
+    if not isinstance(runs, list) or not runs:
+        msg = "a result must hold at least one run"
+        raise ValueError(msg)
+    for run in runs:
+        if not isinstance(run, dict) or run.get("condition") not in set(Condition):
+            msg = "each run must name a known condition"
+            raise ValueError(msg)
+        if run["clients"] < 1 or not 0 <= run["claims"] <= run["ready"] <= run["depth"]:
+            msg = "each run must have clients, and claims within its ready tasks"
+            raise ValueError(msg)
+        if run["elapsed_s"] < 0:
+            msg = "elapsed_s must not be negative"
+            raise ValueError(msg)
+        _check_distribution("latency_ms", run["latency_ms"], run["claims"])
+        if (run["index"] is None) != (run["condition"] == Condition.NONE):
+            msg = "index counters must be recorded exactly when the index exists"
+            raise ValueError(msg)
+        if run["vacuums"] and run["condition"] != Condition.INDEX_VACUUM:
+            msg = "vacuums must be 0 unless the condition is index+vacuum"
+            raise ValueError(msg)
+        if not isinstance(run["table"], dict) or set(run["table"]) != set(TABLE_FIELDS):
+            msg = "each run must record the table's counters"
+            raise ValueError(msg)
+
+
+def _clients(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split(",") if part.strip())
+
+
+def churn_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m benchmarks.claims churn",
+        description="The claim index under concurrent claiming (see the module docstring).",
+    )
+    parser.add_argument("--depth", type=int, default=CHURN_DEPTH)
+    parser.add_argument("--clients", type=_clients, default=CHURN_CLIENTS)
+    parser.add_argument("--repetitions", type=int, default=CHURN_REPETITIONS)
+    parser.add_argument("--vacuum-every", type=int, default=CHURN_VACUUM_EVERY)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--keep-schema", action="store_true")
+    parser.add_argument("--allow-dirty", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        return _churn(args)
+    except (ValueError, UnsafeBenchDatabaseError) as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    except psycopg.OperationalError as exc:
+        print(f"refused: {unreachable_message(exc)}", file=sys.stderr)
+        return 1
+
+
+def _churn(args: argparse.Namespace) -> int:
+    url = require_bench_database_url(os.environ)
+    with connect_verified(url) as admin:
+        code = code_state()
+        if code["git_dirty"] and not args.allow_dirty:
+            print("refused: the working tree has uncommitted changes", file=sys.stderr)
+            return 1
+        run_id = uuid.uuid4().hex[:12]
+        runs = []
+        # Interleaved: every condition and client count once per repetition.
+        for repetition in range(1, args.repetitions + 1):
+            for number, condition in enumerate(Condition):
+                for clients in args.clients:
+                    schema = run_schema_name(run_id, f"churn{number}c{clients}r{repetition}")
+                    create_run_schema(admin, schema)
+                    try:
+                        target = schema_url(admin, url, schema)
+                        migrate(target)
+                        run = churn_run(
+                            target,
+                            condition=condition,
+                            clients=clients,
+                            depth=args.depth,
+                            vacuum_every=args.vacuum_every,
+                        )
+                        runs.append({**run, "repetition": repetition})
+                    finally:
+                        if not args.keep_schema:
+                            drop_run_schema(admin, schema)
+        server = server_info(admin)
+        autovacuum = {str(name): str(value) for name, value in admin.execute(_AUTOVACUUM_SETTINGS)}
+    record = {
+        "format": FORMAT,
+        "kind": CHURN_KIND,
+        "recorded_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "environment": {
+            **code,
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cpu_count": os.cpu_count(),
+            "postgres": server,
+            "autovacuum": autovacuum,
+        },
+        "settings": {
+            "depth": args.depth,
+            "clients": list(args.clients),
+            "repetitions": args.repetitions,
+            "vacuum_every": args.vacuum_every,
+            "conditions": [condition.value for condition in Condition],
+            "claimed_kind": CLAIMED_KIND,
+        },
+        "runs": runs,
+    }
+    validate_churn(record)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(args.out)
+    return 0
+
+
 def _depths(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split(",") if part.strip())
 
@@ -334,7 +645,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--keep-schema", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["churn"]:
+        return churn_main(arguments[1:])
+    args = parser.parse_args(arguments)
 
     try:
         return _measure(args)
