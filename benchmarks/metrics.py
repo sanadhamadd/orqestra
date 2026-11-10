@@ -521,15 +521,19 @@ def job_commits(
     idle_rate_per_s: float | None,
     idle_seconds: float,
     idle_window_s: float | None,
+    expected_idle_rate_per_s: float = 0.0,
 ) -> dict[str, Any]:
     """The job's commits, the submit command's included, or ``None`` with the reason.
 
     ``uncertainty_commits`` bounds the estimate's error: up to ``COUNTER_LAG_S`` of
     idle claims at each end of the delta, plus the same error in the idle rate
-    (measured over ``idle_window_s``) carried through ``idle_seconds``. A figure is
-    recorded only when the estimate is at least twice that bound, so a short job,
-    whose commits the idle claims around it swamp, is never recorded as a negative
-    or a meaningless number; ``estimate_commits`` keeps what the formula gave.
+    (measured over ``idle_window_s``) carried through ``idle_seconds``. The bound
+    uses the larger of the measured idle rate and ``expected_idle_rate_per_s``, the
+    rate the worker settings imply: a short window can count no idle claim at all
+    when every counter it needed was published outside it. A figure is recorded
+    only when the estimate is at least twice that bound, so a short job, whose
+    commits the idle claims around it swamp, is never recorded as a negative or a
+    meaningless number; ``estimate_commits`` keeps what the formula gave.
     """
     estimate = uncertainty = None
     if idle_rate_per_s is None or not idle_window_s:
@@ -537,7 +541,7 @@ def job_commits(
         method = "not measured: the job did not finish, so no idle claim rate was measured"
     else:
         estimate = xact_commit_delta - idle_rate_per_s * idle_seconds
-        lag_claims = idle_rate_per_s * COUNTER_LAG_S
+        lag_claims = max(idle_rate_per_s, expected_idle_rate_per_s) * COUNTER_LAG_S
         uncertainty = 2 * lag_claims + idle_seconds * (2 * lag_claims / idle_window_s)
         if estimate >= 2 * uncertainty:
             commits = estimate
@@ -555,6 +559,7 @@ def job_commits(
         "idle_rate_per_s": idle_rate_per_s,
         "idle_seconds": idle_seconds,
         "idle_window_s": idle_window_s,
+        "expected_idle_rate_per_s": expected_idle_rate_per_s,
         "estimate_commits": estimate,
         "uncertainty_commits": uncertainty,
         "job_commits": commits,

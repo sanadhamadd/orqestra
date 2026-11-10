@@ -718,6 +718,9 @@ def run_cell(
         None if idle_rate is None else idle_rate["per_s"],
         before_job + after_job,
         None if idle_rate is None else idle_rate["window_s"],
+        # Each idle worker claims once per poll interval: the rate the settings imply.
+        cell.workers
+        / parse_duration(worker_settings["ORQESTRA_WORKER_POLL_INTERVAL"]).total_seconds(),
     )
     database_stats["commits"] = commits
     database_stats["commits_per_task"] = (
