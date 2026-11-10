@@ -98,7 +98,12 @@ def test_an_invoice_cell_passes_its_gate(
     usage = {check["name"]: check for check in record["gate"]}["usage"]["detail"]
     assert usage["finality"] == "closed"
     assert usage["budget_verdict"] == "within"
-    assert record["provider"] == {"call_timeout": "PT0.1S", "cap": 16, "route": "route-a"}
+    assert record["provider"] == {
+        "name": "bench-double",
+        "call_timeout": "PT0.1S",
+        "cap": 16,
+        "route": "route-a",
+    }
     assert len(record["resources"]["workers"]) == 2
     _records_the_job_alone(record)
     stored = _written(record, tmp_path / "results")
