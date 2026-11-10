@@ -251,6 +251,25 @@ def test_a_reason_says_how_the_wait_ended(tmp_path: Path) -> None:
     assert "stopped at the limit after 3600.2 s" in excluded
 
 
+def test_a_cell_whose_commits_were_not_measured_says_so(tmp_path: Path) -> None:
+    for rep in (1, 2, 3):
+        record = cell_record(rep=rep)
+        record["database_stats"]["commits_per_task"] = None
+        write(tmp_path, record)
+    row = rows(report.render(tmp_path), "echo 100 w1")[0]  # the measured table, not the derived
+    assert "not measured" in row
+
+
+def test_a_cell_with_some_commits_measured_shows_how_many(tmp_path: Path) -> None:
+    for rep, figure in ((1, None), (2, 4.0), (3, 4.2)):
+        record = cell_record(rep=rep)
+        record["database_stats"]["commits_per_task"] = figure
+        write(tmp_path, record)
+    row = rows(report.render(tmp_path), "echo 100 w1")[0]  # the measured table, not the derived
+    assert "4.10 [4.00, 4.20] (n=2)" in row
+    assert "not measured" not in row
+
+
 def test_an_incomplete_reason_names_the_failures_a_timeout_does_not_explain(
     tmp_path: Path,
 ) -> None:

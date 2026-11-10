@@ -717,6 +717,8 @@ def run_cell(
         database_stats["database"]["xact_commit"],
         None if idle_rate is None else idle_rate["per_s"],
         before_job + after_job,
+        None if idle_rate is None else idle_rate["window_s"],
+        implied_idle_rate(cell.workers, worker_settings),
     )
     database_stats["commits"] = commits
     database_stats["commits_per_task"] = (
@@ -779,6 +781,16 @@ def run_cell(
     # checked here either way.
     validate_result({**record, "environment": {**record_environment, "dirty_allowed": True}})
     return record
+
+
+def implied_idle_rate(workers: int, worker_settings: Mapping[str, str]) -> float:
+    """The idle commits a second the settings imply: each idle worker claims once per
+    poll interval and runs one recovery sweep step per recovery interval, each its own
+    transaction. An upper estimate, not a floor: each call takes time, so the real
+    rate runs a little lower (metrics.job_commits uses the larger of the two)."""
+    poll = parse_duration(worker_settings["ORQESTRA_WORKER_POLL_INTERVAL"]).total_seconds()
+    sweep = parse_duration(worker_settings["ORQESTRA_WORKER_RECOVERY_INTERVAL"]).total_seconds()
+    return workers * (1 / poll + 1 / sweep)
 
 
 def _shutdown_seconds(worker_settings: Mapping[str, str]) -> float:
