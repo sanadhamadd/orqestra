@@ -139,10 +139,20 @@ def _records_the_job_alone(record: dict[str, Any]) -> None:
     assert commits["idle_rate_per_s"] == record["idle_claim_rate"]["per_s"]
     assert commits["idle_seconds"] >= timing["submission"]["seconds"] + STATS_SETTLE
     expected = commits["xact_commit_delta"] - commits["idle_rate_per_s"] * commits["idle_seconds"]
-    assert commits["job_commits"] == pytest.approx(expected)
-    assert record["database_stats"]["commits_per_task"] == pytest.approx(
-        commits["job_commits"] / timing["tasks"]
-    )
+    assert commits["estimate_commits"] == pytest.approx(expected)
+    assert commits["idle_window_s"] == record["idle_claim_rate"]["window_s"]
+    # A figure is recorded only outside twice its uncertainty; a smoke cell is short,
+    # so it may be recorded as not measured instead, with the reason, never negative.
+    if commits["job_commits"] is None:
+        assert commits["estimate_commits"] < 2 * commits["uncertainty_commits"]
+        assert commits["method"].startswith("not measured: the job's commits")
+        assert record["database_stats"]["commits_per_task"] is None
+    else:
+        assert commits["job_commits"] == pytest.approx(expected)
+        assert commits["job_commits"] >= 2 * commits["uncertainty_commits"] > 0
+        assert record["database_stats"]["commits_per_task"] == pytest.approx(
+            commits["job_commits"] / timing["tasks"]
+        )
     # The contention sampler ran from the submission to the end of the wait, no longer.
     contention = record["contention"]
     assert timing["waited_s"] <= contention["window_s"] <= timing["waited_s"] + 1.0

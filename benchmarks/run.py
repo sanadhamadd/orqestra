@@ -717,6 +717,7 @@ def run_cell(
         database_stats["database"]["xact_commit"],
         None if idle_rate is None else idle_rate["per_s"],
         before_job + after_job,
+        None if idle_rate is None else idle_rate["window_s"],
     )
     database_stats["commits"] = commits
     database_stats["commits_per_task"] = (

@@ -136,11 +136,11 @@ def fixed(value: float | None, digits: int) -> str:
     return f"{value:.{digits}f}"
 
 
-def summary(values: Sequence[float | None], digits: int) -> str:
+def summary(values: Sequence[float | None], digits: int, absent: str = DASH) -> str:
     """``median [min, max]`` of the values present, with their count if any is missing."""
     present = [value for value in values if value is not None]
     if not present:
-        return DASH
+        return absent
     text = (
         f"{fixed(statistics.median(present), digits)} "
         f"[{fixed(min(present), digits)}, {fixed(max(present), digits)}]"
@@ -329,6 +329,11 @@ COLUMNS: tuple[tuple[str, Callable[[Mapping[str, Any]], float | None], int], ...
 )
 
 
+# A column whose values a record leaves out on purpose says so, instead of a dash:
+# a short job's commits are not separable from the idle claims around it (metrics).
+ABSENT = {"Commits/task": "not measured"}
+
+
 def _by_cell(loaded: Sequence[Loaded]) -> dict[CellKey, list[Loaded]]:
     cells: dict[CellKey, list[Loaded]] = defaultdict(list)
     for item in loaded:
@@ -354,8 +359,8 @@ def cell_table(loaded: Sequence[Loaded]) -> list[str]:
                 cell_label(key),
                 len(items),
                 *(
-                    summary([read(item.record) for item in items], digits)
-                    for _, read, digits in COLUMNS
+                    summary([read(item.record) for item in items], digits, ABSENT.get(name, DASH))
+                    for name, read, digits in COLUMNS
                 ),
                 _files(item.name for item in items),
             ]

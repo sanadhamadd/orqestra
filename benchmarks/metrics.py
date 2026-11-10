@@ -25,7 +25,11 @@ what the database cannot see: the submission command and the idle window.
   process itself (its schema check and the one submission transaction), a fixed
   number per job whatever its size. Each end of the window can still be off by
   up to about one second of idle claims, because counters are published at most
-  once a second, so it is an estimate. It is measured only for a job that finished, because
+  once a second, so it is an estimate, and the idle rate it subtracts carries
+  the same error. The record keeps that bound (``uncertainty_commits``), and the
+  figure counts only when the estimate is at least twice it; a short job, which
+  the idle claims around it swamp, is recorded as not measured, with the reason
+  and the estimate kept. It is measured only for a job that finished, because
   only then is the idle claim rate measured.
 - **Idle claim rate** is the ``xact_commit`` delta across an idle window after a
   finished job, divided by the window's length on the harness clock: the
@@ -507,20 +511,52 @@ JOB_COMMITS_METHOD = (
 )
 
 
+# How far a counter reading can be off at each end: PostgreSQL publishes a backend's
+# counters at most once a second (PGSTAT_MIN_INTERVAL), so about a second of idle claims.
+COUNTER_LAG_S = 1.0
+
+
 def job_commits(
-    xact_commit_delta: float, idle_rate_per_s: float | None, idle_seconds: float
+    xact_commit_delta: float,
+    idle_rate_per_s: float | None,
+    idle_seconds: float,
+    idle_window_s: float | None,
 ) -> dict[str, Any]:
-    """The job's commits, the submit command's included; ``None`` without an idle rate."""
-    if idle_rate_per_s is None:
+    """The job's commits, the submit command's included, or ``None`` with the reason.
+
+    ``uncertainty_commits`` bounds the estimate's error: up to ``COUNTER_LAG_S`` of
+    idle claims at each end of the delta, plus the same error in the idle rate
+    (measured over ``idle_window_s``) carried through ``idle_seconds``. A figure is
+    recorded only when the estimate is at least twice that bound, so a short job,
+    whose commits the idle claims around it swamp, is never recorded as a negative
+    or a meaningless number; ``estimate_commits`` keeps what the formula gave.
+    """
+    estimate = uncertainty = None
+    if idle_rate_per_s is None or not idle_window_s:
         commits = None
         method = "not measured: the job did not finish, so no idle claim rate was measured"
     else:
-        commits = xact_commit_delta - idle_rate_per_s * idle_seconds
-        method = JOB_COMMITS_METHOD
+        estimate = xact_commit_delta - idle_rate_per_s * idle_seconds
+        lag_claims = idle_rate_per_s * COUNTER_LAG_S
+        uncertainty = 2 * lag_claims + idle_seconds * (2 * lag_claims / idle_window_s)
+        if estimate >= 2 * uncertainty:
+            commits = estimate
+            method = JOB_COMMITS_METHOD
+        else:
+            commits = None
+            method = (
+                f"not measured: the job's commits (estimate {estimate:.1f}) are within "
+                f"twice the {uncertainty:.1f}-commit uncertainty of the idle claims "
+                "subtracted around it, so the job is too short to separate from them "
+                "(counters are published at most once a second)"
+            )
     return {
         "xact_commit_delta": xact_commit_delta,
         "idle_rate_per_s": idle_rate_per_s,
         "idle_seconds": idle_seconds,
+        "idle_window_s": idle_window_s,
+        "estimate_commits": estimate,
+        "uncertainty_commits": uncertainty,
         "job_commits": commits,
         "method": method,
     }
