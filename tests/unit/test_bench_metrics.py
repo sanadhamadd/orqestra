@@ -13,7 +13,7 @@ from typing import Any, NoReturn, cast
 import pytest
 
 import benchmarks.worker
-from benchmarks import metrics
+from benchmarks import metrics, run
 from benchmarks.generate import expected_outcome, generate_invoices
 from benchmarks.ladder import (
     CELL_LIMIT,
@@ -218,17 +218,71 @@ def test_the_harness_reads_in_a_transaction_that_rolls_back() -> None:
 
 
 def test_job_commits_subtract_the_idle_claims_outside_the_job() -> None:
-    commits = metrics.job_commits(1_000.0, 40.0, 2.5)
+    commits = metrics.job_commits(1_000.0, 40.0, 2.5, 2.0)
     assert commits["job_commits"] == 900.0  # 1,000 - 40/s x 2.5 s
+    assert commits["estimate_commits"] == 900.0
+    # Derived bound: one second of idle claims at each end, plus the rate's own error.
+    assert commits["uncertainty_commits"] == pytest.approx(40.0 * 2 + 2.5 * (40.0 * 2 / 2.0))
     assert (commits["xact_commit_delta"], commits["idle_rate_per_s"]) == (1_000.0, 40.0)
-    assert commits["idle_seconds"] == 2.5
+    assert (commits["idle_seconds"], commits["idle_window_s"]) == (2.5, 2.0)
     assert commits["method"] == metrics.JOB_COMMITS_METHOD
 
 
 def test_job_commits_are_not_measured_without_an_idle_rate() -> None:
-    commits = metrics.job_commits(1_000.0, None, 2.5)
+    commits = metrics.job_commits(1_000.0, None, 2.5, None)
     assert commits["job_commits"] is None
     assert commits["method"].startswith("not measured")
+
+
+def test_a_short_cells_commits_are_not_measured_within_their_uncertainty() -> None:
+    # A real 4-task cell (invoice 100 b25, W1 r3 on cdf6fe7): the idle rate came out at
+    # 30.2/s against 18.3/s in its two repetitions, and the estimate went negative.
+    commits = metrics.job_commits(91.0, 30.2, 3.30, 2.0)
+    assert commits["estimate_commits"] == pytest.approx(91.0 - 30.2 * 3.30)
+    assert commits["estimate_commits"] < 0
+    assert commits["job_commits"] is None
+    assert commits["method"].startswith("not measured: the job's commits")
+    # Its sibling, with a positive estimate, is inside the bound too.
+    assert metrics.job_commits(92.0, 18.3, 3.24, 2.0)["job_commits"] is None
+
+
+def test_the_implied_idle_rate_counts_polls_and_sweeps() -> None:
+    settings = {
+        "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+        "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    }
+    # Each idle worker: 20 claims and half a sweep step a second.
+    assert run.implied_idle_rate(2, settings) == pytest.approx(2 * (20 + 0.5))
+    # The campaign's measured idle rate at one worker, 17.4 a second, sits below it:
+    # an upper estimate, since each call takes time.
+    assert run.implied_idle_rate(1, run.BENCH_WORKER_SETTINGS) > 17.4
+
+
+def test_an_idle_window_that_counted_nothing_still_bounds_the_estimate() -> None:
+    # Counters are published at most once a second, so a 2 s idle window can miss
+    # every idle claim: a measured rate of 0 must not make the bound 0. Two workers
+    # polling every 0.05 s imply 40 idle claims a second.
+    commits = metrics.job_commits(150.0, 0.0, 3.2, 2.0, expected_idle_rate_per_s=40.0)
+    assert commits["uncertainty_commits"] == pytest.approx(40.0 * 2 + 3.2 * (40.0 * 2 / 2.0))
+    assert commits["expected_idle_rate_per_s"] == 40.0
+    assert commits["job_commits"] is None
+    assert commits["estimate_commits"] == 150.0
+
+
+@pytest.mark.parametrize("rate", [5.0, 18.3, 50.9, 73.7, 150.0])
+@pytest.mark.parametrize("seconds", [-1.0, -0.5, 0.0, 0.5, 1.0])
+@pytest.mark.parametrize("job", [0.0, 10.0, 40.0, 400.0, 40_000.0])
+def test_a_recorded_figure_is_never_negative_or_inside_its_bound(
+    rate: float, seconds: float, job: float
+) -> None:
+    # The counter's error: up to a second of idle claims more or fewer at an end.
+    idle_seconds = 3.3
+    delta = job + rate * idle_seconds + rate * seconds
+    commits = metrics.job_commits(delta, rate, idle_seconds, 2.0)
+    measured = commits["job_commits"]
+    if measured is not None:
+        assert measured > 0
+        assert measured >= 2 * commits["uncertainty_commits"]
 
 
 def test_the_harness_usage_of_a_cell_is_a_delta() -> None:
