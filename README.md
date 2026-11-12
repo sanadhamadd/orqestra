@@ -4,7 +4,7 @@ Orqestra is a Python-based distributed AI workload execution platform built with
 
 The broader vision is to build a general-purpose execution engine for computational and AI-assisted workflows, including background automation, parallel processing, and large-scale data analytics. Whether coordinating thousands of independent operations or processing datasets that require consistent, trustworthy results, Orqestra focuses on the infrastructure that makes these workflows reliable and scalable.
 
-Its first demonstration uses synthetic invoice verification to test these capabilities. In an initial local benchmark, Orqestra processed 50,000 basic, structured synthetic invoices in 4.867 seconds across eight independent workers, with all benchmark correctness checks passing. The benchmark used an offline simulated AI provider rather than live inference and does not represent real-world PDF processing performance. See Performance for the methodology, results, and limitations.
+Its first demonstration uses synthetic invoice verification to test these capabilities. In an initial local benchmark, Orqestra processed 50,000 basic, structured synthetic invoices in 4.867 seconds across eight independent workers, with all benchmark correctness checks passing. This benchmark used an offline simulated AI provider, and testing with a live provider API is planned as the next stage, to measure performance on real requests. See [Performance](#performance) for the methodology and full results.
 
 ## Status
 
