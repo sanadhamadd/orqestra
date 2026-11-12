@@ -422,6 +422,11 @@ File: `claims/20261109T011052Z-c410ac6-claims.json`.
   tasks, it ranges from 5.50 to 16.10 across repetitions. Derived: there, one second of idle
   claims at the measured idle claim rate (medians of 17.4 to 139.8 commits per second) is up to about 14
   commits per task, as large as the value itself, so those cells' estimates are not used.
+  Derived: under the rule the harness now applies (`metrics.job_commits`: a figure is kept only
+  when the estimate is at least twice its uncertainty bound), 3 of the 12 10,000-invoice cells
+  at batch 100 would record their commits as not measured: every eight-worker cell
+  (`20261109T005308Z`, `20261109T005341Z` and `20261109T005416Z`), whose estimates of 1,314 to
+  1,382 commits fall below twice their bounds of 792 to 808. Their stored values are unchanged.
 - **Dead tuples:** the growth of `n_dead_tup` over an echo cell, summed over the job tables, is
   between 5,604 and 12,580 (medians by worker count). Over a 10,000-invoice cell at batch 100 it
   is 119 to 123.

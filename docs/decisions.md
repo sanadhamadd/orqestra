@@ -6,8 +6,9 @@ reviewed change. Trivial edits are not logged. Cross-cutting choices also get an
 
 No inbound API or framework is planned (DEC-062). Deliberately **undecided** (do not
 infer a choice from the code): which
-models to use (the provider direction is OpenRouter, through an adapter that nothing
-wires in and that has no default model, DEC-060), operational lease and
+models to use (the provider direction is OpenRouter, through an adapter that has no
+default model, DEC-060, and is wired only into the benchmark worker behind an opt-in,
+DEC-071), operational lease and
 execution-timeout values and any per-job-kind policy (DEC-034). The worker model and hosting boundary are
 recorded in DEC-054. The DB driver, migration tool and task queue are no longer open:
 see DEC-016, DEC-017 and DEC-033. Operational cancellation grace periods are
@@ -1781,3 +1782,46 @@ recorded on PR #17.
   - Inside the second window a heartbeat can be sent up to one `db_operation_timeout` late, so a cancellation request is noticed that much later (DEC-048) and the lease is renewed that much later, still before the fence.
   - The guarantee leaves out the claim latency, as DEC-044's check does; a fence that comes early never lets a handler outlive its lease.
 - **VERIFICATION:** `tests/unit/test_worker_runtime.py` (a schedule where every heartbeat takes its whole bound with a 4 s interval and a 3 s bound: usage records progress after every heartbeat and every heartbeat is confirmed before the fence; each window on its own; neither) and `tests/unit/test_worker_settings.py` (the refused boundary and the accepted one).
+
+
+## Benchmark provider
+
+### DEC-071 — OpenRouter is wired into the benchmark invoice worker only, off by default; live calls need the owner's separate approval with a dollar limit
+- **Status:** Accepted (owner, 2026-11-10: "Approve, offline only") · implemented (`benchmarks/live.py`, `benchmarks/worker.py`, `benchmarks/run.py`) · no live call has been made
+- **WHAT:**
+  - **Provider choice.** The benchmark invoice worker is answered by the offline double `SeparatorReader` by default, or by the OpenRouter adapter (DEC-060, unchanged) with `--provider openrouter`. Only `python -m benchmarks.run`, a single cell, accepts that flag; `benchmarks.ladder` and `benchmarks.drills` have none and always use the double. `orqestra worker run` stays diagnostics-only (DEC-051, DEC-062), and no `src` module imports `orqestra.providers`.
+  - **Opt-in and refusals,** in this order, before any worker, transport or database connection:
+    1. no `--allow-live-calls` and no `--dry-run`;
+    2. no `--model`, or a slug the adapter refuses (the value is not echoed);
+    3. no `--max-provider-calls`, or one that is not a positive whole number;
+    4. both `--allow-live-calls` and `--dry-run`;
+    5. a live run without `ORQESTRA_OPENROUTER_API_KEY`, read from the process environment only (blank is unset); a dry run never reads it;
+    6. a worker's `--budget-file` that does not already exist (the harness creates it);
+    7. the existing per-attempt check, `check_provider_call_budget`.
+
+    `benchmarks.run` also refuses a profile other than `invoice`, `--workers` above `--max-provider-calls`, and `--call-timeout` with the double.
+  - **The cell's call maximum.** A counter file in the cell's raw directory, created holding 0 before any worker starts and shared by every worker process of the cell. `CallBudget.reserve` takes an exclusive `flock`, refuses at the maximum, otherwise writes the count plus one and fsyncs. A reservation is never returned, so the count can only overstate what was sent. `BudgetedRecorder` wraps the usage sink's recorder and reserves before each intent; with none left it raises `ProviderCallBudgetExhausted`, a `PermanentError` with the fixed text `provider_call_budget_exhausted`. `ProviderCalls.call` lets a recorder's error propagate before the call, so no intent is written and no request is sent. The attempt fails `permanent` and is not retried: **fail closed**.
+  - **Dry run.** `--dry-run` runs the whole path (real workers, usage ledger, counter, adapter and response parsing) against `CannedTransport`, which answers in memory with a well-formed OpenRouter body: the raw value without separators, the requested model, and synthetic usage (`0.000001` credits a call). It prints, labelled "dry run: canned responses, no network, no cost", the oracle's expected calls, the maximum, the call budget bound (DEC-065) and whether `--call-timeout` fits the execution timeout; after the cell, the requests the canned transport answered, the ledger's calls and the counter.
+  - **Where a real transport is made.** Only `build_openrouter_provider`, only for a live run, which imports `stdlib_transport` there, so a dry run never loads the network modules. A live cell passes the key to its workers in their environment only, never in an argument, a log or the result.
+  - **Ledger and result.** The ledger records provider `openrouter`, the model, the adapter's `PROMPT_VERSION` and the reported credits in `openrouter_credits`, with no price and no invented token counts (DEC-062). The gate's usage check compares calls with the oracle, and credits only for a dry run. The result's `provider` block is `{name, model, max_provider_calls, dry_run, call_timeout, cap, route, calls_made, usage_unit}`; the double's block gains `name: "bench-double"`.
+- **WHY:** the owner approved wiring the adapter offline only. DEC-062's "Live calls" requires each live call to be authorized separately, naming its scope, and its "Registration" keeps the packaged command unwired. DEC-060's adapter is used as built. A spent budget is an operational limit, not a judgement on an invoice: `needs_review` would label invoices that were never asked about, and `PERMANENT` also stops retries from spending more.
+- **RUNNER-UP:**
+  - (a) enforcing the maximum inside `ProviderCalls`, giving `needs_review`;
+  - (b) a database row lock as the counter;
+  - (c) splitting the maximum into per-worker shares.
+- **WHY NOT:**
+  - (a) changes a provider-agnostic module of `src/orqestra/workloads/invoice` (DEC-055, DEC-057).
+  - (b) DEC-062 rejected a per-job spend lock for its lock order.
+  - (c) wastes budget while workers idle, and a restarted worker's share would have to be recomputed.
+- **TRADE-OFF:**
+  - Fail closed turns a whole batch into a failed task when the budget runs out mid-batch; its invoices verified before the refusal are not stored, while every call made stays in the ledger.
+  - The counter covers one cell on one host (DEC-054), not a ladder or several machines.
+  - The ledger holds credits, not tokens: the adapter's token counts are in its `CallReport`, which the `Provider` contract does not return.
+  - The dollar limit is enforced only by the provider account; Orqestra counts calls and stores provider-reported credits.
+  - A live model's answers may differ from the oracle, which would fail the summary check and make the cell `failed_correctness`.
+- **VERIFICATION:**
+  - `tests/unit/test_bench_live.py`: each refusal; the counter across four processes; the recorder refusing before an intent; the canned transport through the real adapter; the live path constructing the real transport once and sending nothing; an AST scan that only `live.py`, inside `build_openrouter_provider`, refers to it; ladder and drills refusing `--provider`; and a live cell's argv, environment and recorded fields with a sentinel key, which appears only as the environment entry.
+  - `tests/unit/test_bench_worker.py`: the worker's refusals, and its dry-run wiring.
+  - `tests/integration/test_bench_live_pg.py`: a dry-run cell with a sentinel key in the parent environment passes its gate. Its ledger, counter and canned requests equal the oracle's calls, and neither the key nor the system prompt appears in the result file, any raw file, any process's argv, or the environment of any process the harness starts. A second cell with the maximum below the oracle's calls stops exactly there, with its failed tasks `permanent` and `provider_call_budget_exhausted`.
+  - Every test replaces `HttpsTransport` with a class that fails when constructed, and blocks sockets.
+- **Cross-references:** DEC-051, DEC-055, DEC-057, DEC-059, DEC-060, DEC-062, DEC-065.

@@ -29,8 +29,9 @@ class Settings(BaseSettings):
     # Concurrent task slots per worker process (not OS threads or hosts). Not read by
     # anything yet: the worker is single-slot by approved direction (DEC-044).
     worker_concurrency: int = Field(default=4, ge=1, le=256)
-    # OpenRouter API key. Optional, and not read by anything yet: the OpenRouter adapter
-    # (orqestra.providers.openrouter) is not wired into a worker or the CLI.
+    # OpenRouter API key. Optional; no packaged command reads it. Only the unpackaged
+    # benchmark worker's live mode uses the adapter (orqestra.providers.openrouter), and it
+    # reads the key from the process environment, not through these settings (DEC-071).
     openrouter_api_key: SecretStr | None = None
 
     @field_validator("database_url", "openrouter_api_key", mode="before")

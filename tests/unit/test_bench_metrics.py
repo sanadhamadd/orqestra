@@ -707,10 +707,12 @@ def _imports(path: Path) -> set[str]:
 
 
 def test_the_worker_imports_no_network_module_and_no_real_provider() -> None:
+    # OpenRouter reaches the worker only through benchmarks.live, behind its opt-in (DEC-071).
     imported = _imports(Path(benchmarks.worker.__file__))
     assert not {name for name in imported if name.split(".")[0] in NETWORK_ROOTS}
     assert not {name for name in imported if name.startswith("orqestra.providers")}
     assert "benchmarks.provider" in imported
+    assert "benchmarks.live" in imported
 
 
 def _git(root: Path, *args: str) -> None:
