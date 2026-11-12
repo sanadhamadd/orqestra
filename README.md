@@ -1,15 +1,10 @@
 # Orqestra
 
-Distributed workload execution platform: concurrent workers, fault-tolerant task
-processing, cost-aware provider orchestration.
+Orqestra is a Python-based distributed AI workload execution platform built with PostgreSQL. It is designed to coordinate and execute work reliably by breaking large jobs into smaller tasks and distributing them across independent workers. Rather than assigning fixed workloads to each worker, Orqestra allows workers to pick up new tasks as they become available, naturally balancing work across the system. It also tracks execution, manages retries, and recovers from failures while protecting results from outdated or duplicate execution.
 
-Orqestra is a portfolio-grade engineering project. Its first proving workload is
-verification of **synthetic** invoices. 50,000 synthetic invoices was the evidence target:
-one 50,000-invoice run, on one machine, completed with every correctness check passed
-([Performance](#performance)). Purchase-order matching is not implemented. Invoices are a
-demonstration scenario, not the product. The goal is a reliable, reproducible,
-well-tested foundation that demonstrates distributed-systems engineering, not an
-invoice SaaS.
+The broader vision is to build a general-purpose execution engine for computational and AI-assisted workflows, including background automation, parallel processing, and large-scale data analytics. Whether coordinating thousands of independent operations or processing datasets that require consistent, trustworthy results, Orqestra focuses on the infrastructure that makes these workflows reliable and scalable.
+
+Its first demonstration uses synthetic invoice verification to test these capabilities. In an initial local benchmark, Orqestra processed 50,000 basic, structured synthetic invoices in 4.867 seconds across eight independent workers, with all benchmark correctness checks passing. The benchmark used an offline simulated AI provider rather than live inference and does not represent real-world PDF processing performance. See Performance for the methodology, results, and limitations.
 
 ## Status
 
