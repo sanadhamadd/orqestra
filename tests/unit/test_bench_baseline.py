@@ -33,7 +33,7 @@ from benchmarks.baseline import (
     retry_delay,
     run_documents,
 )
-from benchmarks.campaign import result_path, step_figures
+from benchmarks.campaign import Tool, result_path, step_figures
 from benchmarks.live import (
     API_KEY_ENV,
     BUDGET_EXHAUSTED,
@@ -325,7 +325,7 @@ def test_the_command_writes_a_record_the_campaign_reads(
     canned = Prices(Decimal(1), Decimal(2), canned=True)
     assert baseline.main(argv, stub_connector(stub), canned) == 0
     out = capsys.readouterr().out
-    path = result_path(out)  # the campaign's own reading of the line
+    path = result_path(out, Tool.BASELINE)  # the campaign's own reading of the line
     assert path is not None
     assert " " in str(path)
     assert out.partition(" ")[0] == "complete"
@@ -391,7 +391,7 @@ def test_a_dry_run_reads_every_document_through_the_extraction_workload(
     assert baseline.main(args(command, *mode, "--dry-run")) == 0
     out = capsys.readouterr().out
     assert out.startswith("complete ")
-    path = result_path(out)
+    path = result_path(out, Tool.BASELINE)
     assert path is not None
     record = json.loads(path.read_text())
     block = record["extraction"]
