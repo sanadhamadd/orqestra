@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -800,6 +801,16 @@ def test_a_bad_extraction_figure_is_refused(
     target[path[-1]] = value
     with pytest.raises(ValueError, match=message):
         metrics.check_extraction(block)
+
+
+@pytest.mark.parametrize("text", ["0", "0.4210", "3E-7", "1.5e+2", "0E-8"])
+def test_decimal_text_in_any_notation_is_accepted(text: str) -> None:
+    assert metrics.decimal_text(text) == Decimal(text)
+
+
+@pytest.mark.parametrize("text", ["", " 1", "-1", "-0", "NaN", "Infinity", "1,5", "abc", 0.5])
+def test_anything_else_is_not_decimal_text(text: object) -> None:
+    assert metrics.decimal_text(text) is None
 
 
 def test_a_missing_extraction_figure_is_named() -> None:

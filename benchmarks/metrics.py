@@ -56,7 +56,6 @@ import itertools
 import json
 import math
 import os
-import re
 import resource
 import signal
 import subprocess
@@ -67,6 +66,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import psycopg
@@ -576,7 +576,6 @@ def job_commits(
 
 # The keys of a result's ``extraction`` block (written by the extract workload, T1) that the
 # report reads, with their types. The block is shown as written: nothing here recomputes it.
-_DECIMAL_TEXT = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]+)?")
 
 
 def _at(block: Mapping[str, Any], path: tuple[str, ...]) -> Any:
@@ -603,6 +602,22 @@ def _optional_number(block: Mapping[str, Any], *path: str) -> None:
         raise ValueError(msg)
 
 
+def decimal_text(value: object) -> Decimal | None:
+    """``value`` as a finite, non-negative ``Decimal`` if it is decimal text, else ``None``.
+
+    Exponent notation is accepted (``str(Decimal)`` writes ``3E-7`` below 1e-6).
+    """
+    if not isinstance(value, str) or not value or value.strip() != value:
+        return None
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        return None
+    if not number.is_finite() or number.is_signed():
+        return None
+    return number
+
+
 def check_extraction(block: object) -> None:
     """Raise ``ValueError`` unless ``block`` carries every figure the report shows.
 
@@ -625,7 +640,7 @@ def check_extraction(block: object) -> None:
     _count(block, "retries")
     _count(block, "transient_errors", "rate_limited")
     cost = _at(block, ("cost", "per_1000_invoices"))
-    if not isinstance(cost, str) or _DECIMAL_TEXT.fullmatch(cost) is None:
+    if decimal_text(cost) is None:
         msg = f"extraction.cost.per_1000_invoices must be decimal text, got {cost!r}"
         raise ValueError(msg)
     if not isinstance(_at(block, ("cost", "currency")), str):

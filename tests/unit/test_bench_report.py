@@ -637,15 +637,36 @@ def extraction_block(**changes: Any) -> dict[str, Any]:
             "latency_ms": {"n": 40, "p50": 812, "p95": 1490, "p99": 2210, "max": 2600},
         },
         "time_split": {"provider_s": 30.0, "handler_s": 40.0, "provider_share": 0.75},
-        "accuracy": {"matched": 380, "expected": 400, "overall": 0.95},
-        "needs_review": {"count": 2, "by_reason": {}},
+        "accuracy": {
+            "matched": 380,
+            "expected": 400,
+            "overall": 0.95,
+            "per_field": {"total": {"matched": 38, "expected": 40}},
+            "exact_documents": 30,
+            "status_matched": 38,
+        },
+        "statuses": {"verified": 30, "rejected": 6, "needs_review": 2, "malformed": 2},
+        "needs_review": {"count": 2, "by_reason": {"field_missing": 2}},
+        "tokens": {
+            "input": 12000,
+            "output": 3000,
+            "succeeded_attempts": {"input": 12000, "output": 3000},
+            "other_attempts": {"input": 0, "output": 0},
+            "answered_without_counts": 0,
+        },
         "cost": {
             "currency": "USD",
             "prices": {"in_per_mtok": "1", "out_per_mtok": "1", "canned": False},
+            "total": "0.01684",
+            "succeeded_attempts": "0.01684",
+            "other_attempts": "0",
             "per_1000_invoices": "0.4210",
+            "per_1000_invoices_succeeded": "0.4210",
+            "reported": {"openrouter_credits": "0.01684"},
         },
         "retries": 3,
         "transient_errors": {"timeout": 0, "rate_limited": 5, "unavailable": 0},
+        "permanent_errors": {"rejected": 0, "unsupported_request": 0},
     }
     block.update(changes)
     return block
@@ -766,6 +787,14 @@ def test_campaign_records_are_read_and_other_campaign_files_skipped(tmp_path: Pa
     (row,) = real_rows(report.render(tmp_path))
     assert row[0].startswith("`campaigns/20261116T000000Z-abcdef0/")
     assert row[2] == "extract 100 w1"
+
+
+def test_exponent_decimal_text_is_shown_plainly(tmp_path: Path) -> None:
+    record = real_record()
+    record["extraction"]["cost"]["per_1000_invoices"] = "3E-7"
+    write(tmp_path, record)
+    (row,) = real_rows(report.render(tmp_path))
+    assert row[9] == "0.0000003 USD"
 
 
 def test_a_malformed_extraction_block_stops_the_report(tmp_path: Path) -> None:

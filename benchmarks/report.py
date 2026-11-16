@@ -596,11 +596,18 @@ def _extraction_cells(name: str, record: Mapping[str, Any]) -> list[str]:
         DASH if share is None else f"{100 * share:.1f} %",
         fixed(overall, 3),
         str(block["needs_review"]["count"]),
-        f"{cost['per_1000_invoices']} {cost['currency']}"
+        f"{_plain(cost['per_1000_invoices'])} {cost['currency']}"
         + (" (canned prices)" if cost["prices"]["canned"] else ""),
         str(block["retries"]),
         str(block["transient_errors"]["rate_limited"]),
     ]
+
+
+def _plain(text: str) -> str:
+    """Checked decimal text in plain notation: ``3E-7`` is shown as ``0.0000003``."""
+    number = metrics.decimal_text(text)
+    assert number is not None  # checked by metrics.check_extraction
+    return text if "E" not in text.upper() else format(number, "f")
 
 
 def _calls_made(record: Mapping[str, Any]) -> str:
