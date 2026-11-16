@@ -7,6 +7,9 @@ Only outcomes and the order of stored timestamps are asserted, never a
 duration: ``STOP`` bounds a hung run.
 """
 
+import json
+import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,7 @@ from benchmarks.drills import (
     KillDrill,
     PayloadDrill,
     RetryDrill,
+    expected_calls_by_item,
     payload_workload,
     retry_policy,
     retry_workload,
@@ -29,9 +33,17 @@ from benchmarks.drills import (
 )
 from benchmarks.faults import create_fault_table
 from benchmarks.generate import generate_invoices
-from benchmarks.result import Status
+from benchmarks.live import (
+    API_KEY_ENV,
+    BUDGET_FILE_NAME,
+    ProviderChoice,
+    ProviderName,
+    read_budget_file,
+)
+from benchmarks.result import Status, write_result
 from benchmarks.run import Cell, Profile
-from benchmarks.worker import parse_duration
+from benchmarks.sysload import METRICS
+from benchmarks.worker import DEFAULT_CAP, parse_duration
 from tests.integration.test_worker_process import ENVIRONMENT
 
 pytestmark = [pytest.mark.integration, pytest.mark.performance]
@@ -132,3 +144,90 @@ def test_d4_retry_job_fails_the_always_batch_and_retries_the_once_batch(
     measured = record["drill"]["measured"]
     assert measured[poison.always_key]["attempts"] == 3
     assert measured[poison.once_key]["attempts"] == 2
+
+
+# --- d1 on the OpenRouter adapter, as a dry run (DEC-071, T2) ---------------------------------
+
+SENTINEL = "sk-or-v1-SENTINEL-not-a-real-key-0123456789abcdef"
+
+
+def test_d1_on_a_dry_run_provider_loses_nothing_and_leaks_nothing(
+    db: psycopg.Connection[TupleRow],
+    schema_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real workers, real PostgreSQL and the real adapter, answered by CannedTransport.
+
+    A sentinel key is set in this process's environment, as for a live run; a dry run
+    must pass it to no worker and write it nowhere.
+    """
+    monkeypatch.setenv(API_KEY_ENV, SENTINEL)
+    started: list[tuple[list[str], dict[str, str]]] = []
+    real = subprocess.Popen
+
+    class Recording(real):  # type: ignore[valid-type,misc]
+        def __init__(self, args: Sequence[str], *rest: Any, **options: Any) -> None:
+            started.append(([str(part) for part in args], dict(options.get("env") or {})))
+            super().__init__(args, *rest, **options)
+
+    monkeypatch.setattr(subprocess, "Popen", Recording)
+    workload = standard_workload(INVOICES, CELL.batch or 0)
+    choice = ProviderChoice(
+        name=ProviderName.OPENROUTER,
+        model="vendor/model-a",
+        max_provider_calls=3 * workload.expected.calls,  # room for the killed attempts' repeats
+        dry_run=True,
+    )
+    raw_dir = tmp_path / "raw"
+    record = run_drill(
+        schema_url,
+        CELL,
+        KillDrill(
+            victims=2,
+            expected_calls=expected_calls_by_item(CELL.size, CELL.batch or 0, DEFAULT_CAP),
+        ),
+        workload,
+        worker_settings=ENVIRONMENT,
+        raw_dir=raw_dir,
+        stop_after=STOP,
+        provider=choice,
+    )
+
+    checks = _passes(record, "d1")
+    assert checks["no_lost_tasks"]["detail"] == {"lost_tasks": 0}
+    assert checks["no_duplicate_calls"]["detail"] == {"duplicate_calls": 0}
+    measured = record["drill"]["measured"]
+    assert measured["recovery_from_kill_s"]["n"] == 2
+    assert measured["lost_tasks"] == 0
+    assert measured["duplicate_calls"] == 0
+    assert measured["repeated_calls_after_recovery"] >= 0
+    assert record["provider"]["name"] == "openrouter"
+    assert record["provider"]["dry_run"] is True
+    providers = db.execute("SELECT DISTINCT provider FROM provider_calls").fetchall()
+    assert providers == [("openrouter",)]
+    calls = db.execute("SELECT count(*) FROM provider_calls").fetchone()
+    assert calls is not None
+    assert record["provider"]["calls_made"] == calls[0]
+    assert read_budget_file(raw_dir / BUDGET_FILE_NAME) >= calls[0]  # a reservation per call
+    sysload = record["resources"]["sysload"]
+    assert set(sysload["metrics"]) == set(METRICS)
+    assert sysload["metrics"]["worker_rss_bytes"]["n"] > 0
+
+    stored = write_result(record, tmp_path / "results", allow_dirty=True)
+    texts = {"result file": stored.read_text(encoding="utf-8")}
+    for path in sorted(raw_dir.rglob("*")):
+        if path.is_file():
+            texts[str(path)] = path.read_bytes().decode("utf-8", errors="replace")
+    harness = [(argv, env) for argv, env in started if "ORQESTRA_DATABASE_URL" in env]
+    workers = [argv for argv, _ in harness if "benchmarks.worker" in argv]
+    assert len(workers) == CELL.workers + record["drill"]["restarts"]  # replacements too
+    for argv, env in harness:
+        assert API_KEY_ENV not in env  # a dry run never passes the key
+        texts[f"env {argv[:3]}"] = json.dumps(env)
+    for argv in workers:
+        assert "--dry-run" in argv
+        assert "--allow-live-calls" not in argv
+    for argv, _ in started:
+        texts[f"argv {argv[:3]}"] = json.dumps(argv)
+    assert [name for name, text in texts.items() if SENTINEL in text] == []

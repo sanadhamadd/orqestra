@@ -27,6 +27,17 @@ medians and labelled with their formulas:
 - engine overhead per task = median makespan x ``W`` / tasks - the median of
   the repetitions' service time p50.
 
+**Real-provider runs.** A cell or drill whose provider is OpenRouter (DEC-071),
+or whose profile is ``extract``, never enters the tables above, the README block
+or the measured limits: those hold the offline double's results only. Such files,
+with the cell and drill records of every campaign folder
+(``benchmarks/results/campaigns/<id>/*.json``; other files there, such as the
+campaign log and baseline records, are skipped), get one more section, "Real-provider
+runs", rendered only when at least one exists. It shows each file's figures as
+written (the ``extraction`` block, checked by ``metrics.check_extraction``, and
+the drill's measured recovery and call counts) without recomputing them, labels
+a dry run as canned, and never prints the model: the result file records it.
+
 **Byte-identical.** Files are read in sorted order, every table is sorted,
 numbers have a fixed format, and nothing about the run itself (time, absolute
 paths) is written, so the same files always render the same text.
@@ -56,7 +67,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from benchmarks import claims
+from benchmarks import claims, metrics
 from benchmarks.result import RESULTS_DIR, ROOT, Status, WaitEnded, validate_result
 
 BEGIN = "<!-- BEGIN GENERATED: python -m benchmarks.report -->"
@@ -64,6 +75,9 @@ END = "<!-- END GENERATED -->"
 DOC = ROOT / "docs" / "performance.md"
 CLAIMS_DIR = "claims"
 DRILLS_DIR = "drills"
+CAMPAIGNS_DIR = "campaigns"
+DOUBLE_PROVIDER = "bench-double"
+EXTRACT_PROFILE = "extract"
 WARM_UP = "warm-up"
 LADDER_ORDER = ("scale", "overhead", "handler-bound", "batch", "large")
 DASH = "—"
@@ -117,6 +131,39 @@ def _load(root: Path, sub: str | None, validate: Callable[[object], None]) -> li
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             validate(record)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            msg = f"{name}: {exc}"
+            raise ReportError(msg) from None
+        loaded.append(Loaded(name, record))
+    return loaded
+
+
+def double_record(record: Mapping[str, Any]) -> bool:
+    """Whether a record ran on the offline double: no OpenRouter provider, not ``extract``."""
+    if str(record["cell"]["profile"]) == EXTRACT_PROFILE:
+        return False
+    provider = record.get("provider")
+    if provider is None:
+        return True
+    return isinstance(provider, Mapping) and provider.get("name", DOUBLE_PROVIDER) in {
+        DOUBLE_PROVIDER,
+        None,
+    }
+
+
+def _load_campaigns(root: Path) -> list[Loaded]:
+    """The cell and drill records (format 1) of every campaign folder; other files skipped."""
+    directory = root / CAMPAIGNS_DIR
+    if not directory.is_dir():
+        return []
+    loaded = []
+    for path in sorted(directory.glob("*/*.json")):
+        name = path.relative_to(root).as_posix()
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict) or record.get("format") != 1:
+                continue  # the campaign log, its summary, baseline records
+            validate_result(record)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             msg = f"{name}: {exc}"
             raise ReportError(msg) from None
@@ -504,14 +551,155 @@ def drill_sections(loaded: Sequence[Loaded]) -> list[str]:
     return lines
 
 
+REAL_NOTE = (
+    "Each row is one result file, shown as written: nothing is pooled across files or "
+    "recomputed. A dry run answered every call with canned responses and says nothing about a "
+    "real provider. The model, the prices and the provider's own usage are in each file."
+)
+
+
+def _mode(record: Mapping[str, Any]) -> str:
+    provider = record.get("provider")
+    if isinstance(provider, Mapping) and provider.get("dry_run") is True:
+        return "dry run (canned)"
+    if isinstance(provider, Mapping) and provider.get("dry_run") is False:
+        return "live"
+    return DASH
+
+
+def _status(record: Mapping[str, Any]) -> str:
+    status = str(record["status"])
+    if record["environment"]["git_dirty"]:
+        status += " (dirty tree)"
+    return status
+
+
+def _ms(value: object) -> str:
+    return DASH if not isinstance(value, int | float) or isinstance(value, bool) else f"{value:g}"
+
+
+def _extraction_cells(name: str, record: Mapping[str, Any]) -> list[str]:
+    block = record.get("extraction")
+    if block is None:
+        return [DASH] * 7
+    try:
+        metrics.check_extraction(block)
+    except ValueError as exc:
+        msg = f"{name}: {exc}"
+        raise ReportError(msg) from None
+    latency = block["calls"]["latency_ms"]
+    share = block["time_split"]["provider_share"]
+    overall = block["accuracy"]["overall"]
+    cost = block["cost"]
+    return [
+        " / ".join(_ms(latency[rank]) for rank in ("p50", "p95", "p99")),
+        DASH if share is None else f"{100 * share:.1f} %",
+        fixed(overall, 3),
+        str(block["needs_review"]["count"]),
+        f"{cost['per_1000_invoices']} {cost['currency']}"
+        + (" (canned prices)" if cost["prices"]["canned"] else ""),
+        str(block["retries"]),
+        str(block["transient_errors"]["rate_limited"]),
+    ]
+
+
+def _calls_made(record: Mapping[str, Any]) -> str:
+    provider = record.get("provider")
+    calls = provider.get("calls_made") if isinstance(provider, Mapping) else None
+    return DASH if calls is None else str(calls)
+
+
+def real_provider_sections(loaded: Sequence[Loaded]) -> list[str]:
+    """The real-provider section's tables; empty when there is no such file."""
+    runs = [item for item in loaded if item.record["drill"] is None]
+    drills = [item for item in loaded if item.record["drill"] is not None]
+    if not runs and not drills:
+        return []
+    lines = ["## Real-provider runs", "", REAL_NOTE, ""]
+    if runs:
+        rows = [
+            [
+                f"`{item.name}`",
+                _mode(item.record),
+                cell_label(cell_key(item.record)),
+                _status(item.record),
+                _calls_made(item.record),
+                *_extraction_cells(item.name, item.record),
+            ]
+            for item in sorted(runs, key=lambda i: i.name)
+        ]
+        header = [
+            "File",
+            "Mode",
+            "Cell",
+            "Status",
+            "Calls",
+            "Call latency p50 / p95 / p99 (ms)",
+            "Provider share of handler time",
+            "Field accuracy",
+            "Needs review",
+            "Cost per 1,000 invoices",
+            "Retries",
+            "429s",
+        ]
+        lines += [*_table(header, rows), ""]
+    if drills:
+        rows = []
+        for item in sorted(drills, key=lambda i: i.name):
+            record = item.record
+            measured = record["drill"].get("measured") or {}
+            from_kill = measured.get("recovery_from_kill_s") or {}
+            failed = [str(check["name"]) for check in record["gate"] if not check["passed"]]
+            rows.append(
+                [
+                    f"`{item.name}`",
+                    _mode(record),
+                    record["drill"].get("name", DASH),
+                    cell_label(cell_key(record)),
+                    _status(record),
+                    "all passed" if not failed else "failed: " + ", ".join(failed),
+                    fixed(_number(from_kill, "p50"), 3),
+                    _count_text(measured.get("lost_tasks")),
+                    _count_text(measured.get("duplicate_calls")),
+                    _count_text(measured.get("repeated_calls_after_recovery")),
+                    _calls_made(record),
+                ]
+            )
+        header = [
+            "File",
+            "Mode",
+            "Drill",
+            "Cell",
+            "Status",
+            "Gate",
+            "Kill to next attempt p50 (s)",
+            "Lost tasks",
+            "Duplicate calls",
+            "Calls repeated after recovery",
+            "Calls",
+        ]
+        lines += [*_table(header, rows), ""]
+    return lines
+
+
+def _count_text(value: object) -> str:
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else DASH
+
+
 # --- the whole section ---------------------------------------------------------------------
 
 
 def render(root: Path = RESULTS_DIR) -> str:
     """The generated Markdown for the result files under ``root``."""
-    cells = _load(root, None, _validate_cell)
+    loaded_cells = _load(root, None, _validate_cell)
     claim_results = _load(root, CLAIMS_DIR, claims.validate_result)
-    drills = _load(root, DRILLS_DIR, _validate_drill)
+    loaded_drills = _load(root, DRILLS_DIR, _validate_drill)
+    cells = [i for i in loaded_cells if double_record(i.record)]
+    drills = [i for i in loaded_drills if double_record(i.record)]
+    real = [
+        *(i for i in [*loaded_cells, *loaded_drills] if not double_record(i.record)),
+        *_load_campaigns(root),
+    ]
 
     tables = [i for i in cells if clean(i.record) and i.record["ladder"] != WARM_UP]
     warm_up = [i for i in cells if clean(i.record) and i.record["ladder"] == WARM_UP]
@@ -554,6 +742,7 @@ def render(root: Path = RESULTS_DIR) -> str:
     lines += claims_sections(clean_claims) or [NO_RESULTS, ""]
     lines += ["## Failure drills (never in the performance tables)", ""]
     lines += drill_sections(drills) or [NO_RESULTS, ""]
+    lines += real_provider_sections(real)
     lines += ["## Not in the tables", ""]
     if excluded:
         lines += _table(["File", "Ladder", "Cell", "Status", "Reason"], sorted(excluded))
@@ -676,7 +865,7 @@ def measured_limits(cells: Sequence[Loaded], claim_results: Sequence[Loaded]) ->
 
 def render_readme(root: Path = RESULTS_DIR) -> str:
     """The README's generated Performance block for the result files under ``root``."""
-    cells = _load(root, None, _validate_cell)
+    cells = [i for i in _load(root, None, _validate_cell) if double_record(i.record)]
     claim_results = _load(root, CLAIMS_DIR, claims.validate_result)
     tables = [i for i in cells if clean(i.record)]
     lines = [

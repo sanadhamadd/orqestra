@@ -56,6 +56,7 @@ import itertools
 import json
 import math
 import os
+import re
 import resource
 import signal
 import subprocess
@@ -569,3 +570,67 @@ def job_commits(
         "job_commits": commits,
         "method": method,
     }
+
+
+# --- real-provider figures -------------------------------------------------------------------
+
+# The keys of a result's ``extraction`` block (written by the extract workload, T1) that the
+# report reads, with their types. The block is shown as written: nothing here recomputes it.
+_DECIMAL_TEXT = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]+)?")
+
+
+def _at(block: Mapping[str, Any], path: tuple[str, ...]) -> Any:
+    value: Any = block
+    for key in path:
+        if not isinstance(value, Mapping) or key not in value:
+            msg = f"extraction.{'.'.join(path)} is missing"
+            raise ValueError(msg)
+        value = value[key]
+    return value
+
+
+def _count(block: Mapping[str, Any], *path: str) -> None:
+    value = _at(block, path)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = f"extraction.{'.'.join(path)} must be a count, got {value!r}"
+        raise ValueError(msg)
+
+
+def _optional_number(block: Mapping[str, Any], *path: str) -> None:
+    value = _at(block, path)
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int | float)):
+        msg = f"extraction.{'.'.join(path)} must be a number or null, got {value!r}"
+        raise ValueError(msg)
+
+
+def check_extraction(block: object) -> None:
+    """Raise ``ValueError`` unless ``block`` carries every figure the report shows.
+
+    Those are the documents, the call latency percentiles (``percentiles``' shape),
+    the provider's share of handler time, the pooled accuracy, the needs_review
+    count, the cost per 1,000 invoices (decimal text, with its currency and whether
+    the prices were canned), the retries and the rate-limited (429) errors. Other
+    keys are not checked here.
+    """
+    if not isinstance(block, Mapping):
+        msg = "extraction must be an object"
+        raise ValueError(msg)
+    _count(block, "documents")
+    _count(block, "calls", "latency_ms", "n")
+    for rank in ("p50", "p95", "p99", "max"):
+        _optional_number(block, "calls", "latency_ms", rank)
+    _optional_number(block, "time_split", "provider_share")
+    _optional_number(block, "accuracy", "overall")
+    _count(block, "needs_review", "count")
+    _count(block, "retries")
+    _count(block, "transient_errors", "rate_limited")
+    cost = _at(block, ("cost", "per_1000_invoices"))
+    if not isinstance(cost, str) or _DECIMAL_TEXT.fullmatch(cost) is None:
+        msg = f"extraction.cost.per_1000_invoices must be decimal text, got {cost!r}"
+        raise ValueError(msg)
+    if not isinstance(_at(block, ("cost", "currency")), str):
+        msg = "extraction.cost.currency must be text"
+        raise ValueError(msg)
+    if not isinstance(_at(block, ("cost", "prices", "canned")), bool):
+        msg = "extraction.cost.prices.canned must be true or false"
+        raise ValueError(msg)

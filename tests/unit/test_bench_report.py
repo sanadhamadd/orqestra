@@ -616,3 +616,181 @@ def test_print_with_readme_prints_the_readme_block(
     _scale(tmp_path)
     assert report.main(["--results", str(tmp_path), "--readme", "README.md"]) == 0
     assert capsys.readouterr().out == report.render_readme(tmp_path)
+
+
+# --- real-provider runs (DEC-071, T2) ------------------------------------------------------
+
+MODEL = "vendor/model-a"
+
+
+def extraction_block(**changes: Any) -> dict[str, Any]:
+    """T1's pinned ``extraction`` block, with the keys the report reads."""
+    block: dict[str, Any] = {
+        "documents": 40,
+        "calls": {
+            "total": 40,
+            "answered": 40,
+            "failed": 0,
+            "unresolved": 0,
+            "succeeded_attempts": 40,
+            "other_attempts": 0,
+            "latency_ms": {"n": 40, "p50": 812, "p95": 1490, "p99": 2210, "max": 2600},
+        },
+        "time_split": {"provider_s": 30.0, "handler_s": 40.0, "provider_share": 0.75},
+        "accuracy": {"matched": 380, "expected": 400, "overall": 0.95},
+        "needs_review": {"count": 2, "by_reason": {}},
+        "cost": {
+            "currency": "USD",
+            "prices": {"in_per_mtok": "1", "out_per_mtok": "1", "canned": False},
+            "per_1000_invoices": "0.4210",
+        },
+        "retries": 3,
+        "transient_errors": {"timeout": 0, "rate_limited": 5, "unavailable": 0},
+    }
+    block.update(changes)
+    return block
+
+
+def real_record(*, dry_run: bool = False, profile: str = "extract", **cell: Any) -> dict[str, Any]:
+    record = cell_record(ladder="single", profile=profile, **cell)
+    record["provider"] = {
+        "name": "openrouter",
+        "model": MODEL,
+        "max_provider_calls": 50,
+        "dry_run": dry_run,
+        "call_timeout": "PT30S",
+        "cap": 16,
+        "route": "route-a",
+        "calls_made": 40,
+        "usage_unit": "openrouter_credits",
+    }
+    if profile == "extract":
+        record["extraction"] = extraction_block()
+    return record
+
+
+def real_rows(text: str) -> list[list[str]]:
+    """The data rows of the real-provider section, split into their cells."""
+    part = text.split("## Real-provider runs", 1)[1].split("## Not in the tables", 1)[0]
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+        for line in part.splitlines()
+        if line.startswith("| `")
+    ]
+
+
+def test_nothing_real_renders_no_real_section(tmp_path: Path) -> None:
+    write(tmp_path, cell_record())
+    assert "## Real-provider runs" not in report.render(tmp_path)
+
+
+def test_a_live_extract_cell_is_shown_as_written_and_kept_out_of_the_tables(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, cell_record())
+    write(tmp_path, real_record(recorded_at="20261108T000001Z", batch=25, workers=4))
+    text = report.render(tmp_path)
+    before = text.split("## Real-provider runs", 1)[0]
+    assert "extract" not in before  # never in the double's tables or "Not in the tables"
+    (row,) = real_rows(text)
+    assert row[1:] == [
+        "live",
+        "extract 100 b25 w4",
+        "complete",
+        "40",
+        "812 / 1490 / 2210",
+        "75.0 %",
+        "0.950",
+        "2",
+        "0.4210 USD",
+        "3",
+        "5",
+    ]
+    assert MODEL not in text  # the model stays in the result file
+    assert "extract" not in report.render_readme(tmp_path)
+
+
+def test_an_openrouter_invoice_cell_and_a_dry_run_are_labelled(tmp_path: Path) -> None:
+    record = real_record(dry_run=True, profile="invoice")
+    write(tmp_path, record)
+    text = report.render(tmp_path)
+    (row,) = real_rows(text)
+    assert row[1] == "dry run (canned)"
+    assert row[5:] == ["—"] * 7  # no extraction block on the invoice profile
+    assert "invoice 100 w1" not in text.split("## Real-provider runs", 1)[0]
+
+
+def test_canned_prices_are_marked(tmp_path: Path) -> None:
+    record = real_record(dry_run=True)
+    record["extraction"]["cost"]["prices"]["canned"] = True
+    write(tmp_path, record)
+    (row,) = real_rows(report.render(tmp_path))
+    assert row[9] == "0.4210 USD (canned prices)"
+
+
+def test_a_live_drill_shows_its_recovery_and_call_counts(tmp_path: Path) -> None:
+    measured = {
+        "recovery_from_kill_s": {"n": 2, "p50": 10.25, "p95": 11.0, "p99": 11.0, "max": 11.0},
+        "lost_tasks": 0,
+        "duplicate_calls": 0,
+        "repeated_calls_after_recovery": 7,
+    }
+    record = real_record(profile="invoice", workers=4)
+    record["drill"] = {"name": "d1", "measured": measured}
+    write_result(record, tmp_path / "drills")
+    write_result(cell_record(drill={"name": "D1"}, workers=4), tmp_path / "drills")
+    text = report.render(tmp_path)
+    drills_part = text.split("## Real-provider runs", 1)[0]
+    assert "| d1 |" not in drills_part  # the double's drill table keeps its own rows
+    (row,) = real_rows(text)
+    assert row[1:] == [
+        "live",
+        "d1",
+        "invoice 100 w4",
+        "complete",
+        "all passed",
+        "10.250",
+        "0",
+        "0",
+        "7",
+        "40",
+    ]
+
+
+def test_campaign_records_are_read_and_other_campaign_files_skipped(tmp_path: Path) -> None:
+    folder = tmp_path / "campaigns" / "20261116T000000Z-abcdef0"
+    write_result(real_record(), folder)
+    (folder / "campaign-log.jsonl").write_text('{"event": "start"}\n', encoding="utf-8")
+    (folder / "campaign.json").write_text('{"campaign": "x"}', encoding="utf-8")
+    (folder / "baseline.json").write_text('{"format": "baseline-1"}', encoding="utf-8")
+    (row,) = real_rows(report.render(tmp_path))
+    assert row[0].startswith("`campaigns/20261116T000000Z-abcdef0/")
+    assert row[2] == "extract 100 w1"
+
+
+def test_a_malformed_extraction_block_stops_the_report(tmp_path: Path) -> None:
+    record = real_record()
+    del record["extraction"]["cost"]["per_1000_invoices"]
+    path = write(tmp_path, record)
+    with pytest.raises(report.ReportError, match=f"{path.name}: extraction.cost.per_1000"):
+        report.render(tmp_path)
+
+
+def test_a_malformed_campaign_record_is_named(tmp_path: Path) -> None:
+    folder = tmp_path / "campaigns" / "c1"
+    folder.mkdir(parents=True)
+    (folder / "bad.json").write_text('{"format": 1}', encoding="utf-8")
+    with pytest.raises(report.ReportError, match=r"campaigns/c1/bad\.json"):
+        report.render(tmp_path)
+
+
+def test_double_records_are_recognized_in_every_published_shape() -> None:
+    assert report.double_record(cell_record())  # provider None
+    invoice = cell_record(profile="invoice")
+    invoice["provider"] = {"call_timeout": "PT0.1S", "cap": 16, "route": "route-a"}
+    assert report.double_record(invoice)  # the published shape, without a name
+    invoice["provider"]["name"] = "bench-double"
+    assert report.double_record(invoice)
+    assert not report.double_record(real_record(profile="invoice"))
+    extract_on_nothing = cell_record(profile="extract")
+    assert not report.double_record(extract_on_nothing)
