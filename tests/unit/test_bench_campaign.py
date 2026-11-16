@@ -1,7 +1,8 @@
 """The paid campaign's runner (DEC-072): plan, budget, gates, commands, log and resume.
 
 No child command runs: a fake runner writes the result a command would have written
-and prints its last line. The key is a sentinel string and sockets are blocked.
+and prints its last line. Fake limits stand in for the extraction workload's. The key
+is a sentinel string and sockets are blocked.
 """
 
 import ast
@@ -9,8 +10,10 @@ import inspect
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -22,17 +25,20 @@ from benchmarks.campaign import (
     APPROVED_PLAN,
     BILLING_NAME,
     COST_GATE,
-    ESTIMATED_COST_PER_CALL,
+    DRY_RUN_PRICES,
+    FRAMING_BYTES,
     LOG_NAME,
     SUMMARY_NAME,
+    UNBOUNDED_CALL_COST,
     Basis,
     Campaign,
     CampaignLog,
-    CampaignPlan,
+    Ceilings,
     Charge,
     Figures,
     Finished,
     PlannedCell,
+    Prices,
     Settings,
     Step,
     Tool,
@@ -41,8 +47,10 @@ from benchmarks.campaign import (
     charge_for,
     child_environment,
     command_for,
-    per_call_ceiling,
+    hard_call_cost,
+    observed_cost_per_call,
     pilot_gates,
+    reservations_between,
     result_path,
     size_large,
     step_figures,
@@ -57,6 +65,25 @@ SENTINEL = "sk-or-v1-SENTINEL-not-a-real-key-0123456789abcdef"
 MODEL = "vendor/model-a"
 PRICE_IN = Decimal("0.10")
 PRICE_OUT = Decimal("0.50")
+LIVE_PRICES = Prices(PRICE_IN, PRICE_OUT)
+
+
+@dataclass(frozen=True)
+class FakeLimits:
+    """A 2,000-byte prompt, a 1,024-token reply, and documents that grow with the set."""
+
+    prompt_bytes: int = 2_000
+    max_output_tokens: int = 1_024
+
+    def largest_document_bytes(self, size: int) -> int:
+        return 1_000 + size // 100
+
+
+def hard(size: int, prices: Prices = LIVE_PRICES) -> Decimal:
+    limits = FakeLimits()
+    return hard_call_cost(
+        limits.prompt_bytes + limits.largest_document_bytes(size), limits.max_output_tokens, prices
+    )
 
 
 def figures(**overrides: Any) -> Figures:
@@ -65,8 +92,7 @@ def figures(**overrides: Any) -> Figures:
         "calls": 100,
         "token_cost": Decimal("0.05"),
         "credits": Decimal("0.01"),
-        "matched": 950,
-        "expected": 1000,
+        "accuracy": Decimal("0.95"),
         "permanent_failures": 0,
         "items_per_s": 10.0,
     }
@@ -81,8 +107,7 @@ def extraction_record(
     calls: int = 100,
     token_priced: str = "0.05",
     credits: str = "0.01",
-    matched: int = 950,
-    expected: int = 1000,
+    accuracy: float = 0.95,
     permanent: Mapping[str, int] | None = None,
     speed: float = 10.0,
 ) -> dict[str, Any]:
@@ -91,6 +116,7 @@ def extraction_record(
         "status": status,
         "throughput": {"makespan_items_per_s": speed},
         "extraction": {
+            "documents": calls,
             "calls": {"total": calls, "answered": calls, "failed": 0, "unresolved": 0},
             "tokens": {"input": calls * 900, "output": calls * 150, "answered_without_counts": 0},
             "cost": {
@@ -98,11 +124,7 @@ def extraction_record(
                 "total": token_priced,
                 "reported": {"openrouter_credits": credits},
             },
-            "accuracy": {
-                "matched": matched,
-                "expected": expected,
-                "overall": matched / expected if expected else None,
-            },
+            "accuracy": {"matched": 0, "expected": 0, "overall": accuracy},
             "permanent_errors": {"rejected": 0, "unsupported_request": 0, **(permanent or {})},
         },
     }
@@ -142,10 +164,15 @@ def test_the_approved_plan_runs_its_cells_in_order() -> None:
         (1, 2),
     ]
     assert len(scaling) == 15
-    assert {cell.size for cell in scaling} == {2_000}
+    assert {(cell.size, cell.batch) for cell in scaling} == {(2_000, 25)}
     assert [cell.batch for cell in cells if cell.step is Step.TASK_SIZE] == [5, 25, 100]
-    (mix,) = [cell for cell in cells if cell.step is Step.RULES_FIRST]
-    assert (mix.workload, mix.size, mix.workers) == (Workload.MIX, 10_000, 8)
+    rules_first = [cell for cell in cells if cell.step is Step.RULES_FIRST]
+    assert [(c.workload, c.size, c.batch, c.workers, c.repetition) for c in rules_first] == [
+        (Workload.MIX, 2_000, 25, 8, 1),
+        (Workload.MIX, 2_000, 25, 8, 2),
+        (Workload.MIX, 2_000, 25, 8, 3),
+        (Workload.MIX, 10_000, 100, 8, 1),
+    ]
     failures = [cell for cell in cells if cell.step is Step.FAILURES]
     assert [cell.tool for cell in failures] == [Tool.DRILL, Tool.RUN]
     assert {cell.workers for cell in failures} == {32}
@@ -184,6 +211,43 @@ def test_a_cells_call_maximum_covers_one_repeated_task_per_worker() -> None:
     assert mix.call_maximum == -(-mix.expected_calls * 11 // 10) + DEFAULT_CAP * 8
 
 
+# --- the most one call can cost ------------------------------------------------------------
+
+
+def test_the_hard_call_cost_counts_every_request_byte_as_a_token_plus_the_reply_limit() -> None:
+    cost = hard_call_cost(3_000, 1_024, LIVE_PRICES)
+    assert cost == (Decimal(3_000 + FRAMING_BYTES) * PRICE_IN + 1_024 * PRICE_OUT) / 1_000_000
+
+
+def test_an_extract_cells_ceiling_comes_from_its_own_largest_document() -> None:
+    ceilings = Ceilings(FakeLimits(), LIVE_PRICES)
+    small = PlannedCell(
+        step=Step.PILOT, tool=Tool.RUN, workload=Workload.EXTRACT, size=100, batch=25, workers=4
+    )
+    large = APPROVED_PLAN.large(50_000, 8)
+    assert ceilings.of(small) == hard(100)
+    assert ceilings.of(large) == hard(50_000) > hard(100)
+    baseline = APPROVED_PLAN.cells()[-1]
+    assert baseline.tool is Tool.BASELINE
+    assert ceilings.of(baseline) == hard(2_000)
+    mix = PlannedCell(
+        step=Step.RULES_FIRST, tool=Tool.RUN, workload=Workload.MIX, size=100, batch=25, workers=4
+    )
+    assert ceilings.of(mix) == UNBOUNDED_CALL_COST == COST_GATE
+
+
+def test_the_observed_mean_is_only_over_token_priced_calls() -> None:
+    assert observed_cost_per_call([]) is None
+    charges = [
+        Charge(Decimal("0.10"), 100, Basis.TOKENS),
+        Charge(Decimal("0.02"), 100, Basis.TOKENS),
+        Charge(Decimal(9), 10, Basis.CALLS),
+        Charge(Decimal(9), 10, Basis.RESERVATIONS),
+        Charge(Decimal(9), None, Basis.CALL_MAXIMUM),
+    ]
+    assert observed_cost_per_call(charges) == Decimal("0.0006")
+
+
 # --- what a result says ------------------------------------------------------------------
 
 
@@ -194,8 +258,7 @@ def test_an_extraction_results_figures() -> None:
         calls=100,
         token_cost=Decimal("0.05"),
         credits=Decimal("0.01"),
-        matched=950,
-        expected=1000,
+        accuracy=Decimal("0.95"),
         permanent_failures=2,
         items_per_s=10.0,
     )
@@ -204,7 +267,7 @@ def test_an_extraction_results_figures() -> None:
 def test_a_mix_results_figures_have_no_token_cost() -> None:
     read = step_figures(mix_record())
     assert (read.calls, read.credits, read.token_cost) == (500, Decimal("0.02"), None)
-    assert read.matched is None
+    assert read.accuracy is None
     assert read.permanent_failures is None
 
 
@@ -219,7 +282,9 @@ def test_a_mix_results_figures_have_no_token_cost() -> None:
         ({"cost": {"total": "a lot"}}, "token_cost"),
         ({"tokens": {"answered_without_counts": 1}}, "token_cost"),
         ({"tokens": {}}, "token_cost"),
-        ({"accuracy": {"matched": 1.5, "expected": 2}}, "matched"),
+        ({"accuracy": {"overall": None}}, "accuracy"),
+        ({"accuracy": {"overall": "0.95"}}, "accuracy"),
+        ({"accuracy": {"overall": True}}, "accuracy"),
     ],
 )
 def test_a_figure_that_is_not_a_clean_number_is_unknown(
@@ -233,55 +298,57 @@ def test_a_figure_that_is_not_a_clean_number_is_unknown(
 # --- budget ------------------------------------------------------------------------------
 
 
+def charge(read: Figures | None, reserved: int | None = None) -> Charge:
+    return charge_for(read, ceiling=Decimal("0.001"), call_maximum=500, reserved=reserved)
+
+
 def test_a_priced_cell_is_charged_the_larger_of_tokens_and_credits() -> None:
-    ceiling = Decimal("0.001")
-    assert charge_for(figures(), 500, ceiling) == Charge(Decimal("0.05"), 100, Basis.TOKENS)
-    more_credits = figures(credits=Decimal("0.07"))
-    assert charge_for(more_credits, 500, ceiling).cost == Decimal("0.07")
-    no_credits = figures(credits=None)
-    assert charge_for(no_credits, 500, ceiling).cost == Decimal("0.05")
+    assert charge(figures()) == Charge(Decimal("0.05"), 100, Basis.TOKENS)
+    assert charge(figures(credits=Decimal("0.07"))).cost == Decimal("0.07")
+    assert charge(figures(credits=None)).cost == Decimal("0.05")
 
 
 def test_a_cell_without_token_figures_is_charged_its_calls_at_the_ceiling() -> None:
-    ceiling = Decimal("0.001")
     read = figures(token_cost=None, credits=Decimal("0.0001"))
-    assert charge_for(read, 500, ceiling) == Charge(Decimal("0.100"), 100, Basis.CALLS)
-    rich = figures(token_cost=None, credits=Decimal("0.5"))
-    assert charge_for(rich, 500, ceiling).cost == Decimal("0.5")
+    assert charge(read) == Charge(Decimal("0.100"), 100, Basis.CALLS)
+    assert charge(figures(token_cost=None, credits=Decimal("0.5"))).cost == Decimal("0.5")
 
 
 @pytest.mark.parametrize("read", [None, figures(calls=None)])
-def test_a_cell_without_a_readable_result_is_charged_its_whole_maximum(
+def test_a_cell_without_a_result_is_charged_its_reservations_or_its_maximum(
     read: Figures | None,
 ) -> None:
-    charge = charge_for(read, 500, Decimal("0.001"))
-    assert charge == Charge(Decimal("0.500"), None, Basis.CALL_MAXIMUM)
+    assert charge(read, reserved=40) == Charge(Decimal("0.040"), 40, Basis.RESERVATIONS)
+    assert charge(read, reserved=0) == Charge(Decimal("0.000"), 0, Basis.RESERVATIONS)
+    assert charge(read) == Charge(Decimal("0.500"), None, Basis.CALL_MAXIMUM)
 
 
-def test_the_ceiling_is_the_gate_until_the_pilot_passes_then_observed_with_a_margin() -> None:
-    cheap = [Charge(Decimal("0.04"), 100, Basis.TOKENS)]  # $0.0004 a call
-    assert per_call_ceiling(False, cheap) == COST_GATE
-    assert per_call_ceiling(True, []) == ESTIMATED_COST_PER_CALL * Decimal("1.25")
-    assert per_call_ceiling(True, cheap) == ESTIMATED_COST_PER_CALL * Decimal("1.25")
-    dear = [
-        Charge(Decimal("0.10"), 100, Basis.TOKENS),
-        Charge(Decimal("0.02"), 100, Basis.TOKENS),
-        Charge(Decimal("9"), None, Basis.CALL_MAXIMUM),  # not an observation
-        Charge(Decimal("9"), 10, Basis.CALLS),  # its cost is the ceiling itself
-    ]
-    assert per_call_ceiling(True, dear) == Decimal("0.0006") * Decimal("1.25")
-    dearer = [Charge(Decimal("0.20"), 100, Basis.TOKENS)]
-    assert per_call_ceiling(True, dearer) == Decimal("0.002") * Decimal("1.25")
+def counter(raw: Path, run_id: str, count: int, written: float) -> Path:
+    path = raw / run_id / "cell" / BUDGET_FILE_NAME
+    path.parent.mkdir(parents=True)
+    path.write_text(f"{count}\n")
+    os.utime(path, (written, written))
+    return path
+
+
+def test_reservations_are_read_from_the_counters_written_in_the_window(raw_dir: Path) -> None:
+    counter(raw_dir, "before", 7, 1_000.0)
+    counter(raw_dir, "inside", 11, 2_000.0)
+    counter(raw_dir, "insidetoo", 13, 2_500.0)
+    counter(raw_dir, "after", 17, 3_000.0)
+    assert reservations_between(1_500.0, 3_000.0) == 24
+    assert reservations_between(1_500.0, None) == 41
+    assert reservations_between(4_000.0, None) is None
 
 
 def test_the_large_run_is_the_largest_whole_task_count_the_budget_pays_for() -> None:
     ceiling = Decimal("0.00075")
-    cell = size_large(APPROVED_PLAN, 8, Decimal("10"), ceiling)
+    cell = size_large(APPROVED_PLAN, 8, Decimal(10), ceiling)
     assert cell is not None
     assert cell.size % APPROVED_PLAN.large_batch == 0
-    assert cell.call_maximum * ceiling <= Decimal("10")
+    assert cell.call_maximum * ceiling <= Decimal(10)
     bigger = APPROVED_PLAN.large(cell.size + APPROVED_PLAN.large_batch, 8)
-    assert bigger.call_maximum * ceiling > Decimal("10")
+    assert bigger.call_maximum * ceiling > Decimal(10)
     assert (cell.step, cell.workers, cell.workload) == (Step.LARGE, 8, Workload.EXTRACT)
 
 
@@ -311,7 +378,7 @@ def priced(cost: str, calls: int = 1000) -> Charge:
 
 
 def test_a_pilot_inside_every_gate_passes_even_at_the_edges() -> None:
-    gates = pilot_gates(figures(matched=900, expected=1000), priced("1.8"))
+    gates = pilot_gates(figures(accuracy=Decimal("0.9")), priced("1.8"))
     assert [gate.name for gate in gates] == [
         "field_accuracy",
         "cost_per_call",
@@ -321,13 +388,13 @@ def test_a_pilot_inside_every_gate_passes_even_at_the_edges() -> None:
 
 
 @pytest.mark.parametrize(
-    ("read", "charge", "failed"),
+    ("read", "spend", "failed"),
     [
-        (figures(matched=899, expected=1000), priced("1"), "field_accuracy"),
-        (figures(matched=None), priced("1"), "field_accuracy"),
-        (figures(expected=0, matched=0), priced("1"), "field_accuracy"),
+        (figures(accuracy=Decimal("0.899")), priced("1"), "field_accuracy"),
+        (figures(accuracy=None), priced("1"), "field_accuracy"),
         (figures(), priced("1.81"), "cost_per_call"),
         (figures(), Charge(Decimal("0.1"), 1000, Basis.CALLS), "cost_per_call"),
+        (figures(), Charge(Decimal("0.1"), 10, Basis.RESERVATIONS), "cost_per_call"),
         (figures(), Charge(Decimal("0.1"), None, Basis.CALL_MAXIMUM), "cost_per_call"),
         (figures(permanent_failures=1), priced("1"), "no_permanent_failure"),
         (figures(permanent_failures=None), priced("1"), "no_permanent_failure"),
@@ -335,9 +402,9 @@ def test_a_pilot_inside_every_gate_passes_even_at_the_edges() -> None:
     ],
 )
 def test_a_pilot_outside_a_gate_or_without_its_figure_fails_it(
-    read: Figures, charge: Charge, failed: str
+    read: Figures, spend: Charge, failed: str
 ) -> None:
-    gates = {gate.name: gate for gate in pilot_gates(read, charge)}
+    gates = {gate.name: gate for gate in pilot_gates(read, spend)}
     assert not gates[failed].passed
     assert all(gate.passed for name, gate in gates.items() if name != failed)
 
@@ -367,6 +434,14 @@ def cell_of(step: Step, tool: Tool | None = None) -> PlannedCell:
         for cell in APPROVED_PLAN.cells()
         if cell.step is step and (tool is None or cell.tool is tool)
     )
+
+
+def test_a_dry_run_plans_with_synthetic_prices_and_a_live_run_with_the_given_ones(
+    tmp_path: Path,
+) -> None:
+    assert settings(tmp_path, live=False).prices == DRY_RUN_PRICES
+    assert DRY_RUN_PRICES.synthetic
+    assert settings(tmp_path, live=True).prices == LIVE_PRICES
 
 
 def test_a_dry_run_command_passes_dry_run_and_no_prices(tmp_path: Path) -> None:
@@ -423,6 +498,20 @@ def test_the_result_path_is_the_last_word_of_the_last_line(tmp_path: Path) -> No
     assert result_path("") is None
 
 
+def test_running_workers_are_found_by_their_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    listing = (
+        "  101 /usr/bin/python -m benchmarks.worker --route route-a\n"
+        "  102 /usr/bin/python -m benchmarks.campaign run --dry-run\n"
+        "  103 /bin/zsh\n"
+    )
+
+    class Listed:
+        stdout = listing
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Listed())
+    assert campaign.workers_alive() == [101]
+
+
 # --- the campaign ------------------------------------------------------------------------
 
 RecordFor = Callable[[str, Sequence[str]], dict[str, Any] | None]
@@ -464,8 +553,7 @@ def good_records(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
         calls=size,
         token_priced=str(Decimal("0.0005") * size),
         credits="0",
-        matched=size * 9,
-        expected=size * 10,
+        accuracy=0.9,
         speed=float(min(workers, 16)),
     )
 
@@ -476,17 +564,23 @@ def new_campaign(
     *,
     live: bool = False,
     budget: Decimal = Decimal(45),
-    plan: CampaignPlan = APPROVED_PLAN,
+    alive: Callable[[], list[int]] = list,
+    clock: Callable[[], float] | None = None,
 ) -> Campaign:
     environ = {API_KEY_ENV: SENTINEL, "PATH": "/bin"}
-    return Campaign(
+    run = Campaign(
         settings(tmp_path, live=live),
         budget,
-        plan,
+        APPROVED_PLAN,
         runner,
         environ,
         CampaignLog(tmp_path / LOG_NAME),
+        FakeLimits(),
+        alive=alive,
     )
+    if clock is not None:
+        run.clock = clock
+    return run
 
 
 def events(tmp_path: Path, kind: str | None = None) -> list[dict[str, Any]]:
@@ -499,12 +593,15 @@ def raw_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     raw = tmp_path / "raw"
     raw.mkdir()
     monkeypatch.setattr(campaign, "RAW_DIR", raw)
+    monkeypatch.setattr(campaign, "DRY_RUN_BASE", raw / "campaigns")
     return raw
 
 
-def test_a_dry_campaign_runs_every_step_in_order(tmp_path: Path) -> None:
+def test_a_live_campaign_runs_every_step_in_order_within_its_hard_bounds(
+    tmp_path: Path,
+) -> None:
     runner = FakeRunner(good_records)
-    run = new_campaign(tmp_path, runner)
+    run = new_campaign(tmp_path, runner, live=True)
     assert run.execute() == 0
     planned = [cell.key for cell in APPROVED_PLAN.cells()]
     assert runner.keys[: len(planned)] == planned
@@ -512,46 +609,59 @@ def test_a_dry_campaign_runs_every_step_in_order(tmp_path: Path) -> None:
     assert large.startswith("s8-run-extract-")
     assert "-w16-" in large  # the fastest median; 32 is no faster
     for argv, env in runner.calls:
-        assert API_KEY_ENV not in env
-        assert "--dry-run" in argv
+        assert env[API_KEY_ENV] == SENTINEL
         assert SENTINEL not in " ".join(argv)
+        assert "--allow-live-calls" in argv
+    for event in events(tmp_path, "cell_started"):
+        assert Decimal(event["projected"]) <= Decimal(event["remaining"])
+        if "-extract-" in event["cell"]:
+            size = int(event["cell"].split("-extract-")[1].split("-")[0])
+            assert Decimal(event["ceiling"]) == hard(size)  # the cell's own documents
+        else:
+            assert Decimal(event["ceiling"]) == UNBOUNDED_CALL_COST
+    large_started = events(tmp_path, "cell_started")[-1]
+    (sized,) = events(tmp_path, "large_sized")
+    assert Decimal(sized["ceiling"]) == hard(50_000)
+    assert large_started["sized"] is True
     kinds = [event["event"] for event in events(tmp_path)]
     assert kinds[0] == "campaign_started"
-    assert kinds.index("pilot_passed") < kinds.index("billing_check")
-    started = [event["cell"] for event in events(tmp_path, "cell_started")]
-    billing = kinds.index("billing_check")
+    assert kinds[-1] == "campaign_finished"
     first_baseline = next(
         index
         for index, event in enumerate(events(tmp_path))
         if event["event"] == "cell_started" and event["cell"].startswith("s7-")
     )
-    assert billing < first_baseline
-    assert len(started) == len(planned) + 1
-    assert kinds[-1] == "campaign_finished"
+    checks = [i for i, kind in enumerate(kinds) if kind == "billing_check"]
+    assert len(checks) == 2
+    assert kinds.index("pilot_passed") < checks[0] < first_baseline < checks[1]
     summary = json.loads((tmp_path / SUMMARY_NAME).read_text())
     assert summary["model"] == MODEL
     assert summary["stopped"] is None
+    assert summary["prices_per_mtok"] == {"input": "0.10", "output": "0.50", "synthetic": False}
     assert Decimal(summary["spent"]) + Decimal(summary["remaining"]) == Decimal(45)
+    assert Decimal(summary["spent"]) <= Decimal(45)
     assert (tmp_path / "logs" / f"{planned[0]}.out").read_text().startswith("complete ")
-
-
-def test_a_live_campaign_passes_the_key_in_the_environment_only(tmp_path: Path) -> None:
-    runner = FakeRunner(good_records)
-    assert new_campaign(tmp_path, runner, live=True).execute() == 0
-    for argv, env in runner.calls:
-        assert env[API_KEY_ENV] == SENTINEL
-        assert SENTINEL not in " ".join(argv)
-        assert "--allow-live-calls" in argv
     assert SENTINEL not in (tmp_path / LOG_NAME).read_text()
     assert SENTINEL not in (tmp_path / SUMMARY_NAME).read_text()
+
+
+def test_a_dry_campaign_passes_dry_run_and_no_key(tmp_path: Path) -> None:
+    runner = FakeRunner(good_records)
+    assert new_campaign(tmp_path, runner).execute() == 0
+    for argv, env in runner.calls:
+        assert API_KEY_ENV not in env
+        assert "--dry-run" in argv
+        assert "--price-in-per-mtok" not in argv
+    (started,) = events(tmp_path, "campaign_started")
+    assert started["prices_synthetic"] is True
 
 
 @pytest.mark.parametrize(
     ("pilot", "gate"),
     [
-        (extraction_record(matched=899, expected=1000, token_priced="0.01"), "field_accuracy"),
+        (extraction_record(accuracy=0.899, token_priced="0.01"), "field_accuracy"),
         (extraction_record(calls=100, token_priced="0.181"), "cost_per_call"),
-        (extraction_record(permanent={"unsupported_request": 1}), "no_permanent_failure"),
+        (extraction_record(permanent={"rejected": 1}), "no_permanent_failure"),
         (None, "field_accuracy"),
     ],
 )
@@ -559,8 +669,7 @@ def test_a_failed_pilot_gate_stops_the_campaign(
     tmp_path: Path, pilot: dict[str, Any] | None, gate: str
 ) -> None:
     runner = FakeRunner(lambda key, argv: pilot)
-    run = new_campaign(tmp_path, runner)
-    assert run.execute() == 1
+    assert new_campaign(tmp_path, runner).execute() == 1
     assert len(runner.calls) == 1
     gates = {event["gate"]: event for event in events(tmp_path, "gate")}
     assert not gates[gate]["passed"]
@@ -574,8 +683,7 @@ def test_a_failed_pilot_gate_stops_the_campaign(
 def test_cells_that_do_not_fit_are_skipped_and_spending_never_passes_the_budget(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner(good_records)
-    run = new_campaign(tmp_path, runner, budget=Decimal(12))
+    run = new_campaign(tmp_path, FakeRunner(good_records), live=True, budget=Decimal(12))
     assert run.execute() == 0
     skipped = events(tmp_path, "cell_skipped")
     assert skipped
@@ -587,62 +695,118 @@ def test_cells_that_do_not_fit_are_skipped_and_spending_never_passes_the_budget(
     assert run.spent <= Decimal(12)
 
 
-def test_a_cell_that_leaves_no_result_is_charged_its_whole_maximum(tmp_path: Path) -> None:
-    def baseline_not_connected(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
-        return None if key.startswith("s7-") else good_records(key, argv)
+def test_a_cell_that_leaves_no_result_is_charged_what_its_counters_reserved(
+    tmp_path: Path, raw_dir: Path
+) -> None:
+    loop = "s7-baseline-loop-extract-2000-b1-w1-r1"
+    threads = "s7-baseline-threads-extract-2000-b1-w4-r1"
 
-    run = new_campaign(tmp_path, FakeRunner(baseline_not_connected))
+    def crash_after_reserving(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
+        if key == loop:
+            counter(raw_dir, "crashedloop", 37, 4e9)  # written after the cell started
+            return None
+        if key.startswith("s7-"):
+            return None  # refused before reserving anything: no counter
+        return good_records(key, argv)
+
+    clock = iter(float(second) for second in range(1_000, 9_000, 10))
+    run = new_campaign(
+        tmp_path, FakeRunner(crash_after_reserving), live=True, clock=lambda: next(clock)
+    )
     assert run.execute() == 0
     finished = {event["cell"]: event for event in events(tmp_path, "cell_finished")}
     started = {event["cell"]: event for event in events(tmp_path, "cell_started")}
-    for key, event in finished.items():
-        if key.startswith("s7-"):
-            assert event["exit_code"] == 1
-            assert event["result"] is None
-            assert event["charge_basis"] == "call_maximum"
-            expected = Decimal(started[key]["call_maximum"]) * Decimal(started[key]["ceiling"])
-            assert Decimal(event["charge"]) == expected
+    assert finished[loop]["charge_basis"] == "reservations"
+    assert finished[loop]["calls"] == 37
+    assert Decimal(finished[loop]["charge"]) == 37 * Decimal(started[loop]["ceiling"])
+    # every later cell's window also holds that counter: it was written "in the future"
+    assert finished[threads]["charge_basis"] == "reservations"
+
+
+def test_a_cell_without_a_result_or_a_counter_is_charged_its_whole_maximum(
+    tmp_path: Path,
+) -> None:
+    threads = "s7-baseline-threads-extract-2000-b1-w4-r1"
+
+    def refuse_baseline(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
+        return None if key.startswith("s7-") else good_records(key, argv)
+
+    assert new_campaign(tmp_path, FakeRunner(refuse_baseline), live=True).execute() == 0
+    finished = {event["cell"]: event for event in events(tmp_path, "cell_finished")}
+    started = {event["cell"]: event for event in events(tmp_path, "cell_started")}
+    assert finished[threads]["charge_basis"] == "call_maximum"
+    expected = Decimal(started[threads]["call_maximum"]) * Decimal(started[threads]["ceiling"])
+    assert Decimal(finished[threads]["charge"]) == expected
 
 
 def test_a_too_small_budget_stops_before_the_pilot(tmp_path: Path) -> None:
     runner = FakeRunner(good_records)
-    assert new_campaign(tmp_path, runner, budget=Decimal("0.1")).execute() == 1
+    assert new_campaign(tmp_path, runner, budget=Decimal("0.01")).execute() == 1
     assert runner.calls == []
     (stopped,) = events(tmp_path, "campaign_stopped")
     assert "fit" in stopped["reason"]
 
 
-def test_the_billing_check_sets_the_ledger_beside_the_counters(
+def test_no_cell_starts_while_a_benchmark_worker_is_alive(tmp_path: Path) -> None:
+    runner = FakeRunner(good_records)
+    answers: list[list[int]] = [[], [], [4242]]  # quiet for two cells, then not
+
+    def alive() -> list[int]:
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    assert new_campaign(tmp_path, runner, alive=alive).execute() == 1
+    assert len(runner.calls) == 2
+    (stopped,) = events(tmp_path, "campaign_stopped")
+    assert "4242" in stopped["reason"]
+    assert json.loads((tmp_path / SUMMARY_NAME).read_text())["stopped"] == stopped["reason"]
+
+
+def test_the_billing_check_sets_the_ledger_beside_the_counters_in_a_utc_window(
     tmp_path: Path, raw_dir: Path
 ) -> None:
-    counter = raw_dir / "run1" / "cell" / BUDGET_FILE_NAME
-    counter.parent.mkdir(parents=True)
-    counter.write_text("103\n")
-    (counter.parent / "worker-0.log").write_text(
+    run1 = raw_dir / "run1" / "cell"
+    run1.mkdir(parents=True)
+    (run1 / BUDGET_FILE_NAME).write_text("103\n")
+    (run1 / "worker-0.log").write_text(
         json.dumps({"event": "canned_transport_requests", "requests": 101}) + "\n"
     )
     assert new_campaign(tmp_path, FakeRunner(good_records)).execute() == 0
     check = json.loads((tmp_path / BILLING_NAME).read_text())
+    assert check["model"] == MODEL
+    assert check["final"] is True
+    window = check["window_utc"]
+    assert window["start"] < window["end"]
+    assert window["start"].endswith("Z")
     pilot = check["cells"][0]
     assert pilot["calls"] == 100
     assert pilot["counted_calls"] == 103
     assert pilot["counted_minus_calls"] == 3
     assert pilot["transport_requests"] == 101
     assert Decimal(pilot["token_cost_minus_credits"]) == Decimal(pilot["token_cost"])
-    assert check["provider_reported_usd"] is None
+    assert (check["router_reported_usd"], check["upstream_reported_usd"]) == (None, None)
+    assert len(check["cells"]) == len(APPROVED_PLAN.cells()) + 1
     assert Decimal(check["totals"]["charged"]) > 0
+    assert check["totals"]["token_cost_unknown_cells"] == 5  # the four mix cells and the drill
+    partial = events(tmp_path, "billing_check")[0]
+    assert partial["final"] is False
 
 
-def test_a_resumed_campaign_never_runs_a_started_cell_again(tmp_path: Path) -> None:
+def test_a_resumed_campaign_never_reruns_a_started_cell_and_keeps_it_charged(
+    tmp_path: Path, raw_dir: Path
+) -> None:
+    times = iter(float(second) for second in range(1_000, 9_000, 10))
     first = FakeRunner(good_records, fail_at=5)
     with pytest.raises(RuntimeError):
-        new_campaign(tmp_path, first).execute()
+        new_campaign(tmp_path, first, clock=lambda: next(times)).execute()
+    crashed = APPROVED_PLAN.cells()[5].key
+    (crashed_start,) = [e for e in events(tmp_path, "cell_started") if e["cell"] == crashed]
+    counter(raw_dir, "crashed", 29, float(crashed_start["started_epoch"]) + 1)
     second = FakeRunner(good_records)
-    resumed = new_campaign(tmp_path, second)
+    resumed = new_campaign(tmp_path, second, clock=lambda: next(times))
     resumed.resume()
     assert resumed.pilot_passed
-    crashed = APPROVED_PLAN.cells()[5].key
-    assert resumed.runs[crashed].charge.basis is Basis.CALL_MAXIMUM
+    assert resumed.runs[crashed].charge.basis is Basis.RESERVATIONS
+    assert resumed.runs[crashed].charge.calls == 29
     assert resumed.execute() == 0
     assert not set(first.keys) & set(second.keys)
     assert crashed not in second.keys
@@ -670,6 +834,10 @@ def bases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         campaign, "code_state", lambda: {"git_sha": "abcdef0123", "git_dirty": False}
     )
     return tmp_path
+
+
+def cli(argv: list[str], runner: FakeRunner) -> int:
+    return campaign.main(argv, runner, FakeLimits, list)
 
 
 DRY = ["run", "--model", MODEL, "--dry-run"]
@@ -704,7 +872,7 @@ def test_the_command_refuses_before_any_folder_or_child(
 ) -> None:
     monkeypatch.setattr(os, "environ", environ)
     runner = FakeRunner(good_records)
-    assert campaign.main(argv, runner) == 1
+    assert cli(argv, runner) == 1
     error = capsys.readouterr().err
     assert error.startswith("refused: ")
     assert words in error
@@ -714,10 +882,20 @@ def test_the_command_refuses_before_any_folder_or_child(
     assert not (bases / "dry").exists()
 
 
+def test_until_the_extraction_workload_is_connected_the_command_refuses(
+    bases: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = FakeRunner(good_records)
+    assert campaign.main(DRY, runner) == 1
+    assert "not connected" in capsys.readouterr().err
+    assert runner.calls == []
+    assert not (bases / "dry").exists()
+
+
 def test_live_and_dry_run_are_exclusive_and_one_is_required(bases: Path) -> None:
     for argv in (["run", "--model", MODEL], [*DRY, "--allow-live-calls"]):
         with pytest.raises(SystemExit):
-            campaign.main(argv, FakeRunner(good_records))
+            cli(argv, FakeRunner(good_records))
 
 
 def test_the_command_runs_a_dry_campaign_into_its_own_folder_and_reconciles(
@@ -725,26 +903,37 @@ def test_the_command_runs_a_dry_campaign_into_its_own_folder_and_reconciles(
 ) -> None:
     monkeypatch.setattr(os, "environ", {API_KEY_ENV: SENTINEL})
     runner = FakeRunner(good_records)
-    assert campaign.main(DRY, runner) == 0
+    assert cli(DRY, runner) == 0
     (folder,) = (bases / "dry").iterdir()
     assert folder.name.endswith("-abcdef0")
     assert (folder / LOG_NAME).is_file()
     assert not (bases / "live").exists()
     assert all(API_KEY_ENV not in env for _, env in runner.calls)
     capsys.readouterr()
-    assert campaign.main(["reconcile", folder.name, "--provider-reported-usd", "12.5"]) == 0
+    assert cli(["reconcile", folder.name], runner) == 1
+    assert "both" in capsys.readouterr().err
+    reconcile = ["reconcile", folder.name, "--router-reported-usd", "12.5"]
+    assert cli([*reconcile, "--upstream-reported-usd", "11"], runner) == 0
     check = json.loads((folder / BILLING_NAME).read_text())
-    assert check["provider_reported_usd"] == "12.5"
-    expected = Decimal("12.5") - Decimal(check["totals"]["token_cost"])
-    assert Decimal(check["provider_minus_token_cost"]) == expected
-    assert events(folder, "reconciled")[0]["provider_reported_usd"] == "12.5"
-    assert campaign.main(["reconcile", "nope", "--provider-reported-usd", "1"]) == 1
+    assert (check["router_reported_usd"], check["upstream_reported_usd"]) == ("12.5", "11")
+    totals = check["totals"]
+    assert Decimal(check["router_minus_charged"]) == Decimal("12.5") - Decimal(totals["charged"])
+    assert Decimal(check["upstream_minus_token_cost"]) == Decimal(11) - Decimal(
+        totals["token_cost"]
+    )
+    assert Decimal(check["upstream_minus_credits"]) == Decimal(11) - Decimal(totals["credits"])
+    (reconciled,) = events(folder, "reconciled")
+    assert (reconciled["router_reported_usd"], reconciled["upstream_reported_usd"]) == (
+        "12.5",
+        "11",
+    )
+    assert cli(["reconcile", "nope", "--router-reported-usd", "1"], runner) == 1
 
 
 def test_a_resume_names_an_existing_campaign(
     bases: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert campaign.main([*DRY, "--resume", "missing"], FakeRunner(good_records)) == 1
+    assert cli([*DRY, "--resume", "missing"], FakeRunner(good_records)) == 1
     assert "no campaign" in capsys.readouterr().err
 
 
@@ -752,8 +941,7 @@ def test_a_resume_names_an_existing_campaign(
 
 
 def test_the_campaign_imports_no_network_module_and_names_no_model() -> None:
-    source = inspect.getsource(campaign)
-    tree = ast.parse(source)
+    tree = ast.parse(inspect.getsource(campaign))
     imported = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

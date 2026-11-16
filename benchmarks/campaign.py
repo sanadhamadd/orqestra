@@ -1,29 +1,35 @@
 """The paid benchmark campaign (DEC-072): ``python -m benchmarks.campaign``.
 
-``run`` executes the approved plan's eight steps in order. Every cell is one
-subprocess of an existing command, ``benchmarks.run``, ``benchmarks.drills`` or
-``benchmarks.baseline``, so the campaign never calls the provider itself and every
-refusal those commands make still applies. The model comes only from ``--model``
-and the per-million-token prices only from ``--price-in-per-mtok`` and
-``--price-out-per-mtok``; both are written into the results, never into code.
+``run`` executes the approved plan's eight steps in order, one cell at a time. Every
+cell is one subprocess of an existing command, ``benchmarks.run``,
+``benchmarks.drills`` or ``benchmarks.baseline``, so the campaign never calls the
+provider itself and every refusal those commands make still applies. The model comes
+only from ``--model`` and the per-million-token prices only from
+``--price-in-per-mtok`` and ``--price-out-per-mtok``; both are written into the
+results, never into code.
 
 **The key.** ``ORQESTRA_OPENROUTER_API_KEY`` is checked for presence before a live
-campaign and reaches live children through their environment only. A dry run
-removes it from every child environment, and its children run on the canned
-transport: no network, no key, no cost.
+campaign and reaches live children through their environment only. A dry run removes
+it from every child environment, and its children run on the canned transport: no
+network, no key, no cost.
 
-**Gates.** After the pilot the campaign stops if field accuracy is below 0.90, if
-the cost per call is above 3 x the $0.0006 estimate, or if any call failed
-permanently. A figure the pilot's result does not carry fails its gate.
+**Gates.** After the pilot the campaign stops if field accuracy is below 0.90, if the
+cost per call is above 3 x the $0.0006 estimate, or if any call failed permanently. A
+figure the pilot's result does not carry fails its gate.
 
-**Budget.** Before every cell, what the campaign has spent is recomputed from its
-own result files (``charge_for``), and the cell gets a call maximum its budget can
-pay for at the per-call ceiling. The existing call counter (DEC-071) enforces that
-maximum before each request, so no cell spends past what it was given. A cell
-that does not fit is skipped, except the large run, which is sized to fit.
+**Budget.** Before every cell, what the campaign has spent is recomputed from its own
+result files (``charge_for``). A cell runs only if its call maximum times its per-call
+ceiling fits what remains. For a cell that reads documents the ceiling is a hard
+bound: the most one call can cost, from the system prompt, the cell's largest
+document and the reply's token limit (``hard_call_cost``). The existing call counter
+(DEC-071) enforces the call maximum before each request, so such a cell cannot spend
+past what it was given. The mix and the drill have no reply limit in code; they are
+charged at the cost gate's figure per call, and the $5 between the campaign budget
+and the account's $50 cap is the reserve for them. A cell that does not fit is
+skipped, except the large run, which is sized to fit.
 
 Every decision is a line of ``campaign-log.jsonl`` in the campaign's folder.
-``reconcile`` records the provider's own usage figure after the campaign.
+``reconcile`` records the router's and the upstream provider's own figures afterwards.
 """
 
 import argparse
@@ -33,6 +39,7 @@ import os
 import statistics
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -40,7 +47,7 @@ from decimal import Decimal, InvalidOperation
 from enum import IntEnum, StrEnum
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from benchmarks.generate import DEFAULT_SEED, expected_outcome, generate_invoices
 from benchmarks.live import (
@@ -60,9 +67,13 @@ from benchmarks.worker import DEFAULT_CAP
 CAMPAIGN_BUDGET = Decimal(45)
 ESTIMATED_COST_PER_CALL = Decimal("0.0006")
 COST_GATE = 3 * ESTIMATED_COST_PER_CALL
+# A mix or drill call has no reply limit in code: it is planned and charged at this figure.
+UNBOUNDED_CALL_COST = COST_GATE
 ACCURACY_GATE = Decimal("0.90")
-CEILING_MARGIN = Decimal("1.25")
 CALL_HEADROOM = Decimal("1.1")
+# The request's JSON, roles and the user message's wrapper around the document, in bytes.
+FRAMING_BYTES = 1_024
+PER_MILLION = Decimal(1_000_000)
 LARGE_MAX = 50_000
 CALL_TIMEOUT = "PT30S"
 CELL_STOP_MINUTES = 60
@@ -70,6 +81,7 @@ LARGE_STOP_MINUTES = 180
 VICTIMS = 2
 WORKER_COUNTS = (1, 4, 8, 16, 32)
 REPETITIONS = 3
+WORKER_MODULE = "benchmarks.worker"
 LOG_NAME = "campaign-log.jsonl"
 SUMMARY_NAME = "campaign.json"
 BILLING_NAME = "billing-check.json"
@@ -157,6 +169,8 @@ class CampaignPlan:
     task_size: int = 1_000
     task_size_batches: tuple[int, ...] = (5, 25, 100)
     task_size_workers: int = 8
+    mix_same_size: int = 2_000  # the scaling cells' size, for a like-for-like comparison
+    mix_same_size_batch: int = 25
     mix: int = 10_000
     mix_batch: int = 100
     mix_workers: int = 8
@@ -171,6 +185,7 @@ class CampaignPlan:
     def cells(self) -> list[PlannedCell]:
         """Every fixed cell of steps 1 to 7, in run order. The large run is sized later."""
         extract = partial_cell(Tool.RUN, Workload.EXTRACT)
+        mix = partial_cell(Tool.RUN, Workload.MIX)
         cells = [extract(Step.PILOT, self.pilot, self.pilot_batch, self.pilot_workers)]
         for repetition in range(1, self.repetitions + 1):
             for workers in self.worker_counts:
@@ -178,27 +193,15 @@ class CampaignPlan:
                 cells.append(replace(cell, repetition=repetition))
         for batch in self.task_size_batches:
             cells.append(extract(Step.TASK_SIZE, self.task_size, batch, self.task_size_workers))
-        cells.append(
-            PlannedCell(
-                step=Step.RULES_FIRST,
-                tool=Tool.RUN,
-                workload=Workload.MIX,
-                size=self.mix,
-                batch=self.mix_batch,
-                workers=self.mix_workers,
+        for repetition in range(1, self.repetitions + 1):
+            cell = mix(
+                Step.RULES_FIRST, self.mix_same_size, self.mix_same_size_batch, self.mix_workers
             )
-        )
+            cells.append(replace(cell, repetition=repetition))
+        cells.append(mix(Step.RULES_FIRST, self.mix, self.mix_batch, self.mix_workers))
         # The drill runs the mix until its extract workload exists.
-        cells.append(
-            PlannedCell(
-                step=Step.FAILURES,
-                tool=Tool.DRILL,
-                workload=Workload.MIX,
-                size=self.failures,
-                batch=self.failure_batch,
-                workers=self.failure_workers,
-            )
-        )
+        drill = partial_cell(Tool.DRILL, Workload.MIX)
+        cells.append(drill(Step.FAILURES, self.failures, self.failure_batch, self.failure_workers))
         cells.append(
             extract(Step.FAILURES, self.failures, self.rate_limit_batch, self.failure_workers)
         )
@@ -233,6 +236,73 @@ def partial_cell(tool: Tool, workload: Workload) -> Callable[[Step, int, int, in
 APPROVED_PLAN = CampaignPlan()
 
 
+# --- the most one call can cost ------------------------------------------------------------
+
+
+class ExtractLimits(Protocol):
+    """What bounds one extraction call, from the extraction workload's own definitions."""
+
+    @property
+    def prompt_bytes(self) -> int:
+        """The UTF-8 size of the fixed system prompt."""
+        ...
+
+    @property
+    def max_output_tokens(self) -> int:
+        """The ``max_tokens`` every extraction request sets."""
+        ...
+
+    def largest_document_bytes(self, size: int) -> int:
+        """The UTF-8 size of the largest of the first ``size`` documents a cell sends."""
+        ...
+
+
+class NotConnectedError(RuntimeError):
+    """The extraction workload is not part of this code base yet."""
+
+
+def connect_limits() -> ExtractLimits:
+    """The extraction workload's limits."""
+    msg = "the extraction workload is not connected to the campaign yet"
+    raise NotConnectedError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class Prices:
+    """USD per million tokens. A dry run plans with synthetic prices, marked as such."""
+
+    input: Decimal
+    output: Decimal
+    synthetic: bool = False
+
+
+DRY_RUN_PRICES = Prices(Decimal("0.10"), Decimal("0.50"), synthetic=True)
+
+
+def hard_call_cost(input_bytes: int, max_output_tokens: int, prices: Prices) -> Decimal:
+    """The most one call can cost. A token covers at least one byte, so the request's
+    bytes bound its input tokens; the reply is bounded by ``max_tokens``."""
+    tokens_in = Decimal(input_bytes + FRAMING_BYTES)
+    return (tokens_in * prices.input + max_output_tokens * prices.output) / PER_MILLION
+
+
+class Ceilings:
+    """The per-call ceiling of each cell: a hard bound where the workload has one."""
+
+    def __init__(self, limits: ExtractLimits, prices: Prices) -> None:
+        self._limits = limits
+        self._prices = prices
+        self._largest: dict[int, int] = {}
+
+    def of(self, cell: PlannedCell) -> Decimal:
+        if cell.workload is not Workload.EXTRACT:
+            return UNBOUNDED_CALL_COST
+        if cell.size not in self._largest:
+            self._largest[cell.size] = self._limits.largest_document_bytes(cell.size)
+        request = self._limits.prompt_bytes + self._largest[cell.size]
+        return hard_call_cost(request, self._limits.max_output_tokens, self._prices)
+
+
 # --- what a result says ------------------------------------------------------------------
 
 # The extraction block: written by ``benchmarks.run --profile extract`` and by the baseline,
@@ -246,10 +316,9 @@ class Figures:
 
     status: str | None
     calls: int | None  # every ledger call, retried and repeated ones included
-    token_cost: Decimal | None  # ledger tokens x the given prices
+    token_cost: Decimal | None  # every answered call's tokens x the given prices
     credits: Decimal | None  # what the provider reported, in its credits
-    matched: int | None
-    expected: int | None
+    accuracy: Decimal | None  # pooled field accuracy
     permanent_failures: int | None
     items_per_s: float | None
 
@@ -293,6 +362,7 @@ def step_figures(record: Mapping[str, Any]) -> Figures:
             if isinstance(permanent, Mapping)
             else None
         )
+        overall = _path(block, "accuracy", "overall")
         # ``cost.total`` prices only the answered calls that reported their tokens; with
         # any that did not, the token cost is unknown rather than low.
         uncounted = _count(_path(block, "tokens", "answered_without_counts"))
@@ -301,8 +371,7 @@ def step_figures(record: Mapping[str, Any]) -> Figures:
             calls=_count(_path(block, "calls", "total")),
             token_cost=_decimal(_path(block, "cost", "total")) if uncounted == 0 else None,
             credits=_decimal(_path(block, "cost", "reported", OPENROUTER_USAGE_UNIT)),
-            matched=_count(_path(block, "accuracy", "matched")),
-            expected=_count(_path(block, "accuracy", "expected")),
+            accuracy=_decimal(overall) if isinstance(overall, float | int) else None,
             permanent_failures=failures,
             items_per_s=speed,
         )
@@ -315,8 +384,7 @@ def step_figures(record: Mapping[str, Any]) -> Figures:
         calls=calls,
         token_cost=None,
         credits=credits,
-        matched=None,
-        expected=None,
+        accuracy=None,
         permanent_failures=None,
         items_per_s=speed,
     )
@@ -328,7 +396,8 @@ def step_figures(record: Mapping[str, Any]) -> Figures:
 class Basis(StrEnum):
     TOKENS = "tokens"  # the larger of tokens x prices and the credits
     CALLS = "calls"  # no token figures: calls x the ceiling, or the credits if larger
-    CALL_MAXIMUM = "call_maximum"  # no readable result: the whole call maximum x the ceiling
+    RESERVATIONS = "reservations"  # no result: the counter's reservations x the ceiling
+    CALL_MAXIMUM = "call_maximum"  # no result and no counter: the call maximum x the ceiling
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,9 +407,16 @@ class Charge:
     basis: Basis
 
 
-def charge_for(figures: Figures | None, call_maximum: int, ceiling: Decimal) -> Charge:
-    """What a cell is charged against the budget. Unknown spend is never zero."""
+def charge_for(
+    figures: Figures | None, *, ceiling: Decimal, call_maximum: int, reserved: int | None
+) -> Charge:
+    """What a cell is charged against the budget. Unknown spend is never zero.
+
+    ``reserved`` is what the cell's call counters hold, read when it left no result.
+    """
     if figures is None or figures.calls is None:
+        if reserved is not None:
+            return Charge(reserved * ceiling, reserved, Basis.RESERVATIONS)
         return Charge(call_maximum * ceiling, None, Basis.CALL_MAXIMUM)
     credits = figures.credits if figures.credits is not None else Decimal(0)
     if figures.token_cost is None:
@@ -348,15 +424,13 @@ def charge_for(figures: Figures | None, call_maximum: int, ceiling: Decimal) -> 
     return Charge(max(figures.token_cost, credits), figures.calls, Basis.TOKENS)
 
 
-def per_call_ceiling(pilot_passed: bool, charges: Sequence[Charge]) -> Decimal:
-    """The cost per call the budget plans with: the gate's limit until the pilot passes,
-    then the observed cost per token-priced call (at least the estimate) with a margin."""
-    if not pilot_passed:
-        return COST_GATE
+def observed_cost_per_call(charges: Sequence[Charge]) -> Decimal | None:
+    """The mean cost of a token-priced call so far: an estimate for the log, never a bound."""
     priced = [charge for charge in charges if charge.basis is Basis.TOKENS and charge.calls]
     calls = sum(charge.calls or 0 for charge in priced)
-    observed = sum((charge.cost for charge in priced), Decimal(0)) / calls if calls else Decimal(0)
-    return max(observed, ESTIMATED_COST_PER_CALL) * CEILING_MARGIN
+    if not calls:
+        return None
+    return sum((charge.cost for charge in priced), Decimal(0)) / calls
 
 
 def fits(cell: PlannedCell, remaining: Decimal, ceiling: Decimal) -> bool:
@@ -367,7 +441,8 @@ def size_large(
     plan: CampaignPlan, workers: int, remaining: Decimal, ceiling: Decimal
 ) -> PlannedCell | None:
     """The largest large run the remaining budget pays for, in whole tasks, or ``None``
-    when it would not give every worker a task."""
+    when it would not give every worker a task. ``ceiling`` must bound a call of any
+    size up to ``plan.large_max``."""
     affordable = math.floor(remaining / ceiling) - plan.large_batch * workers
     size = min(plan.large_max, math.floor(affordable / CALL_HEADROOM))
     size -= size % plan.large_batch
@@ -389,6 +464,24 @@ def best_workers(scaling: Sequence[tuple[int, Figures]]) -> int | None:
         return None
     medians = {workers: statistics.median(values) for workers, values in speeds.items()}
     return min(medians, key=lambda workers: (-medians[workers], workers))
+
+
+def reservations_between(start: float, end: float | None) -> int | None:
+    """The calls reserved by every call counter last written in ``[start, end)``.
+
+    Cells run one at a time and no worker outlives its cell (``Campaign`` checks), so the
+    counters written while a cell ran are that cell's. ``None`` when there are none.
+    """
+    if not RAW_DIR.is_dir():
+        return None
+    total: int | None = None
+    for path in sorted(RAW_DIR.glob(f"*/**/{BUDGET_FILE_NAME}")):
+        if path.is_relative_to(DRY_RUN_BASE):
+            continue
+        written = path.stat().st_mtime
+        if written >= start and (end is None or written < end):
+            total = (total or 0) + read_budget_file(path)
+    return total
 
 
 # --- gates -------------------------------------------------------------------------------
@@ -413,9 +506,7 @@ class Gate:
 
 def pilot_gates(figures: Figures | None, charge: Charge) -> list[Gate]:
     """The three pilot gates. A figure the result does not carry fails its gate."""
-    accuracy: Decimal | None = None
-    if figures is not None and figures.matched is not None and figures.expected:
-        accuracy = Decimal(figures.matched) / Decimal(figures.expected)
+    accuracy = None if figures is None else figures.accuracy
     per_call: Decimal | None = None
     if charge.basis is Basis.TOKENS and charge.calls:
         per_call = charge.cost / charge.calls
@@ -456,6 +547,13 @@ class Settings:
     price_in: Decimal | None
     price_out: Decimal | None
     out_dir: Path
+
+    @property
+    def prices(self) -> Prices:
+        """The prices the budget plans with: the given ones, or a dry run's synthetic ones."""
+        if self.price_in is None or self.price_out is None:
+            return DRY_RUN_PRICES
+        return Prices(self.price_in, self.price_out)
 
     def provider_arguments(self, call_maximum: int) -> list[str]:
         return [
@@ -559,6 +657,7 @@ class Finished:
 
 
 Runner = Callable[[Sequence[str], Mapping[str, str]], Finished]
+Alive = Callable[[], list[int]]
 
 
 def run_command(argv: Sequence[str], env: Mapping[str, str]) -> Finished:
@@ -566,6 +665,19 @@ def run_command(argv: Sequence[str], env: Mapping[str, str]) -> Finished:
         list(argv), env=dict(env), cwd=ROOT, capture_output=True, text=True, check=False
     )
     return Finished(completed.returncode, completed.stdout, completed.stderr)
+
+
+def workers_alive() -> list[int]:
+    """The PIDs of every running benchmark worker process on this machine."""
+    listing = subprocess.run(  # a fixed command
+        ["ps", "-Ao", "pid=,args="], capture_output=True, text=True, check=True, timeout=30
+    ).stdout
+    alive = []
+    for line in listing.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if f"-m {WORKER_MODULE}" in args and pid.isdigit():
+            alive.append(int(pid))
+    return alive
 
 
 def result_path(stdout: str) -> Path | None:
@@ -640,10 +752,18 @@ class Campaign:
     runner: Runner
     environ: Mapping[str, str]
     log: CampaignLog
+    limits: ExtractLimits
+    alive: Alive = workers_alive
+    clock: Callable[[], float] = time.time
     runs: dict[str, CellRun] = field(default_factory=dict)
     skipped: set[str] = field(default_factory=set)
     pilot_passed: bool = False
     stopped: str | None = None
+    started_at: str | None = None
+    ceilings: Ceilings = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.ceilings = Ceilings(self.limits, self.settings.prices)
 
     @property
     def spent(self) -> Decimal:
@@ -653,17 +773,23 @@ class Campaign:
     def remaining(self) -> Decimal:
         return self.budget - self.spent
 
-    def ceiling(self) -> Decimal:
-        return per_call_ceiling(self.pilot_passed, [run.charge for run in self.runs.values()])
+    @property
+    def halted(self) -> bool:
+        return self.stopped is not None
 
     def resume(self) -> None:
-        """Rebuild the state from the log: a started cell is never run again."""
+        """Rebuild the state from the log. A started cell is never run again, and one that
+        left no result stays charged for what its counters reserved."""
         started: dict[str, dict[str, Any]] = {}
         finished: dict[str, Path | None] = {}
+        order: list[str] = []
         for event in self.log.events():
             kind = event.get("event")
-            if kind == "cell_started":
+            if kind == "campaign_started" and self.started_at is None:
+                self.started_at = str(event["at"])
+            elif kind == "cell_started":
                 started[event["cell"]] = event
+                order.append(event["cell"])
             elif kind == "cell_finished":
                 finished[event["cell"]] = Path(event["result"]) if event["result"] else None
             elif kind == "cell_skipped":
@@ -672,34 +798,55 @@ class Campaign:
                 self.pilot_passed = True
             elif kind == "campaign_stopped":
                 self.stopped = str(event["reason"])
-        for key, event in started.items():
+        for index, key in enumerate(order):
+            event = started[key]
+            following = started[order[index + 1]] if index + 1 < len(order) else None
             path = finished.get(key)
             record = read_record(path)
             figures = None if record is None else step_figures(record)
             ceiling = Decimal(event["ceiling"])
+            maximum = int(event["call_maximum"])
+            reserved = None
+            if figures is None or figures.calls is None:
+                end = None if following is None else float(following["started_epoch"])
+                reserved = reservations_between(float(event["started_epoch"]), end)
+            charge = charge_for(figures, ceiling=ceiling, call_maximum=maximum, reserved=reserved)
             self.runs[key] = CellRun(
                 key,
                 int(event["step"]),
                 int(event["workers"]),
-                int(event["call_maximum"]),
+                maximum,
                 ceiling,
                 path,
                 figures,
-                charge_for(figures, int(event["call_maximum"]), ceiling),
+                charge,
             )
 
+    def _workers_quiet(self) -> bool:
+        """No cell starts while a benchmark worker from an earlier one is still running."""
+        alive = self.alive()
+        if alive:
+            self.stop(f"benchmark workers still running: {', '.join(map(str, alive))}")
+            return False
+        return True
+
     def run_cell(self, cell: PlannedCell, *, sized: bool = False) -> CellRun | None:
-        """Run ``cell`` if it fits the remaining budget; ``None`` if it was skipped."""
+        """Run ``cell`` if it fits the remaining budget; ``None`` if it was skipped or the
+        campaign stopped."""
         if cell.key in self.runs:
             return self.runs[cell.key]
-        ceiling = self.ceiling()
+        if self.stopped is not None:
+            return None
+        ceiling = self.ceilings.of(cell)
         remaining = self.remaining
+        observed = observed_cost_per_call([run.charge for run in self.runs.values()])
         budget = {
             "spent": str(self.spent),
             "remaining": str(remaining),
             "ceiling": str(ceiling),
             "call_maximum": cell.call_maximum,
             "projected": str(cell.call_maximum * ceiling),
+            "estimate": None if observed is None else str(cell.expected_calls * observed),
         }
         if cell.key in self.skipped or not fits(cell, remaining, ceiling):
             if cell.key not in self.skipped:
@@ -708,7 +855,10 @@ class Campaign:
                 )
                 self.skipped.add(cell.key)
             return None
+        if not self._workers_quiet():
+            return None
         argv = command_for(cell, self.settings, cell.call_maximum)
+        began = self.clock()
         self.log.write(
             {
                 "event": "cell_started",
@@ -717,6 +867,7 @@ class Campaign:
                 "workers": cell.workers,
                 "sized": sized,
                 "argv": argv,
+                "started_epoch": began,
                 **budget,
             }
         )
@@ -726,7 +877,12 @@ class Campaign:
         self._keep_output(cell, finished)
         record = read_record(path)
         figures = None if record is None else step_figures(record)
-        charge = charge_for(figures, cell.call_maximum, ceiling)
+        reserved = None
+        if figures is None or figures.calls is None:
+            reserved = reservations_between(began, None)
+        charge = charge_for(
+            figures, ceiling=ceiling, call_maximum=cell.call_maximum, reserved=reserved
+        )
         self.log.write(
             {
                 "event": "cell_finished",
@@ -770,6 +926,8 @@ class Campaign:
             self.stop("pilot already ran without passing its gates")
             return False
         run = self.run_cell(cell)
+        if self.stopped is not None:
+            return False
         if run is None:
             self.stop("the pilot does not fit the budget")
             return False
@@ -785,6 +943,8 @@ class Campaign:
         return True
 
     def run_large(self) -> None:
+        if any(run.step == Step.LARGE for run in self.runs.values()):
+            return
         scaling = [
             (run.workers, run.figures)
             for run in self.runs.values()
@@ -794,23 +954,23 @@ class Campaign:
         if workers is None:
             self.log.write({"event": "large_skipped", "reason": "no complete scaling cell"})
             return
-        done = [run for run in self.runs.values() if run.step == Step.LARGE]
-        if done:
-            return
-        ceiling = self.ceiling()
+        # The ceiling of the largest set any size could send bounds every smaller one.
+        ceiling = self.ceilings.of(self.plan.large(self.plan.large_max, workers))
         cell = size_large(self.plan, workers, self.remaining, ceiling)
-        decision: dict[str, Any] = {
-            "event": "large_sized",
-            "workers": workers,
-            "remaining": str(self.remaining),
-            "ceiling": str(ceiling),
-            "size": None if cell is None else cell.size,
-        }
-        self.log.write(decision)
+        self.log.write(
+            {
+                "event": "large_sized",
+                "workers": workers,
+                "remaining": str(self.remaining),
+                "ceiling": str(ceiling),
+                "size": None if cell is None else cell.size,
+            }
+        )
         if cell is not None:
             self.run_cell(cell, sized=True)
 
-    def billing_check(self) -> dict[str, Any]:
+    def billing_check(self, *, final: bool) -> dict[str, Any]:
+        """The ledger beside the counters, per cell and in total; ``final`` closes the window."""
         rows = [billing_row(run, live=self.settings.live) for run in self.runs.values()]
         # Each total sums the cells that report the figure; ``unknown_cells`` says how many
         # do not, so a partial sum is never read as the whole.
@@ -823,24 +983,33 @@ class Campaign:
         totals["token_cost_minus_credits"] = _difference(totals["token_cost"], totals["credits"])
         check = {
             "campaign_id": self.settings.campaign_id,
+            "model": self.settings.model,
+            "live": self.settings.live,
+            "window_utc": {"start": self.started_at, "end": now() if final else None},
+            "final": final,
             "recorded_at": now(),
             "cells": rows,
             "totals": totals,
-            "provider_reported_usd": None,
+            "router_reported_usd": None,
+            "upstream_reported_usd": None,
         }
         path = self.settings.out_dir / BILLING_NAME
         path.write_text(json.dumps(check, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self.log.write({"event": "billing_check", "path": str(path), "totals": totals})
+        self.log.write(
+            {"event": "billing_check", "final": final, "path": str(path), "totals": totals}
+        )
         return check
 
     def summary(self) -> dict[str, Any]:
+        prices = self.settings.prices
         return {
             "campaign_id": self.settings.campaign_id,
             "model": self.settings.model,
             "live": self.settings.live,
             "prices_per_mtok": {
-                "input": None if self.settings.price_in is None else str(self.settings.price_in),
-                "output": None if self.settings.price_out is None else str(self.settings.price_out),
+                "input": str(prices.input),
+                "output": str(prices.output),
+                "synthetic": prices.synthetic,
             },
             "budget": str(self.budget),
             "spent": str(self.spent),
@@ -854,6 +1023,7 @@ class Campaign:
                     "charge": str(run.charge.cost),
                     "charge_basis": run.charge.basis.value,
                     "call_maximum": run.call_maximum,
+                    "ceiling": str(run.ceiling),
                 }
                 for key, run in self.runs.items()
             },
@@ -865,6 +1035,8 @@ class Campaign:
         if self.stopped is not None:
             print(f"refused: campaign stopped earlier: {self.stopped}", file=sys.stderr)
             return 1
+        if self.started_at is None:
+            self.started_at = now()
         self.log.write(
             {
                 "event": "campaign_started",
@@ -872,6 +1044,7 @@ class Campaign:
                 "model": self.settings.model,
                 "live": self.settings.live,
                 "budget": str(self.budget),
+                "prices_synthetic": self.settings.prices.synthetic,
                 "resumed_cells": sorted(self.runs),
             }
         )
@@ -879,25 +1052,33 @@ class Campaign:
         if not self.run_pilot(cells[0]):
             self._write_summary()
             return 1
+        billed = self._billing_done()
         for cell in cells[1:]:
-            if cell.step is Step.BASELINE and not self._billing_done():
-                self.billing_check()
+            if cell.step is Step.BASELINE and not billed:
+                self.billing_check(final=False)  # step 6: steps 1 to 5
+                billed = True
             self.run_cell(cell)
-        if not self._billing_done():
-            self.billing_check()
+            if self.halted:
+                self._write_summary()
+                return 1
+        if not billed:
+            self.billing_check(final=False)
         self.run_large()
+        if self.halted:
+            self._write_summary()
+            return 1
+        self.billing_check(final=True)
         self.log.write({"event": "campaign_finished", "spent": str(self.spent)})
         self._write_summary()
         return 0
 
     def _billing_done(self) -> bool:
-        return (self.settings.out_dir / BILLING_NAME).exists()
+        return any(event.get("event") == "billing_check" for event in self.log.events())
 
     def _write_summary(self) -> None:
         path = self.settings.out_dir / SUMMARY_NAME
-        path.write_text(
-            json.dumps(self.summary(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        text = json.dumps(self.summary(), indent=2, sort_keys=True) + "\n"
+        path.write_text(text, encoding="utf-8")
 
 
 def _difference(left: str | None, right: str | None) -> str | None:
@@ -1004,14 +1185,21 @@ def campaign_folder(identifier: str) -> Path | None:
     return None
 
 
-def start(args: argparse.Namespace, environ: Mapping[str, str], runner: Runner) -> int:
+def start(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    runner: Runner,
+    limits_factory: Callable[[], ExtractLimits],
+    alive: Alive,
+) -> int:
     reason = refusal(args, environ)
     if reason is not None:
         print(f"refused: {reason}", file=sys.stderr)
         return 1
     try:
         refuse_dirty(False)
-    except DirtyTreeError as exc:
+        limits = limits_factory()
+    except (DirtyTreeError, NotConnectedError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
     live = bool(args.allow_live_calls)
@@ -1035,7 +1223,14 @@ def start(args: argparse.Namespace, environ: Mapping[str, str], runner: Runner) 
         out_dir=out_dir,
     )
     campaign = Campaign(
-        settings, args.budget_usd, APPROVED_PLAN, runner, environ, CampaignLog(out_dir / LOG_NAME)
+        settings,
+        args.budget_usd,
+        APPROVED_PLAN,
+        runner,
+        environ,
+        CampaignLog(out_dir / LOG_NAME),
+        limits,
+        alive=alive,
     )
     if args.resume:
         campaign.resume()
@@ -1044,31 +1239,51 @@ def start(args: argparse.Namespace, environ: Mapping[str, str], runner: Runner) 
     return code
 
 
-def reconcile(identifier: str, provider_usd: Decimal) -> int:
-    """Record the provider's own figure beside the ledger's in the billing check."""
+def reconcile(identifier: str, router: Decimal | None, upstream: Decimal | None) -> int:
+    """Record the router's and the upstream provider's own figures beside the ledger's."""
     folder = campaign_folder(identifier)
-    if folder is None or not (folder / BILLING_NAME).is_file():
-        print(f"refused: campaign {identifier!r} has no billing check", file=sys.stderr)
+    path = None if folder is None else folder / BILLING_NAME
+    check = read_record(path)
+    if path is None or folder is None or check is None or not check.get("final"):
+        print(f"refused: campaign {identifier!r} has no final billing check", file=sys.stderr)
         return 1
-    if not provider_usd.is_finite() or provider_usd < 0:
-        print("refused: --provider-reported-usd must be 0 or more", file=sys.stderr)
+    figures = {"router": router, "upstream": upstream}
+    if all(value is None for value in figures.values()):
+        print(
+            "refused: pass --router-reported-usd, --upstream-reported-usd or both",
+            file=sys.stderr,
+        )
         return 1
-    path = folder / BILLING_NAME
-    check = json.loads(path.read_text(encoding="utf-8"))
+    if any(
+        value is not None and (not value.is_finite() or value < 0) for value in figures.values()
+    ):
+        print("refused: a reported figure must be 0 or more", file=sys.stderr)
+        return 1
     totals = check["totals"]
-    check["provider_reported_usd"] = str(provider_usd)
-    check["provider_minus_token_cost"] = _difference(str(provider_usd), totals["token_cost"])
-    check["provider_minus_credits"] = _difference(str(provider_usd), totals["credits"])
-    check["provider_minus_charged"] = _difference(str(provider_usd), totals["charged"])
+    for name, value in figures.items():
+        if value is None:
+            continue
+        check[f"{name}_reported_usd"] = str(value)
+        for total in ("token_cost", "credits", "charged"):
+            check[f"{name}_minus_{total}"] = _difference(str(value), totals[total])
     path.write_text(json.dumps(check, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     CampaignLog(folder / LOG_NAME).write(
-        {"event": "reconciled", "provider_reported_usd": str(provider_usd)}
+        {
+            "event": "reconciled",
+            "router_reported_usd": None if router is None else str(router),
+            "upstream_reported_usd": None if upstream is None else str(upstream),
+        }
     )
     print(f"reconciled {path}")
     return 0
 
 
-def main(argv: Sequence[str] | None = None, runner: Runner = run_command) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    runner: Runner = run_command,
+    limits_factory: Callable[[], ExtractLimits] = connect_limits,
+    alive: Alive = workers_alive,
+) -> int:
     parser = argparse.ArgumentParser(prog="python -m benchmarks.campaign", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run the campaign's steps in order")
@@ -1076,21 +1291,22 @@ def main(argv: Sequence[str] | None = None, runner: Runner = run_command) -> int
     mode = run.add_mutually_exclusive_group(required=True)
     mode.add_argument("--allow-live-calls", action="store_true", help="real, billable calls")
     mode.add_argument("--dry-run", action="store_true", help="canned transport, no key, no cost")
+    run.add_argument("--price-in-per-mtok", type=_price, help="live: USD per million input tokens")
     run.add_argument(
-        "--price-in-per-mtok", type=_price, help="live: price per million input tokens"
-    )
-    run.add_argument(
-        "--price-out-per-mtok", type=_price, help="live: price per million output tokens"
+        "--price-out-per-mtok", type=_price, help="live: USD per million output tokens"
     )
     run.add_argument("--budget-usd", type=_price, default=CAMPAIGN_BUDGET)
     run.add_argument("--resume", help="continue the campaign with this id")
-    check = commands.add_parser("reconcile", help="record the provider's own usage figure")
+    check = commands.add_parser("reconcile", help="record the provider's own usage figures")
     check.add_argument("campaign_id")
-    check.add_argument("--provider-reported-usd", type=_price, required=True)
+    check.add_argument("--router-reported-usd", type=_price, help="the router's activity total")
+    check.add_argument(
+        "--upstream-reported-usd", type=_price, help="the upstream provider console's total"
+    )
     args = parser.parse_args(argv)
     if args.command == "reconcile":
-        return reconcile(args.campaign_id, args.provider_reported_usd)
-    return start(args, os.environ, runner)
+        return reconcile(args.campaign_id, args.router_reported_usd, args.upstream_reported_usd)
+    return start(args, os.environ, runner, limits_factory, alive)
 
 
 if __name__ == "__main__":

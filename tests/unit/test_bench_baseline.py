@@ -330,7 +330,7 @@ def test_the_command_writes_a_record_the_campaign_reads(
     assert counter.parent.parent.name == record["run_id"]
     figures = step_figures(record)
     assert figures.calls == 12
-    assert (figures.matched, figures.expected) == (16, 24)  # 12 totals; vendors 2, 4, 6, 8
+    assert figures.accuracy == Decimal(str(16 / 24))  # 12 totals; vendors 2, 4, 6, 8
     assert figures.status == "complete"
     assert figures.items_per_s is not None
     text = path.read_text()

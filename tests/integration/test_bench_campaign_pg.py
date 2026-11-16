@@ -23,6 +23,7 @@ from psycopg.rows import TupleRow
 from benchmarks import campaign
 from benchmarks.campaign import (
     LOG_NAME,
+    UNBOUNDED_CALL_COST,
     Basis,
     Campaign,
     CampaignLog,
@@ -50,6 +51,21 @@ STOP = 180.0
 MIX = PlannedCell(
     step=Step.RULES_FIRST, tool=Tool.RUN, workload=Workload.MIX, size=100, batch=25, workers=2
 )
+
+
+class NoExtraction:
+    """The mix cell needs no extraction limits; any use of them fails the test."""
+
+    @property
+    def prompt_bytes(self) -> int:
+        raise AssertionError
+
+    @property
+    def max_output_tokens(self) -> int:
+        raise AssertionError
+
+    def largest_document_bytes(self, size: int) -> int:
+        raise AssertionError
 
 
 class Bridge:
@@ -130,6 +146,8 @@ def test_a_campaign_cells_charge_and_billing_row_match_its_ledger(
         bridge,
         {API_KEY_ENV: SENTINEL},
         CampaignLog(out_dir / LOG_NAME),
+        NoExtraction(),
+        alive=list,
     )
 
     done = run.run_cell(MIX)
@@ -156,7 +174,11 @@ def test_a_campaign_cells_charge_and_billing_row_match_its_ledger(
 
     record: dict[str, Any] = json.loads(Path(row["result"]).read_text())
     assert step_figures(record) == done.figures
-    assert charge_for(step_figures(record), MIX.call_maximum, done.ceiling) == done.charge
+    again = charge_for(
+        step_figures(record), ceiling=done.ceiling, call_maximum=MIX.call_maximum, reserved=None
+    )
+    assert again == done.charge
+    assert done.ceiling == UNBOUNDED_CALL_COST
     started = [event for event in CampaignLog(out_dir / LOG_NAME).events()]
     assert [event["event"] for event in started] == ["cell_started", "cell_finished"]
     assert started[0]["call_maximum"] == MIX.call_maximum
