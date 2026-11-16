@@ -493,9 +493,13 @@ def test_the_dry_run_preview_states_the_calls_and_bounds() -> None:
     assert "would stop this run" in lines[-1]
 
 
-def test_a_too_long_call_timeout_is_shown_refused() -> None:
+def test_a_long_call_timeout_is_given_room_and_an_impossible_one_refused() -> None:
     cell = Cell(Profile.INVOICE, size=100, batch=25, workers=2)
     lines = dry_run_preview(cell, DRY, "PT60S")
+    assert "execution timeout PT1058S" in lines[3]  # 16 x (60 + 2 x 3) + 2
+    assert lines[3].endswith(": fits")
+    # A timeout whose execution timeout breaks the settings' century rule is refused.
+    lines = dry_run_preview(cell, DRY, "P3650000D")
     assert ": refused: " in lines[3]
 
 

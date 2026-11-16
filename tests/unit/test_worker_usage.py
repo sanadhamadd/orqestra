@@ -1077,3 +1077,69 @@ def test_usage_diagnostics_carry_ids_only(make: Any, caplog: pytest.LogCaptureFi
         text = record.getMessage()
         for secret in ("route-a", "provider-a", "model-a", "prompt-v1", "interpret_amount"):
             assert secret not in text
+
+
+# --- the call's metadata reaches the ledger (T1) -----------------------------------------------
+
+
+def test_the_calls_metadata_is_passed_through_unchanged() -> None:
+    answered = ProviderCallResult(
+        attempt_id=ATTEMPT,
+        call_seq=3,
+        outcome=CallOutcome.ANSWERED,
+        usage=ProviderUsage("0.0012", "openrouter_credits"),
+        model_served="vendor/model-a",
+        provider_generation_id="gen-1",
+        input_tokens=812,
+        output_tokens=145,
+        latency_ms=1250,
+    )
+    converted = ledger_result(answered)
+    assert converted is not None
+    assert converted == CallResult(
+        attempt_id=ATTEMPT,
+        call_seq=3,
+        outcome=converted.outcome,
+        reported_amount=Decimal("0.0012"),
+        reported_unit="openrouter_credits",
+        model_served="vendor/model-a",
+        provider_generation_id="gen-1",
+        input_tokens=812,
+        output_tokens=145,
+        latency_ms=1250,
+    )
+
+
+def test_a_result_without_metadata_converts_exactly_as_before() -> None:
+    converted = ledger_result(result(0, usage=ProviderUsage("7", "tokens")))
+    assert converted is not None
+    assert (
+        converted.model_served,
+        converted.provider_generation_id,
+        converted.input_tokens,
+        converted.output_tokens,
+        converted.latency_ms,
+    ) == (None, None, None, None, None)
+    assert converted == CallResult(
+        attempt_id=ATTEMPT,
+        call_seq=0,
+        outcome=converted.outcome,
+        reported_amount=Decimal("7"),
+        reported_unit="tokens",
+    )
+
+
+def test_a_whole_document_intent_is_recorded_without_a_field_kind() -> None:
+    sink = UsageSink(["k"], {"r1": "p1"}, {"r1": "vendor/model-a"}, prompt_version="extract.v1")
+    whole = ProviderCallIntent(
+        attempt_id=ATTEMPT,
+        call_seq=0,
+        item_index=4,
+        route_id="r1",
+        capability="extract_invoice",
+        field_kind=None,
+        estimated_cost_units=1,
+    )
+    converted = sink.ledger_intent(whole)
+    assert converted.field_kind is None
+    assert (converted.capability, converted.item_index) == ("extract_invoice", 4)
