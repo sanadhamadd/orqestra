@@ -469,10 +469,10 @@ def test_a_live_drill_without_the_key_is_refused(
 
 
 def test_a_live_timeout_raises_only_the_execution_timeout() -> None:
-    settings = benchmarks.drills.live_worker_settings(BENCH_WORKER_SETTINGS, 16, "PT30S")
+    settings = benchmarks.run.provider_worker_settings(BENCH_WORKER_SETTINGS, 16, "PT30S")
     # 16 x (30 s + 2 x 3 s hand-off) + 2 s fence margin = 578 s.
     assert settings == {**BENCH_WORKER_SETTINGS, "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT578S"}
-    unchanged = benchmarks.drills.live_worker_settings(BENCH_WORKER_SETTINGS, 16, "PT0.1S")
+    unchanged = benchmarks.run.provider_worker_settings(BENCH_WORKER_SETTINGS, 16, "PT0.1S")
     assert unchanged == dict(BENCH_WORKER_SETTINGS)
 
 
@@ -550,3 +550,76 @@ def test_the_provider_is_refused_with_a_drill_other_than_d1() -> None:
                 name=ProviderName.OPENROUTER, model=MODEL, max_provider_calls=5, dry_run=True
             ),
         )
+
+
+# --- d1 on the extraction workload (T4) ------------------------------------------------------
+
+EXTRACT_DRY = [
+    "--workload",
+    "extract",
+    "--provider",
+    "openrouter",
+    "--model",
+    "vendor/model-a",
+    "--max-provider-calls",
+    "500",
+    "--dry-run",
+    "--batch",
+    "25",
+]
+
+
+def test_d1_accepts_the_extract_workload_on_a_dry_run(named: list[str]) -> None:
+    assert benchmarks.drills.main(["d1", *EXTRACT_DRY]) == 0
+    assert named == ["d1"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "fragment"),
+    [
+        (["d2", *EXTRACT_DRY], "only with d1"),
+        (["d1", "--workload", "extract", "--batch", "25"], "needs --provider openrouter"),
+        (["d1", *EXTRACT_DRY, "--price-in-per-mtok", "2.5"], "synthetic prices"),
+        (["d1", "--price-out-per-mtok", "7"], "apply only to the extract profile"),
+    ],
+)
+def test_the_extract_drill_refuses_inconsistent_flags(
+    arguments: list[str],
+    fragment: str,
+    named: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert benchmarks.drills.main(arguments) == 1
+    assert fragment in capsys.readouterr().err
+    assert named == []
+
+
+def test_a_live_extract_drill_needs_both_prices(
+    named: list[str], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ORQESTRA_OPENROUTER_API_KEY", "sk-SENTINEL")
+    live = [*EXTRACT_DRY[:-3], "--allow-live-calls", "--batch", "25"]
+    assert benchmarks.drills.main(["d1", *live]) == 1
+    error = capsys.readouterr().err
+    assert "price" in error
+    assert "SENTINEL" not in error
+    assert named == []
+
+
+def test_the_extract_drill_cell_and_its_call_timeout() -> None:
+    import argparse
+
+    args = argparse.Namespace(
+        workload="extract", invoices=40, batch=10, workers=2, call_timeout=None
+    )
+    assert benchmarks.drills.drill_cell(args) == Cell(Profile.EXTRACT, 40, 10, 2)
+    assert benchmarks.drills.drill_call_timeout(args) == "PT30S"
+    mix = argparse.Namespace(workload="mix", invoices=40, batch=10, workers=2, call_timeout=None)
+    assert benchmarks.drills.drill_cell(mix) == Cell(Profile.INVOICE, 40, 10, 2)
+    assert benchmarks.drills.drill_call_timeout(mix) == "PT0.1S"
+    workload = benchmarks.drills.extract_workload(Cell(Profile.EXTRACT, 40, 10, 2))
+    assert workload.items == 40
+    assert len(workload.tasks) == 4
+    assert workload.expected is None
+    with pytest.raises(ValueError, match="no invoice oracle"):
+        _ = workload.oracle

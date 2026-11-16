@@ -597,7 +597,10 @@ def test_a_live_command_passes_prices_only_where_the_model_reads_every_document(
     assert drill[3:4] == ["d1"]
     assert drill[drill.index("--victims") + 1] == "2"
     assert drill[drill.index("--workers") + 1] == "32"
-    assert "--price-in-per-mtok" not in drill
+    # The crash drill reads every document too (T4), so it is priced like the pilot.
+    assert drill[drill.index("--workload") + 1] == "extract"
+    assert drill[drill.index("--price-in-per-mtok") + 1] == "0.31"
+    assert drill[drill.index("--price-out-per-mtok") + 1] == "1.17"
 
 
 def test_a_dry_runs_children_never_see_the_key() -> None:
@@ -905,7 +908,7 @@ def test_the_billing_check_sets_the_ledger_beside_the_counters_in_a_utc_window(
     assert (check["router_reported_usd"], check["upstream_reported_usd"]) == (None, None)
     assert len(check["cells"]) == len(APPROVED_PLAN.cells()) + 1
     assert Decimal(check["totals"]["charged"]) > 0
-    assert check["totals"]["token_cost_unknown_cells"] == 5  # the four mix cells and the drill
+    assert check["totals"]["token_cost_unknown_cells"] == 4  # the four mix cells
     partial = events(tmp_path, "billing_check")[0]
     assert partial["final"] is False
 
@@ -1001,14 +1004,20 @@ def test_the_command_refuses_before_any_folder_or_child(
     assert not (bases / "dry").exists()
 
 
-def test_until_the_extraction_workload_is_connected_the_command_refuses(
-    bases: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    runner = FakeRunner(good_records)
-    assert campaign.main(DRY, runner) == 1
-    assert "not connected" in capsys.readouterr().err
-    assert runner.calls == []
-    assert not (bases / "dry").exists()
+def test_the_limits_are_the_extraction_workloads_own() -> None:
+    from benchmarks import extract
+    from benchmarks.documents import generate_documents
+    from benchmarks.generate import DEFAULT_SEED
+    from orqestra.providers.openrouter import EXTRACT_MAX_TOKENS, EXTRACT_SYSTEM_PROMPT
+
+    limits = campaign.connect_limits()
+    assert limits.prompt_bytes == len(EXTRACT_SYSTEM_PROMPT.encode("utf-8"))
+    assert limits.max_output_tokens == EXTRACT_MAX_TOKENS
+    sent = [extract.request_text(d.text) for d in generate_documents(300, DEFAULT_SEED)]
+    assert limits.largest_document_bytes(300) == max(len(text.encode()) for text in sent)
+    # Escapes count: the request text is longer than the raw document.
+    largest_raw = max(len(d.text.encode()) for d in generate_documents(300, DEFAULT_SEED))
+    assert limits.largest_document_bytes(300) > largest_raw
 
 
 def test_live_and_dry_run_are_exclusive_and_one_is_required(bases: Path) -> None:
@@ -1077,3 +1086,62 @@ def test_the_campaign_imports_no_network_module_and_names_no_model() -> None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     ]
     assert not [text for text in constants if slug.fullmatch(text)]
+
+
+# --- every argv of the approved plan is accepted by its tool (T4) ----------------------------
+
+
+class _NoDocuments:
+    """A baseline extraction with no documents: the command's parser and refusals run,
+    nothing is called."""
+
+    fields: tuple[str, ...] = ()
+
+    def documents(self, count: int, seed: int) -> list[Any]:
+        return []
+
+    def call(self, text: str) -> Any:
+        raise AssertionError
+
+    def score(self, expected: object, content: str | None) -> Any:
+        raise AssertionError
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["dry", "live"])
+def test_every_command_of_the_approved_plan_passes_its_tools_own_refusals(
+    live: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from benchmarks import baseline as baseline_module
+    from benchmarks import drills as drills_module
+    from benchmarks import run as run_module
+
+    monkeypatch.setenv(API_KEY_ENV, SENTINEL)
+    monkeypatch.setenv("ORQESTRA_BENCH_DATABASE_URL", "postgresql://b@localhost/orqestra_bench")
+    for module in (run_module, drills_module, baseline_module):
+        monkeypatch.setattr(module, "refuse_dirty", lambda allow_dirty: None)
+    monkeypatch.setattr(baseline_module, "RAW_DIR", tmp_path / "raw")
+    # Below the refusals, nothing runs: no database, no worker, no call.
+    record = {"status": "complete", "provider": {"calls_made": 0}}
+    monkeypatch.setattr(
+        run_module, "run_in_bench_database", lambda *a, **k: (record, tmp_path / "r.json")
+    )
+    monkeypatch.setattr(run_module, "dry_run_summary", lambda *a: [])
+    monkeypatch.setattr(drills_module, "run_named", lambda *a: [])
+    plan = APPROVED_PLAN
+    cells = [*plan.cells(), plan.large(plan.large_max, 8)]
+    chosen = settings(tmp_path, live=live)
+    for cell in cells:
+        argv = command_for(cell, chosen, cell.call_maximum)
+        arguments = argv[3:]
+        if cell.tool is Tool.RUN:
+            code = run_module.main(arguments)
+        elif cell.tool is Tool.DRILL:
+            code = drills_module.main(arguments)
+        else:
+            code = baseline_module.main(arguments, connector=lambda *a: _NoDocuments())
+        error = capsys.readouterr().err
+        assert (code, error) == (0, ""), (cell.key, error)
+        assert SENTINEL not in json.dumps(argv)

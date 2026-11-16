@@ -15,8 +15,8 @@ the remaining documents are not called.
 
 The extraction itself (documents, the adapter call, the strict parse and the oracle's
 scoring) is the extraction workload's. ``Extraction`` is the shape this module needs
-from it; ``connect`` binds it, and until that workload is part of the code base the
-command refuses. Only counts and timings are written: never a key, prompt or reply.
+from it; ``connect`` binds it to ``benchmarks.extract`` and the OpenRouter adapter.
+Only counts and timings are written: never a key, prompt or reply.
 """
 
 import argparse
@@ -30,28 +30,33 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from benchmarks import metrics
+from benchmarks import documents, extract, metrics
 from benchmarks.generate import DEFAULT_SEED
 from benchmarks.live import (
     BUDGET_EXHAUSTED,
     BUDGET_FILE_NAME,
     OPENROUTER_USAGE_UNIT,
     CallBudget,
+    CannedTransport,
     ProviderCallBudgetExhausted,
     ProviderChoice,
     ProviderName,
     create_budget_file,
+    document_key,
+    openrouter_wiring,
 )
 from benchmarks.result import RAW_DIR, DirtyTreeError, code_state, now
 from benchmarks.run import BENCH_WORKER_SETTINGS, MAX_ATTEMPTS, refuse_dirty
 from benchmarks.worker import parse_duration
 from orqestra.calls.provider import ProviderTransientError, TransientCode
 from orqestra.domain.errors import PermanentError
+from orqestra.providers.openrouter import ExtractionRequest, OpenRouterProvider
 
 FORMAT = "baseline-1"
 CALL_TIMEOUT = "PT30S"
@@ -127,14 +132,75 @@ class Prices:
     canned: bool
 
 
-class NotConnectedError(RuntimeError):
-    """The extraction workload is not part of this code base yet."""
+ROUTE = "route-a"
+
+
+@dataclass(frozen=True, slots=True)
+class _Document:
+    """A generated document; ``expected`` is the whole oracle (fields and status)."""
+
+    text: str
+    expected: documents.Document
+
+
+class _Workload:
+    """``Extraction`` on the extraction workload (``benchmarks.extract``) and the adapter."""
+
+    def __init__(
+        self, provider: OpenRouterProvider, canned: CannedTransport | None, timeout: timedelta
+    ) -> None:
+        self._provider = provider
+        self._canned = canned
+        self._timeout = timeout
+
+    @property
+    def fields(self) -> Sequence[str]:
+        return extract.SCORED_FIELDS
+
+    def documents(self, count: int, seed: int) -> Sequence[Document]:
+        generated = documents.generate_documents(count, seed)
+        if self._canned is not None:  # a dry run: the canned model reads each one perfectly
+            self._canned.add_replies(
+                {document_key(d.text): extract.canonical_reply(d.expected) for d in generated}
+            )
+        return [_Document(d.text, d) for d in generated]
+
+    def call(self, text: str) -> Reply:
+        request = ExtractionRequest(route_id=ROUTE, document=text, timeout=self._timeout)
+        report = self._provider.extract(request)
+        usage = report.usage
+        credits = (
+            Decimal(usage.amount)
+            if usage is not None and usage.unit == OPENROUTER_USAGE_UNIT
+            else None
+        )
+        return Reply(
+            report.content, report.input_tokens, report.output_tokens, report.latency_ms, credits
+        )
+
+    def score(self, expected: object, content: str | None) -> Score:
+        assert isinstance(expected, documents.Document)
+        read = extract.parse_reply(content)
+        judgement = extract.judge(read)
+        stored = read.as_json() if isinstance(read, extract.Reading) else None
+        scored = extract.score(expected.expected, stored)
+        return Score(
+            status=judgement.status.value,
+            reason=None if judgement.reason is None else judgement.reason.value,
+            fields={
+                name: (scored.matched[name], scored.expected[name])
+                for name in extract.SCORED_FIELDS
+            },
+            exact=scored.exact_documents == 1,
+            status_matched=judgement.status is expected.expected_status,
+        )
 
 
 def connect(choice: ProviderChoice, call_timeout: str, environ: Mapping[str, str]) -> Extraction:
-    """The extraction workload on ``choice``'s adapter."""
-    msg = "the extraction workload is not connected to the baseline yet"
-    raise NotConnectedError(msg)
+    """The extraction workload on ``choice``'s adapter: the canned transport for a dry run
+    (which never reads the key), the real one only for a live run."""
+    wired = openrouter_wiring(choice, ROUTE, environ, prompt_version=extract.PROMPT_VERSION)
+    return _Workload(wired.provider, wired.canned, parse_duration(call_timeout))
 
 
 # --- one document --------------------------------------------------------------------------
@@ -363,13 +429,15 @@ def extraction_figures(run: Run, prices: Prices, fields: Sequence[str] = ()) -> 
         "cost": {
             "currency": "USD",
             "prices": {
-                "in_per_mtok": str(prices.input),
-                "out_per_mtok": str(prices.output),
+                "in_per_mtok": extract.fixed_point_text(prices.input),
+                "out_per_mtok": extract.fixed_point_text(prices.output),
                 "canned": prices.canned,
             },
-            "total": str(total),
-            "per_1000_invoices": str(total * 1000 / documents) if documents else None,
-            "reported": {OPENROUTER_USAGE_UNIT: str(credits)},
+            "total": extract.fixed_point_text(total),
+            "per_1000_invoices": extract.fixed_point_text(total * 1000 / documents)
+            if documents
+            else None,
+            "reported": {OPENROUTER_USAGE_UNIT: extract.fixed_point_text(credits)},
         },
         "retries": sum(transient.values()),
         "transient_errors": {code.value: transient[code.value] for code in TransientCode},
@@ -514,11 +582,13 @@ def main(
     try:
         refuse_dirty(args.allow_dirty)
         extraction = connector(choice, args.call_timeout, os.environ)
-    except (DirtyTreeError, NotConnectedError) as exc:
+    except DirtyTreeError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
     if args.dry_run:
-        prices = canned_prices or Prices(Decimal(0), Decimal(0), canned=True)
+        prices = canned_prices or Prices(
+            extract.CANNED_PRICE_IN_PER_MTOK, extract.CANNED_PRICE_OUT_PER_MTOK, canned=True
+        )
     else:
         prices = Prices(args.price_in_per_mtok, args.price_out_per_mtok, canned=False)
     run_id = uuid.uuid4().hex[:12]

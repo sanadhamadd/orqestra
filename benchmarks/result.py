@@ -299,6 +299,14 @@ def _validate_extraction(record: dict[str, Any]) -> None:
     latency = block["calls"].get("latency_ms") if isinstance(block["calls"], dict) else None
     if not isinstance(latency, dict) or not {"p50", "p95", "p99", "max"} <= set(latency):
         _fail("extraction.calls.latency_ms must give p50, p95, p99 and max")
+    tokens = block["tokens"]
+    if isinstance(tokens, dict) and "max_per_call" in tokens:
+        largest = tokens["max_per_call"]
+        if not isinstance(largest, dict) or set(largest) != {"input", "output"}:
+            _fail("extraction.tokens.max_per_call must give input and output")
+        for value in largest.values():
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                _fail("extraction.tokens.max_per_call values must be counts or null")
 
 
 def _validate_wait(record: dict[str, Any]) -> None:

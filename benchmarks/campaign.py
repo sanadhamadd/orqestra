@@ -49,6 +49,8 @@ from functools import cache
 from pathlib import Path
 from typing import Any, Protocol
 
+from benchmarks import extract
+from benchmarks.extract import fixed_point_text
 from benchmarks.generate import DEFAULT_SEED, expected_outcome, generate_invoices
 from benchmarks.live import (
     API_KEY_ENV,
@@ -199,8 +201,8 @@ class CampaignPlan:
             )
             cells.append(replace(cell, repetition=repetition))
         cells.append(mix(Step.RULES_FIRST, self.mix, self.mix_batch, self.mix_workers))
-        # The drill runs the mix until its extract workload exists.
-        drill = partial_cell(Tool.DRILL, Workload.MIX)
+        # The crash drill runs the extraction workload (``d1 --workload extract``).
+        drill = partial_cell(Tool.DRILL, Workload.EXTRACT)
         cells.append(drill(Step.FAILURES, self.failures, self.failure_batch, self.failure_workers))
         cells.append(
             extract(Step.FAILURES, self.failures, self.rate_limit_batch, self.failure_workers)
@@ -257,14 +259,10 @@ class ExtractLimits(Protocol):
         ...
 
 
-class NotConnectedError(RuntimeError):
-    """The extraction workload is not part of this code base yet."""
-
-
 def connect_limits() -> ExtractLimits:
-    """The extraction workload's limits."""
-    msg = "the extraction workload is not connected to the campaign yet"
-    raise NotConnectedError(msg)
+    """The extraction workload's limits, for the documents every campaign cell sends (the
+    run command's default seed)."""
+    return extract.Limits(DEFAULT_SEED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,13 +546,13 @@ def pilot_gates(figures: Figures | None, charge: Charge) -> list[Gate]:
     return [
         Gate(
             "field_accuracy",
-            None if accuracy is None else str(accuracy),
+            None if accuracy is None else fixed_point_text(accuracy),
             f">= {ACCURACY_GATE}",
             accuracy is not None and accuracy >= ACCURACY_GATE,
         ),
         Gate(
             "cost_per_call",
-            None if per_call is None else str(per_call),
+            None if per_call is None else fixed_point_text(per_call),
             f"<= {COST_GATE}",
             per_call is not None and per_call <= COST_GATE,
         ),
@@ -630,9 +628,9 @@ class Settings:
         assert self.price_out is not None
         return [
             "--price-in-per-mtok",
-            str(self.price_in),
+            fixed_point_text(self.price_in),
             "--price-out-per-mtok",
-            str(self.price_out),
+            fixed_point_text(self.price_out),
         ]
 
     def note(self, cell: PlannedCell) -> str:
@@ -673,7 +671,10 @@ def command_for(cell: PlannedCell, settings: Settings, call_maximum: int) -> lis
             str(VICTIMS),
             "--stop-after",
             str(CELL_STOP_MINUTES * 60),
+            "--workload",
+            "extract" if cell.workload is Workload.EXTRACT else "mix",
             *provider,
+            *(settings.price_arguments() if cell.workload is Workload.EXTRACT else []),
             *common,
         ]
     stop = LARGE_STOP_MINUTES if cell.step is Step.LARGE else CELL_STOP_MINUTES
@@ -898,12 +899,14 @@ class Campaign:
         remaining = self.remaining
         observed = observed_cost_per_call([run.charge for run in self.runs.values()])
         budget = {
-            "spent": str(self.spent),
-            "remaining": str(remaining),
-            "ceiling": str(ceiling),
+            "spent": fixed_point_text(self.spent),
+            "remaining": fixed_point_text(remaining),
+            "ceiling": fixed_point_text(ceiling),
             "call_maximum": cell.call_maximum,
-            "projected": str(cell.call_maximum * ceiling),
-            "estimate": None if observed is None else str(cell.expected_calls * observed),
+            "projected": fixed_point_text(cell.call_maximum * ceiling),
+            "estimate": None
+            if observed is None
+            else fixed_point_text(cell.expected_calls * observed),
         }
         if cell.key in self.skipped or not fits(cell, remaining, ceiling):
             if cell.key not in self.skipped:
@@ -947,7 +950,7 @@ class Campaign:
                 "exit_code": finished.exit_code,
                 "result": None if path is None else str(path),
                 "status": None if figures is None else figures.status,
-                "charge": str(charge.cost),
+                "charge": fixed_point_text(charge.cost),
                 "charge_basis": charge.basis.value,
                 "calls": charge.calls,
             }
@@ -1026,8 +1029,8 @@ class Campaign:
             {
                 "event": "large_sized",
                 "workers": workers,
-                "remaining": str(self.remaining),
-                "ceiling": str(ceiling),
+                "remaining": fixed_point_text(self.remaining),
+                "ceiling": fixed_point_text(ceiling),
                 "size": None if cell is None else cell.size,
             }
         )
@@ -1043,7 +1046,7 @@ class Campaign:
         for name in ("calls", "counted_calls", "token_cost", "credits", "charged"):
             known = [row[name] for row in rows if row[name] is not None]
             total = sum((Decimal(value) for value in known), Decimal(0))
-            totals[name] = int(total) if name.endswith("calls") else str(total)
+            totals[name] = int(total) if name.endswith("calls") else fixed_point_text(total)
             totals[f"{name}_unknown_cells"] = len(rows) - len(known)
         totals["token_cost_minus_credits"] = _difference(totals["token_cost"], totals["credits"])
         check = {
@@ -1072,23 +1075,23 @@ class Campaign:
             "model": self.settings.model,
             "live": self.settings.live,
             "prices_per_mtok": {
-                "input": str(prices.input),
-                "output": str(prices.output),
+                "input": fixed_point_text(prices.input),
+                "output": fixed_point_text(prices.output),
                 "synthetic": prices.synthetic,
             },
-            "budget": str(self.budget),
-            "spent": str(self.spent),
-            "remaining": str(self.remaining),
+            "budget": fixed_point_text(self.budget),
+            "spent": fixed_point_text(self.spent),
+            "remaining": fixed_point_text(self.remaining),
             "pilot_passed": self.pilot_passed,
             "stopped": self.stopped,
             "cells": {
                 key: {
                     "result": None if run.result is None else str(run.result),
                     "status": None if run.figures is None else run.figures.status,
-                    "charge": str(run.charge.cost),
+                    "charge": fixed_point_text(run.charge.cost),
                     "charge_basis": run.charge.basis.value,
                     "call_maximum": run.call_maximum,
-                    "ceiling": str(run.ceiling),
+                    "ceiling": fixed_point_text(run.ceiling),
                 }
                 for key, run in self.runs.items()
             },
@@ -1108,7 +1111,7 @@ class Campaign:
                 "campaign_id": self.settings.campaign_id,
                 "model": self.settings.model,
                 "live": self.settings.live,
-                "budget": str(self.budget),
+                "budget": fixed_point_text(self.budget),
                 "prices_synthetic": self.settings.prices.synthetic,
                 "resumed_cells": sorted(self.runs),
             }
@@ -1133,7 +1136,7 @@ class Campaign:
             self._write_summary()
             return 1
         self.billing_check(final=True)
-        self.log.write({"event": "campaign_finished", "spent": str(self.spent)})
+        self.log.write({"event": "campaign_finished", "spent": fixed_point_text(self.spent)})
         self._write_summary()
         return 0
 
@@ -1149,7 +1152,7 @@ class Campaign:
 def _difference(left: str | None, right: str | None) -> str | None:
     if left is None or right is None:
         return None
-    return str(Decimal(left) - Decimal(right))
+    return fixed_point_text(Decimal(left) - Decimal(right))
 
 
 def counted_calls(record_run_id: str | None) -> int | None:
@@ -1177,8 +1180,14 @@ def billing_row(run: CellRun, *, live: bool) -> dict[str, Any]:
     run_id = None if record is None else record.get("run_id")
     run_id = run_id if isinstance(run_id, str) else None
     figures = run.figures
-    token_cost = None if figures is None or figures.token_cost is None else str(figures.token_cost)
-    credits = None if figures is None or figures.credits is None else str(figures.credits)
+    token_cost = (
+        None
+        if figures is None or figures.token_cost is None
+        else fixed_point_text(figures.token_cost)
+    )
+    credits = (
+        None if figures is None or figures.credits is None else fixed_point_text(figures.credits)
+    )
     calls = None if figures is None else figures.calls
     counted = counted_calls(run_id)
     row: dict[str, Any] = {
@@ -1190,7 +1199,7 @@ def billing_row(run: CellRun, *, live: bool) -> dict[str, Any]:
         "token_cost": token_cost,
         "credits": credits,
         "token_cost_minus_credits": _difference(token_cost, credits),
-        "charged": str(run.charge.cost),
+        "charged": fixed_point_text(run.charge.cost),
         "charge_basis": run.charge.basis.value,
     }
     if not live:
@@ -1264,7 +1273,7 @@ def start(
     try:
         refuse_dirty(False)
         limits = limits_factory()
-    except (DirtyTreeError, NotConnectedError) as exc:
+    except DirtyTreeError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
     live = bool(args.allow_live_calls)
@@ -1328,15 +1337,15 @@ def reconcile(identifier: str, router: Decimal | None, upstream: Decimal | None)
     for name, value in figures.items():
         if value is None:
             continue
-        check[f"{name}_reported_usd"] = str(value)
+        check[f"{name}_reported_usd"] = fixed_point_text(value)
         for total in ("token_cost", "credits", "charged"):
-            check[f"{name}_minus_{total}"] = _difference(str(value), totals[total])
+            check[f"{name}_minus_{total}"] = _difference(fixed_point_text(value), totals[total])
     path.write_text(json.dumps(check, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     CampaignLog(folder / LOG_NAME).write(
         {
             "event": "reconciled",
-            "router_reported_usd": None if router is None else str(router),
-            "upstream_reported_usd": None if upstream is None else str(upstream),
+            "router_reported_usd": None if router is None else fixed_point_text(router),
+            "upstream_reported_usd": None if upstream is None else fixed_point_text(upstream),
         }
     )
     print(f"reconciled {path}")

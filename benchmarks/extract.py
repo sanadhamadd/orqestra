@@ -44,7 +44,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
-from benchmarks.documents import Fields
+from benchmarks.documents import Fields, generate_documents
 from benchmarks.metrics import percentiles
 from orqestra.calls.provider import (
     PermanentCode,
@@ -63,7 +63,9 @@ from orqestra.domain.jobs import JsonValue
 from orqestra.domain.leases import check_duration
 from orqestra.providers.openrouter import (
     EXTRACT_CAPABILITY,
+    EXTRACT_MAX_TOKENS,
     EXTRACT_PROMPT_VERSION,
+    EXTRACT_SYSTEM_PROMPT,
     PROTOCOL_VIOLATION,
     ExtractionReport,
     ExtractionRequest,
@@ -757,6 +759,25 @@ def _cost(input_tokens: int, output_tokens: int, prices: Prices) -> Decimal:
     ) / _MTOK
 
 
+def fixed_point_text(value: Decimal) -> str:
+    """``value`` as fixed-point text, never in exponent form (``str`` writes ``3E-7``)."""
+    return format(value, "f")
+
+
+def _max_per_call(answered: Sequence[_Call], uncounted: int) -> dict[str, int | None]:
+    """The largest input and output token counts any one answered call reported.
+
+    Both are ``None`` with no answered call, or when any answered call reported no
+    counts: that call could have been the largest.
+    """
+    if not answered or uncounted:
+        return {"input": None, "output": None}
+    return {
+        "input": max(call.input_tokens or 0 for call in answered),
+        "output": max(call.output_tokens or 0 for call in answered),
+    }
+
+
 def _tokens_of(calls: Sequence[_Call]) -> dict[str, int]:
     return {
         "input": _sum([call.input_tokens for call in calls]),
@@ -798,6 +819,9 @@ def extraction_block(
     tasks = _scalar(conn, _TASKS, job_id)
 
     tokens = _tokens_of(answered)
+    uncounted = sum(
+        1 for call in answered if call.input_tokens is None or call.output_tokens is None
+    )
     succeeded_tokens = _tokens_of(succeeded)
     other_tokens = _tokens_of(other)
     total = _cost(tokens["input"], tokens["output"], prices)
@@ -848,25 +872,63 @@ def extraction_block(
             **tokens,
             "succeeded_attempts": succeeded_tokens,
             "other_attempts": other_tokens,
-            "answered_without_counts": sum(
-                1 for call in answered if call.input_tokens is None or call.output_tokens is None
-            ),
+            "answered_without_counts": uncounted,
+            "max_per_call": _max_per_call(answered, uncounted),
         },
         "cost": {
             "currency": CURRENCY,
             "prices": {
-                "in_per_mtok": str(prices.in_per_mtok),
-                "out_per_mtok": str(prices.out_per_mtok),
+                "in_per_mtok": fixed_point_text(prices.in_per_mtok),
+                "out_per_mtok": fixed_point_text(prices.out_per_mtok),
                 "canned": prices.canned,
             },
-            "total": str(total),
-            "succeeded_attempts": str(succeeded_cost),
-            "other_attempts": str(other_cost),
-            "per_1000_invoices": str(total * 1000 / documents),
-            "per_1000_invoices_succeeded": str(succeeded_cost * 1000 / documents),
-            "reported": {unit: str(amount) for unit, amount in sorted(reported.items())},
+            "total": fixed_point_text(total),
+            "succeeded_attempts": fixed_point_text(succeeded_cost),
+            "other_attempts": fixed_point_text(other_cost),
+            "per_1000_invoices": fixed_point_text(total * 1000 / documents),
+            "per_1000_invoices_succeeded": fixed_point_text(succeeded_cost * 1000 / documents),
+            "reported": {
+                unit: fixed_point_text(amount) for unit, amount in sorted(reported.items())
+            },
         },
         "retries": int(attempts) - tasks,
         "transient_errors": transient,
         "permanent_errors": permanent,
     }
+
+
+# --- what bounds one call (the campaign's ``ExtractLimits``) ------------------------------
+
+
+def request_text(document: str) -> str:
+    """The user message ``OpenRouterProvider.extract`` sends for ``document``, exactly."""
+    return json.dumps({"document": document}, separators=(",", ":"), ensure_ascii=True)
+
+
+class Limits:
+    """The extraction workload's limits on one call, from its own definitions.
+
+    ``largest_document_bytes(size)`` is the UTF-8 size of the largest user message among
+    the first ``size`` documents of ``seed``: the request text the adapter sends, escapes
+    included, so the bytes really bound what the model reads.
+    """
+
+    def __init__(self, seed: int) -> None:
+        self._seed = seed
+        self._largest: dict[int, int] = {}
+
+    @property
+    def prompt_bytes(self) -> int:
+        return len(EXTRACT_SYSTEM_PROMPT.encode("utf-8"))
+
+    @property
+    def max_output_tokens(self) -> int:
+        return EXTRACT_MAX_TOKENS
+
+    def largest_document_bytes(self, size: int) -> int:
+        if size not in self._largest:
+            documents = generate_documents(size, self._seed)
+            self._largest[size] = max(
+                len(request_text(document.text).encode("utf-8")) for document in documents
+            )
+        return self._largest[size]

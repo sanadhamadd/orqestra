@@ -48,11 +48,11 @@ The summary and usage reads raise ``WrongJobKindError`` for any other kind of
 job, so their checks refuse a non-invoice profile before reading anything.
 
 **The provider** (DEC-071) is the offline double unless ``--provider openrouter``
-is given, which only this command accepts (``benchmarks.ladder`` and
-``benchmarks.drills`` have no provider flag). It needs ``--model``,
-``--max-provider-calls`` and either ``--dry-run`` (canned responses, no network, no
-cost) or ``--allow-live-calls`` (real, billable calls: the owner's separate
-approval, with a dollar limit set on the key, is required first). The cell's call
+is given, which only this command and the crash drill ``benchmarks.drills d1``
+accept (the other drills refuse it; ``benchmarks.ladder`` has no provider flag). It
+needs ``--model``, ``--max-provider-calls`` and either ``--dry-run`` (canned
+responses, no network, no cost) or ``--allow-live-calls`` (real, billable calls: the
+owner's separate approval, with a dollar limit set on the key, is required first). The cell's call
 maximum is a counter file in the cell's raw directory, created before any worker
 starts; ``ORQESTRA_OPENROUTER_API_KEY`` is passed to the workers only for a live
 run. With OpenRouter the usage check compares the calls with the oracle, and the
@@ -125,6 +125,7 @@ from benchmarks.result import (
     validate_result,
     write_result,
 )
+from benchmarks.sysload import SysloadSampler
 from benchmarks.worker import DEFAULT_CALL_TIMEOUT, DEFAULT_CAP, parse_duration
 from orqestra.aggregation.budget import BudgetVerdict, read_job_call_budget
 from orqestra.aggregation.invoice import summarize_invoice_job
@@ -845,6 +846,19 @@ def run_cell(
         own = [conn.info.backend_pid]  # the harness's polling backend, left out of contention
         contention: metrics.Sampler | None = None
         docker: metrics.Sampler | None = None
+        # Machine load from the submission to the end of the wait, on its own connection,
+        # whose backend is left out of contention like the harness's own (``own``).
+        sysload_backends: list[int] = []
+
+        def sysload_connect() -> metrics.Conn:
+            connection = psycopg.connect(url, autocommit=True)
+            sysload_backends.append(connection.info.backend_pid)
+            return connection
+
+        sysload = SysloadSampler(
+            lambda: [h.process.pid for h in fleet.workers if h.exited is None], sysload_connect
+        )
+        load: dict[str, Any] | None = None
         try:
             for _ in range(cell.workers):
                 fleet.start()
@@ -854,10 +868,14 @@ def run_cell(
             job_id, submission = submit(url, KIND_OF[cell.profile], workload.tasks, raw_dir)
             # The samplers cover the job alone: from the submission to the end of the wait.
             contention = metrics.Sampler(
-                lambda: metrics.read_only(sampling, partial(metrics.contention_sample, exclude=own))
+                lambda: metrics.read_only(
+                    sampling,
+                    partial(metrics.contention_sample, exclude=[*own, *sysload_backends]),
+                )
             ).start()
             if container:
                 docker = metrics.Sampler(lambda: metrics.docker_stats_sample(container)).start()
+            sysload.start()
             began = time.monotonic()
             before_job = began - counted
             wait_ended = WaitEnded.STOP_AFTER
@@ -876,6 +894,7 @@ def run_cell(
                 time.sleep(POLL)
             ended = time.monotonic()
             waited = ended - began
+            load = sysload.stop()
             contention_samples = contention.stop()
             contention_window = time.monotonic() - began
             # A docker stats reading takes about a second, so its window is its own.
@@ -903,6 +922,8 @@ def run_cell(
                     ),
                 }
         finally:
+            if load is None:
+                load = sysload.stop()  # idempotent; only an exception reaches here running
             shutdown = _shutdown_seconds(worker_settings)
             reaped = fleet.stop(timeout=shutdown + 10.0)
             for sampler in (contention, docker):
@@ -1001,6 +1022,7 @@ def run_cell(
                 for worker in reaped
             ],
             "harness": harness,
+            "sysload": load,
             "database": (
                 metrics.summarize_docker(docker_samples, docker_window)
                 if docker_samples is not None
@@ -1205,15 +1227,18 @@ def prices_of(
     return extract.Prices(price_in, price_out)
 
 
-def provider_worker_settings(cap: int, call_timeout: str) -> dict[str, str]:
-    """``BENCH_WORKER_SETTINGS`` with an execution timeout that fits ``cap`` calls.
+def provider_worker_settings(
+    worker_settings: Mapping[str, str], cap: int, call_timeout: str
+) -> dict[str, str]:
+    """``worker_settings`` with an execution timeout that fits ``cap`` calls: the one rule
+    every OpenRouter cell and drill uses.
 
     The rule is ``check_provider_call_budget``'s: ``cap * (call_timeout + 2 * handoff
-    bound) <= execution_timeout - fence_margin``, rounded up to whole seconds, and never
-    below the bench's own two minutes. Only the execution timeout changes; the copy is
-    validated as the workers will read it.
+    bound) <= execution_timeout - fence_margin``, rounded up to whole seconds. Settings
+    that already fit keep their own text. Only the execution timeout changes; the copy is
+    validated as the workers will read it, and ``ValueError`` says why it cannot fit.
     """
-    settings = dict(BENCH_WORKER_SETTINGS)
+    settings = dict(worker_settings)
     base = bench_settings(settings)
     per_call = parse_duration(call_timeout) + 2 * usage_handoff_bound(base)
     needed = (cap * per_call + base.fence_margin).total_seconds()
@@ -1233,7 +1258,7 @@ def cell_worker_settings(cell: Cell, provider: ProviderChoice, call_timeout: str
     if not provider.openrouter:
         return dict(BENCH_WORKER_SETTINGS)
     cap = cell.batch if cell.profile is Profile.EXTRACT and cell.batch else DEFAULT_CAP
-    return provider_worker_settings(cap, call_timeout)
+    return provider_worker_settings(BENCH_WORKER_SETTINGS, cap, call_timeout)
 
 
 def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
@@ -1277,7 +1302,7 @@ def _extract_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> l
     assert cell.batch is not None
     assert choice.max_provider_calls is not None
     tasks = math.ceil(cell.size / cell.batch)
-    settings = provider_worker_settings(cell.batch, call_timeout)
+    settings = provider_worker_settings(BENCH_WORKER_SETTINGS, cell.batch, call_timeout)
     lines = [
         f"expected provider calls (one per document): {cell.size}",
         f"cell call maximum (--max-provider-calls): {choice.max_provider_calls}",
