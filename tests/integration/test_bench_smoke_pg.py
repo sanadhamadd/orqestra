@@ -113,6 +113,16 @@ def test_an_invoice_cell_passes_its_gate(
     assert kinds is not None
     assert kinds[0] == kinds[1] > 0
     assert "extraction" not in record
+    sysload = record["resources"]["sysload"]  # T4: every run measures the machine's load
+    assert sysload["samples"] >= 1
+    assert set(sysload["metrics"]) == {
+        "worker_cpu_cores",
+        "worker_rss_bytes",
+        "machine_memory_used_bytes",
+        "load_1m",
+        "db_connections",
+        "db_connections_active",
+    }
     assert record["provider"] == {
         "name": "bench-double",
         "call_timeout": "PT0.1S",

@@ -1,9 +1,10 @@
 """The benchmark's provider choice: the offline double, or OpenRouter behind an opt-in (DEC-071).
 
-Only ``python -m benchmarks.run`` (one cell) and the benchmark worker it starts
-accept ``--provider openrouter``; ``benchmarks.ladder`` and ``benchmarks.drills``
-have no provider flag and always use the double. ``orqestra worker run`` is not
-touched: it runs only the diagnostics (DEC-051, DEC-062).
+Only ``python -m benchmarks.run`` (one cell), the crash drill
+``python -m benchmarks.drills d1`` (with the invoice mix or ``--workload extract``) and
+the benchmark worker they start accept ``--provider openrouter``; the other drills
+refuse it, and ``benchmarks.ladder`` has no provider flag and always uses the double.
+``orqestra worker run`` is not touched: it runs only the diagnostics (DEC-051, DEC-062).
 
 This module holds everything provider-specific:
 
@@ -294,7 +295,12 @@ class CannedTransport:
 
     def __init__(self, replies: Mapping[str, str] | None = None) -> None:
         self.requests = 0
-        self._replies: Mapping[str, str] = dict(replies or {})
+        self._replies: dict[str, str] = dict(replies or {})
+
+    def add_replies(self, replies: Mapping[str, str]) -> None:
+        """Add extraction replies, keyed by ``document_key``: for a caller that learns its
+        documents after the transport is built (the baseline's dry run)."""
+        self._replies.update(replies)
 
     def post(
         self, *, path: str, headers: Mapping[str, str], body: bytes, deadline: Deadline

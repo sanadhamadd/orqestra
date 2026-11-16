@@ -1435,8 +1435,10 @@ and not in its wheel, so it runs only from a clone, as `uv run python -m benchma
 - **The `invoice` profile** runs the unpackaged `python -m benchmarks.worker`: invoice
   verification behind a `UsageSink`, answered by the offline `SeparatorReader` double, which
   makes no network call.
-- **Provider (DEC-071).** The double is the default. `benchmarks.run`, and only it (one
-  cell; `ladder` and `drills` have no provider flag), accepts `--provider openrouter` with
+- **Provider (DEC-071).** The double is the default. `benchmarks.run` (one cell) and the
+  crash drill `benchmarks.drills d1` (with the invoice mix, or the extraction workload with
+  `--workload extract`) accept `--provider openrouter`; the other drills refuse it and
+  `ladder` has no provider flag. The flag comes with
   `--model`, `--max-provider-calls N` and one of:
   - `--dry-run`: the real adapter, workers, usage ledger and call counter, answered by
     canned responses in memory: no network, no cost. It prints the oracle's expected calls,

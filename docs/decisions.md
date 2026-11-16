@@ -1788,6 +1788,7 @@ recorded on PR #17.
 
 ### DEC-071 — OpenRouter is wired into the benchmark invoice worker only, off by default; live calls need the owner's separate approval with a dollar limit
 - **Status:** Accepted (owner, 2026-11-10: "Approve, offline only") · implemented (`benchmarks/live.py`, `benchmarks/worker.py`, `benchmarks/run.py`) · no live call has been made
+- **Note (2026-11-16):** narrowed by DEC-072. The crash drill `benchmarks.drills d1` now also takes the provider flags, with the invoice mix or the extraction workload (`--workload extract`), sharing one call counter across killed and replacement workers; `d2`, `d3a`, `d3b` and `d4` refuse them, and `benchmarks.ladder` still has none. The text below is kept as decided.
 - **WHAT:**
   - **Provider choice.** The benchmark invoice worker is answered by the offline double `SeparatorReader` by default, or by the OpenRouter adapter (DEC-060, unchanged) with `--provider openrouter`. Only `python -m benchmarks.run`, a single cell, accepts that flag; `benchmarks.ladder` and `benchmarks.drills` have none and always use the double. `orqestra worker run` stays diagnostics-only (DEC-051, DEC-062), and no `src` module imports `orqestra.providers`.
   - **Opt-in and refusals,** in this order, before any worker, transport or database connection:

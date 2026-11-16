@@ -380,12 +380,25 @@ def test_a_live_run_without_the_key_is_refused(
     assert "is not set" in capsys.readouterr().err
 
 
-def test_until_the_extraction_workload_is_connected_the_command_refuses(
-    command: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("mode", [["--mode", "loop"], ["--mode", "threads", "--workers", "3"]])
+def test_a_dry_run_reads_every_document_through_the_extraction_workload(
+    command: Path, capsys: pytest.CaptureFixture[str], mode: list[str]
 ) -> None:
-    assert baseline.main(args(command, "--mode", "loop", "--dry-run")) == 1
-    assert "not connected" in capsys.readouterr().err
-    assert not (command / "raw").exists()
+    # The real binding: T1's documents, the adapter's extract call on the canned
+    # transport (which reads each document perfectly), the strict parse and the oracle.
+    assert baseline.main(args(command, *mode, "--dry-run")) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("complete ")
+    record = json.loads(Path(out.split()[-1]).read_text())
+    block = record["extraction"]
+    assert block["documents"] == 12
+    assert block["calls"]["total"] == block["calls"]["answered"] == 12
+    assert block["accuracy"]["overall"] == 1.0
+    assert block["accuracy"]["status_matched"] == 12
+    assert block["tokens"]["max_per_call"]["input"] > 0
+    assert block["cost"]["prices"]["canned"] is True
+    assert "E" not in block["cost"]["total"]
+    assert SENTINEL not in json.dumps(record)
 
 
 def test_the_baseline_imports_no_network_module() -> None:

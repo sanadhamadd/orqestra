@@ -98,7 +98,7 @@ def test_d4_payload_job_fails_only_the_extra_task(
     record = run_drill(
         schema_url,
         CELL,
-        PayloadDrill(workload.expected),
+        PayloadDrill(workload.oracle),
         workload,
         command=FAULTS_COMMAND,
         worker_settings=ENVIRONMENT,
@@ -119,7 +119,7 @@ def test_d4_retry_job_fails_the_always_batch_and_retries_the_once_batch(
     record = run_drill(
         schema_url,
         CELL,
-        RetryDrill(workload.expected, poison, retry_policy(ENVIRONMENT)),
+        RetryDrill(workload.oracle, poison, retry_policy(ENVIRONMENT)),
         workload,
         command=FAULTS_COMMAND,
         worker_settings=ENVIRONMENT,
