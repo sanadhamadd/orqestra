@@ -276,7 +276,8 @@ class Prices:
     synthetic: bool = False
 
 
-DRY_RUN_PRICES = Prices(Decimal("0.10"), Decimal("0.50"), synthetic=True)
+# Arbitrary values of a plausible scale, unrelated to any real price.
+DRY_RUN_PRICES = Prices(Decimal("0.37"), Decimal("1.73"), synthetic=True)
 
 
 def hard_call_cost(input_bytes: int, max_output_tokens: int, prices: Prices) -> Decimal:
@@ -326,6 +327,7 @@ class Figures:
     accuracy: Decimal | None  # pooled field accuracy
     permanent_failures: int | None
     items_per_s: float | None
+    answered: int | None = None  # calls that returned an answer, and so token counts
     max_input_tokens: int | None = None  # the largest any one answered call reported
     max_output_tokens: int | None = None
 
@@ -376,6 +378,7 @@ def step_figures(record: Mapping[str, Any]) -> Figures:
         return Figures(
             status=status,
             calls=_count(_path(block, "calls", "total")),
+            answered=_count(_path(block, "calls", "answered")),
             token_cost=_decimal(_path(block, "cost", "total")) if uncounted == 0 else None,
             credits=_decimal(_path(block, "cost", "reported", OPENROUTER_USAGE_UNIT)),
             accuracy=_decimal(overall) if isinstance(overall, float | int) else None,
@@ -430,7 +433,15 @@ def charge_for(
     credits = figures.credits if figures.credits is not None else Decimal(0)
     if figures.token_cost is None:
         return Charge(max(figures.calls * ceiling, credits), figures.calls, Basis.CALLS)
-    return Charge(max(figures.token_cost, credits), figures.calls, Basis.TOKENS)
+    # The token cost prices answered calls only. A call that failed or never resolved (a
+    # timeout, a worker killed mid-call) may still be billed, so each is charged at the
+    # ceiling; a 429 is charged too, which errs on the safe side.
+    answered = figures.answered
+    if answered is None or answered > figures.calls:
+        answered = 0
+    unanswered = figures.calls - answered
+    token_side = figures.token_cost + unanswered * ceiling
+    return Charge(max(token_side, credits), figures.calls, Basis.TOKENS)
 
 
 def observed_cost_per_call(charges: Sequence[Charge]) -> Decimal | None:
@@ -516,11 +527,22 @@ class Gate:
 
 
 def pilot_gates(figures: Figures | None, charge: Charge) -> list[Gate]:
-    """The three pilot gates. A figure the result does not carry fails its gate."""
+    """The three pilot gates. A figure the result does not carry fails its gate.
+
+    The cost per call is what an answered call cost: the larger of the token cost and the
+    credits over the answered calls. The budget's surcharge for unanswered calls is a
+    safety margin, not a price, so it is left out here.
+    """
     accuracy = None if figures is None else figures.accuracy
     per_call: Decimal | None = None
-    if charge.basis is Basis.TOKENS and charge.calls:
-        per_call = charge.cost / charge.calls
+    if (
+        charge.basis is Basis.TOKENS
+        and figures is not None
+        and figures.token_cost is not None
+        and figures.answered
+    ):
+        credits = figures.credits if figures.credits is not None else Decimal(0)
+        per_call = max(figures.token_cost, credits) / figures.answered
     permanent = None if figures is None else figures.permanent_failures
     complete = figures is not None and figures.status == Status.COMPLETE
     return [

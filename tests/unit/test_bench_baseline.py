@@ -54,7 +54,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
 SENTINEL = "sk-or-v1-SENTINEL-not-a-real-key-0123456789abcdef"
 MODEL = "vendor/model-a"
-PRICES = Prices(Decimal("0.10"), Decimal("0.50"), canned=False)
+PRICES = Prices(Decimal("0.31"), Decimal("1.17"), canned=False)  # arbitrary test prices
 
 
 @dataclass(frozen=True)
@@ -246,14 +246,14 @@ def test_costs_come_from_tokens_and_prices_and_from_credits(tmp_path: Path) -> N
         "answered_without_counts": 0,
         "max_per_call": {"input": 1_000, "output": 200},
     }
-    # 10,000 x 0.10 / 1e6 + 2,000 x 0.50 / 1e6
-    assert Decimal(figures["cost"]["total"]) == Decimal("0.002")
+    # 10,000 x 0.31 / 1e6 + 2,000 x 1.17 / 1e6
+    assert Decimal(figures["cost"]["total"]) == Decimal("0.00544")
     assert Decimal(figures["cost"]["reported"]["openrouter_credits"]) == Decimal("0.0010")
-    assert Decimal(figures["cost"]["per_1000_invoices"]) == Decimal("0.2")
+    assert Decimal(figures["cost"]["per_1000_invoices"]) == Decimal("0.544")
     assert figures["cost"]["currency"] == "USD"
     assert figures["cost"]["prices"] == {
-        "in_per_mtok": "0.10",
-        "out_per_mtok": "0.50",
+        "in_per_mtok": "0.31",
+        "out_per_mtok": "1.17",
         "canned": False,
     }
     assert figures["calls"]["latency_ms"]["p50"] == 120

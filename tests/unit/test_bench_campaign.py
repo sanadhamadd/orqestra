@@ -63,8 +63,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
 SENTINEL = "sk-or-v1-SENTINEL-not-a-real-key-0123456789abcdef"
 MODEL = "vendor/model-a"
-PRICE_IN = Decimal("0.10")
-PRICE_OUT = Decimal("0.50")
+PRICE_IN = Decimal("0.31")  # arbitrary test prices, per million tokens
+PRICE_OUT = Decimal("1.17")
 LIVE_PRICES = Prices(PRICE_IN, PRICE_OUT)
 
 
@@ -90,6 +90,7 @@ def figures(**overrides: Any) -> Figures:
     values: dict[str, Any] = {
         "status": Status.COMPLETE.value,
         "calls": 100,
+        "answered": 100,
         "token_cost": Decimal("0.05"),
         "credits": Decimal("0.01"),
         "accuracy": Decimal("0.95"),
@@ -111,14 +112,21 @@ def extraction_record(
     permanent: Mapping[str, int] | None = None,
     speed: float = 10.0,
     largest: tuple[int | None, int | None] = (3_000, 500),
+    answered: int | None = None,
 ) -> dict[str, Any]:
+    answered = calls if answered is None else answered
     return {
         "run_id": run_id,
         "status": status,
         "throughput": {"makespan_items_per_s": speed},
         "extraction": {
             "documents": calls,
-            "calls": {"total": calls, "answered": calls, "failed": 0, "unresolved": 0},
+            "calls": {
+                "total": calls,
+                "answered": answered,
+                "failed": calls - answered,
+                "unresolved": 0,
+            },
             "tokens": {
                 "input": calls * 900,
                 "output": calls * 150,
@@ -267,6 +275,7 @@ def test_an_extraction_results_figures() -> None:
         accuracy=Decimal("0.95"),
         permanent_failures=2,
         items_per_s=10.0,
+        answered=100,
         max_input_tokens=3_000,
         max_output_tokens=500,
     )
@@ -314,6 +323,31 @@ def test_a_priced_cell_is_charged_the_larger_of_tokens_and_credits() -> None:
     assert charge(figures()) == Charge(Decimal("0.05"), 100, Basis.TOKENS)
     assert charge(figures(credits=Decimal("0.07"))).cost == Decimal("0.07")
     assert charge(figures(credits=None)).cost == Decimal("0.05")
+
+
+@pytest.mark.parametrize(
+    ("answered", "cost"),
+    [
+        (90, Decimal("0.060")),  # 10 failed or unresolved calls at the 0.001 ceiling
+        (0, Decimal("0.150")),
+        (None, Decimal("0.150")),  # not reported: every call may be unpriced
+        (101, Decimal("0.150")),  # more answered than made: not believed
+    ],
+)
+def test_calls_without_an_answer_are_charged_at_the_ceiling(
+    answered: int | None, cost: Decimal
+) -> None:
+    assert charge(figures(answered=answered)) == Charge(cost, 100, Basis.TOKENS)
+    rich = figures(answered=answered, credits=Decimal(1))
+    assert charge(rich).cost == Decimal(1)
+
+
+def test_a_record_with_failed_and_unresolved_calls_is_charged_for_them() -> None:
+    record = extraction_record(calls=100, answered=93, token_priced="0.05", credits="0")
+    record["extraction"]["calls"] |= {"failed": 4, "unresolved": 3}
+    read = step_figures(record)
+    assert (read.calls, read.answered) == (100, 93)
+    assert charge(read).cost == Decimal("0.05") + 7 * Decimal("0.001")
 
 
 def test_a_cell_without_token_figures_is_charged_its_calls_at_the_ceiling() -> None:
@@ -381,12 +415,16 @@ def test_the_best_worker_count_has_the_highest_median_and_ties_go_to_fewer() -> 
 # --- gates -------------------------------------------------------------------------------
 
 
-def priced(cost: str, calls: int = 1000) -> Charge:
-    return Charge(Decimal(cost), calls, Basis.TOKENS)
+PRICED = Charge(Decimal(1), 100, Basis.TOKENS)
+
+
+def answered_at(cost: str, **overrides: Any) -> Figures:
+    """A pilot of 100 answered calls whose tokens cost ``cost`` in all."""
+    return figures(token_cost=Decimal(cost), credits=Decimal(0), **overrides)
 
 
 def test_a_pilot_inside_every_gate_passes_even_at_the_edges() -> None:
-    gates = pilot_gates(figures(accuracy=Decimal("0.9")), priced("1.8"))
+    gates = pilot_gates(answered_at("0.18", accuracy=Decimal("0.9")), PRICED)
     assert [gate.name for gate in gates] == [
         "field_accuracy",
         "cost_per_call",
@@ -398,15 +436,19 @@ def test_a_pilot_inside_every_gate_passes_even_at_the_edges() -> None:
 @pytest.mark.parametrize(
     ("read", "spend", "failed"),
     [
-        (figures(accuracy=Decimal("0.899")), priced("1"), "field_accuracy"),
-        (figures(accuracy=None), priced("1"), "field_accuracy"),
-        (figures(), priced("1.81"), "cost_per_call"),
+        (figures(accuracy=Decimal("0.899")), PRICED, "field_accuracy"),
+        (figures(accuracy=None), PRICED, "field_accuracy"),
+        (answered_at("0.181"), PRICED, "cost_per_call"),
+        (figures(credits=Decimal("0.181")), PRICED, "cost_per_call"),  # credits are larger
+        (figures(answered=None), PRICED, "cost_per_call"),
+        (figures(answered=0), PRICED, "cost_per_call"),
+        (figures(token_cost=None), PRICED, "cost_per_call"),
         (figures(), Charge(Decimal("0.1"), 1000, Basis.CALLS), "cost_per_call"),
         (figures(), Charge(Decimal("0.1"), 10, Basis.RESERVATIONS), "cost_per_call"),
         (figures(), Charge(Decimal("0.1"), None, Basis.CALL_MAXIMUM), "cost_per_call"),
-        (figures(permanent_failures=1), priced("1"), "no_permanent_failure"),
-        (figures(permanent_failures=None), priced("1"), "no_permanent_failure"),
-        (figures(status="incomplete"), priced("1"), "no_permanent_failure"),
+        (figures(permanent_failures=1), PRICED, "no_permanent_failure"),
+        (figures(permanent_failures=None), PRICED, "no_permanent_failure"),
+        (figures(status="incomplete"), PRICED, "no_permanent_failure"),
     ],
 )
 def test_a_pilot_outside_a_gate_or_without_its_figure_fails_it(
@@ -542,8 +584,8 @@ def test_a_live_command_passes_prices_only_where_the_model_reads_every_document(
     pilot = command_for(cell_of(Step.PILOT), live, 10)
     assert "--allow-live-calls" in pilot
     assert pilot[pilot.index("--profile") + 1] == "extract"
-    assert pilot[pilot.index("--price-in-per-mtok") + 1] == "0.10"
-    assert pilot[pilot.index("--price-out-per-mtok") + 1] == "0.50"
+    assert pilot[pilot.index("--price-in-per-mtok") + 1] == "0.31"
+    assert pilot[pilot.index("--price-out-per-mtok") + 1] == "1.17"
     assert pilot[pilot.index("--provider") + 1] == "openrouter"
     baseline = command_for(cell_of(Step.BASELINE), live, 10)
     assert "--price-in-per-mtok" in baseline
@@ -713,7 +755,7 @@ def test_a_live_campaign_runs_every_step_in_order_within_its_hard_bounds(
     summary = json.loads((tmp_path / SUMMARY_NAME).read_text())
     assert summary["model"] == MODEL
     assert summary["stopped"] is None
-    assert summary["prices_per_mtok"] == {"input": "0.10", "output": "0.50", "synthetic": False}
+    assert summary["prices_per_mtok"] == {"input": "0.31", "output": "1.17", "synthetic": False}
     assert Decimal(summary["spent"]) + Decimal(summary["remaining"]) == Decimal(45)
     assert Decimal(summary["spent"]) <= Decimal(45)
     assert (tmp_path / "logs" / f"{planned[0]}.out").read_text().startswith("complete ")
@@ -919,7 +961,7 @@ def cli(argv: list[str], runner: FakeRunner) -> int:
 
 DRY = ["run", "--model", MODEL, "--dry-run"]
 LIVE = ["run", "--model", MODEL, "--allow-live-calls"]
-PRICES = ["--price-in-per-mtok", "0.10", "--price-out-per-mtok", "0.50"]
+PRICES = ["--price-in-per-mtok", "0.31", "--price-out-per-mtok", "1.17"]
 
 
 @pytest.mark.parametrize(
@@ -927,7 +969,7 @@ PRICES = ["--price-in-per-mtok", "0.10", "--price-out-per-mtok", "0.50"]
     [
         (LIVE + PRICES, {}, "is not set"),
         (LIVE, {API_KEY_ENV: SENTINEL}, "--price-in-per-mtok"),
-        ([*LIVE, "--price-in-per-mtok", "0.10"], {API_KEY_ENV: SENTINEL}, "--price-out"),
+        ([*LIVE, "--price-in-per-mtok", "0.31"], {API_KEY_ENV: SENTINEL}, "--price-out"),
         (
             [*LIVE, "--price-in-per-mtok", "0", "--price-out-per-mtok", "1"],
             {API_KEY_ENV: "k"},
