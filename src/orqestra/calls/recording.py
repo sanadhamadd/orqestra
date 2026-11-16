@@ -17,6 +17,16 @@ identifier pattern, and ``capability`` is the constant ``interpret_amount``, so
 the ledger accepts every intent made there once a durable recorder adds the
 provider. A record built some other way can carry a ``route_id`` the ledger
 refuses; a durable recorder then raises in ``record_intent``, before the call.
+``field_kind`` is ``None`` for a call about a whole document rather than one
+amount (the ledger's column is nullable); the invoice verification path always
+gives one. A result may carry what the provider said about the call:
+``model_served`` and ``provider_generation_id`` (text, ``MODEL_MAX_LENGTH`` and
+``GENERATION_ID_MAX_LENGTH``), ``input_tokens`` and ``output_tokens`` (up to
+``BIGINT_MAX``) and ``latency_ms`` (up to ``INTEGER_MAX``). They are held to the
+ledger's own rules (``orqestra.persistence.provider_usage``), mirrored here because
+this module must not import persistence; a test keeps the limits equal. The text
+rule: a ``str``, not blank after ``.strip()``, within its limit, without ``NUL`` and
+encodable as UTF-8.
 ``usage`` is bounded only by ``ProviderUsage``, which is looser than the ledger's
 amount range (below 1E+20, at most 18 decimal places): what a durable recorder does
 with a reported amount outside that range is its own decision, and it learns of it
@@ -40,6 +50,11 @@ from orqestra.calls.provider import FieldKind, PermanentCode, ProviderUsage, Tra
 
 MAX_CALL_SEQ = 2**31 - 1
 MAX_COST_UNITS = 2**63 - 1
+# The usage ledger's limits for a result's call metadata (orqestra.persistence.provider_usage).
+MODEL_MAX_LENGTH = 128
+GENERATION_ID_MAX_LENGTH = 128
+BIGINT_MAX = 2**63 - 1
+INTEGER_MAX = 2**31 - 1
 
 
 class CallOutcome(StrEnum):
@@ -73,6 +88,27 @@ def _check_str(name: str, value: object) -> None:
         raise TypeError(msg)
 
 
+def _check_text(name: str, value: object, limit: int) -> None:
+    """The ledger's text rule; messages never echo the value."""
+    if not isinstance(value, str):
+        msg = f"{name} must be a str, got {type(value).__name__}"
+        raise TypeError(msg)
+    if not value.strip():
+        msg = f"{name} must not be blank"
+        raise ValueError(msg)
+    if len(value) > limit:
+        msg = f"{name} must be at most {limit} characters"
+        raise ValueError(msg)
+    if "\x00" in value:
+        msg = f"{name} must not contain NUL"
+        raise ValueError(msg)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        msg = f"{name} must be valid Unicode text"
+        raise ValueError(msg) from None
+
+
 def _check_type(name: str, value: object, *kinds: type) -> None:
     if not isinstance(value, kinds):
         expected = " or ".join(kind.__name__ for kind in kinds)
@@ -87,7 +123,8 @@ class ProviderCallIntent:
     ``item_index`` is the absolute index of the item the call is about (the
     batch offset plus its position), at most ``MAX_CALL_SEQ``, and
     ``estimated_cost_units`` the chosen route's estimate, at most
-    ``MAX_COST_UNITS``; the estimate is not accounting.
+    ``MAX_COST_UNITS``; the estimate is not accounting. ``field_kind`` is ``None``
+    for a call about a whole document.
     """
 
     attempt_id: uuid.UUID
@@ -95,7 +132,7 @@ class ProviderCallIntent:
     item_index: int
     route_id: str
     capability: str
-    field_kind: FieldKind
+    field_kind: FieldKind | None
     estimated_cost_units: int
 
     def __post_init__(self) -> None:
@@ -104,7 +141,8 @@ class ProviderCallIntent:
         _check_int("item_index", self.item_index, MAX_CALL_SEQ)
         _check_str("route_id", self.route_id)
         _check_str("capability", self.capability)
-        _check_type("field_kind", self.field_kind, FieldKind)
+        if self.field_kind is not None:
+            _check_type("field_kind", self.field_kind, FieldKind)
         _check_int("estimated_cost_units", self.estimated_cost_units, MAX_COST_UNITS)
 
 
@@ -113,7 +151,9 @@ class ProviderCallResult:
     """How call ``call_seq`` of attempt ``attempt_id`` ended.
 
     ``failure_code`` is the provider error's code, set exactly when ``outcome``
-    is ``FAILED``. ``usage`` is the provider's own report, if it gave one.
+    is ``FAILED``. ``usage`` is the provider's own report, if it gave one. The
+    other optional fields are what the provider said about the call, held to the
+    ledger's limits (module docstring); ``None`` when not known.
     """
 
     attempt_id: uuid.UUID
@@ -121,6 +161,11 @@ class ProviderCallResult:
     outcome: CallOutcome
     failure_code: TransientCode | PermanentCode | None = None
     usage: ProviderUsage | None = None
+    model_served: str | None = None
+    provider_generation_id: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    latency_ms: int | None = None
 
     def __post_init__(self) -> None:
         _check_uuid("attempt_id", self.attempt_id)
@@ -133,6 +178,18 @@ class ProviderCallResult:
             raise ValueError(msg)
         if self.usage is not None:
             _check_type("usage", self.usage, ProviderUsage)
+        if self.model_served is not None:
+            _check_text("model_served", self.model_served, MODEL_MAX_LENGTH)
+        if self.provider_generation_id is not None:
+            _check_text(
+                "provider_generation_id", self.provider_generation_id, GENERATION_ID_MAX_LENGTH
+            )
+        if self.input_tokens is not None:
+            _check_int("input_tokens", self.input_tokens, BIGINT_MAX)
+        if self.output_tokens is not None:
+            _check_int("output_tokens", self.output_tokens, BIGINT_MAX)
+        if self.latency_ms is not None:
+            _check_int("latency_ms", self.latency_ms, INTEGER_MAX)
 
 
 @runtime_checkable

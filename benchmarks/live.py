@@ -26,6 +26,7 @@ never values, and the result records only the choice and the call counts.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -37,6 +38,9 @@ from typing import Any
 
 from pydantic import SecretStr
 
+from benchmarks.documents import generate_documents
+from benchmarks.extract import KEYS as EXTRACTION_KEYS
+from benchmarks.extract import canonical_reply
 from orqestra.calls.recording import ProviderCallIntent, ProviderCallRecorder, ProviderCallResult
 from orqestra.domain.errors import PermanentError
 from orqestra.providers import openrouter
@@ -263,17 +267,34 @@ def canned_reply(raw: str) -> str:
     return "".join(char for char in raw if char not in {",", "_", " "})
 
 
+def document_key(document: str) -> str:
+    """The key ``CannedTransport`` looks a document up by: the SHA-256 of its UTF-8 text."""
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+# What the canned model answers for a document it was not given: every field null, so
+# the document needs review rather than being guessed.
+UNKNOWN_DOCUMENT_REPLY = json.dumps(dict.fromkeys(sorted(EXTRACTION_KEYS)))
+
+
 class CannedTransport:
     """An ``HttpTransport`` that answers every request in memory, the way OpenRouter would.
 
-    It reads the adapter's request body, answers 200 with a chat-completions body whose
-    content is ``canned_reply(raw)``, its ``model`` the requested one, a fixed ``id``,
-    token counts from ``len(raw)`` and the synthetic ``CANNED_COST``. ``requests``
-    counts what it answered. Nothing touches a network.
+    It reads the adapter's request body and answers 200 with a chat-completions body:
+    its ``model`` the requested one, a fixed ``id`` and the synthetic ``CANNED_COST``.
+
+    - An amount request (``raw``) gets ``canned_reply(raw)``, with token counts from
+      ``len(raw)``.
+    - An extraction request (``document``) gets ``replies[document_key(document)]``,
+      the reply a perfect reader gives, or ``UNKNOWN_DOCUMENT_REPLY``. Its token counts
+      are synthetic: a quarter of the document's and of the reply's length.
+
+    ``requests`` counts what it answered. Nothing touches a network.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, replies: Mapping[str, str] | None = None) -> None:
         self.requests = 0
+        self._replies: Mapping[str, str] = dict(replies or {})
 
     def post(
         self, *, path: str, headers: Mapping[str, str], body: bytes, deadline: Deadline
@@ -281,21 +302,28 @@ class CannedTransport:
         deadline.remaining()
         request = json.loads(body)
         question = json.loads(request["messages"][-1]["content"])
-        raw = str(question["raw"])
+        if "document" in question:
+            document = str(question["document"])
+            content = self._replies.get(document_key(document), UNKNOWN_DOCUMENT_REPLY)
+            prompt_tokens, completion_tokens = len(document) // 4, len(content) // 4
+        else:
+            raw = str(question["raw"])
+            content = canned_reply(raw)
+            prompt_tokens, completion_tokens = len(raw), len(content)
         self.requests += 1
         answer = {
             "id": CANNED_GENERATION_ID,
             "model": request["model"],
             "choices": [
                 {
-                    "message": {"role": "assistant", "content": canned_reply(raw)},
+                    "message": {"role": "assistant", "content": content},
                     "finish_reason": "stop",
                 }
             ],
             "usage": {
-                "prompt_tokens": len(raw),
-                "completion_tokens": len(canned_reply(raw)),
-                "total_tokens": len(raw) + len(canned_reply(raw)),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
                 "cost": float(CANNED_COST),
             },
         }
@@ -303,16 +331,29 @@ class CannedTransport:
 
 
 def build_openrouter_provider(
-    config: OpenRouterConfig, *, dry_run: bool
+    config: OpenRouterConfig, *, dry_run: bool, replies: Mapping[str, str] | None = None
 ) -> tuple[OpenRouterProvider, CannedTransport | None]:
     """The adapter on ``CannedTransport`` for a dry run (returned too, for its count); on
-    the real transport otherwise. The only place a real transport is made."""
+    the real transport otherwise. The only place a real transport is made. ``replies``
+    are a dry run's canned extraction replies (``perfect_replies``)."""
     if dry_run:
-        canned = CannedTransport()
+        canned = CannedTransport(replies)
         return OpenRouterProvider(config, canned), canned
     from orqestra.providers import stdlib_transport  # a live run only: a dry run never loads it
 
     return OpenRouterProvider(config, stdlib_transport.HttpsTransport()), None
+
+
+def perfect_replies(count: int, seed: int) -> dict[str, str]:
+    """For a dry run: each of the cell's documents, by ``document_key``, to its oracle reply.
+
+    The worker regenerates the same documents the harness submits (``count`` and
+    ``seed`` are the cell's), so the canned model reads every one perfectly.
+    """
+    return {
+        document_key(document.text): canonical_reply(document.expected)
+        for document in generate_documents(count, seed)
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,9 +368,18 @@ class OpenRouterWiring:
 
 
 def openrouter_wiring(
-    choice: ProviderChoice, route: str, environ: Mapping[str, str]
+    choice: ProviderChoice,
+    route: str,
+    environ: Mapping[str, str],
+    *,
+    prompt_version: str = openrouter.PROMPT_VERSION,
+    replies: Mapping[str, str] | None = None,
 ) -> OpenRouterWiring:
-    """The adapter for ``choice`` on ``route``. A dry run never reads ``environ``'s key."""
+    """The adapter for ``choice`` on ``route``. A dry run never reads ``environ``'s key.
+
+    ``prompt_version`` is what the usage ledger records: the amount prompt's unless the
+    caller asks the extraction prompt. ``replies`` are a dry run's extraction replies.
+    """
     assert choice.openrouter
     assert choice.model is not None
     if choice.dry_run:
@@ -341,8 +391,8 @@ def openrouter_wiring(
             raise ValueError(msg)
         credential = found
     config = OpenRouterConfig(credential=credential, route_models={route: choice.model})
-    provider, canned = build_openrouter_provider(config, dry_run=choice.dry_run)
-    return OpenRouterWiring(provider, OPENROUTER, choice.model, openrouter.PROMPT_VERSION, canned)
+    provider, canned = build_openrouter_provider(config, dry_run=choice.dry_run, replies=replies)
+    return OpenRouterWiring(provider, OPENROUTER, choice.model, prompt_version, canned)
 
 
 def canned_requests_line(transport: object) -> str | None:

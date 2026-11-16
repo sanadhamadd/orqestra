@@ -98,6 +98,21 @@ def test_an_invoice_cell_passes_its_gate(
     usage = {check["name"]: check for check in record["gate"]}["usage"]["detail"]
     assert usage["finality"] == "closed"
     assert usage["budget_verdict"] == "within"
+    # The invoice path records no call metadata, and always an amount kind.
+    metadata = db.execute(
+        "SELECT count(*), count(model_served), count(provider_generation_id), "
+        "count(input_tokens), count(output_tokens), count(latency_ms) FROM provider_call_results"
+    ).fetchone()
+    assert metadata is not None
+    assert metadata[0] > 0
+    assert metadata[1:] == (0, 0, 0, 0, 0)
+    kinds = db.execute(
+        "SELECT count(*), count(field_kind) FROM provider_calls WHERE capability = %s",
+        ("interpret_amount",),
+    ).fetchone()
+    assert kinds is not None
+    assert kinds[0] == kinds[1] > 0
+    assert "extraction" not in record
     assert record["provider"] == {
         "name": "bench-double",
         "call_timeout": "PT0.1S",

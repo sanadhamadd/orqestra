@@ -191,6 +191,8 @@ def ledger_result(result: ProviderCallResult) -> CallResult | None:
 
     Codes map by value. The provider's amount text becomes a ``Decimal``
     exactly, with its scale, and its unit is kept verbatim. Nothing is rounded.
+    The call's metadata (model served, generation id, tokens, latency) is passed
+    through unchanged; ``None`` stays ``None``.
     """
     amount: Decimal | None = None
     unit: str | None = None
@@ -208,6 +210,11 @@ def ledger_result(result: ProviderCallResult) -> CallResult | None:
         ),
         reported_amount=amount,
         reported_unit=unit,
+        model_served=result.model_served,
+        provider_generation_id=result.provider_generation_id,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        latency_ms=result.latency_ms,
     )
 
 

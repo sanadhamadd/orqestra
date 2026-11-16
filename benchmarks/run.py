@@ -14,7 +14,17 @@ profile    worker process                                  task payload
 ``echo``   ``orqestra worker run --kind diagnostic.echo``  ``{"n": <index>}``
 ``wait``   ``orqestra worker run --kind diagnostic.wait``  ``{"seconds": 0.05}``
 ``invoice`` ``python -m benchmarks.worker``                a DEC-052 invoice batch
+``extract`` ``python -m benchmarks.worker --workload extract`` a batch of document texts
 =========  ==============================================  ======================
+
+The ``extract`` profile (``benchmarks.extract``) sends every generated document
+(``benchmarks.documents``) to the model and needs ``--provider openrouter``. Its
+workers get their own settings (``extract_worker_settings``): an execution timeout
+that fits one call per document of a batch. Its gate adds ``extraction_complete``
+and ``extraction_usage`` to the engine checks, and its record adds an
+``extraction`` block (latency, time split, accuracy, tokens and cost, retries and
+errors by code). A live run needs the model's price per million tokens
+(``--price-in-per-mtok``, ``--price-out-per-mtok``); a dry run uses synthetic ones.
 
 The job is submitted through ``orqestra job submit`` from a task file, every
 task with ``max_attempts`` 3. Workers start first and are waited for until
@@ -51,6 +61,7 @@ credits only for a dry run, whose canned usage is known.
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -67,7 +78,7 @@ from typing import IO, Any
 
 import psycopg
 
-from benchmarks import metrics
+from benchmarks import extract, metrics
 from benchmarks.database import (
     UnsafeBenchDatabaseError,
     connect_verified,
@@ -78,6 +89,7 @@ from benchmarks.database import (
     schema_url,
     unreachable_message,
 )
+from benchmarks.documents import Document, document_texts, generate_documents
 from benchmarks.generate import (
     DEFAULT_SEED,
     Expected,
@@ -123,7 +135,7 @@ from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.migrate import migrate
 from orqestra.worker.builtin import ECHO, WAIT
 from orqestra.worker.settings import WorkerSettings
-from orqestra.worker.usage import check_provider_call_budget
+from orqestra.worker.usage import check_provider_call_budget, usage_handoff_bound
 from orqestra.workloads.invoice.handler import JOB_KIND
 
 MAX_ATTEMPTS = 3
@@ -159,9 +171,18 @@ class Profile(StrEnum):
     ECHO = "echo"
     WAIT = "wait"
     INVOICE = "invoice"
+    EXTRACT = "extract"
 
 
-KIND_OF = {Profile.ECHO: ECHO, Profile.WAIT: WAIT, Profile.INVOICE: JOB_KIND}
+KIND_OF = {
+    Profile.ECHO: ECHO,
+    Profile.WAIT: WAIT,
+    Profile.INVOICE: JOB_KIND,
+    Profile.EXTRACT: extract.JOB_KIND,
+}
+BATCHED = frozenset({Profile.INVOICE, Profile.EXTRACT})
+# Each extraction call's timeout unless --call-timeout says otherwise.
+DEFAULT_EXTRACT_CALL_TIMEOUT = "PT30S"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,8 +202,8 @@ class Cell:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 msg = f"{name} must be a positive integer"
                 raise ValueError(msg)
-        if (self.profile is Profile.INVOICE) != (self.batch is not None):
-            msg = "only the invoice profile has a batch size, and it needs one"
+        if (self.profile in BATCHED) != (self.batch is not None):
+            msg = "only the invoice and extract profiles have a batch size, and they need one"
             raise ValueError(msg)
 
     @property
@@ -201,9 +222,15 @@ class Workload:
     tasks: list[dict[str, JsonValue]]
     items: int
     expected: Expected | None
+    documents: list[Document] | None = None
 
 
 def build_workload(cell: Cell) -> Workload:
+    if cell.profile is Profile.EXTRACT:
+        assert cell.batch is not None
+        documents = generate_documents(cell.size, cell.seed)
+        tasks = build_tasks(document_texts(documents), cell.batch, MAX_ATTEMPTS)
+        return Workload(tasks, cell.size, None, documents)
     if cell.profile is Profile.INVOICE:
         assert cell.batch is not None
         invoices = generate_invoices(cell.size, cell.seed)
@@ -230,8 +257,31 @@ def worker_command(
     provider: ProviderChoice = DOUBLE,
     budget_file: Path | None = None,
     call_timeout: str = DEFAULT_CALL_TIMEOUT,
+    *,
+    cap: int = DEFAULT_CAP,
+    extra: Sequence[str] = (),
 ) -> list[str]:
-    """A worker's argv. It never holds a credential: the key travels only in the environment."""
+    """A worker's argv. It never holds a credential: the key travels only in the environment.
+
+    For ``extract``, ``cap`` is the batch size and ``extra`` the dry run's document flags.
+    """
+    if profile is Profile.EXTRACT:
+        if not provider.openrouter:
+            msg = "the extract profile needs --provider openrouter"
+            raise ValueError(msg)
+        return [
+            sys.executable,
+            "-m",
+            "benchmarks.worker",
+            "--workload",
+            "extract",
+            "--cap",
+            str(cap),
+            "--call-timeout",
+            call_timeout,
+            *provider.worker_arguments(budget_file),
+            *extra,
+        ]
     if profile is Profile.INVOICE:
         return [
             sys.executable,
@@ -294,6 +344,8 @@ class Fleet:
     provider: ProviderChoice = DOUBLE
     budget_file: Path | None = None
     call_timeout: str = DEFAULT_CALL_TIMEOUT
+    cap: int = DEFAULT_CAP
+    extra: tuple[str, ...] = ()
 
     def start(self) -> WorkerHandle:
         """Start one more worker. Every worker runs from ``ROOT``, where the harness lives."""
@@ -301,7 +353,14 @@ class Fleet:
         path = self.log_dir / f"worker-{self.started}.log"
         log = path.open("wb")
         process = subprocess.Popen(  # a fixed command
-            worker_command(self.profile, self.provider, self.budget_file, self.call_timeout),
+            worker_command(
+                self.profile,
+                self.provider,
+                self.budget_file,
+                self.call_timeout,
+                cap=self.cap,
+                extra=self.extra,
+            ),
             cwd=ROOT,
             env=self.env,
             stdin=subprocess.DEVNULL,
@@ -576,8 +635,12 @@ def run_gate(
     expected_failed: Sequence[str] = (),
     expected_exit_codes: Sequence[int] | None = None,
     provider: ProviderChoice = DOUBLE,
+    documents: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Every gate check of plan 2.6 that applies to ``profile``, in order."""
+    """Every gate check of plan 2.6 that applies to ``profile``, in order.
+
+    For ``extract``, ``documents`` is the cell's document count.
+    """
     progress = get_job_progress(conn, job_id)
     checks: list[dict[str, Any]] = []
     if progress is None:
@@ -602,7 +665,16 @@ def run_gate(
     )
     wanted = [0] * len(exit_codes) if expected_exit_codes is None else list(expected_exit_codes)
     checks.append(_check("worker_exits", list(exit_codes) == wanted, {"exit_codes": exit_codes}))
-    if profile is Profile.INVOICE:
+    if profile is Profile.EXTRACT:
+        assert documents is not None
+        attempts = _count(
+            conn,
+            "SELECT count(*) FROM attempts a JOIN tasks t ON t.id = a.task_id WHERE t.job_id = %s",
+            job_id,
+        )
+        clean = attempts == sum(progress.task_counts.values()) and not failed
+        checks.extend(extract.extraction_gate(conn, job_id, documents, clean=clean))
+    elif profile is Profile.INVOICE:
         assert expected is not None
         attempts = _count(
             conn,
@@ -718,6 +790,7 @@ def run_cell(
     hook: Callable[[Running], None] | None = None,
     provider: ProviderChoice = DOUBLE,
     call_timeout: str = DEFAULT_CALL_TIMEOUT,
+    prices: extract.Prices | None = None,
 ) -> dict[str, Any]:
     """Run ``cell`` against the migrated schema ``url`` and return its result record.
 
@@ -727,19 +800,32 @@ def run_cell(
     (``cell_status``). Raw files go to ``raw_dir``. ``hook``, if given, is called
     on every poll while the job runs (drills use it). ``provider`` is the double
     unless ``benchmarks.run`` was given ``--provider openrouter`` (DEC-071); then
-    the cell's call counter is created in ``raw_dir`` before any worker starts.
+    the cell's call counter is created in ``raw_dir`` before any worker starts. An
+    ``extract`` cell needs OpenRouter and ``prices`` (``CANNED_PRICES`` for a dry run);
+    its per-attempt cap is its batch size.
     """
     run_id = run_id or uuid.uuid4().hex[:12]
     refusal = provider.refusal(os.environ)
     if refusal is not None:
         raise ValueError(refusal)
-    if provider.openrouter and cell.profile is not Profile.INVOICE:
-        msg = "--provider openrouter runs only the invoice profile"
+    if provider.openrouter and cell.profile not in BATCHED:
+        msg = "--provider openrouter runs only the invoice profile or the extract profile"
+        raise ValueError(msg)
+    extracting = cell.profile is Profile.EXTRACT
+    if extracting and (not provider.openrouter or prices is None):
+        msg = "the extract profile needs --provider openrouter and the model's prices"
         raise ValueError(msg)
     raw_dir.mkdir(parents=True, exist_ok=True)
     workload = build_workload(cell)
     env = process_environment(url, worker_settings, provider)
     budget_file = create_budget_file(raw_dir / BUDGET_FILE_NAME) if provider.openrouter else None
+    cap = DEFAULT_CAP
+    extra: tuple[str, ...] = ()
+    if extracting:
+        assert cell.batch is not None
+        cap = cell.batch
+        if provider.dry_run:
+            extra = ("--documents", str(cell.size), "--seed", str(cell.seed))
     fleet = Fleet(
         cell.profile,
         env,
@@ -747,6 +833,8 @@ def run_cell(
         provider=provider,
         budget_file=budget_file,
         call_timeout=call_timeout,
+        cap=cap,
+        extra=extra,
     )
     with (
         psycopg.connect(url, autocommit=True) as conn,
@@ -827,12 +915,29 @@ def run_cell(
         times = metrics.read_stored_times(conn, job_id)
         figures = metrics.timing_figures(times)
         gate = run_gate(
-            conn, job_id, cell.profile, workload.expected, exit_codes, provider=provider
+            conn,
+            job_id,
+            cell.profile,
+            workload.expected,
+            exit_codes,
+            provider=provider,
+            documents=workload.items if extracting else None,
         )
         failures = failure_figures(conn, job_id, exit_codes)
         usage = (
             usage_figures(conn, job_id, DEFAULT_CAP) if cell.profile is Profile.INVOICE else None
         )
+        extraction: dict[str, Any] | None = None
+        if extracting:
+            assert workload.documents is not None
+            assert prices is not None
+            extraction = extract.extraction_block(
+                conn,
+                job_id,
+                [document.expected for document in workload.documents],
+                [document.expected_status for document in workload.documents],
+                prices,
+            )
     status = cell_status(wait_ended, gate)
     database_stats = metrics.delta(before, after)
     tasks = len(workload.tasks)
@@ -861,11 +966,17 @@ def run_cell(
             provider_block(
                 provider,
                 call_timeout=call_timeout,
-                cap=DEFAULT_CAP,
+                cap=cap,
                 route="route-a",
-                calls_made=None if usage is None else usage["calls"],
+                calls_made=(
+                    extraction["calls"]["total"]
+                    if extraction is not None
+                    else None
+                    if usage is None
+                    else usage["calls"]
+                ),
             )
-            if cell.profile is Profile.INVOICE
+            if cell.profile in BATCHED
             else None
         ),
         "timing": {
@@ -906,6 +1017,8 @@ def run_cell(
         "gate": gate,
         "drill": None,
     }
+    if extraction is not None:
+        record["extraction"] = extraction
     # Whether a dirty tree's record may be written is the writer's decision; its shape is
     # checked here either way.
     validate_result({**record, "environment": {**record_environment, "dirty_allowed": True}})
@@ -943,8 +1056,13 @@ def run_in_bench_database(
     note: str = "",
     provider: ProviderChoice = DOUBLE,
     call_timeout: str = DEFAULT_CALL_TIMEOUT,
+    prices: extract.Prices | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    """Run ``cell`` in a fresh run schema of the benchmark database; write its result file."""
+    """Run ``cell`` in a fresh run schema of the benchmark database; write its result file.
+
+    An OpenRouter cell runs with ``cell_worker_settings``; the double with the bench's own.
+    """
+    worker_settings = cell_worker_settings(cell, provider, call_timeout)
     url = require_bench_database_url(os.environ)
     with connect_verified(url) as admin:
         schema = run_schema_name(run_id, cell.name)
@@ -955,6 +1073,7 @@ def run_in_bench_database(
             record = run_cell(
                 target,
                 cell,
+                worker_settings=worker_settings,
                 raw_dir=RAW_DIR / run_id / cell.name,
                 stop_after=stop_after,
                 run_id=run_id,
@@ -963,6 +1082,7 @@ def run_in_bench_database(
                 note=note,
                 provider=provider,
                 call_timeout=call_timeout,
+                prices=prices,
             )
             path = write_result(record, out_dir, allow_dirty=allow_dirty)
         finally:
@@ -1012,7 +1132,20 @@ def add_provider_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--call-timeout",
-        help=f"openrouter: each call's timeout, ISO 8601 (default {DEFAULT_CALL_TIMEOUT})",
+        help=(
+            f"openrouter: each call's timeout, ISO 8601 (default {DEFAULT_CALL_TIMEOUT}; "
+            f"{DEFAULT_EXTRACT_CALL_TIMEOUT} for the extract profile)"
+        ),
+    )
+    parser.add_argument(
+        "--price-in-per-mtok",
+        type=Decimal,
+        help="extract, live: the model's price per million input tokens, from its price list",
+    )
+    parser.add_argument(
+        "--price-out-per-mtok",
+        type=Decimal,
+        help="extract, live: the model's price per million output tokens, from its price list",
     )
 
 
@@ -1023,10 +1156,12 @@ def provider_refusal(
     refusal = choice.refusal(environ)
     if refusal is not None:
         return refusal
+    if cell.profile is Profile.EXTRACT and not choice.openrouter:
+        return "the extract profile needs --provider openrouter: the double reads amounts only"
     if not choice.openrouter:
         return "--call-timeout applies only to --provider openrouter" if call_timeout else None
-    if cell.profile is not Profile.INVOICE:
-        return "--provider openrouter runs only the invoice profile"
+    if cell.profile not in BATCHED:
+        return "--provider openrouter runs only the invoice profile or the extract profile"
     assert choice.max_provider_calls is not None
     if cell.workers > choice.max_provider_calls:
         return (
@@ -1041,6 +1176,66 @@ def provider_refusal(
     return None
 
 
+def prices_of(
+    cell: Cell,
+    choice: ProviderChoice,
+    price_in: Decimal | None,
+    price_out: Decimal | None,
+) -> extract.Prices | None:
+    """The prices an extract cell is costed at; ``ValueError`` when they are wrong or missing.
+
+    A live run must be given both, from the model's price list: nothing is assumed. A
+    dry run uses ``CANNED_PRICES`` and refuses given ones, so a dry run's cost is never
+    mistaken for a real one.
+    """
+    given = price_in is not None or price_out is not None
+    if cell.profile is not Profile.EXTRACT:
+        if given:
+            msg = "--price-in-per-mtok and --price-out-per-mtok apply only to the extract profile"
+            raise ValueError(msg)
+        return None
+    if choice.dry_run:
+        if given:
+            msg = "a dry run uses synthetic prices: leave out --price-in/out-per-mtok"
+            raise ValueError(msg)
+        return extract.CANNED_PRICES
+    if price_in is None or price_out is None:
+        msg = "a live extract run needs --price-in-per-mtok and --price-out-per-mtok"
+        raise ValueError(msg)
+    return extract.Prices(price_in, price_out)
+
+
+def provider_worker_settings(cap: int, call_timeout: str) -> dict[str, str]:
+    """``BENCH_WORKER_SETTINGS`` with an execution timeout that fits ``cap`` calls.
+
+    The rule is ``check_provider_call_budget``'s: ``cap * (call_timeout + 2 * handoff
+    bound) <= execution_timeout - fence_margin``, rounded up to whole seconds, and never
+    below the bench's own two minutes. Only the execution timeout changes; the copy is
+    validated as the workers will read it.
+    """
+    settings = dict(BENCH_WORKER_SETTINGS)
+    base = bench_settings(settings)
+    per_call = parse_duration(call_timeout) + 2 * usage_handoff_bound(base)
+    needed = (cap * per_call + base.fence_margin).total_seconds()
+    if needed > base.execution_timeout.total_seconds():  # else the bench's own text stays
+        settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] = f"PT{math.ceil(needed)}S"
+    check_provider_call_budget(
+        bench_settings(settings),
+        max_provider_calls_per_attempt=cap,
+        provider_call_timeout=parse_duration(call_timeout),
+    )
+    return settings
+
+
+def cell_worker_settings(cell: Cell, provider: ProviderChoice, call_timeout: str) -> dict[str, str]:
+    """The settings a cell's workers run with: the bench's own for the double, and for
+    OpenRouter ``provider_worker_settings`` at the cell's per-attempt cap."""
+    if not provider.openrouter:
+        return dict(BENCH_WORKER_SETTINGS)
+    cap = cell.batch if cell.profile is Profile.EXTRACT and cell.batch else DEFAULT_CAP
+    return provider_worker_settings(cap, call_timeout)
+
+
 def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
     """``worker_settings`` as the worker will read them, without touching the environment."""
     fields = {
@@ -1052,17 +1247,17 @@ def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
 
 def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
     """What a dry run prints before its cell: the oracle's calls and the hard bounds."""
+    if cell.profile is Profile.EXTRACT:
+        return _extract_preview(cell, choice, call_timeout)
     workload = build_workload(cell)
     assert workload.expected is not None
     assert choice.max_provider_calls is not None
     calls = workload.expected.calls
     bound = DEFAULT_CAP * MAX_ATTEMPTS * len(workload.tasks)
+    execution = "?"
     try:
-        check_provider_call_budget(
-            bench_settings(BENCH_WORKER_SETTINGS),
-            max_provider_calls_per_attempt=DEFAULT_CAP,
-            provider_call_timeout=parse_duration(call_timeout),
-        )
+        settings = cell_worker_settings(cell, choice, call_timeout)
+        execution = settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"]
         verdict = "fits"
     except (TypeError, ValueError) as exc:
         verdict = f"refused: {exc}"
@@ -1070,10 +1265,29 @@ def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> li
         f"expected provider calls (oracle): {calls}",
         f"cell call maximum (--max-provider-calls): {choice.max_provider_calls}",
         f"call budget bound (DEC-065, cap x sum of max_attempts): {bound}",
-        f"per-attempt call budget (cap {DEFAULT_CAP}, call timeout {call_timeout}): {verdict}",
+        f"per-attempt call budget (cap {DEFAULT_CAP}, call timeout {call_timeout}, "
+        f"execution timeout {execution}): {verdict}",
     ]
     if calls > choice.max_provider_calls:
         lines.append("the call maximum would stop this run before every invoice is verified")
+    return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
+
+
+def _extract_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
+    assert cell.batch is not None
+    assert choice.max_provider_calls is not None
+    tasks = math.ceil(cell.size / cell.batch)
+    settings = provider_worker_settings(cell.batch, call_timeout)
+    lines = [
+        f"expected provider calls (one per document): {cell.size}",
+        f"cell call maximum (--max-provider-calls): {choice.max_provider_calls}",
+        f"call budget bound (cap {cell.batch} x max_attempts x tasks): "
+        f"{cell.batch * MAX_ATTEMPTS * tasks}",
+        f"execution timeout for a batch of {cell.batch} at {call_timeout} a call: "
+        f"{settings['ORQESTRA_WORKER_EXECUTION_TIMEOUT']}",
+    ]
+    if cell.size > choice.max_provider_calls:
+        lines.append("the call maximum would stop this run before every document is read")
     return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
 
 
@@ -1106,13 +1320,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_live_calls=args.allow_live_calls,
         dry_run=args.dry_run,
     )
-    call_timeout = args.call_timeout or DEFAULT_CALL_TIMEOUT
+    default_timeout = (
+        DEFAULT_EXTRACT_CALL_TIMEOUT if args.profile is Profile.EXTRACT else DEFAULT_CALL_TIMEOUT
+    )
+    call_timeout = args.call_timeout or default_timeout
     run_id = uuid.uuid4().hex[:12]
     try:
         cell = Cell(args.profile, args.size, args.batch, args.workers, args.repetition, args.seed)
         refusal = provider_refusal(choice, cell, args.call_timeout, os.environ)
         if refusal is not None:
             raise ValueError(refusal)
+        prices = prices_of(cell, choice, args.price_in_per_mtok, args.price_out_per_mtok)
         refuse_dirty(args.allow_dirty)
         if choice.dry_run:
             print("\n".join(dry_run_preview(cell, choice, call_timeout)))
@@ -1128,6 +1346,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             note=args.note,
             provider=choice,
             call_timeout=call_timeout,
+            prices=prices,
         )
     except (ValueError, DirtyTreeError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)

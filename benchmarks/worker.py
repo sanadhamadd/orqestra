@@ -23,6 +23,15 @@ the cell's calls before its intent is recorded; with none left the attempt fails
 closed (``ProviderCallBudgetExhausted``). A dry run never reads the key; a live run
 reads ``ORQESTRA_OPENROUTER_API_KEY`` from the environment, never from ``.env``.
 
+With ``--workload extract`` it runs the document extraction workload instead
+(``benchmarks.extract``, job kind ``invoice_extraction``): every document goes to the
+OpenRouter adapter's ``extract`` call, so the extract workload accepts only
+``--provider openrouter``. Its calls go through the same sink, budget and cap, and the
+ledger records the extraction prompt's version. A dry run is given the cell's
+``--documents`` and ``--seed``, regenerates the same documents and answers each with
+its oracle reply (``live.perfect_replies``). The default workload, ``mix``, is the
+invoice verification above, unchanged.
+
 Before it connects, it checks the provider flags, then with
 ``check_provider_call_budget`` that the call cap, each call's timeout and the
 usage handoffs fit in the execution timeout, and exits 1 if they do not.
@@ -35,10 +44,12 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import TypeAdapter, ValidationError
 
+from benchmarks import extract
 from benchmarks.live import (
     DOUBLE,
     BudgetedRecorder,
@@ -48,13 +59,14 @@ from benchmarks.live import (
     ProviderName,
     canned_requests_line,
     openrouter_wiring,
+    perfect_replies,
 )
 from benchmarks.provider import SeparatorReader
 from orqestra.calls.provider import Provider
 from orqestra.calls.recording import ProviderCallRecorder
 from orqestra.calls.routing import RouteOption
 from orqestra.logging import configure_logging
-from orqestra.worker.handlers import HandlerRegistry
+from orqestra.worker.handlers import Handler, HandlerRegistry
 from orqestra.worker.runtime import Worker, connect_supervisor
 from orqestra.worker.settings import WorkerSettings
 from orqestra.worker.shutdown import run_until_signalled
@@ -68,6 +80,12 @@ PROVIDER = "bench-double"
 PROMPT_VERSION = "bench-v1"
 DEFAULT_CAP = 16
 DEFAULT_CALL_TIMEOUT = "PT0.1S"
+
+
+class WorkloadName(StrEnum):
+    MIX = "mix"
+    EXTRACT = "extract"
+
 
 _DURATION = TypeAdapter(timedelta)
 
@@ -116,6 +134,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true", help="openrouter: canned responses, no network, no cost"
     )
+    parser.add_argument(
+        "--workload",
+        type=WorkloadName,
+        choices=list(WorkloadName),
+        default=WorkloadName.MIX,
+        help="mix: invoice verification (default); extract: the model reads every document",
+    )
+    parser.add_argument("--documents", type=int, help="extract dry run: the cell's document count")
+    parser.add_argument("--seed", type=int, help="extract dry run: the cell's document seed")
     return parser
 
 
@@ -143,6 +170,24 @@ def provider_refusal(
     return None
 
 
+def workload_refusal(
+    workload: WorkloadName, choice: ProviderChoice, documents: int | None, seed: int | None
+) -> str | None:
+    """Why the workload flags may not run, or ``None``."""
+    if workload is WorkloadName.MIX:
+        if documents is not None or seed is not None:
+            return "--documents and --seed apply only to --workload extract"
+        return None
+    if not choice.openrouter:
+        return "--workload extract needs --provider openrouter: the double reads amounts only"
+    given = documents is not None and seed is not None
+    if choice.dry_run and (not given or documents is None or documents < 1):
+        return "an extract dry run needs --documents (a positive count) and --seed"
+    if not choice.dry_run and (documents is not None or seed is not None):
+        return "--documents and --seed apply only to an extract dry run"
+    return None
+
+
 def build_worker(
     url: str,
     settings: WorkerSettings,
@@ -153,13 +198,31 @@ def build_worker(
     budget_file: Path | None = None,
     environ: Mapping[str, str] = os.environ,
     wiring: list[OpenRouterWiring] | None = None,
+    workload: WorkloadName = WorkloadName.MIX,
+    documents: int | None = None,
+    seed: int | None = None,
 ) -> Worker:
-    """A worker running only ``invoice_verification``, its provider behind a ``UsageSink``.
+    """A worker running one job kind, its provider behind a ``UsageSink``.
 
-    The double by default. For OpenRouter the sink's recorder is wrapped in a
-    ``BudgetedRecorder`` on ``budget_file``; the wiring is appended to ``wiring``
-    when given, so the caller can read a dry run's request count.
+    The ``mix`` workload runs only ``invoice_verification``, on the double by default.
+    For OpenRouter the sink's recorder is wrapped in a ``BudgetedRecorder`` on
+    ``budget_file``; the wiring is appended to ``wiring`` when given, so the caller
+    can read a dry run's request count. The ``extract`` workload runs only
+    ``invoice_extraction`` on OpenRouter (``workload_refusal`` has been checked).
     """
+    if workload is WorkloadName.EXTRACT:
+        return _extract_worker(
+            url,
+            settings,
+            cap=cap,
+            call_timeout=call_timeout,
+            choice=choice,
+            budget_file=budget_file,
+            environ=environ,
+            wiring=wiring,
+            documents=documents,
+            seed=seed,
+        )
     provider: Provider
     recorder: ProviderCallRecorder
     if choice.openrouter:
@@ -197,6 +260,54 @@ def build_worker(
     )
 
 
+def _extract_worker(
+    url: str,
+    settings: WorkerSettings,
+    *,
+    cap: int,
+    call_timeout: timedelta,
+    choice: ProviderChoice,
+    budget_file: Path | None,
+    environ: Mapping[str, str],
+    wiring: list[OpenRouterWiring] | None,
+    documents: int | None,
+    seed: int | None,
+) -> Worker:
+    assert choice.openrouter
+    assert budget_file is not None
+    assert choice.max_provider_calls is not None
+    replies = None
+    if choice.dry_run:
+        assert documents is not None
+        assert seed is not None
+        replies = perfect_replies(documents, seed)
+    wired = openrouter_wiring(
+        choice, ROUTE, environ, prompt_version=extract.PROMPT_VERSION, replies=replies
+    )
+    if wiring is not None:
+        wiring.append(wired)
+    sink = UsageSink(
+        [extract.JOB_KIND],
+        {ROUTE: wired.provider_name},
+        {ROUTE: wired.model},
+        prompt_version=wired.prompt_version,
+    )
+    recorder = BudgetedRecorder(sink.recorder, CallBudget(budget_file, choice.max_provider_calls))
+    handler: Handler = extract.extraction_handler(
+        wired.provider,
+        ROUTE,
+        call_timeout,
+        max_provider_calls_per_attempt=cap,
+        recorder=recorder,
+    )
+    return Worker(
+        registry=HandlerRegistry({extract.JOB_KIND: handler}),
+        settings=settings,
+        connect=functools.partial(connect_supervisor, url, settings),
+        usage=sink,
+    )
+
+
 def _refuse(message: str) -> int:
     print(json.dumps({"status": "error", "error": message}))
     return 1
@@ -205,7 +316,9 @@ def _refuse(message: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     choice = choice_of(args)
-    refusal = provider_refusal(choice, args.budget_file, os.environ)
+    refusal = provider_refusal(choice, args.budget_file, os.environ) or workload_refusal(
+        args.workload, choice, args.documents, args.seed
+    )
     if refusal is not None:
         return _refuse(refusal)
     try:
@@ -234,6 +347,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         choice=choice,
         budget_file=args.budget_file,
         wiring=wiring,
+        workload=args.workload,
+        documents=args.documents,
+        seed=args.seed,
     )
     run_until_signalled(worker)  # until a signal stops it, or the process ends
     for wired in wiring:
