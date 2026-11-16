@@ -223,3 +223,113 @@ def test_the_in_memory_recorder_refuses_what_is_not_a_record() -> None:
     wrong = intent(0)
     with pytest.raises(TypeError, match="result"):
         recorder.record_result(wrong)
+
+
+# --- a whole-document call, and what a result says about the call (T1) -----------------------
+
+
+def test_an_intent_may_carry_no_field_kind_for_a_whole_document() -> None:
+    whole = intent(field_kind=None, capability="extract_invoice")
+    assert whole.field_kind is None
+    with pytest.raises(TypeError, match="field_kind"):
+        intent(field_kind="total")
+
+
+def test_the_call_metadata_limits_are_the_ledgers() -> None:
+    from orqestra.calls import recording
+    from orqestra.persistence import provider_usage
+
+    assert recording.MODEL_MAX_LENGTH == provider_usage.MODEL_MAX_LENGTH
+    assert recording.GENERATION_ID_MAX_LENGTH == provider_usage.GENERATION_ID_MAX_LENGTH
+    assert recording.BIGINT_MAX == provider_usage.BIGINT_MAX
+    assert recording.INTEGER_MAX == provider_usage.INTEGER_MAX
+
+
+def test_a_result_without_call_metadata_is_the_old_result() -> None:
+    plain = result()
+    assert (
+        plain.model_served,
+        plain.provider_generation_id,
+        plain.input_tokens,
+        plain.output_tokens,
+        plain.latency_ms,
+    ) == (None, None, None, None, None)
+    fields = [f.name for f in dataclasses.fields(ProviderCallResult)]
+    assert fields[:5] == ["attempt_id", "call_seq", "outcome", "failure_code", "usage"]
+
+
+def test_call_metadata_is_accepted_at_its_limits() -> None:
+    upper = result(
+        model_served="m" * 128,
+        provider_generation_id="g" * 128,
+        input_tokens=BIGINT_MAX,
+        output_tokens=BIGINT_MAX,
+        latency_ms=INTEGER_MAX,
+    )
+    assert (upper.input_tokens, upper.latency_ms) == (BIGINT_MAX, INTEGER_MAX)
+    lower = result(input_tokens=0, output_tokens=0, latency_ms=0, model_served="m")
+    assert (lower.input_tokens, lower.output_tokens, lower.latency_ms) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        ({"model_served": "m" * 129}, ValueError),
+        ({"model_served": "  "}, ValueError),
+        ({"model_served": "a\x00b"}, ValueError),
+        ({"model_served": "\ud800"}, ValueError),
+        ({"model_served": 7}, TypeError),
+        ({"provider_generation_id": "g" * 129}, ValueError),
+        ({"provider_generation_id": ""}, ValueError),
+        ({"provider_generation_id": b"gen"}, TypeError),
+        ({"input_tokens": BIGINT_MAX + 1}, ValueError),
+        ({"input_tokens": -1}, ValueError),
+        ({"input_tokens": True}, TypeError),
+        ({"input_tokens": 1.0}, TypeError),
+        ({"output_tokens": BIGINT_MAX + 1}, ValueError),
+        ({"output_tokens": "3"}, TypeError),
+        ({"latency_ms": INTEGER_MAX + 1}, ValueError),
+        ({"latency_ms": -1}, ValueError),
+        ({"latency_ms": False}, TypeError),
+    ],
+)
+def test_call_metadata_outside_the_ledgers_rules_is_refused_when_built(
+    fields: dict[str, Any], error: type[Exception]
+) -> None:
+    with pytest.raises(error) as raised:
+        result(**fields)
+    assert SECRET not in str(raised.value)
+
+
+def test_metadata_never_echoes_the_value() -> None:
+    with pytest.raises(ValueError, match="model_served") as raised:
+        result(model_served=SECRET + "x" * 128)
+    assert SECRET not in str(raised.value)
+
+
+def test_the_invoice_verifier_always_names_the_field_kind() -> None:
+    from datetime import timedelta
+
+    from benchmarks.generate import generate_invoices
+    from benchmarks.provider import SeparatorReader
+    from orqestra.calls.routing import RouteOption
+    from orqestra.workloads.invoice.verify import (
+        REQUIRED_CAPABILITY,
+        ProviderCalls,
+        verify_invoice,
+    )
+
+    recorder = InMemoryCallRecorder()
+    routes = (RouteOption("r1", frozenset({REQUIRED_CAPABILITY}), estimated_cost_units=1),)
+    calls = ProviderCalls(attempt_id=A, cap=1000, recorder=recorder)
+    for index, invoice in enumerate(generate_invoices(200)):
+        verify_invoice(
+            invoice,
+            routes=routes,
+            providers={"r1": SeparatorReader()},
+            timeout=timedelta(seconds=1),
+            calls=calls,
+            item_index=index,
+        )
+    assert len(recorder.intents) == 10  # the ambiguous invoices: 5 % of 200
+    assert all(isinstance(made.field_kind, FieldKind) for made in recorder.intents)

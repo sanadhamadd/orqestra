@@ -69,6 +69,23 @@ TOP_LEVEL = frozenset(
     }
 )
 CELL_FIELDS = frozenset({"profile", "size", "batch", "workers", "repetition", "seed"})
+# An extract cell's ``extraction`` block (``benchmarks.extract.extraction_block``); other
+# records do not have one, so their files are unchanged.
+EXTRACTION_FIELDS = frozenset(
+    {
+        "documents",
+        "calls",
+        "time_split",
+        "accuracy",
+        "statuses",
+        "needs_review",
+        "tokens",
+        "cost",
+        "retries",
+        "transient_errors",
+        "permanent_errors",
+    }
+)
 ENVIRONMENT_FIELDS = frozenset(
     {
         "git_sha",
@@ -265,6 +282,23 @@ def validate_result(record: object) -> None:
     if record["status"] != Status.COMPLETE and record["throughput"] is not None:
         _fail("only a complete result may report throughput")
     _validate_wait(record)
+    _validate_extraction(record)
+
+
+def _validate_extraction(record: dict[str, Any]) -> None:
+    """An ``extraction`` block, when present, belongs to an extract cell and is complete."""
+    if "extraction" not in record:
+        if record["cell"]["profile"] == "extract":
+            _fail("an extract result must carry its extraction block")
+        return
+    block = record["extraction"]
+    if record["cell"]["profile"] != "extract":
+        _fail("only an extract result carries an extraction block")
+    if not isinstance(block, dict) or set(block) != EXTRACTION_FIELDS:
+        _fail(f"the extraction block must hold exactly {sorted(EXTRACTION_FIELDS)}")
+    latency = block["calls"].get("latency_ms") if isinstance(block["calls"], dict) else None
+    if not isinstance(latency, dict) or not {"p50", "p95", "p99", "max"} <= set(latency):
+        _fail("extraction.calls.latency_ms must give p50, p95, p99 and max")
 
 
 def _validate_wait(record: dict[str, Any]) -> None:
