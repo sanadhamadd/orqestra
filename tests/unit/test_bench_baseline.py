@@ -33,7 +33,7 @@ from benchmarks.baseline import (
     retry_delay,
     run_documents,
 )
-from benchmarks.campaign import step_figures
+from benchmarks.campaign import Tool, result_path, step_figures
 from benchmarks.live import (
     API_KEY_ENV,
     BUDGET_EXHAUSTED,
@@ -303,7 +303,7 @@ def args(tmp_path: Path, *extra: str) -> list[str]:
         "--max-provider-calls",
         "50",
         "--out-dir",
-        str(tmp_path / "out"),
+        str(tmp_path / "out dir"),  # the owner's workspace path has spaces too
         *extra,
     ]
 
@@ -324,9 +324,11 @@ def test_the_command_writes_a_record_the_campaign_reads(
     argv = args(command, "--mode", "threads", "--workers", "4", "--dry-run", "--note", "c1")
     canned = Prices(Decimal(1), Decimal(2), canned=True)
     assert baseline.main(argv, stub_connector(stub), canned) == 0
-    status, path_text = capsys.readouterr().out.split()
-    path = Path(path_text)
-    assert status == "complete"
+    out = capsys.readouterr().out
+    path = result_path(out, Tool.BASELINE)  # the campaign's own reading of the line
+    assert path is not None
+    assert " " in str(path)
+    assert out.partition(" ")[0] == "complete"
     assert path.name.endswith("-abc1234-baseline-threads-12-w4.json")
     record = json.loads(path.read_text())
     assert record["format"] == "baseline-1"
@@ -389,7 +391,9 @@ def test_a_dry_run_reads_every_document_through_the_extraction_workload(
     assert baseline.main(args(command, *mode, "--dry-run")) == 0
     out = capsys.readouterr().out
     assert out.startswith("complete ")
-    record = json.loads(Path(out.split()[-1]).read_text())
+    path = result_path(out, Tool.BASELINE)
+    assert path is not None
+    record = json.loads(path.read_text())
     block = record["extraction"]
     assert block["documents"] == 12
     assert block["calls"]["total"] == block["calls"]["answered"] == 12

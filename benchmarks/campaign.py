@@ -738,12 +738,22 @@ def workers_alive() -> list[int]:
     return alive
 
 
-def result_path(stdout: str) -> Path | None:
-    """The result file a command named on its last line (``<status> [drill] <path>``)."""
+def result_path(stdout: str, tool: Tool) -> Path | None:
+    """The result file a command named on its last line.
+
+    ``benchmarks.run`` and ``benchmarks.baseline`` print ``<status> <path>``;
+    ``benchmarks.drills`` prints ``<status> <drill> <path>``. The fields before the path
+    are split off by count, so the path is the rest of the line, read whole: a folder
+    name may contain spaces, or even a word that looks like a drill's name.
+    """
     lines = [line for line in stdout.splitlines() if line.strip()]
     if not lines:
         return None
-    candidate = Path(lines[-1].split()[-1])
+    fields = 3 if tool is Tool.DRILL else 2
+    parts = lines[-1].split(" ", fields - 1)
+    if len(parts) < fields or not parts[-1]:
+        return None
+    candidate = Path(parts[-1])
     return candidate if candidate.suffix == ".json" and candidate.is_file() else None
 
 
@@ -933,7 +943,7 @@ class Campaign:
         )
         env = child_environment(self.environ, live=self.settings.live)
         finished = self.runner(argv, env)
-        path = result_path(finished.stdout)
+        path = result_path(finished.stdout, cell.tool)
         self._keep_output(cell, finished)
         record = read_record(path)
         figures = None if record is None else step_figures(record)
