@@ -240,7 +240,12 @@ def test_the_call_counter_bounds_what_is_sent(tmp_path: Path, mode: Mode, worker
 def test_costs_come_from_tokens_and_prices_and_from_credits(tmp_path: Path) -> None:
     outcome = run(tmp_path, StubExtraction(), count=10)
     figures = extraction_figures(outcome, PRICES)
-    assert figures["tokens"] == {"input": 10_000, "output": 2_000, "answered_without_counts": 0}
+    assert figures["tokens"] == {
+        "input": 10_000,
+        "output": 2_000,
+        "answered_without_counts": 0,
+        "max_per_call": {"input": 1_000, "output": 200},
+    }
     # 10,000 x 0.10 / 1e6 + 2,000 x 0.50 / 1e6
     assert Decimal(figures["cost"]["total"]) == Decimal("0.002")
     assert Decimal(figures["cost"]["reported"]["openrouter_credits"]) == Decimal("0.0010")
@@ -259,7 +264,12 @@ def test_a_call_without_token_counts_leaves_the_token_cost_unknown(tmp_path: Pat
     blind = Reply("reply", None, 200, 120, None)
     outcome = run(tmp_path, StubExtraction({"doc-3": [blind]}), count=5)
     figures = extraction_figures(outcome, PRICES)
-    assert figures["tokens"] == {"input": 4_000, "output": 800, "answered_without_counts": 1}
+    assert figures["tokens"] == {
+        "input": 4_000,
+        "output": 800,
+        "answered_without_counts": 1,
+        "max_per_call": {"input": None, "output": None},  # the uncounted call could be larger
+    }
     record = {"status": "complete", "extraction": figures}
     assert step_figures(record).token_cost is None  # priced over four of five calls only
     assert step_figures(record).calls == 5

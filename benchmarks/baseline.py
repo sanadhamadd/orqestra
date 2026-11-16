@@ -151,6 +151,8 @@ class Outcome:
     input_tokens: int = 0
     output_tokens: int = 0
     without_counts: int = 0  # answered calls that reported no token counts
+    max_input_tokens: int = 0  # the largest one call reported
+    max_output_tokens: int = 0
     credits: Decimal = Decimal(0)
     transient: Counter[str] = field(default_factory=Counter)
     permanent: str | None = None
@@ -220,6 +222,8 @@ def handle(
         else:
             outcome.input_tokens += reply.input_tokens
             outcome.output_tokens += reply.output_tokens
+            outcome.max_input_tokens = max(outcome.max_input_tokens, reply.input_tokens)
+            outcome.max_output_tokens = max(outcome.max_output_tokens, reply.output_tokens)
         if reply.credits is not None:
             outcome.credits += reply.credits
         score = extraction.score(document.expected, reply.content)
@@ -308,6 +312,7 @@ def extraction_figures(run: Run, prices: Prices, fields: Sequence[str] = ()) -> 
     statuses = Counter({name: 0 for name in STATUSES})
     statuses.update(outcome.status for outcome in outcomes)
     answered = len(latencies)
+    uncounted = sum(outcome.without_counts for outcome in outcomes)
     return {
         "documents": documents,
         "calls": {
@@ -344,7 +349,16 @@ def extraction_figures(run: Run, prices: Prices, fields: Sequence[str] = ()) -> 
         "tokens": {
             "input": input_tokens,
             "output": output_tokens,
-            "answered_without_counts": sum(outcome.without_counts for outcome in outcomes),
+            "answered_without_counts": uncounted,
+            # A call without counts could have been the largest, so then the maximum is unknown.
+            "max_per_call": {
+                "input": None
+                if uncounted or not answered
+                else max(outcome.max_input_tokens for outcome in outcomes),
+                "output": None
+                if uncounted or not answered
+                else max(outcome.max_output_tokens for outcome in outcomes),
+            },
         },
         "cost": {
             "currency": "USD",

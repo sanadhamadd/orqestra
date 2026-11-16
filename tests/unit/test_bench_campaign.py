@@ -110,6 +110,7 @@ def extraction_record(
     accuracy: float = 0.95,
     permanent: Mapping[str, int] | None = None,
     speed: float = 10.0,
+    largest: tuple[int | None, int | None] = (3_000, 500),
 ) -> dict[str, Any]:
     return {
         "run_id": run_id,
@@ -118,7 +119,12 @@ def extraction_record(
         "extraction": {
             "documents": calls,
             "calls": {"total": calls, "answered": calls, "failed": 0, "unresolved": 0},
-            "tokens": {"input": calls * 900, "output": calls * 150, "answered_without_counts": 0},
+            "tokens": {
+                "input": calls * 900,
+                "output": calls * 150,
+                "answered_without_counts": 0,
+                "max_per_call": {"input": largest[0], "output": largest[1]},
+            },
             "cost": {
                 "currency": "USD",
                 "total": token_priced,
@@ -261,6 +267,8 @@ def test_an_extraction_results_figures() -> None:
         accuracy=Decimal("0.95"),
         permanent_failures=2,
         items_per_s=10.0,
+        max_input_tokens=3_000,
+        max_output_tokens=500,
     )
 
 
@@ -412,6 +420,74 @@ def test_a_pilot_outside_a_gate_or_without_its_figure_fails_it(
 def test_a_pilot_with_no_result_fails_every_gate() -> None:
     gates = pilot_gates(None, Charge(Decimal(1), None, Basis.CALL_MAXIMUM))
     assert not any(gate.passed for gate in gates)
+
+
+def test_the_token_bounds_are_the_ones_the_ceiling_assumes() -> None:
+    ceilings = Ceilings(FakeLimits(), LIVE_PRICES)
+    pilot = APPROVED_PLAN.cells()[0]
+    assert ceilings.token_bounds(pilot) == (2_000 + 1_001 + FRAMING_BYTES, 1_024)
+    assert ceilings.of(pilot) == hard(100)
+
+
+@pytest.mark.parametrize(
+    ("largest", "failed"),
+    [
+        ((4_025, 1_024), set()),  # both exactly at their bound
+        ((4_026, 1_024), {"input_tokens_bound"}),
+        ((4_025, 1_025), {"output_tokens_bound"}),
+        ((None, 10), {"input_tokens_bound"}),
+        ((10, None), {"output_tokens_bound"}),
+    ],
+)
+def test_the_bound_gate_compares_each_calls_largest_tokens_with_the_bound(
+    largest: tuple[int | None, int | None], failed: set[str]
+) -> None:
+    read = figures(max_input_tokens=largest[0], max_output_tokens=largest[1])
+    gates = campaign.bound_gates("c", read, (4_025, 1_024))
+    assert {gate.name for gate in gates if not gate.passed} == failed
+    assert {gate.threshold for gate in gates} == {"<= 4025", "<= 1024"}
+    assert {gate.cell for gate in gates} == {"c"}
+    assert not any(gate.passed for gate in campaign.bound_gates("c", None, (4_025, 1_024)))
+
+
+@pytest.mark.parametrize(
+    ("largest", "gate"),
+    [((4_045, 500), "input_tokens_bound"), ((3_000, 1_025), "output_tokens_bound")],
+)
+def test_an_extract_cell_past_its_per_call_bound_stops_the_campaign(
+    tmp_path: Path, largest: tuple[int, int], gate: str
+) -> None:
+    breaking = "s2-run-extract-2000-b25-w8-r1"  # bounds (2,000 + 1,020 + 1,024, 1,024)
+
+    def one_cell_breaks(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
+        record = good_records(key, argv)
+        if key == breaking and record is not None:
+            record["extraction"]["tokens"]["max_per_call"] = {
+                "input": largest[0],
+                "output": largest[1],
+            }
+        return record
+
+    runner = FakeRunner(one_cell_breaks)
+    assert new_campaign(tmp_path, runner, live=True).execute() == 1
+    assert runner.keys[-1] == breaking
+    verdicts = [event for event in events(tmp_path, "gate") if event["cell"] == breaking]
+    failed = {event["gate"]: event for event in verdicts if not event["passed"]}
+    assert set(failed) == {gate}
+    assert failed[gate]["value"] == str(largest[0] if gate == "input_tokens_bound" else largest[1])
+    (stopped,) = events(tmp_path, "campaign_stopped")
+    assert breaking in stopped["reason"]
+    assert gate in stopped["reason"]
+
+
+def test_every_extract_cell_and_no_mix_cell_is_bound_checked(tmp_path: Path) -> None:
+    assert new_campaign(tmp_path, FakeRunner(good_records)).execute() == 0
+    checked = {event["cell"] for event in events(tmp_path, "gate") if event["cell"]}
+    extract = {
+        event["cell"] for event in events(tmp_path, "cell_started") if "-extract-" in event["cell"]
+    }
+    assert checked == extract
+    assert all(event["passed"] for event in events(tmp_path, "gate") if event["cell"] is not None)
 
 
 # --- commands ----------------------------------------------------------------------------
@@ -675,7 +751,10 @@ def test_a_failed_pilot_gate_stops_the_campaign(
     assert not gates[gate]["passed"]
     assert gates[gate]["threshold"]
     (stopped,) = events(tmp_path, "campaign_stopped")
-    assert gate in stopped["reason"]
+    if pilot is None:  # no result: the per-call bound is unproven, which stops it first
+        assert "per-call bound" in stopped["reason"]
+    else:
+        assert gate in stopped["reason"]
     assert json.loads((tmp_path / SUMMARY_NAME).read_text())["stopped"] == stopped["reason"]
     assert not (tmp_path / BILLING_NAME).exists()
 
@@ -699,44 +778,42 @@ def test_a_cell_that_leaves_no_result_is_charged_what_its_counters_reserved(
     tmp_path: Path, raw_dir: Path
 ) -> None:
     loop = "s7-baseline-loop-extract-2000-b1-w1-r1"
-    threads = "s7-baseline-threads-extract-2000-b1-w4-r1"
 
     def crash_after_reserving(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
         if key == loop:
             counter(raw_dir, "crashedloop", 37, 4e9)  # written after the cell started
             return None
-        if key.startswith("s7-"):
-            return None  # refused before reserving anything: no counter
         return good_records(key, argv)
 
     clock = iter(float(second) for second in range(1_000, 9_000, 10))
     run = new_campaign(
         tmp_path, FakeRunner(crash_after_reserving), live=True, clock=lambda: next(clock)
     )
-    assert run.execute() == 0
+    assert run.execute() == 1
     finished = {event["cell"]: event for event in events(tmp_path, "cell_finished")}
     started = {event["cell"]: event for event in events(tmp_path, "cell_started")}
     assert finished[loop]["charge_basis"] == "reservations"
     assert finished[loop]["calls"] == 37
     assert Decimal(finished[loop]["charge"]) == 37 * Decimal(started[loop]["ceiling"])
-    # every later cell's window also holds that counter: it was written "in the future"
-    assert finished[threads]["charge_basis"] == "reservations"
+    assert run.runs[loop].charge.cost == 37 * run.runs[loop].ceiling
+    (stopped,) = events(tmp_path, "campaign_stopped")
+    assert stopped["reason"].startswith(f"per-call bound not verified for {loop}")
 
 
 def test_a_cell_without_a_result_or_a_counter_is_charged_its_whole_maximum(
     tmp_path: Path,
 ) -> None:
-    threads = "s7-baseline-threads-extract-2000-b1-w4-r1"
+    loop = "s7-baseline-loop-extract-2000-b1-w1-r1"
 
     def refuse_baseline(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
         return None if key.startswith("s7-") else good_records(key, argv)
 
-    assert new_campaign(tmp_path, FakeRunner(refuse_baseline), live=True).execute() == 0
+    assert new_campaign(tmp_path, FakeRunner(refuse_baseline), live=True).execute() == 1
     finished = {event["cell"]: event for event in events(tmp_path, "cell_finished")}
     started = {event["cell"]: event for event in events(tmp_path, "cell_started")}
-    assert finished[threads]["charge_basis"] == "call_maximum"
-    expected = Decimal(started[threads]["call_maximum"]) * Decimal(started[threads]["ceiling"])
-    assert Decimal(finished[threads]["charge"]) == expected
+    assert finished[loop]["charge_basis"] == "call_maximum"
+    expected = Decimal(started[loop]["call_maximum"]) * Decimal(started[loop]["ceiling"])
+    assert Decimal(finished[loop]["charge"]) == expected
 
 
 def test_a_too_small_budget_stops_before_the_pilot(tmp_path: Path) -> None:

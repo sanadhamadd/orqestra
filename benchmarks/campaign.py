@@ -297,10 +297,15 @@ class Ceilings:
     def of(self, cell: PlannedCell) -> Decimal:
         if cell.workload is not Workload.EXTRACT:
             return UNBOUNDED_CALL_COST
+        input_bound, output_bound = self.token_bounds(cell)
+        return hard_call_cost(input_bound - FRAMING_BYTES, output_bound, self._prices)
+
+    def token_bounds(self, cell: PlannedCell) -> tuple[int, int]:
+        """The most input and output tokens one call of ``cell`` may report."""
         if cell.size not in self._largest:
             self._largest[cell.size] = self._limits.largest_document_bytes(cell.size)
-        request = self._limits.prompt_bytes + self._largest[cell.size]
-        return hard_call_cost(request, self._limits.max_output_tokens, self._prices)
+        request = self._limits.prompt_bytes + self._largest[cell.size] + FRAMING_BYTES
+        return request, self._limits.max_output_tokens
 
 
 # --- what a result says ------------------------------------------------------------------
@@ -321,6 +326,8 @@ class Figures:
     accuracy: Decimal | None  # pooled field accuracy
     permanent_failures: int | None
     items_per_s: float | None
+    max_input_tokens: int | None = None  # the largest any one answered call reported
+    max_output_tokens: int | None = None
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -374,6 +381,8 @@ def step_figures(record: Mapping[str, Any]) -> Figures:
             accuracy=_decimal(overall) if isinstance(overall, float | int) else None,
             permanent_failures=failures,
             items_per_s=speed,
+            max_input_tokens=_count(_path(block, "tokens", "max_per_call", "input")),
+            max_output_tokens=_count(_path(block, "tokens", "max_per_call", "output")),
         )
     calls = _count(_path(record, "usage", "calls"))
     if calls is None:
@@ -493,10 +502,12 @@ class Gate:
     value: str | None
     threshold: str
     passed: bool
+    cell: str | None = None
 
     def event(self) -> dict[str, Any]:
         return {
             "event": "gate",
+            "cell": self.cell,
             "gate": self.name,
             "value": self.value,
             "threshold": self.threshold,
@@ -530,6 +541,30 @@ def pilot_gates(figures: Figures | None, charge: Charge) -> list[Gate]:
             None if figures is None else f"{permanent} permanent, status {figures.status}",
             "0 permanent and complete",
             permanent == 0 and complete,
+        ),
+    ]
+
+
+def bound_gates(cell: str, figures: Figures | None, bounds: tuple[int, int]) -> list[Gate]:
+    """Whether every call of an extract cell stayed inside the per-call bound its budget
+    assumed. A cell whose result does not say fails both: its spend is then unproven."""
+    input_bound, output_bound = bounds
+    largest_in = None if figures is None else figures.max_input_tokens
+    largest_out = None if figures is None else figures.max_output_tokens
+    return [
+        Gate(
+            "input_tokens_bound",
+            None if largest_in is None else str(largest_in),
+            f"<= {input_bound}",
+            largest_in is not None and largest_in <= input_bound,
+            cell,
+        ),
+        Gate(
+            "output_tokens_bound",
+            None if largest_out is None else str(largest_out),
+            f"<= {output_bound}",
+            largest_out is not None and largest_out <= output_bound,
+            cell,
         ),
     ]
 
@@ -906,6 +941,13 @@ class Campaign:
             charge,
         )
         self.runs[cell.key] = run
+        if cell.workload is Workload.EXTRACT:
+            gates = bound_gates(cell.key, figures, self.ceilings.token_bounds(cell))
+            for gate in gates:
+                self.log.write(gate.event())
+            failed = [gate.name for gate in gates if not gate.passed]
+            if failed:
+                self.stop(f"per-call bound not verified for {cell.key}: {', '.join(failed)}")
         return run
 
     def _keep_output(self, cell: PlannedCell, finished: Finished) -> None:
@@ -926,14 +968,15 @@ class Campaign:
             self.stop("pilot already ran without passing its gates")
             return False
         run = self.run_cell(cell)
-        if self.stopped is not None:
-            return False
         if run is None:
-            self.stop("the pilot does not fit the budget")
+            if not self.halted:
+                self.stop("the pilot does not fit the budget")
             return False
         gates = pilot_gates(run.figures, run.charge)
         for gate in gates:
             self.log.write(gate.event())
+        if self.halted:  # the per-call bound already failed
+            return False
         if not all(gate.passed for gate in gates):
             failed = ", ".join(gate.name for gate in gates if not gate.passed)
             self.stop(f"pilot gate failed: {failed}")
