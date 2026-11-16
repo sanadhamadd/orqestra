@@ -17,7 +17,14 @@ import psycopg
 import pytest
 from psycopg.rows import TupleRow
 
-from benchmarks.drills import KillDrill, expected_calls_by_item, run_drill, standard_workload
+from benchmarks import extract
+from benchmarks.drills import (
+    KillDrill,
+    expected_calls_by_item,
+    extract_workload,
+    run_drill,
+    standard_workload,
+)
 from benchmarks.generate import generate_invoices
 from benchmarks.live import (
     API_KEY_ENV,
@@ -77,7 +84,7 @@ def test_d1_on_a_dry_run_provider_loses_nothing_and_leaks_nothing(
     choice = ProviderChoice(
         name=ProviderName.OPENROUTER,
         model="vendor/model-a",
-        max_provider_calls=3 * workload.expected.calls,  # room for the killed attempts' repeats
+        max_provider_calls=3 * workload.oracle.calls,  # room for the killed attempts' repeats
         dry_run=True,
     )
     raw_dir = tmp_path / "raw"
@@ -132,3 +139,70 @@ def test_d1_on_a_dry_run_provider_loses_nothing_and_leaks_nothing(
     for argv, _ in started:
         texts[f"argv {argv[:3]}"] = json.dumps(argv)
     assert [name for name, text in texts.items() if SENTINEL in text] == []
+
+
+# The extraction workload (T4): every document is one call, so a batch of 25 is 25 calls.
+EXTRACT_CELL = Cell(Profile.EXTRACT, size=300, batch=25, workers=2)
+
+
+def test_d1_on_the_extract_workload_loses_nothing_and_records_its_figures(
+    db: psycopg.Connection[TupleRow],
+    schema_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(API_KEY_ENV, SENTINEL)
+    started: list[list[str]] = []
+    real = subprocess.Popen
+
+    class Recording(real):  # type: ignore[valid-type,misc]
+        def __init__(self, args: Sequence[str], *rest: Any, **options: Any) -> None:
+            started.append([str(part) for part in args])
+            super().__init__(args, *rest, **options)
+
+    monkeypatch.setattr(subprocess, "Popen", Recording)
+    workload = extract_workload(EXTRACT_CELL)
+    choice = ProviderChoice(
+        name=ProviderName.OPENROUTER,
+        model="vendor/model-a",
+        max_provider_calls=3 * EXTRACT_CELL.size,
+        dry_run=True,
+    )
+    raw_dir = tmp_path / "raw"
+    record = run_drill(
+        schema_url,
+        EXTRACT_CELL,
+        KillDrill(victims=1, expected_calls=dict.fromkeys(range(EXTRACT_CELL.size), 1)),
+        workload,
+        worker_settings=ENVIRONMENT,
+        raw_dir=raw_dir,
+        stop_after=STOP,
+        provider=choice,
+        call_timeout="PT1S",
+        prices=extract.CANNED_PRICES,
+    )
+
+    checks = _passes(record)
+    assert {
+        "extraction_complete",
+        "extraction_usage",
+        "no_lost_tasks",
+        "no_duplicate_calls",
+    } <= set(checks)
+    assert checks["no_duplicate_calls"]["detail"] == {"duplicate_calls": 0}
+    block = record["extraction"]
+    assert block["documents"] == EXTRACT_CELL.size
+    assert block["accuracy"]["overall"] == 1.0
+    assert block["tokens"]["max_per_call"]["input"] is not None
+    assert record["provider"]["cap"] == EXTRACT_CELL.batch
+    assert record["provider"]["calls_made"] == block["calls"]["total"]
+    assert record["usage"] is None  # the invoice usage report reads invoice jobs only
+    assert record["resources"]["sysload"]["samples"] >= 1
+    workers = [argv for argv in started if "benchmarks.worker" in argv]
+    assert workers
+    for argv in workers:
+        assert argv[argv.index("--workload") + 1] == "extract"
+        assert argv[argv.index("--cap") + 1] == str(EXTRACT_CELL.batch)
+        assert "--dry-run" in argv
+    stored = write_result(record, tmp_path / "results", allow_dirty=True)
+    assert SENTINEL not in stored.read_text(encoding="utf-8")

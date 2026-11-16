@@ -73,6 +73,14 @@ def started(monkeypatch: pytest.MonkeyPatch) -> list[tuple[list[str], dict[str, 
     return seen
 
 
+def cost_text(block: dict[str, Any]) -> str:
+    """Every decimal text of the cost, joined: none may be in exponent form."""
+    cost = block["cost"]
+    texts = [cost[key] for key in ("total", "succeeded_attempts", "other_attempts")]
+    texts += [cost["per_1000_invoices"], cost["per_1000_invoices_succeeded"]]
+    return " ".join([*texts, *cost["reported"].values()]).upper()
+
+
 def _cell(schema_url: str, raw_dir: Path) -> dict[str, Any]:
     return run_cell(
         schema_url,
@@ -139,6 +147,12 @@ def test_a_dry_extract_cell_reads_every_document_and_records_every_figure(
     assert tokens["output"] == sum(len(reply) // 4 for reply in replies)
     assert tokens["other_attempts"] == {"input": 0, "output": 0}
     assert tokens["answered_without_counts"] == 0
+    assert tokens["max_per_call"] == {
+        "input": max(len(document.text) // 4 for document in DOCUMENTS),
+        "output": max(len(reply) // 4 for reply in replies),
+    }
+    assert "E" not in cost_text(block)
+    assert record["resources"]["sysload"]["samples"] >= 1
 
     cost = block["cost"]
     expected_cost = (

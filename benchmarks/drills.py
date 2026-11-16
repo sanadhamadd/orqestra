@@ -56,7 +56,7 @@ machine's memory and load, and the database's connections while it runs
 its raw directory before any worker starts, and every worker, the replacements
 of killed ones included, shares it, so the maximum covers the whole drill. The
 workers' execution timeout is raised just enough to fit the call cap at the
-chosen ``--call-timeout`` (``live_worker_settings``); lease, heartbeat and
+chosen ``--call-timeout`` (``run.provider_worker_settings``); lease, heartbeat and
 recovery settings stay those of the double's drills. ``d1`` then also records
 the delay from each kill to the next attempt, the tasks that did not succeed
 (``no_lost_tasks``: none may), the calls beyond the oracle's in the attempts
@@ -88,7 +88,7 @@ from typing import Any, cast
 
 import psycopg
 
-from benchmarks import metrics
+from benchmarks import extract, metrics
 from benchmarks.database import (
     BENCH_DATABASE_URL_ENV,
     UnsafeBenchDatabaseError,
@@ -99,6 +99,7 @@ from benchmarks.database import (
     run_schema_name,
     schema_url,
 )
+from benchmarks.documents import Document
 from benchmarks.faults import Fault, create_fault_table, poison_total
 from benchmarks.generate import (
     POISON_KEY_PREFIX,
@@ -129,6 +130,8 @@ from benchmarks.result import (
 )
 from benchmarks.run import (
     BENCH_WORKER_SETTINGS,
+    DEFAULT_EXTRACT_CALL_TIMEOUT,
+    KIND_OF,
     MAX_ATTEMPTS,
     POLL,
     STARTUP_TIMEOUT,
@@ -138,10 +141,12 @@ from benchmarks.run import (
     WorkerHandle,
     add_common_arguments,
     add_provider_arguments,
-    bench_settings,
+    build_workload,
     failure_figures,
+    prices_of,
     process_environment,
     provider_refusal,
+    provider_worker_settings,
     refuse_dirty,
     run_gate,
     submit,
@@ -158,8 +163,7 @@ from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.migrate import migrate
 from orqestra.persistence.snapshots import job_batch_snapshot
 from orqestra.worker.fence import ExitCode
-from orqestra.worker.usage import check_provider_call_budget, usage_handoff_bound
-from orqestra.workloads.invoice.handler import BATCH_PAYLOAD_INVALID, JOB_KIND
+from orqestra.workloads.invoice.handler import BATCH_PAYLOAD_INVALID
 from tests.integration.pg_proxy import PgProxy
 
 DRILLS_DIR = RESULTS_DIR / "drills"
@@ -694,27 +698,6 @@ def expected_calls_by_item(count: int, batch_size: int, cap: int) -> dict[int, i
     return calls
 
 
-EXECUTION_TIMEOUT = "ORQESTRA_WORKER_EXECUTION_TIMEOUT"
-
-
-def live_worker_settings(
-    worker_settings: Mapping[str, str], cap: int, call_timeout: str
-) -> dict[str, str]:
-    """``worker_settings`` with the execution timeout raised just enough for ``cap`` calls of
-    ``call_timeout`` each (``check_provider_call_budget``'s rule), in whole seconds; nothing
-    else changes, and settings that already fit are returned unchanged."""
-    settings = bench_settings(worker_settings)
-    timeout = parse_duration(call_timeout)
-    needed = cap * (timeout + 2 * usage_handoff_bound(settings)) + settings.fence_margin
-    copied = dict(worker_settings)
-    if needed > settings.execution_timeout:
-        copied[EXECUTION_TIMEOUT] = f"PT{math.ceil(needed.total_seconds())}S"
-    check_provider_call_budget(
-        bench_settings(copied), max_provider_calls_per_attempt=cap, provider_call_timeout=timeout
-    )
-    return copied
-
-
 class FreezeDrill(Drill):
     """D2: SIGSTOP one busy worker for ``seconds``, then SIGCONT it."""
 
@@ -1097,10 +1080,33 @@ class RetryDrill(Drill):
 
 @dataclass(frozen=True, slots=True)
 class DrillWorkload:
+    """What a drill submits. ``expected`` is the invoice mix's oracle; an extract drill
+    (``d1 --workload extract``) has ``documents`` instead."""
+
     tasks: list[dict[str, JsonValue]]
-    expected: Expected
+    expected: Expected | None
     status: JobStatus = JobStatus.SUCCEEDED
     failed: tuple[str, ...] = ()
+    documents: list[Document] | None = None
+
+    @property
+    def oracle(self) -> Expected:
+        """The invoice mix's oracle; only a mix workload has one."""
+        if self.expected is None:
+            msg = "an extract workload has no invoice oracle"
+            raise ValueError(msg)
+        return self.expected
+
+    @property
+    def items(self) -> int:
+        return len(self.documents) if self.documents is not None else self.oracle.invoices
+
+
+def extract_workload(cell: Cell) -> DrillWorkload:
+    """The extraction workload's tasks for ``cell``: T1's documents, one call each."""
+    built = build_workload(cell)
+    assert built.documents is not None
+    return DrillWorkload(built.tasks, None, documents=built.documents)
 
 
 def standard_workload(invoices: Sequence[JsonValue], batch: int) -> DrillWorkload:
@@ -1237,15 +1243,29 @@ def run_drill(
     note: str = "",
     provider: ProviderChoice = DOUBLE,
     call_timeout: str = DEFAULT_CALL_TIMEOUT,
+    prices: extract.Prices | None = None,
 ) -> dict[str, Any]:
     """Run ``drill`` against the migrated schema ``url``; its format 1 result record.
 
     ``provider`` is the double unless ``d1`` was given ``--provider openrouter``:
     then the drill's call counter is created in ``raw_dir`` before any worker
-    starts, and the workers' execution timeout fits ``call_timeout``.
+    starts, and the workers' execution timeout fits ``call_timeout``
+    (``run.provider_worker_settings``). An ``extract`` cell (``d1`` only, on
+    OpenRouter, with ``prices``) runs the extraction workload: its per-attempt cap is
+    its batch, its gate adds the extraction checks and its record the ``extraction``
+    block.
     """
-    if cell.profile is not Profile.INVOICE:
-        msg = "drills run the invoice profile"
+    extracting = cell.profile is Profile.EXTRACT
+    if cell.profile not in {Profile.INVOICE, Profile.EXTRACT}:
+        msg = "drills run the invoice or the extract profile"
+        raise ValueError(msg)
+    if extracting and (
+        drill.name != "d1"
+        or not provider.openrouter
+        or prices is None
+        or workload.documents is None
+    ):
+        msg = "the extract workload runs only with d1, on --provider openrouter, with prices"
         raise ValueError(msg)
     if provider.openrouter and (drill.name != "d1" or command is not None):
         msg = "--provider openrouter runs only with d1"
@@ -1257,18 +1277,25 @@ def run_drill(
         raise ValueError(refusal)
     run_id = run_id or uuid.uuid4().hex[:12]
     budget_file: Path | None = None
+    cap = cell.batch if extracting and cell.batch else DEFAULT_CAP
     if provider.openrouter:
-        worker_settings = live_worker_settings(worker_settings, DEFAULT_CAP, call_timeout)
+        worker_settings = provider_worker_settings(worker_settings, cap, call_timeout)
     raw_dir.mkdir(parents=True, exist_ok=True)
     env = process_environment(drill.worker_url(url), worker_settings, provider)
     if provider.openrouter:
         budget_file = create_budget_file(raw_dir / BUDGET_FILE_NAME)
+    extra: tuple[str, ...] = ()
+    if extracting and provider.dry_run:
+        extra = ("--documents", str(cell.size), "--seed", str(cell.seed))
     fleet = DrillFleet(
         cell.profile,
         env,
         raw_dir,
         command=list(
-            command or worker_command(Profile.INVOICE, provider, budget_file, call_timeout)
+            command
+            or worker_command(
+                cell.profile, provider, budget_file, call_timeout, cap=cap, extra=extra
+            )
         ),
     )
     harness = Harness(url)
@@ -1286,7 +1313,7 @@ def run_drill(
     try:
         record_environment = environment(harness.conn, note=note)
         # Submitted before any worker starts, so polling begins before the job does.
-        job_id, submission = submit(url, JOB_KIND, workload.tasks, raw_dir)
+        job_id, submission = submit(url, KIND_OF[cell.profile], workload.tasks, raw_dir)
         for _ in range(cell.workers):
             fleet.start()
         sysload.start()
@@ -1325,18 +1352,30 @@ def run_drill(
         gate = run_gate(
             conn,
             job_id,
-            Profile.INVOICE,
+            cell.profile,
             workload.expected,
             codes,
             expected_status=workload.status,
             expected_failed=workload.failed,
             expected_exit_codes=wanted,
             provider=provider,
+            documents=workload.items if extracting else None,
         )
         gate += drill.checks(conn, job_id, fleet)
         figures = metrics.timing_figures(metrics.read_stored_times(conn, job_id))
         failures = failure_figures(conn, job_id, codes)
-        usage = usage_figures(conn, job_id, DEFAULT_CAP)
+        usage = None if extracting else usage_figures(conn, job_id, DEFAULT_CAP)
+        extraction: dict[str, Any] | None = None
+        if extracting:
+            assert workload.documents is not None
+            assert prices is not None
+            extraction = extract.extraction_block(
+                conn,
+                job_id,
+                [document.expected for document in workload.documents],
+                [document.expected_status for document in workload.documents],
+                prices,
+            )
         measured = drill.measured(conn, job_id, fleet)
     finally:
         harness.close()
@@ -1357,9 +1396,15 @@ def run_drill(
             provider_block(
                 provider,
                 call_timeout=call_timeout,
-                cap=DEFAULT_CAP,
+                cap=cap,
                 route="route-a",
-                calls_made=None if usage is None else usage["calls"],
+                calls_made=(
+                    extraction["calls"]["total"]
+                    if extraction is not None
+                    else None
+                    if usage is None
+                    else usage["calls"]
+                ),
             )
             if provider.openrouter
             else {"call_timeout": DEFAULT_CALL_TIMEOUT, "cap": DEFAULT_CAP, "route": "route-a"}
@@ -1368,7 +1413,7 @@ def run_drill(
             **figures["timing"],
             "submission": submission,
             "tasks": len(workload.tasks),
-            "items": workload.expected.invoices,
+            "items": workload.items,
             "stop_after_s": stop_after,
         },
         "throughput": None,  # a drill is not a performance cell
@@ -1394,6 +1439,8 @@ def run_drill(
             "measured": measured,
         },
     }
+    if extraction is not None:
+        record["extraction"] = extraction
     validate_result({**record, "environment": {**record_environment, "dirty_allowed": True}})
     return record
 
@@ -1412,11 +1459,16 @@ def _jobs(
         payload = payload_workload(invoices, args.batch)
         policy = retry_policy(BENCH_WORKER_SETTINGS)
         return [
-            (PayloadDrill(payload.expected), payload, FAULTS_COMMAND),
-            (RetryDrill(retry.expected, poison, policy), retry, FAULTS_COMMAND),
+            (PayloadDrill(payload.oracle), payload, FAULTS_COMMAND),
+            (RetryDrill(retry.oracle, poison, policy), retry, FAULTS_COMMAND),
         ]
-    workload = standard_workload(invoices, args.batch)
     drill: Drill
+    if name == "d1" and args.workload == EXTRACT_WORKLOAD:
+        workload = extract_workload(drill_cell(args))
+        # The extraction workload asks about every document exactly once.
+        drill = KillDrill(args.victims, expected_calls=dict.fromkeys(range(workload.items), 1))
+        return [(drill, workload, None)]
+    workload = standard_workload(invoices, args.batch)
     if name == "d1":
         drill = KillDrill(
             args.victims,
@@ -1432,10 +1484,30 @@ def _jobs(
     return [(drill, workload, None)]
 
 
+EXTRACT_WORKLOAD = "extract"
+MIX_WORKLOAD = "mix"
+
+
+def drill_cell(args: argparse.Namespace) -> Cell:
+    """The drill's cell: the invoice mix, or the extraction workload for ``d1 --workload
+    extract``."""
+    profile = Profile.EXTRACT if args.workload == EXTRACT_WORKLOAD else Profile.INVOICE
+    return Cell(profile, args.invoices, args.batch, args.workers)
+
+
+def drill_call_timeout(args: argparse.Namespace) -> str:
+    if args.call_timeout:
+        return str(args.call_timeout)
+    return (
+        DEFAULT_EXTRACT_CALL_TIMEOUT if args.workload == EXTRACT_WORKLOAD else DEFAULT_CALL_TIMEOUT
+    )
+
+
 def run_named(name: str, args: argparse.Namespace, url: str) -> list[tuple[dict[str, Any], Path]]:
     """Run drill ``name`` in fresh run schemas of the benchmark database; write each result."""
     run_id = uuid.uuid4().hex[:12]
-    cell = Cell(Profile.INVOICE, args.invoices, args.batch, args.workers)
+    cell = drill_cell(args)
+    prices = prices_of(cell, choice_of(args), args.price_in_per_mtok, args.price_out_per_mtok)
     written = []
     if name == "d3b":
         with connect_verified(url) as admin:
@@ -1462,7 +1534,8 @@ def run_named(name: str, args: argparse.Namespace, url: str) -> list[tuple[dict[
                 run_id=run_id,
                 note=args.note,
                 provider=choice_of(args),
-                call_timeout=args.call_timeout or DEFAULT_CALL_TIMEOUT,
+                call_timeout=drill_call_timeout(args),
+                prices=prices,
             )
             written.append(
                 (record, write_result(record, args.out_dir, allow_dirty=args.allow_dirty))
@@ -1490,14 +1563,24 @@ def drill_provider_refusal(args: argparse.Namespace, environ: Mapping[str, str])
     choice = choice_of(args)
     if choice.openrouter and args.drill != "d1":
         return "--provider openrouter runs only with d1"
-    cell = Cell(Profile.INVOICE, args.invoices, args.batch, args.workers)
+    if args.workload == EXTRACT_WORKLOAD and args.drill != "d1":
+        return "--workload extract runs only with d1"
+    try:
+        cell = drill_cell(args)
+    except ValueError as exc:
+        return str(exc)
     refusal = provider_refusal(choice, cell, args.call_timeout, environ)
-    if refusal is not None or not choice.openrouter:
+    if refusal is not None:
         return refusal
     try:
-        live_worker_settings(
-            BENCH_WORKER_SETTINGS, DEFAULT_CAP, args.call_timeout or DEFAULT_CALL_TIMEOUT
-        )
+        prices_of(cell, choice, args.price_in_per_mtok, args.price_out_per_mtok)
+    except ValueError as exc:
+        return str(exc)
+    if not choice.openrouter:
+        return None
+    cap = cell.batch if cell.profile is Profile.EXTRACT and cell.batch else DEFAULT_CAP
+    try:
+        provider_worker_settings(BENCH_WORKER_SETTINGS, cap, drill_call_timeout(args))
     except (TypeError, ValueError) as exc:
         return f"--call-timeout does not fit the worker settings: {exc}"
     return None
@@ -1517,6 +1600,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--batch", type=int, default=100)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--victims", type=int, default=2, help="d1: workers killed")
+    parser.add_argument(
+        "--workload",
+        choices=(MIX_WORKLOAD, EXTRACT_WORKLOAD),
+        default=MIX_WORKLOAD,
+        help="d1: the invoice mix (default) or the extraction workload (needs openrouter)",
+    )
     parser.add_argument("--stop-after", type=float, default=1800.0, help="a bound, in seconds")
     parser.add_argument(
         "--allow-db-restart",

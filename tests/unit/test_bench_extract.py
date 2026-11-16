@@ -1,6 +1,8 @@
 """Strict reply parsing, judging and scoring of the extraction workload (``benchmarks.extract``)."""
 
 import json
+from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -15,8 +17,10 @@ from benchmarks.extract import (
     Score,
     Unusable,
     canonical_reply,
+    fixed_point_text,
     judge,
     parse_reply,
+    request_text,
     score,
     score_all,
 )
@@ -270,3 +274,54 @@ def test_scores_add_up_over_documents() -> None:
 
 def test_an_unusable_reply_is_its_reason() -> None:
     assert parse_reply(None) == Unusable(Reason.REPLY_INCOMPLETE)
+
+
+# --- T4: fixed-point text, the request text, the largest call ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (Decimal("3E-7"), "0.0000003"),
+        (Decimal("0.000001") * 40, "0.000040"),
+        (Decimal("1E+2"), "100"),
+        (Decimal("12.50"), "12.50"),
+    ],
+)
+def test_fixed_point_text_is_never_in_exponent_form(value: Decimal, text: str) -> None:
+    assert fixed_point_text(value) == text
+    assert "E" not in fixed_point_text(value).upper()
+
+
+def test_the_request_text_is_exactly_what_the_adapter_sends() -> None:
+    from orqestra.providers.openrouter import ExtractionRequest
+    from tests.unit.test_openrouter_adapter import FakeExchange, FakeTransport, provider_for
+    from tests.unit.test_providers_openrouter import replied
+
+    document = DOCUMENTS[3].text + "\\u00e9 é"  # escapes and a non-ASCII character
+    transport = FakeTransport(FakeExchange(200, [replied()]))
+    provider_for(transport).extract(
+        ExtractionRequest(route_id="route-a", document=document, timeout=timedelta(seconds=5))
+    )
+    (post,) = transport.posts
+    sent = json.loads(post["body"])["messages"][-1]["content"]
+    assert sent == request_text(document)
+
+
+def _call(state: str, outcome: str | None, tokens: tuple[int | None, int | None]) -> Any:
+    from benchmarks.extract import _Call
+
+    return _Call(state, outcome, None, tokens[0], tokens[1], 10, None, None)
+
+
+def test_the_largest_call_is_over_every_answered_call_of_every_attempt() -> None:
+    from benchmarks.extract import _max_per_call
+
+    answered = [
+        _call("succeeded", "answered", (300, 90)),
+        _call("revoked", "answered", (420, 60)),
+        _call("succeeded", "answered", (310, 130)),
+    ]
+    assert _max_per_call(answered, 0) == {"input": 420, "output": 130}
+    assert _max_per_call([], 0) == {"input": None, "output": None}
+    assert _max_per_call(answered, 1) == {"input": None, "output": None}
