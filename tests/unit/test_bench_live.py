@@ -8,11 +8,13 @@ Sockets are blocked as well. The key is a sentinel string, never a real one.
 """
 
 import ast
+import fcntl
 import inspect
 import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Iterator, Mapping
 from datetime import timedelta
@@ -32,6 +34,7 @@ from benchmarks import result, run
 from benchmarks.live import (
     API_KEY_ENV,
     BUDGET_EXHAUSTED,
+    BUDGET_FILE_NAME,
     CANNED_COST,
     DOUBLE,
     DRY_RUN_LABEL,
@@ -548,3 +551,252 @@ def test_the_canned_request_carries_the_system_prompt_only_in_memory() -> None:
     report = provider.call(request())
     assert SYSTEM_PROMPT in json.loads(seen[0])["messages"][0]["content"]
     assert SYSTEM_PROMPT not in repr(report)
+
+
+# --- a counter no kill can tear (K1) ------------------------------------------------------------
+
+# Each script runs in its own process, as a worker does. ``DIE_BEFORE`` and ``DIE_AFTER``
+# end the process abruptly (``os._exit``, no cleanup, the lock still held) just before and
+# just after the counter is replaced.
+DIE_BEFORE = """
+import os, sys
+from pathlib import Path
+from benchmarks import live
+os.replace = lambda *args, **kwargs: os._exit(9)
+live.CallBudget(Path(sys.argv[1]), 10**6).reserve()
+"""
+DIE_AFTER = """
+import os, sys
+from pathlib import Path
+from benchmarks import live
+live._sync_directory = lambda directory: os._exit(9)
+live.CallBudget(Path(sys.argv[1]), 10**6).reserve()
+"""
+LOOPER = """
+import sys
+from pathlib import Path
+from benchmarks.live import CallBudget
+budget = CallBudget(Path(sys.argv[1]), 10**9)
+while True:
+    budget.reserve()
+"""
+READER = """
+import sys
+from pathlib import Path
+from benchmarks.live import read_budget_file
+path, last = Path(sys.argv[1]), 0
+for _ in range(int(sys.argv[2])):
+    count = read_budget_file(path)  # raises on a torn or empty counter
+    assert count >= last, (count, last)
+    last = count
+print(last)
+"""
+
+
+def _script(script: str, *arguments: str) -> subprocess.Popen[str]:
+    env = {**os.environ, "PYTHONPATH": str(ROOT.resolve())}
+    return subprocess.Popen(  # a fixed command
+        [sys.executable, "-c", script, *arguments],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _counters(directory: Path) -> list[str]:
+    """What the campaign's globs would read in ``directory``: the counter's exact name."""
+    return sorted(path.name for path in directory.glob(BUDGET_FILE_NAME))
+
+
+def test_a_new_counter_is_published_whole_with_its_lock_file(tmp_path: Path) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    assert read_budget_file(path) == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        BUDGET_FILE_NAME,
+        BUDGET_FILE_NAME + benchmarks.live.LOCK_SUFFIX,
+    ]
+
+
+def test_six_processes_count_exactly_to_the_cap_and_lose_nothing(tmp_path: Path) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    processes = [_script(RESERVER, str(path), "200", "60") for _ in range(6)]
+    granted = []
+    for process in processes:
+        out, error = process.communicate(timeout=120)
+        assert process.returncode == 0, error
+        granted.append(int(out))
+    assert sum(granted) == 200  # 360 attempts against a cap of 200
+    assert read_budget_file(path) == 200
+
+
+@pytest.mark.parametrize(("script", "after"), [(DIE_BEFORE, 3), (DIE_AFTER, 4)])
+def test_a_process_killed_while_reserving_leaves_a_complete_count(
+    tmp_path: Path, script: str, after: int
+) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    budget = CallBudget(path, 10)
+    for _ in range(3):
+        budget.reserve()
+    process = _script(script, str(path))
+    process.communicate(timeout=60)
+    assert process.returncode == 9  # it died mid-reserve, holding the lock
+    # Before the replace: the old count, the call never made. After: the new one.
+    assert read_budget_file(path) == after
+    budget.reserve()  # the dead process's lock was released by the kernel
+    assert read_budget_file(path) == after + 1
+    assert _counters(tmp_path) == [BUDGET_FILE_NAME]  # a stray temporary file is never read
+
+
+def test_real_kills_at_varied_moments_never_tear_the_counter(tmp_path: Path) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    budget = CallBudget(path, 10**9)
+    last = 0
+    for attempt in range(20):
+        process = _script(LOOPER, str(path))
+        deadline = time.monotonic() + 30
+        while read_budget_file(path) <= last and time.monotonic() < deadline:
+            time.sleep(0.005)  # until the looper is reserving
+        time.sleep((attempt % 5) * 0.003)
+        process.kill()  # SIGKILL: no cleanup of any kind
+        process.communicate(timeout=30)
+        count = read_budget_file(path)
+        assert count > last, attempt
+        budget.reserve()
+        assert read_budget_file(path) == count + 1
+        last = count + 1
+
+
+def test_readers_see_only_whole_counts_while_writers_reserve(tmp_path: Path) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    writers = [_script(RESERVER, str(path), str(10**6), "300") for _ in range(3)]
+    reader = _script(READER, str(path), "2000")
+    out, error = reader.communicate(timeout=120)
+    assert reader.returncode == 0, error
+    for writer in writers:
+        writer.communicate(timeout=120)
+        assert writer.returncode == 0
+    assert read_budget_file(path) == 900
+    assert int(out) <= 900
+
+
+def test_the_dry_run_summary_says_not_measured_for_an_unreadable_counter(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / BUDGET_FILE_NAME).write_text("", encoding="ascii")
+    lines = run.dry_run_summary({"provider": {"calls_made": 4}}, tmp_path)
+    assert lines[-1].endswith("calls counted against the maximum: not measured")
+    (tmp_path / BUDGET_FILE_NAME).write_text("7\n", encoding="ascii")
+    assert run.dry_run_summary({"provider": {"calls_made": 4}}, tmp_path)[-1].endswith(": 7")
+
+
+# --- A's conditions: the lock's identity, its release, and failing closed (K1) ----------------
+
+
+def _lock_is_free(path: Path) -> bool:
+    """Whether another open file description can take the lock at once (flock is per one)."""
+    descriptor = os.open(benchmarks.live.lock_path(path), os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def test_a_counter_made_before_the_lock_file_gets_one_and_the_cap_stays_exact(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / BUDGET_FILE_NAME
+    path.write_text("0\n", encoding="ascii")  # a counter as create_budget_file made it before
+    lock = benchmarks.live.lock_path(path)
+    assert not lock.exists()
+    processes = [_script(RESERVER, str(path), "200", "60") for _ in range(6)]
+    granted = []
+    for process in processes:
+        out, error = process.communicate(timeout=120)
+        assert process.returncode == 0, error
+        granted.append(int(out))
+    assert sum(granted) == 200
+    assert read_budget_file(path) == 200
+    assert lock.exists()
+
+
+def test_the_lock_file_keeps_its_identity_across_reservations(tmp_path: Path) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    lock = benchmarks.live.lock_path(path)
+    before = lock.stat().st_ino
+    budget = CallBudget(path, 50)
+    for _ in range(50):
+        budget.reserve()
+    with pytest.raises(ProviderCallBudgetExhausted):
+        budget.reserve()
+    assert lock.stat().st_ino == before
+    assert lock.read_bytes() == b""  # never written, truncated or replaced
+
+
+def test_the_lock_is_released_on_every_way_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    CallBudget(path, 1).reserve()
+    with pytest.raises(ProviderCallBudgetExhausted):
+        CallBudget(path, 1).reserve()
+    assert _lock_is_free(path)
+
+    def fail(path: Path, count: int) -> Path:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(benchmarks.live, "_write_temporary", fail)
+    with pytest.raises(OSError, match="No space"):
+        CallBudget(path, 5).reserve()
+    assert _lock_is_free(path)
+    monkeypatch.undo()
+    path.write_text("not a count\n", encoding="ascii")
+    with pytest.raises(ProviderCallBudgetFileInvalid):
+        CallBudget(path, 5).reserve()
+    assert _lock_is_free(path)
+
+
+def test_after_a_refusal_at_the_maximum_another_process_reserves_promptly(
+    tmp_path: Path,
+) -> None:
+    path = create_budget_file(tmp_path / BUDGET_FILE_NAME)
+    budget = CallBudget(path, 2)
+    budget.reserve()
+    budget.reserve()
+    with pytest.raises(ProviderCallBudgetExhausted):
+        budget.reserve()
+    other = _script(RESERVER, str(path), "3", "1")  # its own, larger maximum
+    out, error = other.communicate(timeout=10)  # a held lock would block it past this
+    assert other.returncode == 0, error
+    assert int(out) == 1
+    assert read_budget_file(path) == 3
+
+
+def test_a_counter_that_cannot_be_published_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(source: object, target: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "link", refuse)
+    path = tmp_path / BUDGET_FILE_NAME
+    with pytest.raises(benchmarks.live.CallCounterUnavailableError, match="Permission denied"):
+        create_budget_file(path)
+    assert not path.exists()  # never an in-place fallback
+    assert list(tmp_path.iterdir()) == []  # and the temporary file is gone
+    monkeypatch.undo()
+
+    def unsynced(directory: Path) -> None:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(benchmarks.live, "_sync_directory", unsynced)
+    with pytest.raises(benchmarks.live.CallCounterUnavailableError, match="could not create"):
+        create_budget_file(tmp_path / "other")
+
+
+def test_the_campaign_commands_refuse_a_cell_whose_counter_cannot_be_made() -> None:
+    assert issubclass(benchmarks.live.CallCounterUnavailableError, ValueError)  # "refused: ..."

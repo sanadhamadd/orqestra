@@ -1145,3 +1145,62 @@ def test_every_command_of_the_approved_plan_passes_its_tools_own_refusals(
         error = capsys.readouterr().err
         assert (code, error) == (0, ""), (cell.key, error)
         assert SENTINEL not in json.dumps(argv)
+
+
+# --- an unreadable counter never aborts the campaign (K1) -----------------------------------
+
+
+def empty_counter(raw: Path, run_id: str, written: float) -> Path:
+    """A counter left empty, as an in-place update torn by a kill used to leave it."""
+    path = raw / run_id / "cell" / BUDGET_FILE_NAME
+    path.parent.mkdir(parents=True)
+    path.write_text("")
+    os.utime(path, (written, written))
+    return path
+
+
+def test_an_unreadable_counter_is_not_measured_in_the_billing_check(raw_dir: Path) -> None:
+    counter(raw_dir, "fine", 12, 1_000.0)
+    assert campaign.counted_calls("fine") == 12
+    empty_counter(raw_dir, "torn", 1_000.0)
+    assert campaign.counted_calls("torn") is None  # never read as zero, never raised
+
+
+def test_a_crashed_cell_with_an_unreadable_counter_is_charged_its_maximum_and_logged(
+    tmp_path: Path, raw_dir: Path
+) -> None:
+    mix = "s4-run-invoice-2000-b25-w8-r1"
+
+    def crash_with_a_torn_counter(key: str, argv: Sequence[str]) -> dict[str, Any] | None:
+        if key == mix:
+            empty_counter(raw_dir, "tornmix", 4e9)  # written after the cell started
+            return None
+        return good_records(key, argv)
+
+    clock = iter(float(second) for second in range(1_000, 9_000, 10))
+    run = new_campaign(
+        tmp_path, FakeRunner(crash_with_a_torn_counter), live=True, clock=lambda: next(clock)
+    )
+    assert run.execute() == 0  # the campaign goes on and finishes
+    (unreadable,) = events(tmp_path, "counter_unreadable")
+    assert unreadable["cell"] == mix
+    assert unreadable["charged"] == "call_maximum"
+    assert unreadable["path"].endswith(BUDGET_FILE_NAME)
+    finished = {event["cell"]: event for event in events(tmp_path, "cell_finished")}
+    started = {event["cell"]: event for event in events(tmp_path, "cell_started")}
+    assert finished[mix]["charge_basis"] == "call_maximum"
+    expected = Decimal(started[mix]["call_maximum"]) * Decimal(started[mix]["ceiling"])
+    assert Decimal(finished[mix]["charge"]) == expected
+    assert events(tmp_path, "campaign_finished")
+    assert events(tmp_path, "campaign_stopped") == []
+
+    # Resumed, the counter is found in the cell's own window (from its start to the next
+    # cell's), still unreadable: the cell stays charged its maximum and it is logged again.
+    torn = raw_dir / "tornmix" / "cell" / BUDGET_FILE_NAME
+    inside = float(started[mix]["started_epoch"]) + 1
+    os.utime(torn, (inside, inside))
+    resumed = new_campaign(tmp_path, FakeRunner(good_records), live=True)
+    resumed.resume()
+    assert resumed.runs[mix].charge.basis is Basis.CALL_MAXIMUM
+    assert resumed.runs[mix].charge.cost == expected
+    assert len(events(tmp_path, "counter_unreadable")) == 2
