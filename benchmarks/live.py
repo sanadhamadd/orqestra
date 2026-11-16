@@ -26,10 +26,12 @@ No credential, prompt or response is ever logged or written: refusals name flags
 never values, and the result records only the choice and the call counts.
 """
 
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -176,17 +178,83 @@ def credential_from(environ: Mapping[str, str]) -> SecretStr | None:
 # --- the cell's call maximum ---------------------------------------------------------------
 
 
-def create_budget_file(path: Path) -> Path:
-    """Create the cell's counter holding 0; refuse if it already exists (never reset a count)."""
-    with path.open("x", encoding="ascii") as file:
-        file.write("0\n")
+# The counter is replaced whole, never edited in place, so a reader or a process that
+# outlives a killed one always finds a complete count. Updates are serialized by a lock
+# held on a separate file: the counter itself is swapped by each update, so a lock on it
+# would not be held on the file the next updater opens.
+LOCK_SUFFIX = ".lock"
+
+
+def lock_path(path: Path) -> Path:
+    """The lock file every update of the counter ``path`` holds while it runs."""
+    return path.with_name(path.name + LOCK_SUFFIX)
+
+
+def _open_lock(path: Path) -> int:
+    """A descriptor of ``path``'s lock file, created if missing (a counter made before it)."""
+    # Never O_TRUNC, O_EXCL, unlink, rename or replace: every process must lock the same
+    # inode, so the lock file's identity may never change while a cell can run.
+    return os.open(lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
+
+
+class CallCounterUnavailableError(ValueError):
+    """The cell's call counter could not be published; the cell must not start."""
+
+
+def _write_temporary(path: Path, count: int) -> Path:
+    """``count`` in a new, synced file beside ``path``, named so no counter glob matches it."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("x", encoding="ascii") as file:
+        file.write(f"{count}\n")
         file.flush()
         os.fsync(file.fileno())
+    return temporary
+
+
+def _sync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _discard(temporary: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        temporary.unlink()
+
+
+def create_budget_file(path: Path) -> Path:
+    """Create the cell's counter holding 0; refuse if it already exists (never reset a count).
+
+    The 0 is written to a temporary file first and published with ``os.link``, which is
+    atomic and fails if ``path`` exists, so the counter is never seen empty.
+    """
+    temporary = _write_temporary(path, 0)
+    failure: OSError | None = None
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        raise  # never reset a count
+    except OSError as exc:
+        failure = exc
+    finally:
+        _discard(temporary)
+    if failure is None:
+        try:
+            _sync_directory(path.parent)
+            os.close(_open_lock(path))
+        except OSError as exc:
+            failure = exc
+    if failure is not None:  # fail closed: never fall back to an in-place write
+        reason = failure.strerror or type(failure).__name__
+        msg = f"could not create the call counter {path}: {reason}"
+        raise CallCounterUnavailableError(msg)
     return path
 
 
 def read_budget_file(path: Path) -> int:
-    """The calls reserved so far."""
+    """The calls reserved so far. Lock-free: every update replaces the file whole."""
     return _count_of(path.read_text(encoding="ascii"))
 
 
@@ -198,7 +266,14 @@ def _count_of(text: str) -> int:
 
 
 class CallBudget:
-    """At most ``maximum`` reservations across every process that shares ``path``."""
+    """At most ``maximum`` reservations across every process that shares ``path``.
+
+    Each reservation holds an exclusive lock on ``lock_path(path)``, reads the count,
+    writes count + 1 to a synced temporary file and ``os.replace``s it over the counter.
+    A process killed at any point leaves the counter complete: the old count if it died
+    before the replace (it made no call: ``reserve`` had not returned), the new one after.
+    The kernel releases the lock of a process that dies.
+    """
 
     __slots__ = ("maximum", "path")
 
@@ -211,16 +286,21 @@ class CallBudget:
 
     def reserve(self) -> None:
         """Count one call, or raise ``ProviderCallBudgetExhausted`` if none is left."""
-        with self.path.open("r+", encoding="ascii") as file:
-            fcntl.flock(file.fileno(), fcntl.LOCK_EX)  # released when the file closes
-            count = _count_of(file.read())
+        lock = _open_lock(self.path)
+        try:  # the lock is released on every way out: refused, invalid, an OSError
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            count = read_budget_file(self.path)
             if count >= self.maximum:
                 raise ProviderCallBudgetExhausted
-            file.seek(0)
-            file.truncate()
-            file.write(f"{count + 1}\n")
-            file.flush()
-            os.fsync(file.fileno())
+            temporary = _write_temporary(self.path, count + 1)
+            try:
+                os.replace(temporary, self.path)
+            except BaseException:
+                _discard(temporary)
+                raise
+            _sync_directory(self.path.parent)
+        finally:
+            os.close(lock)  # closing the descriptor releases the flock
 
 
 class BudgetedRecorder:

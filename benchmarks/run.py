@@ -103,6 +103,7 @@ from benchmarks.live import (
     BUDGET_FILE_NAME,
     DOUBLE,
     DRY_RUN_LABEL,
+    ProviderCallBudgetFileInvalid,
     ProviderChoice,
     ProviderName,
     canned_requests,
@@ -1316,12 +1317,20 @@ def _extract_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> l
     return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
 
 
+def _counted(path: Path) -> int | str:
+    """The counter's count, or ``not measured`` when it cannot be read: never a crash."""
+    try:
+        return read_budget_file(path)
+    except (ProviderCallBudgetFileInvalid, OSError):
+        return metrics.NOT_MEASURED.replace("_", " ")
+
+
 def dry_run_summary(record: Mapping[str, Any], raw_dir: Path) -> list[str]:
     """What a dry run prints after its cell: the requests sent and the counts kept."""
     lines = [
         f"requests answered by the canned transport: {canned_requests(raw_dir)}",
         f"calls in the usage ledger: {record['provider']['calls_made']}",
-        f"calls counted against the maximum: {read_budget_file(raw_dir / BUDGET_FILE_NAME)}",
+        f"calls counted against the maximum: {_counted(raw_dir / BUDGET_FILE_NAME)}",
     ]
     return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
 
