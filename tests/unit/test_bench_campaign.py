@@ -609,14 +609,46 @@ def test_a_dry_runs_children_never_see_the_key() -> None:
     assert child_environment(environ, live=True) == environ
 
 
-def test_the_result_path_is_the_last_word_of_the_last_line(tmp_path: Path) -> None:
+def test_the_result_path_is_the_rest_of_the_last_line(tmp_path: Path) -> None:
     path = tmp_path / "r.json"
     path.write_text("{}")
     assert result_path(f"dry run: a line\ncomplete {path}\n") == path
     assert result_path(f"complete d1 {path}\n\n") == path
     assert result_path(f"complete {tmp_path / 'missing.json'}") is None
     assert result_path(f"complete {tmp_path}") is None
+    assert result_path("complete") is None
     assert result_path("") is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "complete {path}",  # benchmarks.run, and benchmarks.baseline's same shape
+        "failed_correctness {path}",
+        "complete d1 {path}",  # benchmarks.drills
+        "failed {path}",  # benchmarks.baseline
+    ],
+)
+@pytest.mark.parametrize(
+    "folder", ["Orqestra Project/bench workspace", "two  spaces", "trailing ", " d1 x"]
+)
+def test_a_result_path_with_spaces_is_read_whole(tmp_path: Path, line: str, folder: str) -> None:
+    path = tmp_path / folder / "20261116T000000Z-abc1234 cell.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}")
+    assert result_path(f"dry run: a line\n{line.format(path=path)}\n") == path
+
+
+def test_a_campaign_under_a_folder_with_spaces_reads_every_result(tmp_path: Path) -> None:
+    out_dir = tmp_path / "Orqestra Project" / "bench workspace"
+    out_dir.mkdir(parents=True)
+    runner = FakeRunner(good_records)
+    assert new_campaign(out_dir, runner).execute() == 0
+    finished = events(out_dir, "cell_finished")
+    assert len(finished) == len(runner.calls)
+    assert all(event["result"] is not None for event in finished)
+    assert all(" " in event["result"] for event in finished)
+    assert all(event["status"] == "complete" for event in finished)
 
 
 def test_running_workers_are_found_by_their_module(monkeypatch: pytest.MonkeyPatch) -> None:

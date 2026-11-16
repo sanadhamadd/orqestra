@@ -739,12 +739,21 @@ def workers_alive() -> list[int]:
 
 
 def result_path(stdout: str) -> Path | None:
-    """The result file a command named on its last line (``<status> [drill] <path>``)."""
+    """The result file a command named on its last line (``<status> [drill] <path>``).
+
+    The path is the rest of the line after the status (and after the drill's name, for
+    a drill), read whole: a folder name may contain spaces.
+    """
     lines = [line for line in stdout.splitlines() if line.strip()]
     if not lines:
         return None
-    candidate = Path(lines[-1].split()[-1])
-    return candidate if candidate.suffix == ".json" and candidate.is_file() else None
+    _, _, rest = lines[-1].partition(" ")
+    _, _, after_drill = rest.partition(" ")
+    for text in (rest, after_drill):
+        candidate = Path(text)
+        if text and candidate.suffix == ".json" and candidate.is_file():
+            return candidate
+    return None
 
 
 def read_record(path: Path | None) -> dict[str, Any] | None:
