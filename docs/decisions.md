@@ -1825,3 +1825,41 @@ recorded on PR #17.
   - `tests/integration/test_bench_live_pg.py`: a dry-run cell with a sentinel key in the parent environment passes its gate. Its ledger, counter and canned requests equal the oracle's calls, and neither the key nor the system prompt appears in the result file, any raw file, any process's argv, or the environment of any process the harness starts. A second cell with the maximum below the oracle's calls stops exactly there, with its failed tasks `permanent` and `provider_call_budget_exhausted`.
   - Every test replaces `HttpsTransport` with a class that fails when constructed, and blocks sockets.
 - **Cross-references:** DEC-051, DEC-055, DEC-057, DEC-059, DEC-060, DEC-062, DEC-065.
+
+### DEC-072 — One paid benchmark campaign: a low-cost hosted model through OpenRouter, a $45 campaign budget under a $50 hard cap, eight steps with gates enforced in code
+- **Status:** Accepted (owner, 2026-11-16: "approve, $50 cap, start building") · implemented (`benchmarks/campaign.py`, `benchmarks/baseline.py`) · no live call has been made
+- **WHAT:**
+  - **Scope of the approval.** One campaign of live calls, to show how long Orqestra takes on document work and to find what to improve. The model is a low-cost hosted model selected by the owner, recorded per run: the campaign takes it only as `--model` and writes it into each result. Calls go through the OpenRouter adapter (DEC-060), the usage ledger and the call maximum (DEC-071), routed on the owner's own provider key. The account carries a $50 hard cap; the campaign spends at most $45 of it, so the account cap is never the limit that stops a run.
+  - **The runner.** `python -m benchmarks.campaign run --model M (--allow-live-calls --price-in-per-mtok P --price-out-per-mtok Q | --dry-run)` runs the steps below in order. Every cell is one subprocess of an existing command (`benchmarks.run`, `benchmarks.drills`, `benchmarks.baseline`) against the isolated `orqestra_bench` database, so the campaign adds no second path to the provider. The key comes only from `ORQESTRA_OPENROUTER_API_KEY` in the environment, read from the macOS Keychain by the operator at run time; the campaign checks that it is set and passes it to live children in their environment only. A dry run removes it from every child environment and runs the whole campaign on the canned transport: no network, no key, no cost. The per-million-token prices are arguments, required for a live run, and recorded with the results.
+  - **Steps.** All cells use the extraction workload unless stated.
+    1. Pilot: 100 invoices, tasks of 25, 4 workers.
+    2. Worker scaling: 2,000 invoices, tasks of 25, at 1, 4, 8, 16 and 32 workers, 3 repetitions, interleaved by repetition.
+    3. Task size: 1,000 invoices in tasks of 5, 25 and 100 at 8 workers.
+    4. Rules first: the existing invoice mix (about 1 in 20 invoices calls the model), 10,000 invoices, tasks of 100, 8 workers, compared per invoice with step 2's 8-worker cells.
+    5. Failures: crash drill `d1` (2 workers killed) at 32 workers on 2,000 invoices, and one cell of 2,000 invoices in tasks of 5 at 32 workers to draw rate limits and retries from the real provider.
+    6. Billing check: no calls (below).
+    7. Plain-script baseline: the same 2,000 documents through a sequential loop and through a thread pool at 1, 4, 8, 16 and 32 threads, calling the same adapter without Orqestra.
+    8. Large run: at the step 2 worker count with the highest median throughput (ties to fewer workers), as many invoices as the remaining budget allows, up to 50,000.
+  - **Pilot gates.** The campaign stops after the pilot if field accuracy (matched over expected fields, all documents) is below 0.90, if the cost per call is above 3 × the $0.0006 estimate ($0.0018), or if any call failed permanently or the pilot cell is not `complete`. A missing figure fails its gate.
+  - **Budget.** Before every cell the campaign recomputes what it has spent from its own result files. Each cell is charged the larger of its ledger tokens × the given prices and its ledger credits, over every ledger call (a retry re-calls a whole task). A cell whose result has no token figures is charged its calls × the per-call ceiling, and a cell with no readable result its whole call maximum × the ceiling: unknown spend is never zero. The ceiling is $0.0018 until the pilot passes, then 1.25 × the larger of the observed cost per call and $0.0006. Each cell's `--max-provider-calls` is its expected calls + 10 % + one task per worker; a cell whose maximum × ceiling exceeds the remaining budget is skipped (steps 1 to 7: a smaller cell would no longer compare), and the large run is sized to fit. The call maximum is enforced by the existing counter (DEC-071), so no cell can spend past the budget it was given.
+  - **Billing check.** Per cell and in total, the ledger's calls, tokens, token-priced cost and credits beside each cell's independent call counter, with their differences reported, never assumed zero. Under own-key routing the credits and the token-priced cost can differ. The provider's own figure is entered afterwards with `python -m benchmarks.campaign reconcile <id> --provider-reported-usd X`.
+  - **Records.** Results go under `benchmarks/results/campaigns/<id>/` (a dry run's under `build/bench/campaigns/<id>/`), beside `campaign-log.jsonl`, one event per line (each command, budget figures, every gate decision with its value and threshold, skips and sizing, result paths and exit codes), and the `campaign.json` summary. `report.py` reads neither, so published tables are unchanged. `--resume <id>` never reruns a started cell.
+  - **Provider surface.** The extraction workload extends the adapter with one extraction call and lets the ledger carry tokens and latency, with an intent that names no amount; its pull request lists the exact change. The ledger still holds no prices (DEC-062): prices exist only in the campaign's arguments and result files.
+- **WHY:** the owner approved the spend and its cap for this purpose. Running every cell through the existing commands keeps one tested path to the provider and the ledger, and the call maximum turns the budget into a bound enforced before each request rather than an accounting after it.
+- **RUNNER-UP:**
+  - (a) a campaign that calls `run_cell` in process;
+  - (b) the budget checked once per step instead of per cell;
+  - (c) shrinking every cell that does not fit.
+- **WHY NOT:**
+  - (a) one crash or leak in a cell would take the campaign and its log with it, and the commands' refusals would be bypassed.
+  - (b) a 15-cell step could overrun before the next check.
+  - (c) a shrunken scaling or task-size cell no longer compares with its neighbours; only the large run has no neighbour.
+- **TRADE-OFF:**
+  - The charge rules overstate rather than understate, so the campaign may skip cells it could have afforded.
+  - Limits: generated plain-text documents, not scans or real invoices; one machine, one model, one provider route; one repetition of each failure test; the provider's own usage figure is entered by hand. A live model's speed and errors on another day may differ.
+  - Step 4 compares per-invoice figures across two sizes instead of rerunning extraction at 10,000 invoices, which would cost about $6 for the same figures.
+- **VERIFICATION:**
+  - `tests/unit/test_bench_campaign.py`: each gate at and just past its threshold; budget charges for every record shape, including a missing result; skipped cells; the large run's sizing and worker choice; the call maximum each cell is given; the dry run's child environment without the key and with `--dry-run`; refusals; resume; the log; no network module imported.
+  - `tests/unit/test_bench_baseline.py`: the loop and the thread pool on a stub extraction, the call counter, retries on transient errors only, and every recorded field.
+  - `tests/integration/test_bench_campaign_pg.py`: the campaign's charge for a dry-run cell equals what the cell's usage ledger holds.
+- **Cross-references:** DEC-054, DEC-060, DEC-062, DEC-065, DEC-071.
