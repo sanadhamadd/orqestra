@@ -57,6 +57,7 @@ from benchmarks.live import (
     BUDGET_FILE_NAME,
     OPENROUTER,
     OPENROUTER_USAGE_UNIT,
+    ProviderCallBudgetFileInvalid,
     ProviderChoice,
     ProviderName,
     canned_requests,
@@ -484,11 +485,28 @@ def best_workers(scaling: Sequence[tuple[int, Figures]]) -> int | None:
     return min(medians, key=lambda workers: (-medians[workers], workers))
 
 
+class CounterUnreadable(Exception):  # noqa: N818 - a reason to charge the maximum, not a defect
+    """A call counter could not be read; the cell is charged its whole call maximum."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"call counter unreadable: {path}")
+        self.path = path
+
+
+def read_counter(path: Path) -> int | None:
+    """``path``'s count, or ``None`` if it cannot be read (it is then not measured)."""
+    try:
+        return read_budget_file(path)
+    except (ProviderCallBudgetFileInvalid, OSError):
+        return None
+
+
 def reservations_between(start: float, end: float | None) -> int | None:
     """The calls reserved by every call counter last written in ``[start, end)``.
 
     Cells run one at a time and no worker outlives its cell (``Campaign`` checks), so the
-    counters written while a cell ran are that cell's. ``None`` when there are none.
+    counters written while a cell ran are that cell's. ``None`` when there are none;
+    ``CounterUnreadable`` when one of them cannot be read.
     """
     if not RAW_DIR.is_dir():
         return None
@@ -498,7 +516,10 @@ def reservations_between(start: float, end: float | None) -> int | None:
             continue
         written = path.stat().st_mtime
         if written >= start and (end is None or written < end):
-            total = (total or 0) + read_budget_file(path)
+            count = read_counter(path)
+            if count is None:
+                raise CounterUnreadable(path)
+            total = (total or 0) + count
     return total
 
 
@@ -877,7 +898,7 @@ class Campaign:
             reserved = None
             if figures is None or figures.calls is None:
                 end = None if following is None else float(following["started_epoch"])
-                reserved = reservations_between(float(event["started_epoch"]), end)
+                reserved = self._reserved(key, float(event["started_epoch"]), end)
             charge = charge_for(figures, ceiling=ceiling, call_maximum=maximum, reserved=reserved)
             self.runs[key] = CellRun(
                 key,
@@ -889,6 +910,22 @@ class Campaign:
                 figures,
                 charge,
             )
+
+    def _reserved(self, cell_key: str, start: float, end: float | None) -> int | None:
+        """The reservations of a cell that left no result. An unreadable counter is
+        logged, and the cell is then charged its whole call maximum (``None``)."""
+        try:
+            return reservations_between(start, end)
+        except CounterUnreadable as exc:
+            self.log.write(
+                {
+                    "event": "counter_unreadable",
+                    "cell": cell_key,
+                    "path": str(exc.path),
+                    "charged": Basis.CALL_MAXIMUM.value,
+                }
+            )
+            return None
 
     def _workers_quiet(self) -> bool:
         """No cell starts while a benchmark worker from an earlier one is still running."""
@@ -949,7 +986,7 @@ class Campaign:
         figures = None if record is None else step_figures(record)
         reserved = None
         if figures is None or figures.calls is None:
-            reserved = reservations_between(began, None)
+            reserved = self._reserved(cell.key, began, None)
         charge = charge_for(
             figures, ceiling=ceiling, call_maximum=cell.call_maximum, reserved=reserved
         )
@@ -1172,7 +1209,10 @@ def counted_calls(record_run_id: str | None) -> int | None:
     files = sorted((RAW_DIR / record_run_id).glob(f"**/{BUDGET_FILE_NAME}"))
     if not files:
         return None
-    return sum(read_budget_file(path) for path in files)
+    counts = [read_counter(path) for path in files]
+    if any(count is None for count in counts):
+        return None  # not measured: an unreadable counter is never read as zero
+    return sum(count for count in counts if count is not None)
 
 
 def transport_requests(record_run_id: str | None) -> int | None:
