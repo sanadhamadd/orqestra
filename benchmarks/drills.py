@@ -44,6 +44,27 @@ its own signal handlers.
 Nothing here predicts a duration. Delays are measured from stored PostgreSQL
 timestamps and recorded; the checks assert outcomes and the order of stored
 timestamps only.
+
+**Machine load.** Every drill samples the workers' CPU and memory, the
+machine's memory and load, and the database's connections while it runs
+(``benchmarks.sysload``), and records the summary as ``resources.sysload``.
+
+**A live provider (d1 only).** ``d1`` accepts the provider flags of
+``benchmarks.run`` (DEC-071): the offline double stays the default, and
+``--provider openrouter`` needs ``--model``, ``--max-provider-calls`` and
+``--dry-run`` or ``--allow-live-calls``. The drill's call counter is created in
+its raw directory before any worker starts, and every worker, the replacements
+of killed ones included, shares it, so the maximum covers the whole drill. The
+workers' execution timeout is raised just enough to fit the call cap at the
+chosen ``--call-timeout`` (``live_worker_settings``); lease, heartbeat and
+recovery settings stay those of the double's drills. ``d1`` then also records
+the delay from each kill to the next attempt, the tasks that did not succeed
+(``no_lost_tasks``: none may), the calls beyond the oracle's in the attempts
+that succeeded (``no_duplicate_calls``: none may) and the calls the killed
+attempts made for tasks that later succeeded, which is the documented price of
+at-least-once execution (ADR-0005), recorded, not gated. The ledger holds no
+request identity (DEC-057), so calls are counted per invoice: in this workload
+each ambiguous invoice is asked about exactly once.
 """
 
 import argparse
@@ -61,6 +82,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -87,6 +109,13 @@ from benchmarks.generate import (
     generate_invoices,
     kind_of,
 )
+from benchmarks.live import (
+    BUDGET_FILE_NAME,
+    DOUBLE,
+    ProviderChoice,
+    create_budget_file,
+    provider_block,
+)
 from benchmarks.result import (
     RAW_DIR,
     RESULTS_DIR,
@@ -108,14 +137,18 @@ from benchmarks.run import (
     Profile,
     WorkerHandle,
     add_common_arguments,
+    add_provider_arguments,
+    bench_settings,
     failure_figures,
     process_environment,
+    provider_refusal,
     refuse_dirty,
     run_gate,
     submit,
     usage_figures,
     worker_command,
 )
+from benchmarks.sysload import SysloadSampler
 from benchmarks.worker import DEFAULT_CALL_TIMEOUT, DEFAULT_CAP, parse_duration
 from orqestra.aggregation.usage import AttemptCapture, attempt_capture
 from orqestra.domain.jobs import JobProgress, JobStatus, JsonValue
@@ -125,6 +158,7 @@ from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.migrate import migrate
 from orqestra.persistence.snapshots import job_batch_snapshot
 from orqestra.worker.fence import ExitCode
+from orqestra.worker.usage import check_provider_call_budget, usage_handoff_bound
 from orqestra.workloads.invoice.handler import BATCH_PAYLOAD_INVALID, JOB_KIND
 from tests.integration.pg_proxy import PgProxy
 
@@ -442,13 +476,23 @@ class KillDrill(Drill):
 
     name = "d1"
 
-    def __init__(self, victims: int, *, at_call_boundary: bool = False) -> None:
+    def __init__(
+        self,
+        victims: int,
+        *,
+        at_call_boundary: bool = False,
+        expected_calls: Mapping[int, int] | None = None,
+    ) -> None:
+        """``expected_calls`` is the oracle's calls per invoice index
+        (``expected_calls_by_item``). With it, the drill also checks that no task was
+        lost and no call was duplicated; ``python -m benchmarks.drills d1`` passes it."""
         super().__init__()
         if victims < 1:
             msg = "d1 needs at least one victim"
             raise ValueError(msg)
         self.victims = victims
         self.at_call_boundary = at_call_boundary
+        self.expected_calls = expected_calls
 
     def step(self, poll: Poll) -> None:
         if self.injected or not poll.reached():
@@ -539,6 +583,17 @@ class KillDrill(Drill):
                 {"read": [str(c) for c in read], "expected": [str(c) for c in wanted]},
             ),
             _check("victims_ledger_kept", all(a == b for a, b in kept), {"rows": kept}),
+            *self._outcome_checks(conn, job_id),
+        ]
+
+    def _outcome_checks(self, conn: Conn, job_id: uuid.UUID) -> list[Check]:
+        if self.expected_calls is None:
+            return []
+        lost = lost_tasks(conn, job_id)
+        duplicates = duplicate_calls(_succeeded_calls(conn, job_id), self.expected_calls)
+        return [
+            _check("no_lost_tasks", lost == 0, {"lost_tasks": lost}),
+            _check("no_duplicate_calls", duplicates == 0, {"duplicate_calls": duplicates}),
         ]
 
     def measured(self, conn: Conn, job_id: uuid.UUID, fleet: DrillFleet) -> dict[str, Any]:
@@ -552,6 +607,11 @@ class KillDrill(Drill):
             _seconds(v["next_started_at"] - v["lease_expires_at"])
             for v in victims
             if v["next_started_at"] is not None
+        ]
+        from_kill = [
+            _seconds(v["next_started_at"] - datetime.fromisoformat(v["killed_at"]))
+            for v in victims
+            if v["next_started_at"] is not None and v["killed_at"] is not None
         ]
         return {
             "victims": [
@@ -572,7 +632,87 @@ class KillDrill(Drill):
             "recovery_delay_formula": (
                 "next attempt's started_at - revoked attempt's lease_expires_at"
             ),
+            "recovery_from_kill_s": metrics.percentiles([s for s in from_kill if s is not None]),
+            "recovery_from_kill_formula": (
+                "next attempt's started_at - the kill (clock_timestamp() read just before it)"
+            ),
+            "lost_tasks": lost_tasks(conn, job_id),
+            "duplicate_calls": (
+                None
+                if self.expected_calls is None
+                else duplicate_calls(_succeeded_calls(conn, job_id), self.expected_calls)
+            ),
+            "repeated_calls_after_recovery": _count_one(conn, _REPEATED_CALLS, job_id),
+            "calls_formula": (
+                "duplicate: calls beyond the oracle's per invoice in succeeded attempts; "
+                "repeated: calls of attempts that did not succeed, in tasks that succeeded"
+            ),
         }
+
+
+_LOST_TASKS = "SELECT count(*) FROM tasks WHERE job_id = %s AND state <> 'succeeded'"
+_SUCCEEDED_CALLS = (
+    "SELECT c.item_index, count(*) FROM provider_calls c JOIN attempts a ON a.id = c.attempt_id "
+    "WHERE c.job_id = %s AND a.state = 'succeeded' AND c.item_index IS NOT NULL GROUP BY 1"
+)
+_REPEATED_CALLS = (
+    "SELECT count(*) FROM provider_calls c JOIN attempts a ON a.id = c.attempt_id "
+    "JOIN tasks t ON t.id = a.task_id "
+    "WHERE c.job_id = %s AND a.state <> 'succeeded' AND t.state = 'succeeded'"
+)
+
+
+def _count_one(conn: Conn, query: str, *params: object) -> int:
+    return int(_one(conn, query, *params)[0])
+
+
+def lost_tasks(conn: Conn, job_id: uuid.UUID) -> int:
+    """Tasks of the job that did not succeed (d1 expects every task to)."""
+    return _count_one(conn, _LOST_TASKS, job_id)
+
+
+def _succeeded_calls(conn: Conn, job_id: uuid.UUID) -> list[tuple[int, int]]:
+    return [(int(index), int(count)) for index, count in conn.execute(_SUCCEEDED_CALLS, (job_id,))]
+
+
+def duplicate_calls(calls: Sequence[tuple[int, int]], expected: Mapping[int, int]) -> int:
+    """Calls beyond the oracle's, summed over invoices: ``(item_index, calls)`` rows of the
+    attempts that succeeded against ``item_index -> expected calls``."""
+    return sum(max(count - expected.get(index, 0), 0) for index, count in calls)
+
+
+def expected_calls_by_item(count: int, batch_size: int, cap: int) -> dict[int, int]:
+    """The oracle's provider calls per invoice index, by ``expected_outcome``'s rule: one
+    for each ambiguous invoice, while its batch's per-attempt cap leaves a call."""
+    calls: dict[int, int] = {}
+    for start in range(0, count, batch_size):
+        remaining = cap
+        for index in range(start, min(start + batch_size, count)):
+            if kind_of(index) is Kind.AMBIGUOUS and remaining >= 1:
+                remaining -= 1
+                calls[index] = 1
+    return calls
+
+
+EXECUTION_TIMEOUT = "ORQESTRA_WORKER_EXECUTION_TIMEOUT"
+
+
+def live_worker_settings(
+    worker_settings: Mapping[str, str], cap: int, call_timeout: str
+) -> dict[str, str]:
+    """``worker_settings`` with the execution timeout raised just enough for ``cap`` calls of
+    ``call_timeout`` each (``check_provider_call_budget``'s rule), in whole seconds; nothing
+    else changes, and settings that already fit are returned unchanged."""
+    settings = bench_settings(worker_settings)
+    timeout = parse_duration(call_timeout)
+    needed = cap * (timeout + 2 * usage_handoff_bound(settings)) + settings.fence_margin
+    copied = dict(worker_settings)
+    if needed > settings.execution_timeout:
+        copied[EXECUTION_TIMEOUT] = f"PT{math.ceil(needed.total_seconds())}S"
+    check_provider_call_budget(
+        bench_settings(copied), max_provider_calls_per_attempt=cap, provider_call_timeout=timeout
+    )
+    return copied
 
 
 class FreezeDrill(Drill):
@@ -1095,18 +1235,47 @@ def run_drill(
     stop_after: float,
     run_id: str | None = None,
     note: str = "",
+    provider: ProviderChoice = DOUBLE,
+    call_timeout: str = DEFAULT_CALL_TIMEOUT,
 ) -> dict[str, Any]:
-    """Run ``drill`` against the migrated schema ``url``; its format 1 result record."""
+    """Run ``drill`` against the migrated schema ``url``; its format 1 result record.
+
+    ``provider`` is the double unless ``d1`` was given ``--provider openrouter``:
+    then the drill's call counter is created in ``raw_dir`` before any worker
+    starts, and the workers' execution timeout fits ``call_timeout``.
+    """
     if cell.profile is not Profile.INVOICE:
         msg = "drills run the invoice profile"
         raise ValueError(msg)
+    if provider.openrouter and (drill.name != "d1" or command is not None):
+        msg = "--provider openrouter runs only with d1"
+        raise ValueError(msg)
+    refusal = provider_refusal(
+        provider, cell, call_timeout if provider.openrouter else None, os.environ
+    )
+    if refusal is not None:
+        raise ValueError(refusal)
     run_id = run_id or uuid.uuid4().hex[:12]
+    budget_file: Path | None = None
+    if provider.openrouter:
+        worker_settings = live_worker_settings(worker_settings, DEFAULT_CAP, call_timeout)
     raw_dir.mkdir(parents=True, exist_ok=True)
-    env = process_environment(drill.worker_url(url), worker_settings)
+    env = process_environment(drill.worker_url(url), worker_settings, provider)
+    if provider.openrouter:
+        budget_file = create_budget_file(raw_dir / BUDGET_FILE_NAME)
     fleet = DrillFleet(
-        cell.profile, env, raw_dir, command=list(command or worker_command(Profile.INVOICE))
+        cell.profile,
+        env,
+        raw_dir,
+        command=list(
+            command or worker_command(Profile.INVOICE, provider, budget_file, call_timeout)
+        ),
     )
     harness = Harness(url)
+    sysload = SysloadSampler(
+        lambda: [h.process.pid for h in fleet.workers if h.exited is None],
+        partial(psycopg.connect, url, autocommit=True),
+    )
     operation = parse_duration(worker_settings["ORQESTRA_WORKER_DB_OPERATION_TIMEOUT"])
     quiet = 2 * operation.total_seconds() + 1.0  # a statement outlives its bound by little
     seen: set[int] = set()
@@ -1120,6 +1289,7 @@ def run_drill(
         job_id, submission = submit(url, JOB_KIND, workload.tasks, raw_dir)
         for _ in range(cell.workers):
             fleet.start()
+        sysload.start()
         began = time.monotonic()
         while time.monotonic() - began < stop_after:
             counts = harness.progress(job_id).task_counts
@@ -1136,6 +1306,7 @@ def run_drill(
         harness.close()
         raise
     finally:
+        load = sysload.stop()  # before the workers stop: it covers the drill, not the shutdown
         # Each step runs even if an earlier one raised: a frozen worker is continued,
         # every worker is stopped and reaped, and the proxy is closed.
         try:
@@ -1160,6 +1331,7 @@ def run_drill(
             expected_status=workload.status,
             expected_failed=workload.failed,
             expected_exit_codes=wanted,
+            provider=provider,
         )
         gate += drill.checks(conn, job_id, fleet)
         figures = metrics.timing_figures(metrics.read_stored_times(conn, job_id))
@@ -1181,7 +1353,17 @@ def run_drill(
         "cell": {**asdict(cell), "profile": cell.profile.value},
         "environment": record_environment,
         "worker_settings": dict(worker_settings),
-        "provider": {"call_timeout": DEFAULT_CALL_TIMEOUT, "cap": DEFAULT_CAP, "route": "route-a"},
+        "provider": (
+            provider_block(
+                provider,
+                call_timeout=call_timeout,
+                cap=DEFAULT_CAP,
+                route="route-a",
+                calls_made=None if usage is None else usage["calls"],
+            )
+            if provider.openrouter
+            else {"call_timeout": DEFAULT_CALL_TIMEOUT, "cap": DEFAULT_CAP, "route": "route-a"}
+        ),
         "timing": {
             **figures["timing"],
             "submission": submission,
@@ -1196,6 +1378,7 @@ def run_drill(
         "resources": {
             "workers": reaped,
             "harness": metrics.harness_delta(harness_start, metrics.harness_usage()),
+            "sysload": load,
         },
         "database_stats": None,
         "contention": None,
@@ -1235,7 +1418,10 @@ def _jobs(
     workload = standard_workload(invoices, args.batch)
     drill: Drill
     if name == "d1":
-        drill = KillDrill(args.victims)
+        drill = KillDrill(
+            args.victims,
+            expected_calls=expected_calls_by_item(args.invoices, args.batch, DEFAULT_CAP),
+        )
     elif name == "d2":
         lease = parse_duration(BENCH_WORKER_SETTINGS["ORQESTRA_WORKER_LEASE"])
         drill = FreezeDrill(lease.total_seconds() + FREEZE_EXTRA)
@@ -1275,6 +1461,8 @@ def run_named(name: str, args: argparse.Namespace, url: str) -> list[tuple[dict[
                 stop_after=args.stop_after,
                 run_id=run_id,
                 note=args.note,
+                provider=choice_of(args),
+                call_timeout=args.call_timeout or DEFAULT_CALL_TIMEOUT,
             )
             written.append(
                 (record, write_result(record, args.out_dir, allow_dirty=args.allow_dirty))
@@ -1284,6 +1472,35 @@ def run_named(name: str, args: argparse.Namespace, url: str) -> list[tuple[dict[
                 with connect_verified(url) as admin:
                     drop_run_schema(admin, schema)
     return written
+
+
+def choice_of(args: argparse.Namespace) -> ProviderChoice:
+    """The provider the command line chose; the double unless ``--provider openrouter``."""
+    return ProviderChoice(
+        name=args.provider,
+        model=args.model,
+        max_provider_calls=args.max_provider_calls,
+        allow_live_calls=args.allow_live_calls,
+        dry_run=args.dry_run,
+    )
+
+
+def drill_provider_refusal(args: argparse.Namespace, environ: Mapping[str, str]) -> str | None:
+    """Why the provider flags may not run this drill, or ``None``; nothing is touched."""
+    choice = choice_of(args)
+    if choice.openrouter and args.drill != "d1":
+        return "--provider openrouter runs only with d1"
+    cell = Cell(Profile.INVOICE, args.invoices, args.batch, args.workers)
+    refusal = provider_refusal(choice, cell, args.call_timeout, environ)
+    if refusal is not None or not choice.openrouter:
+        return refusal
+    try:
+        live_worker_settings(
+            BENCH_WORKER_SETTINGS, DEFAULT_CAP, args.call_timeout or DEFAULT_CALL_TIMEOUT
+        )
+    except (TypeError, ValueError) as exc:
+        return f"--call-timeout does not fit the worker settings: {exc}"
+    return None
 
 
 def _first_line(exc: BaseException) -> str:
@@ -1307,9 +1524,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="d3b only: allow restarting the orqestra-bench project's server",
     )
     add_common_arguments(parser)
+    add_provider_arguments(parser)
     parser.set_defaults(out_dir=DRILLS_DIR)
     args = parser.parse_args(argv)
     try:
+        refusal = drill_provider_refusal(args, os.environ)
+        if refusal is not None:
+            raise ValueError(refusal)
         if args.drill == "d3b":
             check_restart_allowed(args.allow_db_restart, os.environ)
         if args.drill == "d1" and args.victims > args.workers:

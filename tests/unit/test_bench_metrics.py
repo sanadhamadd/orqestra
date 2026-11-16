@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -750,3 +751,72 @@ def test_a_result_file_alone_does_not_make_the_tree_dirty(tmp_path: Path) -> Non
     (tmp_path / "benchmarks" / "other.py").unlink()
     (tmp_path / "code.py").write_text("x = 2\n")
     assert code_state(tmp_path)["git_dirty"] is True
+
+
+# --- the extraction block the report reads (T1's pinned shape) -------------------------------
+
+
+def _extraction() -> dict[str, Any]:
+    return {
+        "documents": 40,
+        "calls": {"latency_ms": {"n": 40, "p50": 812, "p95": 1490, "p99": 2210, "max": 2600}},
+        "time_split": {"provider_share": 0.75},
+        "accuracy": {"overall": 0.95},
+        "needs_review": {"count": 2},
+        "cost": {"currency": "USD", "prices": {"canned": False}, "per_1000_invoices": "0.4210"},
+        "retries": 3,
+        "transient_errors": {"rate_limited": 5},
+    }
+
+
+def test_a_complete_extraction_block_passes() -> None:
+    metrics.check_extraction(_extraction())
+    empty = _extraction()
+    empty["calls"]["latency_ms"] = {"n": 0, "p50": None, "p95": None, "p99": None, "max": None}
+    empty["time_split"]["provider_share"] = None
+    empty["accuracy"]["overall"] = None
+    metrics.check_extraction(empty)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("documents",), -1, "extraction.documents must be a count"),
+        (("documents",), True, "extraction.documents must be a count"),
+        (("calls", "latency_ms", "p95"), "1490", "calls.latency_ms.p95 must be a number"),
+        (("time_split", "provider_share"), "0.75", "provider_share must be a number"),
+        (("cost", "per_1000_invoices"), 0.421, "per_1000_invoices must be decimal text"),
+        (("cost", "per_1000_invoices"), "-1", "per_1000_invoices must be decimal text"),
+        (("cost", "prices", "canned"), "no", "canned must be true or false"),
+        (("transient_errors", "rate_limited"), None, "rate_limited must be a count"),
+    ],
+)
+def test_a_bad_extraction_figure_is_refused(
+    path: tuple[str, ...], value: object, message: str
+) -> None:
+    block = _extraction()
+    target: Any = block
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
+        metrics.check_extraction(block)
+
+
+@pytest.mark.parametrize("text", ["0", "0.4210", "3E-7", "1.5e+2", "0E-8"])
+def test_decimal_text_in_any_notation_is_accepted(text: str) -> None:
+    assert metrics.decimal_text(text) == Decimal(text)
+
+
+@pytest.mark.parametrize("text", ["", " 1", "-1", "-0", "NaN", "Infinity", "1,5", "abc", 0.5])
+def test_anything_else_is_not_decimal_text(text: object) -> None:
+    assert metrics.decimal_text(text) is None
+
+
+def test_a_missing_extraction_figure_is_named() -> None:
+    block = _extraction()
+    del block["needs_review"]
+    with pytest.raises(ValueError, match=r"extraction\.needs_review\.count is missing"):
+        metrics.check_extraction(block)
+    with pytest.raises(ValueError, match="must be an object"):
+        metrics.check_extraction([])

@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, NoReturn, cast
 
 import psycopg
@@ -28,6 +29,9 @@ from benchmarks.drills import (
     check_restart_target,
     wait_over,
 )
+from benchmarks.generate import generate_invoices
+from benchmarks.live import BUDGET_FILE_NAME, DOUBLE, ProviderChoice, ProviderName
+from benchmarks.run import BENCH_WORKER_SETTINGS, Cell, Profile
 from orqestra.domain.states import TaskState
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
@@ -397,3 +401,152 @@ def test_a_failed_in_flight_read_continues_the_victim_and_raises(
 
     assert signals == [(4242, signal.SIGCONT)]
     assert drill.killed == set()
+
+
+# --- the crash drill with a live provider (DEC-071, T2) ------------------------------------
+
+MODEL = "vendor/model-a"
+SENTINEL = "sk-or-v1-SENTINEL-not-a-real-key-0123456789abcdef"
+DRY = ["--provider", "openrouter", "--model", MODEL, "--max-provider-calls", "50", "--dry-run"]
+
+
+def test_d1_accepts_the_provider_flags(named: list[str]) -> None:
+    assert benchmarks.drills.main(["d1", *DRY]) == 0
+    assert named == ["d1"]
+
+
+def test_the_double_stays_the_default(monkeypatch: pytest.MonkeyPatch, named: list[str]) -> None:
+    chosen: list[ProviderChoice] = []
+
+    def run_named(name: str, args: Any, url: str) -> list[object]:
+        chosen.append(benchmarks.drills.choice_of(args))
+        return []
+
+    monkeypatch.setattr(benchmarks.drills, "run_named", run_named)
+    assert benchmarks.drills.main(["d1"]) == 0
+    assert chosen == [DOUBLE]
+
+
+@pytest.mark.parametrize("drill", ["d2", "d3a", "d3b", "d4"])
+def test_every_other_drill_refuses_the_provider(
+    named: list[str], capsys: pytest.CaptureFixture[str], drill: str
+) -> None:
+    assert benchmarks.drills.main([drill, *DRY]) == 1
+    assert capsys.readouterr().err == "refused: --provider openrouter runs only with d1\n"
+    assert named == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "fragment"),
+    [
+        (["--provider", "openrouter", "--model", MODEL, "--max-provider-calls", "5"], "--dry-run"),
+        (["--provider", "openrouter", "--max-provider-calls", "5", "--dry-run"], "needs --model"),
+        (["--provider", "openrouter", "--model", MODEL, "--dry-run"], "--max-provider-calls"),
+        ([*DRY[:5], "2", "--dry-run", "--workers", "4", "--victims", "1"], "--workers is above"),
+        (["--call-timeout", "PT1S"], "--call-timeout applies only"),
+        ([*DRY, "--allow-live-calls"], "contradict"),
+    ],
+)
+def test_the_l1_refusals_reach_the_drill_before_any_database(
+    named: list[str],
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    fragment: str,
+) -> None:
+    assert benchmarks.drills.main(["d1", *arguments]) == 1
+    assert fragment in capsys.readouterr().err
+    assert named == []
+
+
+def test_a_live_drill_without_the_key_is_refused(
+    named: list[str], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ORQESTRA_OPENROUTER_API_KEY", raising=False)
+    live = [*DRY[:-1], "--allow-live-calls", "--call-timeout", "PT30S"]
+    assert benchmarks.drills.main(["d1", *live]) == 1
+    assert "ORQESTRA_OPENROUTER_API_KEY is not set" in capsys.readouterr().err
+    assert named == []
+
+
+def test_a_live_timeout_raises_only_the_execution_timeout() -> None:
+    settings = benchmarks.drills.live_worker_settings(BENCH_WORKER_SETTINGS, 16, "PT30S")
+    # 16 x (30 s + 2 x 3 s hand-off) + 2 s fence margin = 578 s.
+    assert settings == {**BENCH_WORKER_SETTINGS, "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT578S"}
+    unchanged = benchmarks.drills.live_worker_settings(BENCH_WORKER_SETTINGS, 16, "PT0.1S")
+    assert unchanged == dict(BENCH_WORKER_SETTINGS)
+
+
+def test_expected_calls_per_item_match_the_oracle() -> None:
+    from benchmarks.generate import expected_outcome
+
+    for count, batch, cap in [(2_000, 100, 16), (1_000, 25, 16), (997, 40, 1), (300, 300, 3)]:
+        by_item = benchmarks.drills.expected_calls_by_item(count, batch, cap)
+        expected = expected_outcome(generate_invoices(count), batch, cap)
+        assert sum(by_item.values()) == expected.calls, (count, batch, cap)
+        assert set(by_item.values()) <= {1}
+
+
+def test_duplicate_calls_count_only_calls_beyond_the_oracle() -> None:
+    expected = {7: 1, 27: 1}
+    assert benchmarks.drills.duplicate_calls([(7, 1), (27, 1)], expected) == 0
+    assert benchmarks.drills.duplicate_calls([(7, 2), (27, 1)], expected) == 1
+    assert benchmarks.drills.duplicate_calls([(7, 1), (8, 3)], expected) == 3  # 8 expects none
+    assert benchmarks.drills.duplicate_calls([], expected) == 0
+
+
+class _Stop(Exception):  # noqa: N818 - ends run_drill once its workers' setup is known
+    pass
+
+
+def test_a_live_drill_passes_the_key_only_in_the_workers_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.setenv("ORQESTRA_OPENROUTER_API_KEY", SENTINEL)
+    seen: dict[str, Any] = {}
+
+    def fleet(profile: object, env: dict[str, str], raw_dir: object, *, command: list[str]) -> None:
+        seen["env"], seen["command"] = env, command
+
+    def harness(url: str) -> NoReturn:
+        raise _Stop
+
+    monkeypatch.setattr(benchmarks.drills, "DrillFleet", fleet)
+    monkeypatch.setattr(benchmarks.drills, "Harness", harness)
+    choice = ProviderChoice(
+        name=ProviderName.OPENROUTER, model=MODEL, max_provider_calls=50, allow_live_calls=True
+    )
+    with pytest.raises(_Stop):
+        benchmarks.drills.run_drill(
+            "postgresql:///never-connected",
+            Cell(Profile.INVOICE, 200, 100, 2),
+            KillDrill(1),
+            benchmarks.drills.standard_workload(generate_invoices(200), 100),
+            raw_dir=tmp_path,
+            stop_after=1.0,
+            provider=choice,
+            call_timeout="PT30S",
+        )
+    command, env = seen["command"], seen["env"]
+    assert "--allow-live-calls" in command
+    assert command[command.index("--budget-file") + 1] == str(tmp_path / BUDGET_FILE_NAME)
+    assert (tmp_path / BUDGET_FILE_NAME).read_text(encoding="ascii") == "0\n"
+    assert not [part for part in command if SENTINEL in part]
+    assert [key for key, value in env.items() if SENTINEL in value] == [
+        "ORQESTRA_OPENROUTER_API_KEY"
+    ]
+    assert env["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == "PT578S"
+
+
+def test_the_provider_is_refused_with_a_drill_other_than_d1() -> None:
+    with pytest.raises(ValueError, match="only with d1"):
+        benchmarks.drills.run_drill(
+            "postgresql:///never-connected",
+            Cell(Profile.INVOICE, 200, 100, 2),
+            benchmarks.drills.FreezeDrill(1.0),
+            benchmarks.drills.standard_workload(generate_invoices(200), 100),
+            raw_dir=Path("/nonexistent"),
+            stop_after=1.0,
+            provider=ProviderChoice(
+                name=ProviderName.OPENROUTER, model=MODEL, max_provider_calls=5, dry_run=True
+            ),
+        )

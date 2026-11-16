@@ -377,11 +377,15 @@ def test_the_ladder_has_no_provider_flag(capsys: pytest.CaptureFixture[str]) -> 
     assert "unrecognized arguments: --provider" in capsys.readouterr().err
 
 
-def test_the_drills_have_no_provider_flag(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as caught:
-        benchmarks.drills.main(["d1", "--provider", "openrouter"])
-    assert caught.value.code == 2
-    assert "unrecognized arguments: --provider" in capsys.readouterr().err
+@pytest.mark.parametrize("drill", ["d2", "d3a", "d3b", "d4"])
+def test_only_the_crash_drill_accepts_the_provider(
+    drill: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # T2 gives d1 the provider flags (DEC-071's "the drills have no provider flag" is
+    # narrowed to every drill but d1); the others refuse before any database or schema.
+    arguments = [drill, "--provider", "openrouter", "--model", MODEL]
+    assert benchmarks.drills.main([*arguments, "--max-provider-calls", "5", "--dry-run"]) == 1
+    assert capsys.readouterr().err == "refused: --provider openrouter runs only with d1\n"
 
 
 def test_every_shared_entry_point_defaults_to_the_double() -> None:
