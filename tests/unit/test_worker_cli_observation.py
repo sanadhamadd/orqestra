@@ -329,7 +329,9 @@ def written(h: Harness, expiry: Expiry) -> dict[str, Any]:
     """The JSON line ``end_process`` writes for ``expiry``."""
     lines: list[dict[str, Any]] = []
 
-    def capture(code: ExitCode, event: str, message: str, context: Mapping[str, str]) -> None:
+    def capture(
+        code: ExitCode, event: str, message: str, context: Mapping[str, str], **_: object
+    ) -> None:
         lines.append({"message": message, "event": event, "exit_code": int(code), **context})
 
     h.monkeypatch.setattr(fence, "end_process", capture)

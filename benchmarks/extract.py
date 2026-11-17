@@ -34,10 +34,13 @@ A reading is scored against the oracle field by field (``score``); a ``null`` re
 for a field the document leaves out is correct.
 """
 
+import hashlib
 import json
+import math
 import re
+import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
@@ -46,6 +49,7 @@ from typing import Any, Protocol, cast
 
 from benchmarks.documents import Fields, generate_documents
 from benchmarks.metrics import percentiles
+from benchmarks.ratelimit import LIMITER_MAX_WAIT
 from orqestra.calls.provider import (
     PermanentCode,
     ProviderPermanentError,
@@ -61,6 +65,7 @@ from orqestra.calls.recording import (
 from orqestra.domain.errors import PermanentError
 from orqestra.domain.jobs import JsonValue
 from orqestra.domain.leases import check_duration
+from orqestra.domain.retry import RetryPolicy, retry_delay
 from orqestra.providers.openrouter import (
     EXTRACT_CAPABILITY,
     EXTRACT_MAX_TOKENS,
@@ -479,6 +484,67 @@ class Extractor(Protocol):
     def extract(self, request: ExtractionRequest) -> ExtractionReport: ...
 
 
+class Pace(Protocol):
+    """A shared pace for calls (``benchmarks.ratelimit.RateLimiter``'s contract)."""
+
+    def reserve(self, max_wait: float) -> float | None: ...
+
+
+# The failures a document is called again for, inside the attempt (DEC-073). A timeout is
+# not one: the provider may still be working, and billing, on the first request.
+RETRIED_CODES = frozenset({TransientCode.RATE_LIMITED, TransientCode.UNAVAILABLE})
+DOCUMENT_TRIES = 6
+DOCUMENT_RETRY_BASE = timedelta(seconds=1)
+DOCUMENT_RETRY_MAX = timedelta(seconds=16)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentRetry:
+    """How often, and after what wait, one document is called again inside an attempt.
+
+    Try ``k`` (from 1) that failed with a ``RETRIED_CODES`` code is followed by a wait in
+    ``[capped / 2, capped]``, ``capped = min(maximum, base * 2 ** (k - 1))``: the engine's
+    DEC-053 shape and jitter (``retry_delay``), keyed by the attempt and the document.
+    """
+
+    tries: int = DOCUMENT_TRIES
+    base: timedelta = DOCUMENT_RETRY_BASE
+    maximum: timedelta = DOCUMENT_RETRY_MAX
+
+    def __post_init__(self) -> None:
+        if isinstance(self.tries, bool) or not isinstance(self.tries, int) or self.tries < 1:
+            msg = "tries must be a positive int"
+            raise ValueError(msg)
+        RetryPolicy(self.base, self.maximum)  # validates both durations
+
+    def wait(self, attempt_id: uuid.UUID, index: int, tries: int) -> float:
+        """Seconds to wait after the ``tries``-th failed try of document ``index``."""
+        digest = hashlib.sha256(attempt_id.bytes + index.to_bytes(8, "big")).digest()
+        key = uuid.UUID(bytes=digest[:16])
+        return retry_delay(RetryPolicy(self.base, self.maximum), key, tries).total_seconds()
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptTime:
+    """The time one attempt's calls may use, from the worker's settings.
+
+    ``budget`` is the execution timeout less the fence margin and one usage handoff
+    bound (the claim before the handler starts); ``per_call`` is one call's timeout
+    with its two handoffs. A wait is taken only if every document still to call keeps
+    a full ``per_call`` after it and, when paced, its own ``LIMITER_MAX_WAIT`` for its
+    slot: pacing has its own allowance, beside the calls' (DEC-073).
+    """
+
+    budget: timedelta
+    per_call: timedelta
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.budget, timedelta) or self.budget < timedelta(0):
+            msg = "budget must be a non-negative timedelta"  # none left: no wait is ever taken
+            raise ValueError(msg)
+        check_duration("per_call", self.per_call)
+
+
 def extraction_handler(
     extractor: Extractor,
     route_id: str,
@@ -486,6 +552,10 @@ def extraction_handler(
     *,
     max_provider_calls_per_attempt: int,
     recorder: ProviderCallRecorder,
+    retry: DocumentRetry | None = None,
+    pace: Pace | None = None,
+    attempt_time: AttemptTime | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Handler:
     """The handler for ``JOB_KIND``: one call per document, every call recorded.
 
@@ -504,6 +574,16 @@ def extraction_handler(
     raised fresh, after its result is recorded; anything else the provider does
     wrong is ``PermanentError("provider_protocol_violation")`` and leaves the call
     unresolved. Whatever the recorder raises propagates unchanged.
+
+    With ``retry`` and ``attempt_time`` (DEC-073), a ``RETRIED_CODES`` failure is
+    instead followed by another try of the same document, each one its own recorded
+    (and budgeted) call, while all of these hold: the document has had fewer than
+    ``retry.tries`` tries; a cap slot is left for the try and one for every later
+    document; the wait and a full call for this and every later document fit in
+    ``attempt_time``. A document already answered is never called again. With
+    ``pace``, every try first reserves a slot (``Pace.reserve``) and waits for it; no
+    slot within the wait is a 429 for that document, with no intent and no call.
+    Every wait ends at once on cancellation (``HandlerCancelled``).
     """
     cap = check_call_cap("max_provider_calls_per_attempt", max_provider_calls_per_attempt)
     checked = check_recorder(recorder)
@@ -511,36 +591,96 @@ def extraction_handler(
         msg = "the extraction handler needs a recorder: every call is billable"
         raise ValueError(msg)
     check_duration("timeout", timeout)
+    if pace is not None and attempt_time is None:
+        msg = "a paced handler needs attempt_time: every wait must fit in the attempt"
+        raise ValueError(msg)
 
     def handle(context: TaskContext, payload: JsonValue) -> JsonValue:
         offset, documents = _batch(payload)
+        started = clock()
+
+        slot_allowance = 0.0 if pace is None else LIMITER_MAX_WAIT
+
+        def slack(calls: int, slots: int) -> float:
+            """Seconds left after ``calls`` full calls and ``slots`` slot allowances."""
+            if attempt_time is None:
+                return -math.inf
+            per_call = attempt_time.per_call.total_seconds()
+            needed = per_call * calls + slot_allowance * slots
+            return attempt_time.budget.total_seconds() - (clock() - started) - needed
+
+        def wait(seconds: float) -> None:
+            if seconds > 0 and context.cancellation.wait(seconds):
+                raise HandlerCancelled
+
         made = 0
         results: list[JsonValue] = []
         for position, document in enumerate(documents):
             if context.cancellation.is_set():
                 raise HandlerCancelled
             index = offset + position
+            later = len(documents) - position - 1
             if made >= cap:
                 judgement = Judgement(Status.NEEDS_REVIEW, Reason.PROVIDER_CALL_CAP_REACHED)
                 results.append(_item_result(index, judgement, None))
                 continue
             request = ExtractionRequest(route_id=route_id, document=document, timeout=timeout)
-            checked.record_intent(_intent(context.attempt_id, made, index, route_id))
-            seq = made
-            made += 1
-            reply = _extract(extractor, request)  # a BaseException passes through: no result
-            if isinstance(reply, ExtractionReport):
-                checked.record_result(_answered(context.attempt_id, seq, reply))
-            else:
-                if isinstance(reply, ProviderTransientError | ProviderPermanentError):
-                    checked.record_result(_failed(context.attempt_id, seq, reply.code))
-                raise reply
-            read = parse_reply(reply.content)
+            tries = 0
+            answer: ExtractionReport
+            while True:
+                tries += 1
+                # This slot may use its own allowance; every later document keeps its own.
+                delay = (
+                    0.0
+                    if pace is None
+                    else _reserve(pace, min(LIMITER_MAX_WAIT, slack(1 + later, later)))
+                )
+                reply: ExtractionReport | Exception
+                if delay is None:  # no slot in time: a 429 that never reached the provider
+                    reply = ProviderTransientError(TransientCode.RATE_LIMITED)
+                else:
+                    wait(delay)
+                    checked.record_intent(_intent(context.attempt_id, made, index, route_id))
+                    seq = made
+                    made += 1
+                    reply = _extract(extractor, request)  # a BaseException passes through
+                    if isinstance(reply, ExtractionReport):
+                        checked.record_result(_answered(context.attempt_id, seq, reply))
+                        answer = reply
+                        break
+                    if isinstance(reply, ProviderTransientError | ProviderPermanentError):
+                        checked.record_result(_failed(context.attempt_id, seq, reply.code))
+                if (
+                    retry is None
+                    or not isinstance(reply, ProviderTransientError)
+                    or reply.code not in RETRIED_CODES
+                    or tries >= retry.tries
+                    or made + 1 + later > cap
+                ):
+                    raise reply
+                backoff = retry.wait(context.attempt_id, index, tries)
+                if backoff > slack(1 + later, 1 + later):  # the next try is paced too
+                    raise reply
+                wait(backoff)
+                if context.cancellation.is_set():
+                    raise HandlerCancelled
+            read = parse_reply(answer.content)
             fields = read.as_json() if isinstance(read, Reading) else None
             results.append(_item_result(index, judge(read), fields))
         return {"offset": offset, "results": results}
 
     return handle
+
+
+def _reserve(pace: Pace, max_wait: float) -> float | None:
+    """The delay to a reserved slot, or ``None``: none in time, or the pace failed."""
+    try:
+        delay = pace.reserve(max(max_wait, 0.0))
+    except Exception:  # a broken pace is no slot: the try is a 429, never a crash
+        return None
+    if delay is None or not math.isfinite(delay) or delay < 0:
+        return None
+    return float(delay)
 
 
 def _batch(payload: JsonValue) -> tuple[int, list[str]]:
@@ -648,7 +788,9 @@ SELECT t.result FROM tasks t WHERE t.job_id = %s AND t.state = 'succeeded' ORDER
 """
 _CALLS = """
 SELECT a.state, r.outcome, r.failure_code, r.input_tokens, r.output_tokens, r.latency_ms,
-       r.reported_amount, r.reported_unit
+       r.reported_amount, r.reported_unit,
+       EXISTS (SELECT 1 FROM provider_calls n WHERE n.attempt_id = c.attempt_id
+               AND n.item_index = c.item_index AND n.call_seq > c.call_seq)
 FROM provider_calls c
 JOIN attempts a ON a.id = c.attempt_id
 LEFT JOIN provider_call_results r ON r.attempt_id = c.attempt_id AND r.call_seq = c.call_seq
@@ -658,7 +800,11 @@ _ATTEMPTS = """
 SELECT count(*), coalesce(sum(extract(epoch FROM a.finished_at - a.started_at)), 0)
 FROM attempts a JOIN tasks t ON t.id = a.task_id WHERE t.job_id = %s
 """
-_TASKS = "SELECT count(*) FROM tasks WHERE job_id = %s"
+# Tasks that ran at least once: a task never claimed (a partial cell) is not retried.
+_TASKS_ATTEMPTED = """
+SELECT count(DISTINCT a.task_id) FROM attempts a JOIN tasks t ON t.id = a.task_id
+WHERE t.job_id = %s
+"""
 _OPEN_CLOSURES = """
 SELECT count(*) FROM attempts a JOIN tasks t ON t.id = a.task_id
 LEFT JOIN attempt_usage_closures u ON u.attempt_id = a.id
@@ -676,6 +822,17 @@ class _Call:
     latency_ms: int | None
     reported_amount: Decimal | None
     reported_unit: str | None
+    # Whether the same attempt called the same document again after this call.
+    tried_again: bool = False
+
+    @property
+    def retried(self) -> bool:
+        """A failure the handler followed with another try of the document (DEC-073)."""
+        return (
+            self.outcome == "failed"
+            and self.failure_code in {code.value for code in RETRIED_CODES}
+            and self.tried_again
+        )
 
 
 def _item_results(conn: Any, job_id: uuid.UUID) -> dict[int, list[Mapping[str, Any]]]:
@@ -707,9 +864,11 @@ def extraction_gate(
 
     ``extraction_complete``: each of the ``documents`` has exactly one item result.
     ``extraction_usage``: the succeeded attempts answered exactly one call per
-    document they called, left none unresolved and closed their capture complete;
-    when ``clean`` (no retry and no failed task) the job made no other call. A
-    model's wrong reading is measured, never gated.
+    document they called, made no other call than a retried throttled try
+    (``RETRIED_CODES``, followed by another try of the same document: DEC-073), left
+    none unresolved and closed their capture complete; when ``clean`` (no retry and
+    no failed task) the job made no other call. A model's wrong reading is measured,
+    never gated.
     """
     by_index = _item_results(conn, job_id)
     missing = [index for index in range(documents) if index not in by_index]
@@ -732,15 +891,22 @@ def extraction_gate(
     calls = _calls(conn, job_id)
     succeeded = [call for call in calls if call.attempt_state == "succeeded"]
     answered = sum(1 for call in succeeded if call.outcome == "answered")
+    retried = sum(1 for call in succeeded if call.retried)
     unresolved = sum(1 for call in succeeded if call.outcome is None)
     open_closures = _scalar(conn, _OPEN_CLOSURES, job_id)
-    passed = answered == called == len(succeeded) and unresolved == 0 and open_closures == 0
+    passed = (
+        answered == called
+        and len(succeeded) == answered + retried
+        and unresolved == 0
+        and open_closures == 0
+    )
     if clean:
         passed = passed and len(calls) == len(succeeded)
     detail = {
         "documents_called": called,
         "succeeded_calls": len(succeeded),
         "succeeded_answered": answered,
+        "succeeded_retried": retried,
         "succeeded_unresolved": unresolved,
         "open_closures": open_closures,
         "calls": len(calls),
@@ -792,11 +958,25 @@ def extraction_block(
     statuses: Sequence[Status],
     prices: Prices,
 ) -> dict[str, Any]:
-    """The result's ``extraction`` block, in the shape the T1 plan pins; counts only."""
+    """The result's ``extraction`` block, in the shape the T1 plan pins; counts only.
+
+    ``documents_processed`` counts the documents with an item result. Accuracy is
+    scored over those documents, the cost per 1,000 is per processed document, and
+    ``retries`` counts attempts beyond the first of each task that ran (DEC-073), so a
+    partial cell (stopped before every task ran) gives per-document figures and never
+    a negative retry count. In a complete cell each equals the figure over all
+    documents and tasks. With nothing processed, the cost per 1,000 is over every
+    document: what was spent, with nothing to show.
+    """
     documents = len(expected)
     by_index = _item_results(conn, job_id)
     items = [by_index.get(index, [None])[0] for index in range(documents)]
-    accuracy = score_all(expected, [None if item is None else item["fields"] for item in items])
+    processed = [
+        (fields, item) for fields, item in zip(expected, items, strict=True) if item is not None
+    ]
+    accuracy = score_all(
+        [fields for fields, _ in processed], [item["fields"] for _, item in processed]
+    )
     status_counts = {status.value: 0 for status in Status}
     reasons = {reason.value: 0 for reason in Reason}
     status_matched = 0
@@ -816,7 +996,8 @@ def extraction_block(
     provider_s = sum(latencies) / 1000
     attempts, handler = conn.execute(_ATTEMPTS, (job_id,)).fetchone()
     handler_s = float(handler)
-    tasks = _scalar(conn, _TASKS, job_id)
+    tasks = _scalar(conn, _TASKS_ATTEMPTED, job_id)
+    per_document = len(processed) or documents
 
     tokens = _tokens_of(answered)
     uncounted = sum(
@@ -841,6 +1022,7 @@ def extraction_block(
             permanent[call.failure_code] += 1
     return {
         "documents": documents,
+        "documents_processed": len(processed),
         "calls": {
             "total": len(calls),
             "answered": len(answered),
@@ -848,6 +1030,7 @@ def extraction_block(
             "unresolved": sum(1 for call in calls if call.outcome is None),
             "succeeded_attempts": sum(1 for call in calls if call.attempt_state == "succeeded"),
             "other_attempts": sum(1 for call in calls if call.attempt_state != "succeeded"),
+            "retried_in_attempt": sum(1 for call in calls if call.retried),
             "latency_ms": percentiles(latencies),
         },
         "time_split": {
@@ -885,8 +1068,8 @@ def extraction_block(
             "total": fixed_point_text(total),
             "succeeded_attempts": fixed_point_text(succeeded_cost),
             "other_attempts": fixed_point_text(other_cost),
-            "per_1000_invoices": fixed_point_text(total * 1000 / documents),
-            "per_1000_invoices_succeeded": fixed_point_text(succeeded_cost * 1000 / documents),
+            "per_1000_invoices": fixed_point_text(total * 1000 / per_document),
+            "per_1000_invoices_succeeded": fixed_point_text(succeeded_cost * 1000 / per_document),
             "reported": {
                 unit: fixed_point_text(amount) for unit, amount in sorted(reported.items())
             },

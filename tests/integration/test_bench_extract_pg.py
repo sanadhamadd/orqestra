@@ -114,8 +114,8 @@ def test_a_dry_extract_cell_reads_every_document_and_records_every_figure(
     assert canned_requests(raw_dir) == CELL.size
 
     block = record["extraction"]
-    assert set(block) == EXTRACTION_FIELDS
-    assert block["documents"] == CELL.size
+    assert set(block) == EXTRACTION_FIELDS | {"documents_processed"}
+    assert block["documents"] == block["documents_processed"] == CELL.size
     calls = block["calls"]
     assert (calls["total"], calls["answered"], calls["failed"], calls["unresolved"]) == (
         CELL.size,
