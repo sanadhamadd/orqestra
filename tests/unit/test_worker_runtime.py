@@ -1688,3 +1688,21 @@ def test_the_idle_back_off_doubles_to_eight_bounds_with_stable_jitter(harness: H
 
 def test_only_the_idle_operations_are_abortable() -> None:
     assert {"claim", "revoke_next_expired", "settle_abandoned"} == runtime.IDLE_OPERATIONS
+
+
+def test_only_a_claim_reads_its_connection_s_backend_and_only_once(harness: Harness) -> None:
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", lambda *a, **k: None)
+    harness.worker._sweep()  # idle, but not a claim: nothing to identify
+    assert runtime._BACKEND not in harness.conn.queries
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", lambda *a, **k: None)
+    harness.worker._claim()
+    harness.worker._claim()
+    assert harness.conn.queries.count(runtime._BACKEND) == 1  # once per connection
+    assert harness.worker._backend == runtime.Backend(4242, BACKEND_START)
+
+
+def test_an_owning_call_on_a_new_connection_never_reads_the_backend(harness: Harness) -> None:
+    harness.start()
+    harness.worker._call("renew_lease", lambda conn: None, {})  # a heartbeat's reconnect
+    assert runtime._BACKEND not in harness.conn.queries
+    assert harness.worker._backend is None

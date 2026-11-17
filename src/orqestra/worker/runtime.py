@@ -185,7 +185,8 @@ class OperationAbandoned(Exception):  # noqa: N818 - it names what happened, not
 # their bound they are abandoned and retried, not fatal. Every other call keeps
 # DEC-045's fail-fast, including the reads of a claimed task not yet started.
 IDLE_OPERATIONS = frozenset({"claim", "revoke_next_expired", "settle_abandoned"})
-# The connection's own server process, read once per connection (DEC-074).
+# The connection's own server process, read once per connection, before its first
+# abortable claim (DEC-074).
 _BACKEND = (
     "SELECT pg_backend_pid(), backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()"
 )
@@ -1557,17 +1558,18 @@ class Worker:
                 except psycopg.Error as exc:
                     raise ConnectionUnavailable(str(exc)) from exc
                 self._backend = None
-                if abort is not None and not abort.attach(self._conn.fileno()):
-                    raise OperationAbandoned(operation, None)
-                if self._settings.idle_stall_limit > 0:
-                    try:
-                        self._backend = _identify(self._conn)
-                    except psycopg.Error:
-                        if abort is not None and abort.fired:
-                            raise OperationAbandoned(operation, None) from None
-                        raise
-            elif abort is not None and not abort.attach(self._conn.fileno()):
+            if abort is not None and not abort.attach(self._conn.fileno()):
                 raise OperationAbandoned(operation, None)
+            if abort is not None and operation == "claim" and self._backend is None:
+                # Only a claim needs its server process known, to end it if abandoned;
+                # read once per connection, inside the claim's own guard, so no owning
+                # call ever spends its bound on it.
+                try:
+                    self._backend = _identify(self._conn)
+                except psycopg.Error:
+                    if abort.fired:
+                        raise OperationAbandoned(operation, None) from None
+                    raise
             backend = self._backend
             try:
                 return call(self._conn)
