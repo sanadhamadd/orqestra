@@ -285,6 +285,7 @@ def validate_result(record: object) -> None:
         _fail("only a complete result may report throughput")
     _validate_wait(record)
     _validate_extraction(record)
+    _validate_checkpoints(record)
 
 
 def _validate_extraction(record: dict[str, Any]) -> None:
@@ -322,6 +323,70 @@ def _validate_extraction(record: dict[str, Any]) -> None:
         for value in largest.values():
             if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
                 _fail("extraction.tokens.max_per_call values must be counts or null")
+
+
+CHECKPOINT_FIELDS = frozenset(
+    {
+        "source",
+        "count",
+        "timed",
+        "requested",
+        "write_ms",
+        "sync_ms",
+        "longest_ms",
+        "events",
+        "samples",
+        "lost_samples",
+    }
+)
+CHECKPOINT_EVENT_FIELDS = frozenset({"ended_by_s", "checkpoints", "write_ms", "sync_ms"})
+
+
+def _count_value(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _amount(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_checkpoints(record: dict[str, Any]) -> None:
+    """``database_stats.checkpoints``, when present: ``not_measured`` or a complete block.
+
+    Records written before it existed carry none and stay valid.
+    """
+    stats = record.get("database_stats")
+    if not isinstance(stats, dict) or "checkpoints" not in stats:
+        return
+    block = stats["checkpoints"]
+    if block == NOT_MEASURED:
+        return
+    if not isinstance(block, dict) or set(block) != CHECKPOINT_FIELDS:
+        _fail(f"database_stats.checkpoints must hold exactly {sorted(CHECKPOINT_FIELDS)}")
+    if block["source"] not in {"pg_stat_checkpointer", "pg_stat_bgwriter"}:
+        _fail("database_stats.checkpoints.source must name a checkpoint view")
+    for name in ("count", "timed", "requested", "samples", "lost_samples"):
+        if not _count_value(block[name]):
+            _fail(f"database_stats.checkpoints.{name} must be a count")
+    if block["count"] != block["timed"] + block["requested"]:
+        _fail("database_stats.checkpoints.count must be timed + requested")
+    for name in ("write_ms", "sync_ms"):
+        if not _amount(block[name]):
+            _fail(f"database_stats.checkpoints.{name} must be a non-negative number")
+    if block["longest_ms"] is not None and not _amount(block["longest_ms"]):
+        _fail("database_stats.checkpoints.longest_ms must be a non-negative number or null")
+    events = block["events"]
+    if not isinstance(events, list):
+        _fail("database_stats.checkpoints.events must be a list")
+    for event in events:
+        if not isinstance(event, dict) or set(event) != CHECKPOINT_EVENT_FIELDS:
+            _fail(f"each checkpoint event must hold exactly {sorted(CHECKPOINT_EVENT_FIELDS)}")
+        if not _count_value(event["checkpoints"]) or event["checkpoints"] < 1:
+            _fail("a checkpoint event must count at least one checkpoint")
+        if not all(_amount(event[name]) for name in ("ended_by_s", "write_ms", "sync_ms")):
+            _fail("a checkpoint event's times must be non-negative numbers")
+    if sum(event["checkpoints"] for event in events) != block["count"]:
+        _fail("database_stats.checkpoints.count must equal the checkpoints of its events")
 
 
 def _validate_wait(record: dict[str, Any]) -> None:

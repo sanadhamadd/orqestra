@@ -4,15 +4,18 @@ No database, worker or network: the fleet tests start plain Python processes tha
 with a chosen code, in place of benchmark workers.
 """
 
-import importlib
+import contextlib
+import math
 import subprocess
 import sys
 import time
 import types
 import uuid
+from collections.abc import Iterator, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +28,7 @@ from benchmarks.run import (
     LIVE_WORKER_SETTINGS,
     MAX_ATTEMPTS,
     RATE_LIMIT_FILE_NAME,
+    STALL_REPLACEMENT_DELAY,
     Cell,
     Fleet,
     Profile,
@@ -165,15 +169,18 @@ def test_an_extract_worker_gets_the_pacing_flags_and_the_cells_limiter_file(
         (EXTRACT, Decimal(0), "above 0"),
         (EXTRACT, Decimal(-1), "above 0"),
         (EXTRACT, Decimal("NaN"), "above 0"),
+        (EXTRACT, Decimal("Infinity"), "at most 1000"),
+        (EXTRACT, Decimal("1000.5"), "at most 1000"),  # the limiter's own MAX_PER_S
     ],
 )
-def test_the_rate_limit_is_refused_off_extract_and_below_one_call(
+def test_the_rate_limit_is_refused_off_extract_and_outside_the_limiters_range(
     cell: Cell, rate: Decimal, words: str
 ) -> None:
     refusal = rate_limit_refusal(cell, rate)
     assert refusal is not None
     assert words in refusal
-    assert rate_limit_refusal(EXTRACT, Decimal(10)) is None
+    for allowed in (Decimal(10), Decimal("0.5"), Decimal(1000)):
+        assert rate_limit_refusal(EXTRACT, allowed) is None
     assert rate_limit_refusal(INVOICE, None) is None
 
 
@@ -253,46 +260,72 @@ def wait_exited(fleet: Fleet, count: int) -> None:
         time.sleep(0.02)
 
 
-def test_a_worker_that_exits_is_recorded_and_replaced(tmp_path: Path) -> None:
+def test_a_stalled_worker_is_replaced_only_after_the_delay(tmp_path: Path) -> None:
     fleet = fleet_with(tmp_path, [4, None, None])
     fleet.start()
     fleet.start()
     wait_exited(fleet, 1)
-    found = fleet.supervise(1.25, limit=2)
+    found = fleet.supervise(10.0, limit=8)
     assert found == [
         {
             "worker": 1,
             "pid": fleet.workers[0].process.pid,
             "exit_code": 4,
-            "at_s": 1.25,
-            "replaced": True,
+            "at_s": 10.0,
+            "replaced": False,
+            "replacement_at_s": None,
         }
     ]
-    assert fleet.replaced == 1
+    assert len(fleet.workers) == 2  # not yet: the slowdown may still be on
+    assert fleet.pending
+    assert fleet.supervise(10.5, limit=8) == []
+    assert len(fleet.workers) == 2
+    assert fleet.supervise(10.0 + STALL_REPLACEMENT_DELAY, limit=8) == []  # each exit once
     assert len(fleet.workers) == 3
+    assert found[0]["replaced"] is True
+    assert found[0]["replacement_at_s"] == 11.0
+    assert (fleet.replaced, fleet.scheduled, fleet.pending) == (1, 1, [])
     assert fleet.alive() == 2
-    assert fleet.supervise(1.5, limit=2) == []  # each exit is recorded once
-    stopped = fleet.stop(timeout=10)
-    assert len(stopped) == 3
+    fleet.stop(timeout=10)
     assert [handle.died for handle in fleet.workers] == [True, False, False]
 
 
-def test_replacements_stop_at_the_limit_and_the_fleet_runs_down(tmp_path: Path) -> None:
-    fleet = fleet_with(tmp_path, [4, 4, 4, 4])
+@pytest.mark.parametrize("code", [ExitCode.FENCED, ExitCode.DEFECT, 1, 0])
+def test_any_other_exit_is_replaced_at_once(tmp_path: Path, code: int) -> None:
+    fleet = fleet_with(tmp_path, [code, None])
     fleet.start()
-    found: list[dict[str, object]] = []
-    for _ in range(3):  # the first worker and its two replacements
-        wait_exited(fleet, len(found) + 1)
-        found += fleet.supervise(0.0, limit=replacement_limit(1))
-    assert replacement_limit(1) == 2
-    assert [item["replaced"] for item in found] == [True, True, False]
-    assert fleet.replaced == 2
+    wait_exited(fleet, 1)
+    (found,) = fleet.supervise(2.0, limit=4)
+    assert (found["exit_code"], found["replaced"], found["replacement_at_s"]) == (code, True, 2.0)
+    assert len(fleet.workers) == 2
+    assert fleet.pending == []
+    fleet.stop(timeout=10)
+
+
+def test_replacements_stop_at_the_limit_and_count_the_pending_ones(tmp_path: Path) -> None:
+    fleet = fleet_with(tmp_path, [4, 4, 4, 4, 4])
+    fleet.start()
+    found: list[dict[str, Any]] = []
+    elapsed = 0.0
+    limit = replacement_limit(1)
+    for exits in range(1, limit + 2):  # the first worker and its four replacements
+        wait_exited(fleet, exits)
+        found += fleet.supervise(elapsed, limit=limit)
+        assert fleet.scheduled == min(exits, limit)  # granted when scheduled
+        elapsed += STALL_REPLACEMENT_DELAY
+        fleet.supervise(elapsed, limit=limit)  # starts the one that is due
+    assert limit == 4
+    assert [item["replaced"] for item in found] == [True, True, True, True, False]
+    assert found[-1]["replacement_at_s"] is None
+    assert fleet.replaced == 4
+    assert fleet.pending == []
     assert fleet.alive() == 0
     fleet.stop(timeout=10)
 
 
-def test_the_replacement_limit_is_at_least_two_and_one_per_worker() -> None:
-    assert [replacement_limit(workers) for workers in (1, 2, 4, 32)] == [2, 2, 4, 32]
+def test_the_replacement_limit_is_four_per_worker() -> None:
+    assert [replacement_limit(workers) for workers in (1, 2, 8, 32)] == [4, 8, 32, 128]
+    assert STALL_REPLACEMENT_DELAY == 1.0
 
 
 def test_settle_waits_only_for_running_workers_that_have_not_started(tmp_path: Path) -> None:
@@ -330,28 +363,11 @@ def test_a_paced_cell_gives_every_call_of_its_cap_the_limiters_longest_wait() ->
     assert cell_worker_settings(INVOICE, DOUBLE, "PT0.1S") == dict(BENCH_WORKER_SETTINGS)
 
 
-@pytest.mark.parametrize("wait", [timedelta(seconds=5), 5, 5.0])
-def test_the_pacing_wait_is_read_from_the_workers_limiter(
-    monkeypatch: pytest.MonkeyPatch, wait: object
-) -> None:
-    monkeypatch.setitem(
-        sys.modules, "benchmarks.ratelimit", types.SimpleNamespace(LIMITER_MAX_WAIT=wait)
-    )
-    assert run.limiter_max_wait() == timedelta(seconds=5)
+def test_the_pacing_wait_is_the_workers_limiters_own() -> None:
+    assert run.limiter_max_wait() == timedelta(seconds=LIMITER_MAX_WAIT)
     settings = cell_worker_settings(EXTRACT, LIVE, "PT30S", Decimal(10))
-    assert settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == "PT1592S"
-
-
-def test_without_the_workers_limiter_a_paced_cell_is_refused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def missing(name: str) -> object:
-        raise ImportError(name)
-
-    monkeypatch.setattr(importlib, "import_module", missing)
-    with pytest.raises(ValueError, match="rate limiter"):
-        cell_worker_settings(EXTRACT, LIVE, "PT30S", Decimal(10))
-    assert cell_worker_settings(EXTRACT, LIVE, "PT30S")  # unpaced needs no limiter
+    seconds = 30 * (30 + 18 + LIMITER_MAX_WAIT) + 2
+    assert settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == f"PT{math.ceil(seconds)}S"
 
 
 def test_a_paced_cell_covers_the_limiters_own_minimum_timeout() -> None:
@@ -365,3 +381,140 @@ def test_a_paced_cell_covers_the_limiters_own_minimum_timeout() -> None:
         minimum = extract_cap(batch) * (30 + handoff) + 2 + batch * LIMITER_MAX_WAIT
         assert seconds >= minimum
         assert seconds == extract_cap(batch) * (30 + handoff + LIMITER_MAX_WAIT) + 2
+
+
+# --- checkpoints during a cell ------------------------------------------------------------
+
+
+def sample(at: float, timed: float, requested: float, write: float, sync: float) -> Any:
+    return (at, timed, requested, write, sync)
+
+
+def test_each_reading_whose_count_rose_is_one_event_of_ended_checkpoints() -> None:
+    samples = [
+        sample(0.0, 10, 3, 1_000.0, 50.0),
+        sample(1.0, 10, 3, 1_000.0, 50.0),
+        sample(2.0, 11, 3, 59_500.0, 70.0),  # a timed checkpoint of 58.5 s write ended
+        sample(3.0, 11, 3, 59_500.0, 70.0),
+        sample(4.0, 11, 5, 59_600.0, 75.0),  # two requested ones within one interval
+    ]
+    summary = run.summarize_checkpoints("pg_stat_bgwriter", samples, lost=1)
+    assert summary == {
+        "source": "pg_stat_bgwriter",
+        "count": 3,
+        "timed": 1,
+        "requested": 2,
+        "write_ms": 58_600.0,
+        "sync_ms": 25.0,
+        "longest_ms": 58_520.0,  # only an event of exactly one checkpoint
+        "events": [
+            {"ended_by_s": 2.0, "checkpoints": 1, "write_ms": 58_500.0, "sync_ms": 20.0},
+            {"ended_by_s": 4.0, "checkpoints": 2, "write_ms": 100.0, "sync_ms": 5.0},
+        ],
+        "samples": 5,
+        "lost_samples": 1,
+    }
+
+
+def test_no_checkpoint_and_a_statistics_reset_are_counted_right() -> None:
+    quiet = [sample(0.0, 4, 1, 10.0, 1.0), sample(1.0, 4, 1, 10.0, 1.0)]
+    summary = run.summarize_checkpoints("pg_stat_checkpointer", quiet)
+    assert isinstance(summary, dict)
+    assert (summary["count"], summary["events"], summary["longest_ms"]) == (0, [], None)
+    reset = [
+        sample(0.0, 40, 9, 9_000.0, 90.0),
+        sample(1.0, 0, 0, 0.0, 0.0),  # pg_stat_reset_shared: a new baseline, no event
+        sample(2.0, 1, 0, 300.0, 4.0),
+    ]
+    after = run.summarize_checkpoints("pg_stat_checkpointer", reset)
+    assert isinstance(after, dict)
+    assert (after["count"], after["write_ms"], after["sync_ms"]) == (1, 300.0, 4.0)
+    assert [event["ended_by_s"] for event in after["events"]] == [2.0]
+
+
+@pytest.mark.parametrize(
+    ("source", "samples"),
+    [(None, [sample(0.0, 1, 1, 1.0, 1.0)] * 3), ("pg_stat_bgwriter", [sample(0.0, 1, 1, 1, 1)])],
+)
+def test_without_a_view_or_two_readings_checkpoints_are_not_measured(
+    source: str | None, samples: list[Any]
+) -> None:
+    assert run.summarize_checkpoints(source, samples) == "not_measured"
+
+
+class FakeStats:
+    """A connection whose catalog has the views in ``views``; every reading of a counter
+    view returns the next row of ``rows``, or raises when the row is an exception."""
+
+    def __init__(self, views: set[str], rows: list[Any]) -> None:
+        self.views = views
+        self.rows = rows
+        self.queries: list[str] = []
+        self.transactions = 0
+
+    @contextlib.contextmanager
+    def transaction(self, force_rollback: bool = False) -> Iterator[None]:
+        assert force_rollback
+        self.transactions += 1
+        yield
+
+    def execute(self, query: str, params: Sequence[object] = ()) -> Any:
+        self.queries.append(query)
+        if "to_regclass" in query:
+            found = str(params[0]).removeprefix("pg_catalog.") in self.views
+            return types.SimpleNamespace(fetchone=lambda: (found,))
+        row = self.rows.pop(0)
+        if isinstance(row, Exception):
+            raise row
+        return types.SimpleNamespace(fetchone=lambda: row)
+
+
+@pytest.mark.parametrize(
+    ("views", "source", "columns"),
+    [
+        ({"pg_stat_checkpointer", "pg_stat_bgwriter"}, "pg_stat_checkpointer", "num_timed"),
+        ({"pg_stat_bgwriter"}, "pg_stat_bgwriter", "checkpoints_timed"),
+    ],
+)
+def test_the_watch_reads_the_view_the_server_has_and_never_a_missing_one(
+    views: set[str], source: str, columns: str
+) -> None:
+    conn = FakeStats(views, [(1, 0, 10.0, 1.0), (2, 0, 30.0, 2.0)])
+    watch = run.CheckpointWatch(conn)  # type: ignore[arg-type]
+    watch.sample(0.0)
+    watch.sample(1.0)
+    readings = [query for query in conn.queries if "to_regclass" not in query]
+    assert all(f"FROM pg_catalog.{source}" in query and columns in query for query in readings)
+    summary = watch.summary()
+    assert isinstance(summary, dict)
+    assert (summary["source"], summary["count"], summary["write_ms"]) == (source, 1, 20.0)
+    assert conn.transactions == 1 + 2  # the choice, then one transaction per reading
+
+
+def test_a_failed_reading_is_counted_and_never_raised() -> None:
+    conn = FakeStats(
+        {"pg_stat_bgwriter"}, [(1, 0, 1.0, 1.0), RuntimeError("gone"), (1, 0, 1.0, 1.0)]
+    )
+    watch = run.CheckpointWatch(conn)  # type: ignore[arg-type]
+    for at in (0.0, 1.0, 2.0):
+        watch.sample(at)
+    summary = watch.summary()
+    assert isinstance(summary, dict)
+    assert (summary["samples"], summary["lost_samples"], summary["count"]) == (2, 1, 0)
+
+
+def test_a_server_without_either_view_is_not_measured_and_sends_no_reading() -> None:
+    conn = FakeStats(set(), [])
+    watch = run.CheckpointWatch(conn)  # type: ignore[arg-type]
+    watch.sample(0.0)
+    watch.sample(1.0)
+    assert watch.summary() == "not_measured"
+    assert all("to_regclass" in query for query in conn.queries)
+
+
+def test_the_watch_reads_at_most_once_an_interval() -> None:
+    watch = run.CheckpointWatch(FakeStats(set(), []))  # type: ignore[arg-type]
+    assert watch.due(0.0)
+    watch.sample(0.0)
+    assert not watch.due(0.5)
+    assert watch.due(run.CHECKPOINT_SAMPLE_INTERVAL)
