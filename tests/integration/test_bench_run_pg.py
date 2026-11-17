@@ -69,6 +69,7 @@ def test_a_worker_killed_mid_cell_is_recorded_and_replaced_and_the_job_finishes(
     (died,) = failures["exits_while_running"]
     assert (died["worker"], died["pid"], died["replaced"]) == (1, killed[0], True)
     assert died["exit_code"] not in (0, ExitCode.STALLED)
+    assert died["replacement_at_s"] == died["at_s"]  # not a stall: replaced at once
     assert failures["replacements"] == 1
     assert len(failures["worker_exit_codes"]) == CELL.workers + 1
     gate = {check["name"]: check for check in record["gate"]}
@@ -111,7 +112,6 @@ def test_an_openrouter_cell_writes_its_max_attempts_into_the_task_file(
 def test_the_pacing_flags_reach_every_worker_of_a_dry_extract_cell(
     db: psycopg.Connection[TupleRow], schema_url: str, tmp_path: Path
 ) -> None:
-    pytest.importorskip("benchmarks.ratelimit", reason="the workers' limiter comes with F1")
     raw_dir = tmp_path / "raw"
     record = run_cell(
         schema_url,
