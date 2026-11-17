@@ -1,7 +1,9 @@
 """Worker runtime settings (DEC-044).
 
 Every timing value is required: there are no defaults, because operational
-values are undecided and need the owner's approval (DEC-034). Values come
+values are undecided and need the owner's approval (DEC-034). The one count with
+a default, ``idle_stall_limit`` (5, DEC-074), is not a timing value: it bounds
+how many idle calls in a row a worker abandons before it ends itself. Values come
 from the environment with the prefix ``ORQESTRA_WORKER_`` (or a local
 ``.env``). Durations there are ISO 8601 durations such as ``PT30S`` (or
 ``HH:MM:SS``); a bare number has no unit and is refused.
@@ -111,6 +113,19 @@ class WorkerSettings(BaseSettings):
     # of a deployment must use the same values: nothing enforces that.
     retry_base_delay: timedelta
     retry_max_delay: timedelta
+    # How many idle database calls in a row may run past db_operation_timeout and be
+    # abandoned before the worker ends itself (exit 4), as it always does for a call made
+    # while it owns a task; 0 ends it at the first, as before (DEC-074). It acts only
+    # while nothing is owned, so it has no relationship to the lease rules (DEC-070).
+    idle_stall_limit: int = Field(default=5, ge=0, le=20)
+
+    @field_validator("idle_stall_limit", mode="before")
+    @classmethod
+    def _a_count(cls, value: object) -> object:
+        if isinstance(value, bool):
+            msg = "idle_stall_limit must be a whole number, not a bool"
+            raise ValueError(msg)
+        return value
 
     @field_validator(
         "lease",

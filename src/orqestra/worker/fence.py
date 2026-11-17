@@ -19,6 +19,12 @@ It holds at most one deadline per ``Guard``; the earliest expiry ends the proces
   moment the handler's work has ended.
 - ``OPERATION``: armed around each supervisor database call, so a stalled call
   ends the process instead of hanging it. It says nothing about ownership.
+  An idle call (no handler running or awaiting settlement, DEC-074) arms it with
+  an ``abort``: when it expires, the watchdog calls ``abort`` instead of ending
+  the process, and moves the same token's deadline to ``backstop`` seconds
+  later with no abort, so a call that the abort does not end still ends the
+  process one bound later. An abortable expiry with OWNERSHIP or DRAIN armed
+  ends the process as before.
 - ``DRAIN``: armed once, when a stopping worker still holds a task: the end of
   the time ``shutdown_timeout`` gives it to settle that task (DEC-049). It can
   only end the process sooner, never extend a lease or another guard.
@@ -44,6 +50,7 @@ that thread (DEC-045 notes).
 """
 
 import _thread
+import contextlib
 import json
 import math
 import os
@@ -221,6 +228,9 @@ class _Armed:
     token: int
     deadline: float
     context: Mapping[str, str]
+    # An idle OPERATION guard's abort, called once at its first expiry (DEC-074).
+    abort: Callable[[], None] | None = None
+    backstop: float = 0.0
 
 
 class Watchdog:
@@ -267,12 +277,36 @@ class Watchdog:
 
     def arm(self, guard: Guard, deadline: float, context: Mapping[str, str]) -> int:
         """Arm ``guard`` to expire at ``deadline`` (local clock); return its token."""
+        return self._arm(_Armed(0, deadline, dict(context)), guard)
+
+    def arm_abortable(
+        self,
+        deadline: float,
+        context: Mapping[str, str],
+        *,
+        abort: Callable[[], None],
+        backstop: float,
+    ) -> int:
+        """Arm the OPERATION guard for an idle call (DEC-074); return its token.
+
+        At its first expiry ``abort`` is called instead of ending the process, and the
+        same token's deadline moves ``backstop`` seconds later with no abort, so a call
+        the abort does not end still ends the process then. With OWNERSHIP or DRAIN
+        armed at that expiry it ends the process at once, as ``arm``'s would.
+        """
+        if not (math.isfinite(backstop) and backstop > 0):
+            msg = f"an abortable guard needs a positive, finite backstop, not {backstop!r}"
+            raise ValueError(msg)
+        return self._arm(_Armed(0, deadline, dict(context), abort, backstop), Guard.OPERATION)
+
+    def _arm(self, armed: _Armed, guard: Guard) -> int:
         with self._condition:
             if guard in self._armed:
                 msg = f"the {guard.value} guard is already armed"
                 raise RuntimeError(msg)
             self._tokens += 1
-            self._armed[guard] = _Armed(self._tokens, deadline, dict(context))
+            armed.token = self._tokens
+            self._armed[guard] = armed
             self._condition.notify_all()
             return self._tokens
 
@@ -349,6 +383,19 @@ class Watchdog:
         if not due:
             return None
         _, guard = min(due)
+        armed = self._armed[guard]
+        if (
+            armed.abort is not None
+            and Guard.OWNERSHIP not in self._armed
+            and Guard.DRAIN not in self._armed
+        ):
+            # An idle call ran past its bound: abort it and give it one backstop to return.
+            abort, armed.abort = armed.abort, None
+            armed.deadline = now + armed.backstop
+            with contextlib.suppress(Exception):  # the backstop still ends a call it missed
+                abort()
+            self._condition.notify_all()
+            return None
         owned = self._armed.get(Guard.OWNERSHIP)
         expiry = Expiry(
             guard,

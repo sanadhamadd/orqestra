@@ -1,15 +1,17 @@
+import contextlib
 import re
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, tzinfo
+from types import SimpleNamespace
 from typing import Any, NoReturn
 from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
-from psycopg import errors
+from psycopg import errors, pq
 from psycopg.conninfo import conninfo_to_dict
 
 from orqestra.domain.errors import TransientError
@@ -462,12 +464,45 @@ def terminate(code: ExitCode, event: str, message: str, context: Any) -> NoRetur
     raise Terminated(code, event)
 
 
+BACKEND_START = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class FakeRows:
+    def __init__(self, row: tuple[Any, ...] | None) -> None:
+        self.row = row
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        return self.row
+
+
 class FakeConn:
-    def __init__(self) -> None:
+    """A connection the injected lifecycle operations ignore. Through
+    ``owned_transaction`` it answers the worker's own queries: its backend's identity,
+    and a termination that finds that backend gone."""
+
+    def __init__(self, pid: int = 4242) -> None:
         self.closed = False
+        self.pid = pid
+        self.queries: list[str] = []
+        self.info = SimpleNamespace(transaction_status=pq.TransactionStatus.IDLE)
 
     def close(self) -> None:
         self.closed = True
+
+    def fileno(self) -> int:
+        return -1  # not a socket: an abort's shutdown fails quietly, as the backstop allows
+
+    def transaction(self) -> contextlib.AbstractContextManager[None]:
+        return contextlib.nullcontext()
+
+    def cursor(self, **kwargs: Any) -> contextlib.AbstractContextManager["FakeConn"]:
+        return contextlib.nullcontext(self)
+
+    def execute(self, query: str, params: Any = None) -> FakeRows:
+        self.queries.append(query)
+        if query == runtime._BACKEND:
+            return FakeRows((self.pid, BACKEND_START))
+        return FakeRows(None)  # SET statements, and _TERMINATE: not listed, so gone
 
 
 def attempt(
@@ -1471,3 +1506,227 @@ def test_a_cooperative_handler_that_saw_the_request_ends_cancelled(
     harness.worker._heartbeat(running)
     assert running.done.wait(10)
     assert running.outcome == [AttemptCancelled()]
+
+
+# --- an idle call past its bound is abandoned, not fatal (DEC-074) -----------------------
+
+BOUND = SETTINGS.db_operation_timeout.total_seconds()  # 2 s
+
+
+def stalls_then(harness: Harness, outcome: Callable[[], Any]) -> Callable[..., Any]:
+    """A lifecycle call that outlives its bound (the watchdog checks past it), then ends
+    with ``outcome()``: a value it returns, or an exception it raises."""
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        harness.clock.now += BOUND + 0.5
+        harness.watchdog.check()
+        return outcome()
+
+    return call
+
+
+def broken() -> Any:
+    raise psycopg.OperationalError("server closed the connection unexpectedly")
+
+
+def with_limit(harness: Harness, limit: int) -> None:
+    harness.worker._settings = SETTINGS.model_copy(update={"idle_stall_limit": limit})
+
+
+def test_an_idle_claim_past_its_bound_is_abandoned_and_retried_after_a_back_off(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, broken))
+    harness.worker._claim()
+    assert harness.expiries == []  # the process was not ended
+    assert harness.worker._abandoned == runtime.Backend(4242, BACKEND_START)
+    assert harness.conn.closed  # the aborted connection is discarded
+    assert harness.worker._conn is None
+    assert harness.worker._idle_stalls == 1
+    now = harness.clock.now
+    assert now + BOUND / 2 <= harness.worker._schedule.claim_due <= now + BOUND
+    assert harness.worker._schedule.sweep.due == harness.worker._schedule.claim_due
+    assert "idle_operation_abandoned" in [r.message.split(":")[0] for r in caplog.records]
+
+
+def test_no_claim_is_sent_until_the_abandoned_claim_s_backend_is_gone_then_one_lease(
+    harness: Harness,
+) -> None:
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, broken))
+    harness.worker._claim()
+    fresh = FakeConn(pid=99)
+    harness.conn = fresh  # the next connection
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", raising(AssertionError("sent")))
+    harness.worker._claim()  # this step only settles the abandoned claim
+    assert runtime._TERMINATE in fresh.queries
+    assert harness.worker._abandoned is None
+    assert harness.worker._idle_stalls == 0
+    held = harness.worker._held
+    assert held is not None
+    assert held.attempt is None
+    assert held.until == harness.clock.now + 30.0  # the lost-claim hold: one lease
+    assert harness.worker._schedule.claim_due == held.until
+
+
+def test_a_backend_still_running_is_another_idle_stall_and_still_no_claim(
+    harness: Harness,
+) -> None:
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, broken))
+    harness.worker._claim()
+
+    class StillRunning(FakeConn):
+        def execute(self, query: str, params: Any = None) -> FakeRows:
+            if query == runtime._TERMINATE:
+                return FakeRows((False,))  # the terminate's wait ran out
+            return super().execute(query, params)
+
+    harness.conn = StillRunning()
+    harness.worker._claim()
+    assert harness.worker._abandoned is not None  # still unconfirmed: still no claim
+    assert harness.worker._idle_stalls == 2
+    assert harness.worker._held is None
+
+
+def test_a_claim_that_returns_after_its_abort_is_honoured(harness: Harness) -> None:
+    # B's R1: the abort fires, but the claim's answer arrived: it is a valid claim.
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, attempt))
+    harness.monkeypatch.setattr(runtime, "get_task", lambda *a, **k: ClaimedTask())
+    harness.monkeypatch.setattr(runtime, "get_job", lambda *a, **k: ClaimedJob())
+    first = harness.conn
+    harness.conn = FakeConn(pid=99)  # what the next call connects to
+    harness.worker._conn = first  # type: ignore[assignment]
+    harness.worker._backend = runtime.Backend(4242, BACKEND_START)
+    harness.worker._claim()
+    assert harness.worker._abandoned is None  # nothing to settle
+    assert first.closed  # the aborted call's connection was still discarded
+    assert harness.worker._schedule.running is not None  # claimed and started
+    assert harness.connects == 1  # the reads opened a fresh connection
+    assert harness.worker._idle_stalls == 0
+
+
+def test_a_claim_aborted_before_it_was_sent_leaves_nothing_to_settle(harness: Harness) -> None:
+    def connect_slowly() -> Any:
+        harness.connects += 1
+        harness.clock.now += BOUND + 0.5
+        harness.watchdog.check()  # the abort fires while connecting: no socket yet
+        return harness.conn
+
+    harness.worker._connect = connect_slowly
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", raising(AssertionError("sent")))
+    harness.worker._claim()
+    assert harness.worker._abandoned is None
+    assert harness.worker._idle_stalls == 1
+    assert harness.conn.closed
+
+
+def test_a_read_of_a_claimed_task_past_its_bound_still_ends_the_process(
+    harness: Harness,
+) -> None:
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", lambda *a, **k: attempt())
+    harness.monkeypatch.setattr(runtime, "get_task", stalls_then(harness, ClaimedTask))
+    harness.monkeypatch.setattr(runtime, "get_job", lambda *a, **k: ClaimedJob())
+    harness.worker._claim()
+    (expiry,) = harness.expiries  # not an idle call: DEC-045's fail-fast, as before
+    assert expiry.context["operation"] == "read_task"
+
+
+def test_an_idle_sweep_past_its_bound_ends_the_sweep_and_backs_off(harness: Harness) -> None:
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", stalls_then(harness, broken))
+    harness.worker._sweep()
+    assert harness.expiries == []
+    sweep = harness.worker._schedule.sweep
+    assert sweep.left == 0
+    assert harness.clock.now + BOUND / 2 <= sweep.due <= harness.clock.now + BOUND
+    assert harness.worker._abandoned is None  # a late revocation is any worker's to make
+
+
+def test_a_sweep_while_a_handler_runs_still_ends_the_process(harness: Harness) -> None:
+    harness.start()
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", stalls_then(harness, lambda: None))
+    harness.worker._sweep()
+    (expiry,) = harness.expiries
+    assert expiry.guard is Guard.OPERATION  # owning: DEC-045's fail-fast, unchanged
+    assert expiry.context["operation"] == "revoke_next_expired"
+
+
+def test_the_idle_stall_limit_ends_the_process_and_a_completed_call_resets_it(
+    harness: Harness,
+) -> None:
+    with_limit(harness, 2)
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", stalls_then(harness, broken))
+    harness.worker._sweep()
+    assert harness.worker._idle_stalls == 1
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", lambda *a, **k: None)
+    harness.worker._sweep()
+    assert harness.worker._idle_stalls == 0  # the database answered
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", stalls_then(harness, broken))
+    harness.worker._sweep()
+    with pytest.raises(Terminated) as ended:
+        harness.worker._sweep()
+    assert (ended.value.code, ended.value.event) == (ExitCode.STALLED, "idle_stall_limit_reached")
+
+
+def test_a_limit_of_zero_ends_the_process_at_the_first_idle_stall_as_before(
+    harness: Harness,
+) -> None:
+    with_limit(harness, 0)
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, lambda: None))
+    harness.worker._claim()
+    (expiry,) = harness.expiries
+    assert expiry.guard is Guard.OPERATION
+    assert expiry.context["operation"] == "claim"
+    assert runtime._BACKEND not in harness.conn.queries  # no identity read at all
+
+
+def test_the_idle_back_off_doubles_to_eight_bounds_with_stable_jitter(harness: Harness) -> None:
+    for stalls in range(1, 12):
+        capped = BOUND * min(8, 2 ** (stalls - 1))
+        wait = harness.worker._idle_backoff(stalls)
+        assert capped / 2 <= wait <= capped
+        assert wait == harness.worker._idle_backoff(stalls)
+
+
+def test_only_the_idle_operations_are_abortable() -> None:
+    assert {"claim", "revoke_next_expired", "settle_abandoned"} == runtime.IDLE_OPERATIONS
+
+
+def test_only_a_claim_reads_its_connection_s_backend_and_only_once(harness: Harness) -> None:
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", lambda *a, **k: None)
+    harness.worker._sweep()  # idle, but not a claim: nothing to identify
+    assert runtime._BACKEND not in harness.conn.queries
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", lambda *a, **k: None)
+    harness.worker._claim()
+    harness.worker._claim()
+    assert harness.conn.queries.count(runtime._BACKEND) == 1  # once per connection
+    assert harness.worker._backend == runtime.Backend(4242, BACKEND_START)
+
+
+def test_an_owning_call_on_a_new_connection_never_reads_the_backend(harness: Harness) -> None:
+    harness.start()
+    harness.worker._call("renew_lease", lambda conn: None, {})  # a heartbeat's reconnect
+    assert runtime._BACKEND not in harness.conn.queries
+    assert harness.worker._backend is None
+
+
+def test_a_connect_that_outlives_an_idle_bound_is_an_idle_stall(harness: Harness) -> None:
+    def frozen() -> Any:
+        harness.clock.now += BOUND + 0.5
+        harness.watchdog.check()  # the abort fires while the connect still waits
+        raise psycopg.OperationalError("timeout expired")
+
+    harness.worker._conn = None
+    harness.worker._connect = frozen
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", raising(AssertionError("sent")))
+    harness.worker._sweep()
+    assert harness.worker._idle_stalls == 1  # counted toward the limit, unlike a refusal
+    assert harness.expiries == []
+
+
+@pytest.mark.parametrize(("bound", "backstop"), [(0.9, 2.0), (2.0, 2.0), (2.5, 3.0), (3.0, 3.0)])
+def test_the_idle_backstop_is_a_bound_and_never_shorter_than_the_connect_timeout(
+    harness: Harness, bound: float, backstop: float
+) -> None:
+    harness.worker._settings = SETTINGS.model_copy(
+        update={"db_operation_timeout": timedelta(seconds=bound)}
+    )
+    assert harness.worker._idle_backstop() == backstop

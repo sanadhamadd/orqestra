@@ -745,3 +745,97 @@ def test_the_watchdog_hands_its_clock_to_the_expiry() -> None:
     expiry = dog.check()
     assert expiry is not None
     assert expiry.clock is clock
+
+
+# --- an idle call's abortable operation guard (DEC-074) -----------------------------------
+
+
+class Abort:
+    def __init__(self, fail: bool = False) -> None:
+        self.calls = 0
+        self.fail = fail
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.fail:
+            raise OSError("not a socket")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_an_idle_call_past_its_bound_is_aborted_and_ends_the_process_one_backstop_later(
+    fail: bool,
+) -> None:
+    clock = FakeClock()
+    dog, recorder = watchdog(clock)
+    abort = Abort(fail)
+    token = dog.arm_abortable(103.0, CONTEXT, abort=abort, backstop=3.0)
+    clock.now = 103.0
+    assert dog.check() is None  # aborted, not ended: even an abort that raised
+    assert abort.calls == 1
+    assert recorder.expiries == []
+    assert dog.deadline(Guard.OPERATION) == 106.0  # the same token, one backstop later
+    clock.now = 105.9
+    assert dog.check() is None
+    clock.now = 106.0
+    expiry = dog.check()  # the call did not return: the process ends, as today
+    assert expiry is not None
+    assert (expiry.guard, expiry.deadline) == (Guard.OPERATION, 106.0)
+    assert recorder.expiries == [expiry]
+    assert abort.calls == 1  # never twice
+    assert dog.disarm(token) is False
+
+
+def test_a_call_that_returns_after_its_abort_disarms_the_backstop() -> None:
+    clock = FakeClock()
+    dog, recorder = watchdog(clock)
+    token = dog.arm_abortable(103.0, CONTEXT, abort=Abort(), backstop=3.0)
+    clock.now = 103.5
+    dog.check()
+    assert dog.disarm(token) is True
+    clock.now = 200.0
+    assert dog.check() is None
+    assert recorder.expiries == []
+
+
+@pytest.mark.parametrize("owned", [Guard.OWNERSHIP, Guard.DRAIN])
+def test_an_abortable_guard_ends_the_process_while_a_task_is_owned(owned: Guard) -> None:
+    clock = FakeClock()
+    dog, recorder = watchdog(clock)
+    abort = Abort()
+    dog.arm(owned, 500.0, CONTEXT)
+    dog.arm_abortable(103.0, CONTEXT, abort=abort, backstop=3.0)
+    clock.now = 103.0
+    expiry = dog.check()
+    assert expiry is not None
+    assert expiry.guard is Guard.OPERATION
+    assert abort.calls == 0
+    assert recorder.expiries == [expiry]
+
+
+def test_an_abortable_guard_is_still_the_one_operation_guard() -> None:
+    dog, _ = watchdog(FakeClock())
+    dog.arm_abortable(103.0, CONTEXT, abort=Abort(), backstop=3.0)
+    with pytest.raises(RuntimeError, match="already armed"):
+        dog.arm(Guard.OPERATION, 104.0, CONTEXT)
+
+
+@pytest.mark.parametrize("backstop", [0.0, -1.0, math.inf, math.nan])
+def test_an_abortable_guard_needs_a_positive_finite_backstop(backstop: float) -> None:
+    dog, _ = watchdog(FakeClock())
+    with pytest.raises(ValueError, match="backstop"):
+        dog.arm_abortable(103.0, CONTEXT, abort=Abort(), backstop=backstop)
+    assert dog.deadline(Guard.OPERATION) is None
+
+
+def test_the_thread_aborts_a_blocked_idle_call_and_ends_it_only_at_the_backstop() -> None:
+    dog, recorder = watchdog()
+    aborted = threading.Event()
+    dog.start()
+    try:
+        dog.arm_abortable(time.monotonic() + 0.05, CONTEXT, abort=aborted.set, backstop=0.2)
+        assert aborted.wait(5)
+        assert not recorder.fired.is_set()  # aborted, the process not ended
+        assert recorder.fired.wait(5)  # nothing returned: the backstop ends it
+        assert recorder.expiries[0].guard is Guard.OPERATION
+    finally:
+        dog.stop(5)
