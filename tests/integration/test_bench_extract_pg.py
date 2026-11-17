@@ -30,7 +30,7 @@ from benchmarks.live import (
     canned_requests,
 )
 from benchmarks.result import EXTRACTION_FIELDS, Status, validate_result, write_result
-from benchmarks.run import Cell, Profile, extract_cap, run_cell
+from benchmarks.run import Cell, Profile, cell_cap, run_cell
 from orqestra.calls.provider import ProviderUsage
 from orqestra.calls.recording import CallOutcome, ProviderCallResult
 from orqestra.persistence.provider_usage import UsageReplayConflictError, record_call_result
@@ -110,7 +110,7 @@ def test_a_dry_extract_cell_reads_every_document_and_records_every_figure(
     assert [check for check in record["gate"] if not check["passed"]] == []
     assert record["status"] == Status.COMPLETE
     assert record["provider"]["calls_made"] == CELL.size
-    assert record["provider"]["cap"] == extract_cap(CELL.batch)  # room for in-attempt retries
+    assert record["provider"]["cap"] == cell_cap(CELL) == 15  # batch 10 + room for retries
     assert canned_requests(raw_dir) == CELL.size
 
     block = record["extraction"]
