@@ -32,6 +32,13 @@ ledger records the extraction prompt's version. A dry run is given the cell's
 its oracle reply (``live.perfect_replies``). The default workload, ``mix``, is the
 invoice verification above, unchanged.
 
+The extract workload calls a document again inside the attempt after a throttled
+try (``extract.DocumentRetry``, DEC-073), within the attempt's cap and its time, which
+the worker derives from its settings (``attempt_time``). With ``--rate-limit-per-s``
+and ``--rate-limit-file`` (always together, extract only) every try first takes a slot
+of the cell's shared pace (``benchmarks.ratelimit``); the file is created on first use.
+Without them nothing is paced.
+
 Before it connects, it checks the provider flags, then with
 ``check_provider_call_budget`` that the call cap, each call's timeout and the
 usage handoffs fit in the execution timeout, and exits 1 if they do not.
@@ -49,7 +56,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter, ValidationError
 
-from benchmarks import extract
+from benchmarks import extract, ratelimit
 from benchmarks.live import (
     DOUBLE,
     BudgetedRecorder,
@@ -70,7 +77,7 @@ from orqestra.worker.handlers import Handler, HandlerRegistry
 from orqestra.worker.runtime import Worker, connect_supervisor
 from orqestra.worker.settings import WorkerSettings
 from orqestra.worker.shutdown import run_until_signalled
-from orqestra.worker.usage import UsageSink, check_provider_call_budget
+from orqestra.worker.usage import UsageSink, check_provider_call_budget, usage_handoff_bound
 from orqestra.workloads.invoice.handler import JOB_KIND, invoice_verification_handler
 from orqestra.workloads.invoice.verify import REQUIRED_CAPABILITY
 
@@ -143,6 +150,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--documents", type=int, help="extract dry run: the cell's document count")
     parser.add_argument("--seed", type=int, help="extract dry run: the cell's document seed")
+    parser.add_argument(
+        "--rate-limit-per-s",
+        type=float,
+        help="extract: the most calls a second the whole cell starts (absent: no pace)",
+    )
+    parser.add_argument(
+        "--rate-limit-file",
+        type=Path,
+        help="extract: the cell's shared pace file, created on first use",
+    )
     return parser
 
 
@@ -188,6 +205,35 @@ def workload_refusal(
     return None
 
 
+def rate_limit_refusal(
+    workload: WorkloadName, per_s: float | None, path: Path | None
+) -> str | None:
+    """Why the pace flags may not run, or ``None``."""
+    if per_s is None and path is None:
+        return None
+    if per_s is None or path is None:
+        return "--rate-limit-per-s and --rate-limit-file go together"
+    if workload is not WorkloadName.EXTRACT:
+        return "--rate-limit-per-s applies only to --workload extract"
+    try:
+        ratelimit.check_rate(per_s)
+    except ValueError as exc:
+        return f"--rate-limit-per-s: {exc}"
+    if not path.parent.is_dir():
+        return "--rate-limit-file must be in an existing directory"
+    return None
+
+
+def attempt_time(settings: WorkerSettings, call_timeout: timedelta) -> extract.AttemptTime:
+    """What one attempt's calls may use: the execution timeout less the fence margin and
+    one handoff bound (the claim), each call its timeout and two handoffs (DEC-073)."""
+    handoff = usage_handoff_bound(settings)
+    return extract.AttemptTime(
+        budget=max(settings.execution_timeout - settings.fence_margin - handoff, timedelta(0)),
+        per_call=call_timeout + 2 * handoff,
+    )
+
+
 def build_worker(
     url: str,
     settings: WorkerSettings,
@@ -201,6 +247,7 @@ def build_worker(
     workload: WorkloadName = WorkloadName.MIX,
     documents: int | None = None,
     seed: int | None = None,
+    pace: ratelimit.RateLimiter | None = None,
 ) -> Worker:
     """A worker running one job kind, its provider behind a ``UsageSink``.
 
@@ -208,7 +255,8 @@ def build_worker(
     For OpenRouter the sink's recorder is wrapped in a ``BudgetedRecorder`` on
     ``budget_file``; the wiring is appended to ``wiring`` when given, so the caller
     can read a dry run's request count. The ``extract`` workload runs only
-    ``invoice_extraction`` on OpenRouter (``workload_refusal`` has been checked).
+    ``invoice_extraction`` on OpenRouter (``workload_refusal`` has been checked), with
+    the per-document retry and, given ``pace``, the cell's shared pace.
     """
     if workload is WorkloadName.EXTRACT:
         return _extract_worker(
@@ -222,7 +270,11 @@ def build_worker(
             wiring=wiring,
             documents=documents,
             seed=seed,
+            pace=pace,
         )
+    if pace is not None:
+        msg = "only the extract workload is paced"
+        raise ValueError(msg)
     provider: Provider
     recorder: ProviderCallRecorder
     if choice.openrouter:
@@ -272,6 +324,7 @@ def _extract_worker(
     wiring: list[OpenRouterWiring] | None,
     documents: int | None,
     seed: int | None,
+    pace: ratelimit.RateLimiter | None,
 ) -> Worker:
     assert choice.openrouter
     assert budget_file is not None
@@ -299,6 +352,9 @@ def _extract_worker(
         call_timeout,
         max_provider_calls_per_attempt=cap,
         recorder=recorder,
+        retry=extract.DocumentRetry(),
+        pace=pace,
+        attempt_time=attempt_time(settings, call_timeout),
     )
     return Worker(
         registry=HandlerRegistry({extract.JOB_KIND: handler}),
@@ -316,8 +372,10 @@ def _refuse(message: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     choice = choice_of(args)
-    refusal = provider_refusal(choice, args.budget_file, os.environ) or workload_refusal(
-        args.workload, choice, args.documents, args.seed
+    refusal = (
+        provider_refusal(choice, args.budget_file, os.environ)
+        or workload_refusal(args.workload, choice, args.documents, args.seed)
+        or rate_limit_refusal(args.workload, args.rate_limit_per_s, args.rate_limit_file)
     )
     if refusal is not None:
         return _refuse(refusal)
@@ -350,6 +408,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         workload=args.workload,
         documents=args.documents,
         seed=args.seed,
+        pace=None
+        if args.rate_limit_file is None
+        else ratelimit.RateLimiter(args.rate_limit_file, args.rate_limit_per_s),
     )
     run_until_signalled(worker)  # until a signal stops it, or the process ends
     for wired in wiring:
