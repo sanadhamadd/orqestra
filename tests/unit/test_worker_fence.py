@@ -94,8 +94,9 @@ def test_nothing_expires_before_its_deadline_and_an_expiry_fires_once() -> None:
     clock.now = 109.999
     assert dog.check() is None
     clock.now = 110.0
-    assert dog.check() == Expiry(Guard.OWNERSHIP, 110.0, 110.0, CONTEXT)
-    assert recorder.expiries == [Expiry(Guard.OWNERSHIP, 110.0, 110.0, CONTEXT)]
+    # An OWNERSHIP expiry carries its own deadline as the ownership deadline.
+    assert dog.check() == Expiry(Guard.OWNERSHIP, 110.0, 110.0, CONTEXT, 110.0)
+    assert recorder.expiries == [Expiry(Guard.OWNERSHIP, 110.0, 110.0, CONTEXT, 110.0)]
     assert dog.deadline(Guard.OWNERSHIP) is None  # every guard is disarmed after an expiry
     clock.now = 200.0
     assert dog.check() is None
@@ -315,20 +316,27 @@ def test_end_process_writes_one_json_line_then_exits_with_the_code(
 
 
 @pytest.mark.parametrize(
-    ("guard", "code", "event"),
+    ("guard", "code", "event", "bound"),
     [
-        (Guard.OWNERSHIP, ExitCode.FENCED, "ownership_deadline_passed"),
-        (Guard.OPERATION, ExitCode.STALLED, "operation_deadline_passed"),
-        (Guard.DRAIN, ExitCode.SHUTDOWN, "drain_deadline_passed"),
+        (Guard.OWNERSHIP, ExitCode.FENCED, "ownership_deadline_passed", 0.1),
+        (Guard.OPERATION, ExitCode.STALLED, "operation_deadline_passed", 1.0),
+        (Guard.DRAIN, ExitCode.SHUTDOWN, "drain_deadline_passed", 1.0),
     ],
 )
 def test_the_default_terminate_ends_the_process_for_each_guard(
-    monkeypatch: pytest.MonkeyPatch, guard: Guard, code: ExitCode, event: str
+    monkeypatch: pytest.MonkeyPatch, guard: Guard, code: ExitCode, event: str, bound: float
 ) -> None:
-    calls: list[tuple[ExitCode, str]] = []
+    calls: list[tuple[ExitCode, str, float]] = []
 
-    def fake_end(code: ExitCode, event: str, message: str, context: object) -> None:
-        calls.append((code, event))
+    def fake_end(
+        code: ExitCode,
+        event: str,
+        message: str,
+        context: object,
+        *,
+        line_write_bound: float = fence._LINE_WRITE_BOUND,
+    ) -> None:
+        calls.append((code, event, line_write_bound))
         raise Exited
 
     monkeypatch.setattr(fence, "end_process", fake_end)
@@ -337,7 +345,8 @@ def test_the_default_terminate_ends_the_process_for_each_guard(
     dog.arm(guard, 100.0, CONTEXT)
     with pytest.raises(Exited):
         dog.check()
-    assert calls == [(code, event)]
+    # Nothing else owned: an OWNERSHIP expiry keeps 0.1 s, the others get 1 s for the line.
+    assert calls == [(code, event, bound)]
 
 
 @pytest.mark.parametrize(
@@ -552,3 +561,187 @@ def test_exit_codes_are_stable() -> None:
         "UNRECORDED": 8,
         "SHUTDOWN": 9,
     }
+
+
+# --- the watchdog's reason line is not lost on a loaded machine (F2) ---------------------------
+
+# stderr writes slowed to 0.5 s, as a loaded machine delayed the writer in the campaign. The
+# main thread blocks as in a stalled database call; the watchdog's OPERATION guard ends it.
+_SLOW_STDERR = textwrap.dedent(
+    """
+    import os, sys, threading, time
+    from orqestra.worker import fence
+
+    real_write = os.write
+
+    def slow_write(fd, data):
+        if fd == 2:
+            time.sleep(0.5)
+        return real_write(fd, data)
+
+    os.write = slow_write
+    if sys.argv[1] == "watchdog":
+        watchdog = fence.Watchdog()
+        watchdog.start()
+        context = {"worker_id": "test", "operation": "heartbeat"}
+        watchdog.arm(fence.Guard.OPERATION, time.monotonic() + 0.2, context)
+        threading.Event().wait(10)
+        print("still running", flush=True)
+    else:  # the signal-handler path: end_process with its default, short bound
+        fence.end_process(fence.ExitCode.SHUTDOWN, "shutdown_forced", "signal", {"worker_id": "t"})
+    """
+)
+
+
+def _slow_stderr_child(path: str) -> tuple[subprocess.CompletedProcess[str], float]:
+    started = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-c", _SLOW_STDERR, path],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return result, time.monotonic() - started
+
+
+def test_a_stalled_operation_s_reason_line_is_written_even_when_stderr_is_slow() -> None:
+    result, _ = _slow_stderr_child("watchdog")
+    assert result.returncode == ExitCode.STALLED
+    assert "still running" not in result.stdout
+    line = json.loads(result.stderr.strip().splitlines()[-1])
+    assert line["level"] == "CRITICAL"
+    assert line["event"] == "operation_deadline_passed"
+    assert line["exit_code"] == ExitCode.STALLED
+    assert line["operation"] == "heartbeat"  # the line names what stalled
+
+
+def test_the_signal_path_keeps_its_short_bound_and_does_not_wait_for_a_slow_line() -> None:
+    result, seconds = _slow_stderr_child("signal")
+    assert result.returncode == ExitCode.SHUTDOWN
+    assert result.stderr == ""  # it ended before the slowed write could finish
+    # Well under the 0.5 s write: the 0.1 s bound held (interpreter start-up included).
+    assert seconds < 5
+
+
+def test_the_bounds_are_short_for_a_signal_and_one_second_for_the_watchdog() -> None:
+    assert fence._LINE_WRITE_BOUND == 0.1
+    assert fence._WATCHDOG_LINE_WRITE_BOUND == 1.0
+
+
+# --- the line's wait never runs past the lease (F2, C's review) -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("guard", "ownership_left", "bound"),
+    [
+        (Guard.OWNERSHIP, 0.0, 0.1),
+        (Guard.OPERATION, None, 1.0),
+        (Guard.DRAIN, None, 1.0),
+        (Guard.OPERATION, 5.0, 1.0),
+        (Guard.OPERATION, 0.4, 0.4),
+        (Guard.DRAIN, 0.4, 0.4),
+        (Guard.OPERATION, 0.02, 0.1),
+    ],
+)
+def test_the_line_bound_is_cut_to_what_ownership_has_left(
+    guard: Guard, ownership_left: float | None, bound: float
+) -> None:
+    owned = None if ownership_left is None else 100.0 + ownership_left
+    expiry = Expiry(guard, 100.0, 100.0, CONTEXT, owned)
+    assert fence._line_bound_for(expiry) == pytest.approx(bound)
+
+
+def test_an_expiry_carries_the_ownership_deadline_armed_when_it_fired() -> None:
+    recorder = Recorder()
+    dog = Watchdog(clock=FakeClock(100.0), terminate=recorder)
+    dog.arm(Guard.OWNERSHIP, 105.0, CONTEXT)
+    dog.arm(Guard.OPERATION, 100.0, CONTEXT)
+    expiry = dog.check()
+    assert expiry is not None
+    assert (expiry.guard, expiry.ownership_deadline) == (Guard.OPERATION, 105.0)
+    alone = Watchdog(clock=FakeClock(100.0), terminate=Recorder())
+    alone.arm(Guard.OPERATION, 100.0, CONTEXT)
+    expiry = alone.check()
+    assert expiry is not None
+    assert expiry.ownership_deadline is None
+
+
+# OPERATION expires 0.2 s after arming while OWNERSHIP has 0.2 s more left; the line's write
+# takes 0.5 s. The child prints when OPERATION was armed; the parent measures the exit.
+_OWNED_AND_STALLED = textwrap.dedent(
+    """
+    import os, sys, threading, time
+    from orqestra.worker import fence
+
+    real_write = os.write
+
+    def slow_write(fd, data):
+        if fd == 2:
+            time.sleep(0.5)
+        return real_write(fd, data)
+
+    os.write = slow_write
+    watchdog = fence.Watchdog()
+    watchdog.start()
+    now = time.monotonic()
+    guard = fence.Guard[sys.argv[1]]
+    if guard is fence.Guard.OPERATION:
+        watchdog.arm(fence.Guard.OWNERSHIP, now + 0.4, {"worker_id": "test"})
+    print(time.time(), flush=True)
+    watchdog.arm(guard, now + 0.2, {"worker_id": "test", "operation": "heartbeat"})
+    threading.Event().wait(10)
+    print("still running", flush=True)
+    """
+)
+
+
+def _owned_child(guard: str) -> tuple[subprocess.CompletedProcess[str], float]:
+    result = subprocess.run(
+        [sys.executable, "-c", _OWNED_AND_STALLED, guard],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    ended = time.time()
+    armed = float(result.stdout.splitlines()[0])
+    return result, ended - armed
+
+
+def test_a_stall_while_owning_waits_for_its_line_only_until_the_lease_ends() -> None:
+    result, seconds = _owned_child("OPERATION")
+    assert result.returncode == ExitCode.STALLED
+    assert "still running" not in result.stdout
+    # OPERATION at +0.2 s, then at most the 0.2 s ownership had left. The proof is that
+    # the 0.5 s write never finished: the wait was cut short of it. (A late watchdog on a
+    # loaded machine moves both ends, so the wall time is only a loose sanity bound.)
+    assert result.stderr == ""
+    assert seconds < 5
+
+
+def test_an_ownership_expiry_keeps_the_short_bound() -> None:
+    result, seconds = _owned_child("OWNERSHIP")
+    assert result.returncode == ExitCode.FENCED
+    assert result.stderr == ""  # 0.1 s, shorter than the 0.5 s write
+    assert seconds < 5
+
+
+def test_the_time_left_is_read_from_the_clock_at_the_wait_not_at_the_check() -> None:
+    clock = FakeClock(100.0)
+    expiry = Expiry(Guard.OPERATION, 100.0, 100.0, CONTEXT, 100.6, clock)
+    assert fence._line_bound_for(expiry) == pytest.approx(0.6)
+    clock.now = 100.3  # time passed between the check and the wait
+    assert fence._line_bound_for(expiry) == pytest.approx(0.3)
+    clock.now = 100.55
+    assert fence._line_bound_for(expiry) == pytest.approx(0.1)  # never below 0.1 s
+
+
+def test_the_watchdog_hands_its_clock_to_the_expiry() -> None:
+    clock = FakeClock(100.0)
+    dog = Watchdog(clock=clock, terminate=Recorder())
+    dog.arm(Guard.OWNERSHIP, 101.0, CONTEXT)
+    dog.arm(Guard.OPERATION, 100.0, CONTEXT)
+    expiry = dog.check()
+    assert expiry is not None
+    assert expiry.clock is clock
