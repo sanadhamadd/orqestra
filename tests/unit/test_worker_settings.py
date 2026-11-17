@@ -275,3 +275,30 @@ def test_the_retry_base_delay_cannot_exceed_its_maximum() -> None:
 
 def test_the_retry_policy_is_built_from_the_two_settings() -> None:
     assert settings().retry_policy == RetryPolicy(timedelta(seconds=1), timedelta(minutes=5))
+
+
+# --- the idle stall limit (DEC-074) ---------------------------------------------------------
+
+
+def test_the_idle_stall_limit_defaults_to_five() -> None:
+    assert settings().idle_stall_limit == 5
+
+
+@pytest.mark.parametrize("limit", [0, 1, 20])
+def test_an_idle_stall_limit_from_zero_to_twenty_is_accepted(limit: int) -> None:
+    assert settings(idle_stall_limit=limit).idle_stall_limit == limit
+
+
+@pytest.mark.parametrize("limit", [-1, 21, True, False, 2.5, "many"])
+def test_an_idle_stall_limit_outside_its_bounds_is_refused(limit: object) -> None:
+    with pytest.raises(ValidationError, match="idle_stall_limit"):
+        settings(idle_stall_limit=limit)
+
+
+def test_the_idle_stall_limit_is_read_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in VALID.items():
+        monkeypatch.setenv(f"ORQESTRA_WORKER_{name.upper()}", str(value))
+    monkeypatch.setenv("ORQESTRA_WORKER_IDLE_STALL_LIMIT", "7")
+    assert WorkerSettings(_env_file=None).idle_stall_limit == 7

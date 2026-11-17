@@ -12,6 +12,18 @@ by the ownership guard (``fence``). When the supervisor cannot establish that
 it still owns a running task, it ends the process and recovery (a live worker's
 sweep, ``revoke_next_expired``) decides.
 
+An idle call (DEC-074), made while no handler runs or awaits settlement (a claim,
+or an idle sweep step), that runs past its bound does not end the process. The
+watchdog shuts that connection's socket; the call fails, its connection is
+discarded, and the worker logs ``idle_operation_abandoned``, backs off with
+jitter and tries again on a fresh connection. An outcome the call returned is
+still honoured. An abandoned claim's statement may still commit on the server,
+so no claim is sent until that backend is confirmed gone
+(``pg_terminate_backend``, matched by pid and start), and then none for one
+lease, as after a lost claim answer. After ``idle_stall_limit`` idle stalls in
+a row the worker ends itself (exit 4); a call made while it owns a task ends it
+at once, as before (DEC-045).
+
 When a completion's answer is lost, the supervisor keeps the handler's outcome
 and reconciles it from PostgreSQL's evidence (DEC-047): the completion
 committed, the attempt still runs and the same outcome is written again, or
@@ -55,6 +67,7 @@ there is no production service or workload handler yet.
 """
 
 import contextlib
+import hashlib
 import logging
 import math
 import os
@@ -74,6 +87,7 @@ import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from orqestra.domain.jobs import Attempt, AttemptOutcome, JsonValue
+from orqestra.persistence._shared import owned_transaction
 from orqestra.persistence.jobs import get_job, get_task
 from orqestra.persistence.lifecycle import (
     AttemptCompletion,
@@ -143,6 +157,102 @@ _OWNERSHIP_LOST = (
 
 class ConnectionUnavailable(Exception):  # noqa: N818 - it names a state, not an error kind
     """The supervisor could not connect; nothing was sent to the database."""
+
+
+@dataclass(frozen=True, slots=True)
+class Backend:
+    """A supervisor connection's server process: its pid and its start, which a reused
+    pid never shares."""
+
+    pid: int
+    started: datetime
+
+
+class OperationAbandoned(Exception):  # noqa: N818 - it names what happened, not an error kind
+    """An idle call ran past its bound and its connection was shut (DEC-074).
+
+    ``backend`` is set only when the call itself had been sent and failed after the
+    abort: its statement may still be running on that server process.
+    """
+
+    def __init__(self, operation: str, backend: Backend | None) -> None:
+        super().__init__(operation)
+        self.operation = operation
+        self.backend = backend
+
+
+# The calls that are idle when no handler runs or awaits settlement (DEC-074): past
+# their bound they are abandoned and retried, not fatal. Every other call keeps
+# DEC-045's fail-fast, including the reads of a claimed task not yet started.
+IDLE_OPERATIONS = frozenset({"claim", "revoke_next_expired", "settle_abandoned"})
+# The connection's own server process, read once per connection (DEC-074).
+_BACKEND = (
+    "SELECT pg_backend_pid(), backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+)
+# Ends an abandoned claim's server process and waits for it, up to the given milliseconds.
+# No row: the process is gone. A reused pid has another start, so it is never touched.
+_TERMINATE = (
+    "SELECT pg_terminate_backend(pid, %s) FROM pg_stat_activity "
+    "WHERE pid = %s AND backend_start = %s"
+)
+
+
+def _identify(conn: Conn) -> Backend | None:
+    # In its own transaction, so backend_start is decoded in UTC (DEC-067).
+    with owned_transaction(conn, "identify_backend") as cur:
+        row = cur.execute(_BACKEND).fetchone()
+    return None if row is None else Backend(int(row[0]), row[1])
+
+
+def _terminate_backend(conn: Conn, backend: Backend, wait_ms: int) -> bool:
+    """Whether ``backend`` is certainly gone: never listed, or terminated within the wait."""
+    with owned_transaction(conn, "settle_abandoned") as cur:
+        row = cur.execute(_TERMINATE, (wait_ms, backend.pid, backend.started)).fetchone()
+    return row is None or bool(row[0])
+
+
+class _Abort:
+    """The watchdog's abort for one idle call: it shuts that call's socket (DEC-074).
+
+    ``shutdown(2)`` on a duplicate descriptor ends the socket for both, touches no
+    libpq state, and returns at once, so it is safe from the watchdog thread; the
+    supervisor's blocked read then fails. The descriptor is attached after the
+    connection is open and detached before it is closed, under one lock, so an abort
+    can never reach a descriptor number that has since been reused.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fd: int | None = None
+        self.fired = False
+
+    def attach(self, fd: int) -> bool:
+        """Watch ``fd``; ``False`` if the abort has already fired."""
+        with self._lock:
+            if self.fired:
+                return False
+            self._fd = fd
+            return True
+
+    def detach(self) -> None:
+        with self._lock:
+            self._fd = None
+
+    def __call__(self) -> None:
+        with self._lock:
+            self.fired = True
+            if self._fd is None:
+                return
+            try:
+                duplicate = socket.socket(fileno=os.dup(self._fd))
+            except OSError:
+                return
+            try:
+                duplicate.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already shut, or not a socket: the backstop still bounds the call
+            finally:
+                duplicate.close()
 
 
 class UncontrolledExitError(RuntimeError):
@@ -534,6 +644,9 @@ class Worker:
         self._drain_due: float | None = None
         self._drain_token: int | None = None
         self._held: _Held | None = None
+        self._backend: Backend | None = None  # the open connection's server process
+        self._abandoned: Backend | None = None  # an abandoned claim's, until it is gone
+        self._idle_stalls = 0  # idle calls abandoned in a row (DEC-074)
         self._finished = False
         self._usage = usage
         if usage is not None:
@@ -648,6 +761,14 @@ class Worker:
         return self._stopping_at is not None
 
     def _stopped(self) -> None:
+        if self._abandoned is not None:
+            self._event(
+                logging.WARNING,
+                "stopped_with_uncertain_claim",
+                "an abandoned claim's backend was not confirmed gone; if the claim "
+                "committed, recovery revokes that attempt once its lease ends, using one "
+                "attempt of its task's budget",
+            )
         held = self._held
         if held is not None and self._clock() < held.until:
             # Exit 0 does not mean every claim is settled: say which one is not.
@@ -704,6 +825,9 @@ class Worker:
     # --- claiming and running ---------------------------------------------------
 
     def _claim(self) -> None:
+        if self._abandoned is not None:
+            self._settle_abandoned()  # no claim while an abandoned one may still commit
+            return
         anchor = self._clock()
         poll = self._settings.poll_interval.total_seconds()
         try:
@@ -714,6 +838,10 @@ class Worker:
                 ),
                 {},
             )
+        except OperationAbandoned as abandoned:
+            self._abandoned = abandoned.backend  # None: the claim was never sent
+            self._idle_stall("claim")
+            return
         # No ValueError is caught here, on purpose. The claim's only ValueError sources are
         # initial_lease, which the settings rule out (DEC-070's century rule: now +
         # execution_timeout stays representable for a century, so only a database clock
@@ -736,6 +864,7 @@ class Worker:
                 self._schedule.claim_due = self._clock() + poll
             return
         returned = self._clock()
+        self._idle_stalls = 0
         if attempt is None:
             self._schedule.claim_due = returned + poll
             return
@@ -770,6 +899,81 @@ class Worker:
             )
         if not self._start(attempt, anchor, context, task.payload, job.kind):
             self._hold(attempt, returned)
+
+    def _settle_abandoned(self) -> None:
+        """End an abandoned claim's server process, then hold claims for one lease.
+
+        Once the process is gone its claim either committed before now or never
+        will, so the lost-claim hold (no claim until now + lease) covers any attempt
+        it made. Until then nothing is claimed, and every try that cannot confirm it
+        counts as an idle stall (DEC-074).
+        """
+        backend = self._abandoned
+        assert backend is not None
+        wait_ms = max(1, math.floor(self._bound() * 500))  # half the bound
+        try:
+            gone = self._call(
+                "settle_abandoned",
+                lambda conn: _terminate_backend(conn, backend, wait_ms),
+                {},
+            )
+        except OperationAbandoned:
+            self._idle_stall("settle_abandoned")
+            return
+        except (psycopg.Error, ConnectionUnavailable) as exc:
+            self._event(logging.WARNING, "abandoned_claim_unsettled", type(exc).__name__)
+            self._idle_stall("settle_abandoned")
+            return
+        if not gone:
+            self._event(
+                logging.WARNING, "abandoned_claim_unsettled", f"backend {backend.pid} still runs"
+            )
+            self._idle_stall("settle_abandoned")
+            return
+        self._abandoned = None
+        self._idle_stalls = 0
+        self._event(
+            logging.WARNING,
+            "claim_uncertain",
+            f"an abandoned claim's backend {backend.pid} is gone; if the claim committed, "
+            "recovery takes that attempt back once its lease ends",
+        )
+        until = self._clock() + self._policy.lease.total_seconds()
+        self._held = _Held(None, until)
+        self._schedule.claim_due = until
+
+    def _idle_stall(self, operation: str, context: Mapping[str, str] | None = None) -> None:
+        """Count one abandoned idle call; back off, or end the process at the limit."""
+        self._idle_stalls += 1
+        stalls = self._idle_stalls
+        if stalls >= self._settings.idle_stall_limit:
+            self._terminate(
+                ExitCode.STALLED,
+                "idle_stall_limit_reached",
+                f"{stalls} idle database calls in a row ran past their bound",
+                {**self._base_context(), **(context or {}), "operation": operation},
+            )
+        wait = self._idle_backoff(stalls)
+        self._event(
+            logging.WARNING,
+            "idle_operation_abandoned",
+            f"operation={operation} consecutive={stalls} retry_in={wait:.3f}s",
+            context,
+        )
+        due = self._clock() + wait
+        self._schedule.claim_due = max(self._schedule.claim_due, due)
+        sweep = self._schedule.sweep
+        sweep.left = 0  # a sweep in progress ends here
+        sweep.due = max(sweep.due, due)
+
+    def _idle_backoff(self, stalls: int) -> float:
+        """The wait after the ``stalls``-th idle stall in a row, in [capped / 2, capped]:
+        ``capped = min(8, 2 ** (stalls - 1)) * db_operation_timeout``, its jitter keyed by
+        the worker and the count (DEC-053's shape)."""
+        capped = self._bound() * min(8, 1 << (min(stalls, 4) - 1))
+        digest = hashlib.sha256(f"{self.worker_id}:{stalls}".encode()).digest()
+        fraction = int.from_bytes(digest[:8], "big") / 2**64
+        return capped / 2 + capped / 2 * fraction
 
     def _stopping_before_start(
         self, attempt: Attempt, returned: float, context: Mapping[str, str]
@@ -1286,8 +1490,12 @@ class Worker:
             # The sink's kinds are closed at T3 (DEC-059); every worker must use this map.
             return revoke_next_expired(conn, retry_policy=self._retry_policy, usage_capture=tiers)
 
+        idle = self._schedule.running is None  # a sweep step is idle only then (DEC-074)
         try:
             revocation = self._call("revoke_next_expired", revoke, {})
+        except OperationAbandoned:
+            self._idle_stall("revoke_next_expired")  # it also ends this sweep
+            return
         except (psycopg.Error, ConnectionUnavailable) as exc:
             self._event(logging.WARNING, "sweep_failed", type(exc).__name__)
             revocation, sweep.left = None, 1  # end this sweep
@@ -1301,6 +1509,9 @@ class Worker:
                 f"the recovery sweep was refused: {type(exc).__name__}",
                 self._base_context(),
             )
+        else:
+            if idle:
+                self._idle_stalls = 0
         if revocation is not None:
             revoked = revocation.attempt
             self._event(
@@ -1319,25 +1530,65 @@ class Worker:
     # --- database calls ---------------------------------------------------------------------
 
     def _call[T](self, operation: str, call: Callable[[Conn], T], context: Mapping[str, str]) -> T:
-        """Run one supervisor database call under the watchdog's operation guard."""
+        """Run one supervisor database call under the watchdog's operation guard.
+
+        An idle call, one of ``IDLE_OPERATIONS`` made while no handler runs or
+        awaits settlement, is abortable (DEC-074): past its bound the watchdog shuts
+        its socket. If the call then fails, ``OperationAbandoned`` is raised instead,
+        carrying the server process when the call had been sent. An outcome the call
+        returned is still returned. Either way an aborted call's connection is
+        discarded, so the next call opens a fresh one. Any other call ends the
+        process past its bound.
+        """
         guard_context = {**self._base_context(), **context, "operation": operation}
-        token = self._watchdog.arm(Guard.OPERATION, self._clock() + self._bound(), guard_context)
+        idle = operation in IDLE_OPERATIONS and self._schedule.running is None
+        abort = _Abort() if idle and self._settings.idle_stall_limit > 0 else None
+        bound = self._bound()
+        deadline = self._clock() + bound
+        token = (
+            self._watchdog.arm(Guard.OPERATION, deadline, guard_context)
+            if abort is None
+            else self._watchdog.arm_abortable(deadline, guard_context, abort=abort, backstop=bound)
+        )
         try:
             if self._conn is None:
                 try:
                     self._conn = self._connect()
                 except psycopg.Error as exc:
                     raise ConnectionUnavailable(str(exc)) from exc
-            return call(self._conn)
+                self._backend = None
+                if abort is not None and not abort.attach(self._conn.fileno()):
+                    raise OperationAbandoned(operation, None)
+                if self._settings.idle_stall_limit > 0:
+                    try:
+                        self._backend = _identify(self._conn)
+                    except psycopg.Error:
+                        if abort is not None and abort.fired:
+                            raise OperationAbandoned(operation, None) from None
+                        raise
+            elif abort is not None and not abort.attach(self._conn.fileno()):
+                raise OperationAbandoned(operation, None)
+            backend = self._backend
+            try:
+                return call(self._conn)
+            except Exception as exc:
+                if abort is not None and abort.fired:
+                    raise OperationAbandoned(operation, backend) from exc
+                raise
         finally:
             self._watchdog.disarm(token)
+            if abort is not None:
+                abort.detach()  # before any close: a reused descriptor is never shut
+                if abort.fired:
+                    self._close()
             if self._conn is not None and self._conn.closed:
                 self._conn = None
 
     def _close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        conn, self._conn, self._backend = self._conn, None, None
+        if conn is not None:
+            with contextlib.suppress(psycopg.Error):  # a shut socket may fail to close cleanly
+                conn.close()
 
     # --- helpers --------------------------------------------------------------------------------
 
