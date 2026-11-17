@@ -28,7 +28,7 @@ from benchmarks.live import (
     read_budget_file,
 )
 from benchmarks.result import Status, write_result
-from benchmarks.run import Cell, Profile, build_workload, run_cell
+from benchmarks.run import LIVE_MAX_ATTEMPTS, Cell, Profile, build_workload, run_cell
 from orqestra.providers.openrouter import PROMPT_VERSION, SYSTEM_PROMPT, USAGE_UNIT
 from tests.integration.test_worker_process import ENVIRONMENT
 
@@ -176,6 +176,8 @@ def test_a_dry_run_cell_passes_its_gate_and_leaks_nothing(
         "route": "route-a",
         "calls_made": expected.calls,
         "usage_unit": USAGE_UNIT,
+        "max_attempts": LIVE_MAX_ATTEMPTS,  # an OpenRouter cell's retry budget
+        "rate_limit_per_s": None,
     }
 
     ledger = _ledger(db, _job_id(db))

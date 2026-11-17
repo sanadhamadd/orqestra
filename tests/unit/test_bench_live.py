@@ -495,7 +495,7 @@ def test_the_dry_run_preview_states_the_calls_and_bounds() -> None:
     expected = run.build_workload(cell).expected
     assert expected is not None
     assert f"expected provider calls (oracle): {expected.calls}" in lines[0]
-    assert lines[2].endswith(f": {16 * 3 * 4}")
+    assert lines[2].endswith(f": {16 * run.LIVE_MAX_ATTEMPTS * 4}")  # an OpenRouter cell: 8
     assert lines[3].endswith(": fits")
     assert "would stop this run" in lines[-1]
 
@@ -503,7 +503,7 @@ def test_the_dry_run_preview_states_the_calls_and_bounds() -> None:
 def test_a_long_call_timeout_is_given_room_and_an_impossible_one_refused() -> None:
     cell = Cell(Profile.INVOICE, size=100, batch=25, workers=2)
     lines = dry_run_preview(cell, DRY, "PT60S")
-    assert "execution timeout PT1058S" in lines[3]  # 16 x (60 + 2 x 3) + 2
+    assert "execution timeout PT1250S" in lines[3]  # 16 x (60 + 2 x 3 x 3) + 2, live bounds
     assert lines[3].endswith(": fits")
     # A timeout whose execution timeout breaks the settings' century rule is refused.
     lines = dry_run_preview(cell, DRY, "P3650000D")
