@@ -86,6 +86,8 @@ EXTRACTION_FIELDS = frozenset(
         "permanent_errors",
     }
 )
+# Keys a block may add (DEC-073); a result written before them stays valid without them.
+EXTRACTION_OPTIONAL_FIELDS = frozenset({"documents_processed"})
 ENVIRONMENT_FIELDS = frozenset(
     {
         "git_sha",
@@ -294,8 +296,21 @@ def _validate_extraction(record: dict[str, Any]) -> None:
     block = record["extraction"]
     if record["cell"]["profile"] != "extract":
         _fail("only an extract result carries an extraction block")
-    if not isinstance(block, dict) or set(block) != EXTRACTION_FIELDS:
-        _fail(f"the extraction block must hold exactly {sorted(EXTRACTION_FIELDS)}")
+    if not isinstance(block, dict) or not (
+        EXTRACTION_FIELDS <= set(block) <= EXTRACTION_FIELDS | EXTRACTION_OPTIONAL_FIELDS
+    ):
+        _fail(
+            f"the extraction block must hold exactly {sorted(EXTRACTION_FIELDS)}, "
+            f"and may hold {sorted(EXTRACTION_OPTIONAL_FIELDS)}"
+        )
+    processed = block.get("documents_processed", block["documents"])
+    if (
+        isinstance(processed, bool)
+        or not isinstance(processed, int)
+        or not isinstance(block["documents"], int)
+        or not 0 <= processed <= block["documents"]
+    ):
+        _fail("extraction.documents_processed must be a count from 0 to documents")
     latency = block["calls"].get("latency_ms") if isinstance(block["calls"], dict) else None
     if not isinstance(latency, dict) or not {"p50", "p95", "p99", "max"} <= set(latency):
         _fail("extraction.calls.latency_ms must give p50, p95, p99 and max")
