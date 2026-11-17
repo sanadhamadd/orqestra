@@ -64,7 +64,7 @@ from benchmarks.live import (
     read_budget_file,
 )
 from benchmarks.result import RAW_DIR, RESULTS_DIR, ROOT, DirtyTreeError, Status, code_state
-from benchmarks.run import refuse_dirty
+from benchmarks.run import extract_cap, refuse_dirty
 from benchmarks.worker import DEFAULT_CAP
 
 CAMPAIGN_BUDGET = Decimal(45)
@@ -82,6 +82,9 @@ CALL_TIMEOUT = "PT30S"
 CELL_STOP_MINUTES = 60
 LARGE_STOP_MINUTES = 180
 VICTIMS = 2
+# Live extract run cells pace their calls across workers below the provider's observed
+# throttling threshold (about 11 to 16 a second), except the throttle probe.
+RATE_LIMIT_PER_S = 10
 WORKER_COUNTS = (1, 4, 8, 16, 32)
 REPETITIONS = 3
 WORKER_MODULE = "benchmarks.worker"
@@ -145,11 +148,39 @@ class PlannedCell:
         return mix_calls(self.size, self.batch)
 
     @property
+    def throttle_probe(self) -> bool:
+        """The step-5 run cell: 32 workers in tasks of 5, unpaced, to draw the provider's
+        429s and show that a throttled document is retried inside its attempt."""
+        return self.step is Step.FAILURES and self.tool is Tool.RUN
+
+    @property
+    def paced(self) -> bool:
+        """Whether a live run of this cell passes ``--rate-limit-per-s``."""
+        return (
+            self.tool is Tool.RUN and self.workload is Workload.EXTRACT and not self.throttle_probe
+        )
+
+    @property
     def call_maximum(self) -> int:
-        """Expected calls plus 10 %, plus one task's calls per worker: a retry or a killed
-        worker's task is called again whole. A mix task calls at most the per-attempt cap."""
-        per_task = self.batch if self.workload is Workload.EXTRACT else min(self.batch, DEFAULT_CAP)
-        return math.ceil(self.expected_calls * CALL_HEADROOM) + per_task * self.workers
+        """Expected calls plus 10 %, plus one attempt's calls per worker: a retry or a killed
+        worker's task is called again whole. A run cell's extract attempt may call up to
+        ``extract_cap`` of its batch (throttled documents are retried inside it); a drill's
+        up to its batch; a mix task at most the per-attempt cap. The throttle probe also
+        gets one call per invoice for throttled tries, which cost nothing."""
+        if self.workload is not Workload.EXTRACT:
+            per_attempt = min(self.batch, DEFAULT_CAP)
+        elif self.tool is Tool.RUN:
+            per_attempt = extract_cap(self.batch)
+        else:
+            per_attempt = self.batch
+        maximum = math.ceil(self.expected_calls * CALL_HEADROOM) + per_attempt * self.workers
+        return maximum + self.size if self.throttle_probe else maximum
+
+    @property
+    def headroom_reason(self) -> str | None:
+        if self.throttle_probe:
+            return "throttle probe: one extra call per invoice for throttled tries"
+        return None
 
 
 @cache
@@ -166,6 +197,7 @@ class CampaignPlan:
     pilot_batch: int = 25
     pilot_workers: int = 4
     scaling: int = 2_000
+    scaling_one_worker: int = 1_000  # so one worker finishes inside the cell's time limit
     scaling_batch: int = 25
     worker_counts: tuple[int, ...] = WORKER_COUNTS
     repetitions: int = REPETITIONS
@@ -192,7 +224,8 @@ class CampaignPlan:
         cells = [extract(Step.PILOT, self.pilot, self.pilot_batch, self.pilot_workers)]
         for repetition in range(1, self.repetitions + 1):
             for workers in self.worker_counts:
-                cell = extract(Step.SCALING, self.scaling, self.scaling_batch, workers)
+                size = self.scaling_one_worker if workers == 1 else self.scaling
+                cell = extract(Step.SCALING, size, self.scaling_batch, workers)
                 cells.append(replace(cell, repetition=repetition))
         for batch in self.task_size_batches:
             cells.append(extract(Step.TASK_SIZE, self.task_size, batch, self.task_size_workers))
@@ -700,6 +733,7 @@ def command_for(cell: PlannedCell, settings: Settings, call_maximum: int) -> lis
         ]
     stop = LARGE_STOP_MINUTES if cell.step is Step.LARGE else CELL_STOP_MINUTES
     prices = settings.price_arguments() if cell.workload is Workload.EXTRACT else []
+    pacing = ["--rate-limit-per-s", str(RATE_LIMIT_PER_S)] if settings.live and cell.paced else []
     return [
         *head,
         "--profile",
@@ -716,6 +750,7 @@ def command_for(cell: PlannedCell, settings: Settings, call_maximum: int) -> lis
         str(stop),
         *provider,
         *prices,
+        *pacing,
         *common,
     ]
 
@@ -951,6 +986,7 @@ class Campaign:
             "ceiling": fixed_point_text(ceiling),
             "call_maximum": cell.call_maximum,
             "projected": fixed_point_text(cell.call_maximum * ceiling),
+            "call_headroom": cell.headroom_reason,
             "estimate": None
             if observed is None
             else fixed_point_text(cell.expected_calls * observed),
