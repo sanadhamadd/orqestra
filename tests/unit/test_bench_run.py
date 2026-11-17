@@ -18,6 +18,7 @@ import pytest
 
 from benchmarks import run
 from benchmarks.live import ProviderChoice, ProviderName
+from benchmarks.ratelimit import LIMITER_MAX_WAIT
 from benchmarks.run import (
     BENCH_WORKER_SETTINGS,
     LIVE_MAX_ATTEMPTS,
@@ -351,3 +352,16 @@ def test_without_the_workers_limiter_a_paced_cell_is_refused(
     with pytest.raises(ValueError, match="rate limiter"):
         cell_worker_settings(EXTRACT, LIVE, "PT30S", Decimal(10))
     assert cell_worker_settings(EXTRACT, LIVE, "PT30S")  # unpaced needs no limiter
+
+
+def test_a_paced_cell_covers_the_limiters_own_minimum_timeout() -> None:
+    # The workers' limiter asks for batch x LIMITER_MAX_WAIT on top of the calls; every
+    # call of the cap may wait for a token, so the cell gives cap x LIMITER_MAX_WAIT.
+    for batch in (5, 25, 100):
+        cell = Cell(Profile.EXTRACT, size=1_000, batch=batch, workers=8)
+        settings = cell_worker_settings(cell, LIVE, "PT30S", Decimal(10))
+        seconds = bench_settings(settings).execution_timeout.total_seconds()
+        handoff = 2 * 3 * 3  # two handoff bounds of three live database bounds
+        minimum = extract_cap(batch) * (30 + handoff) + 2 + batch * LIMITER_MAX_WAIT
+        assert seconds >= minimum
+        assert seconds == extract_cap(batch) * (30 + handoff + LIMITER_MAX_WAIT) + 2
