@@ -1549,13 +1549,18 @@ class Worker:
         token = (
             self._watchdog.arm(Guard.OPERATION, deadline, guard_context)
             if abort is None
-            else self._watchdog.arm_abortable(deadline, guard_context, abort=abort, backstop=bound)
+            else self._watchdog.arm_abortable(
+                deadline, guard_context, abort=abort, backstop=self._idle_backstop()
+            )
         )
         try:
             if self._conn is None:
                 try:
                     self._conn = self._connect()
                 except psycopg.Error as exc:
+                    if abort is not None and abort.fired:
+                        # The connect itself outlived the bound: an idle stall, nothing sent.
+                        raise OperationAbandoned(operation, None) from exc
                     raise ConnectionUnavailable(str(exc)) from exc
                 self._backend = None
             if abort is not None and not abort.attach(self._conn.fileno()):
@@ -1603,6 +1608,13 @@ class Worker:
 
     def _bound(self) -> float:
         return self._settings.db_operation_timeout.total_seconds()
+
+    def _idle_backstop(self) -> float:
+        """How long an aborted idle call gets to return: one bound, and never less than
+        the connect timeout (``supervisor_conninfo``), so a connect stalled by a frozen
+        server fails as an idle stall before the backstop could end the process."""
+        bound = self._bound()
+        return max(bound, float(max(2, math.ceil(bound))))
 
     def _margin(self) -> float:
         return self._settings.fence_margin.total_seconds()

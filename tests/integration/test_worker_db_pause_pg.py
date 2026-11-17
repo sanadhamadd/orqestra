@@ -171,13 +171,15 @@ def test_a_claim_still_running_on_the_server_is_ended_and_never_commits(
 
 
 def test_idle_stalls_up_to_the_limit_end_the_process_with_exit_4(
-    schema_url: str, worker_logs: pytest.LogCaptureFixture
+    schema_url: str, db: Conn, worker_logs: pytest.LogCaptureFixture
 ) -> None:
     settings = SETTINGS.model_copy(update={"idle_stall_limit": 2})
     with PgProxy(schema_url) as proxy:
         proxy.hold_on(CLAIM)  # never resumed while the worker runs: the database stays frozen
         try:
-            with running(supervisor(proxy.url(schema_url), settings), {}, settings) as probe:
+            with running(
+                supervisor(proxy.url(schema_url), settings), {"echo": echo}, settings
+            ) as probe:
                 eventually(lambda: probe.terminations, "the stall limit")
                 assert probe.terminations == [(ExitCode.STALLED, "idle_stall_limit_reached")]
                 assert probe.expiries == []  # each stall was abandoned, none fatal

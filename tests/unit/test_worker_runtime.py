@@ -1706,3 +1706,27 @@ def test_an_owning_call_on_a_new_connection_never_reads_the_backend(harness: Har
     harness.worker._call("renew_lease", lambda conn: None, {})  # a heartbeat's reconnect
     assert runtime._BACKEND not in harness.conn.queries
     assert harness.worker._backend is None
+
+
+def test_a_connect_that_outlives_an_idle_bound_is_an_idle_stall(harness: Harness) -> None:
+    def frozen() -> Any:
+        harness.clock.now += BOUND + 0.5
+        harness.watchdog.check()  # the abort fires while the connect still waits
+        raise psycopg.OperationalError("timeout expired")
+
+    harness.worker._conn = None
+    harness.worker._connect = frozen
+    harness.monkeypatch.setattr(runtime, "revoke_next_expired", raising(AssertionError("sent")))
+    harness.worker._sweep()
+    assert harness.worker._idle_stalls == 1  # counted toward the limit, unlike a refusal
+    assert harness.expiries == []
+
+
+@pytest.mark.parametrize(("bound", "backstop"), [(0.9, 2.0), (2.0, 2.0), (2.5, 3.0), (3.0, 3.0)])
+def test_the_idle_backstop_is_a_bound_and_never_shorter_than_the_connect_timeout(
+    harness: Harness, bound: float, backstop: float
+) -> None:
+    harness.worker._settings = SETTINGS.model_copy(
+        update={"db_operation_timeout": timedelta(seconds=bound)}
+    )
+    assert harness.worker._idle_backstop() == backstop
