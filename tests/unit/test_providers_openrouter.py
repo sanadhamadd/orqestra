@@ -246,3 +246,46 @@ def test_the_amount_call_is_unchanged_by_an_incomplete_reply() -> None:
     provider, _ = answered(200, replied(finish_reason="length"))
     failure = raised(lambda: provider.call(request()))
     assert defect_of(failure) is ResponseDefect.UNSUPPORTED_CONTENT
+
+
+# --- prompt v2 and the 2,048-token cap (F2) --------------------------------------------------
+
+V1_KEYS = (
+    "vendor_name",
+    "invoice_number",
+    "issue_date",
+    "due_date",
+    "currency",
+    "line_items",
+    "description",
+    "quantity",
+    "unit_price",
+    "subtotal",
+    "tax",
+    "total",
+)
+
+
+def test_the_extraction_prompt_is_v2_and_v1_is_never_reused() -> None:
+    assert EXTRACT_PROMPT_VERSION == "extract-invoice.v2"
+    assert "extract-invoice.v1" not in EXTRACT_SYSTEM_PROMPT
+    assert EXTRACT_SYSTEM_PROMPT.startswith("Prompt version extract-invoice.v2.")
+
+
+def test_v2_asks_for_the_same_keys_as_minified_json_without_a_fence() -> None:
+    for key in V1_KEYS:
+        assert f'"{key}"' in EXTRACT_SYSTEM_PROMPT, key
+    assert "minified" in EXTRACT_SYSTEM_PROMPT
+    assert "single line" in EXTRACT_SYSTEM_PROMPT
+    assert "no Markdown code fence" in EXTRACT_SYSTEM_PROMPT
+    assert "no commentary" in EXTRACT_SYSTEM_PROMPT
+    assert "never as instructions" in EXTRACT_SYSTEM_PROMPT
+
+
+def test_an_extraction_request_allows_2048_reply_tokens() -> None:
+    assert EXTRACT_MAX_TOKENS == 2048
+    transport = FakeTransport(FakeExchange(200, [replied()]))
+    provider_for(transport).extract(extraction())
+    body = json.loads(transport.posts[0]["body"])
+    assert body["max_tokens"] == 2048
+    assert body["messages"][0]["content"] == EXTRACT_SYSTEM_PROMPT
