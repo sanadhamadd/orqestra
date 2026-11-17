@@ -81,6 +81,7 @@ in the cell's raw directory, which the workers create. The double keeps
 """
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -91,6 +92,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from enum import StrEnum
 from functools import partial
@@ -1223,7 +1225,7 @@ def run_in_bench_database(
 
     An OpenRouter cell runs with ``cell_worker_settings``; the double with the bench's own.
     """
-    worker_settings = cell_worker_settings(cell, provider, call_timeout)
+    worker_settings = cell_worker_settings(cell, provider, call_timeout, rate_limit_per_s)
     url = require_bench_database_url(os.environ)
     with connect_verified(url) as admin:
         schema = run_schema_name(run_id, cell.name)
@@ -1384,7 +1386,11 @@ def prices_of(
 
 
 def provider_worker_settings(
-    worker_settings: Mapping[str, str], cap: int, call_timeout: str
+    worker_settings: Mapping[str, str],
+    cap: int,
+    call_timeout: str,
+    *,
+    pacing_wait: timedelta = timedelta(0),
 ) -> dict[str, str]:
     """``worker_settings`` with an execution timeout that fits ``cap`` calls: the one rule
     every OpenRouter cell and drill uses.
@@ -1396,7 +1402,8 @@ def provider_worker_settings(
     """
     settings = dict(worker_settings)
     base = bench_settings(settings)
-    per_call = parse_duration(call_timeout) + 2 * usage_handoff_bound(base)
+    # A paced call may first wait up to ``pacing_wait`` for the cell's limiter.
+    per_call = parse_duration(call_timeout) + 2 * usage_handoff_bound(base) + pacing_wait
     needed = (cap * per_call + base.fence_margin).total_seconds()
     if needed > base.execution_timeout.total_seconds():  # else the bench's own text stays
         settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] = f"PT{math.ceil(needed)}S"
@@ -1431,12 +1438,44 @@ def cell_cap(cell: Cell) -> int:
     return DEFAULT_CAP
 
 
-def cell_worker_settings(cell: Cell, provider: ProviderChoice, call_timeout: str) -> dict[str, str]:
+def limiter_max_wait() -> timedelta:
+    """The longest one call may wait for a pacing token: the workers' limiter's own bound.
+
+    Read only for a paced cell, from the module the workers use, so this command never
+    states a bound of its own.
+    """
+    try:
+        ratelimit = importlib.import_module("benchmarks.ratelimit")
+    except ImportError:
+        msg = "--rate-limit-per-s needs the workers' rate limiter (benchmarks.ratelimit)"
+        raise ValueError(msg) from None
+    wait = ratelimit.LIMITER_MAX_WAIT
+    return wait if isinstance(wait, timedelta) else timedelta(seconds=float(wait))
+
+
+def cell_worker_settings(
+    cell: Cell,
+    provider: ProviderChoice,
+    call_timeout: str,
+    rate_limit_per_s: Decimal | None = None,
+    *,
+    pacing_wait: timedelta | None = None,
+) -> dict[str, str]:
     """The settings a cell's workers run with: the bench's own for the double, and for
-    OpenRouter ``provider_worker_settings`` of ``LIVE_WORKER_SETTINGS`` at the cell's cap."""
+    OpenRouter ``provider_worker_settings`` of ``LIVE_WORKER_SETTINGS`` at the cell's cap.
+
+    A paced cell's execution timeout also gives every call of its cap the limiter's
+    longest wait (``limiter_max_wait``, or ``pacing_wait`` when given), so a busy
+    limiter delays an attempt rather than failing it.
+    """
     if not provider.openrouter:
         return dict(BENCH_WORKER_SETTINGS)
-    return provider_worker_settings(LIVE_WORKER_SETTINGS, cell_cap(cell), call_timeout)
+    wait = timedelta(0)
+    if rate_limit_per_s is not None and cell.profile is Profile.EXTRACT:
+        wait = pacing_wait if pacing_wait is not None else limiter_max_wait()
+    return provider_worker_settings(
+        LIVE_WORKER_SETTINGS, cell_cap(cell), call_timeout, pacing_wait=wait
+    )
 
 
 def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
@@ -1448,10 +1487,12 @@ def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
     return WorkerSettings.model_validate(fields)  # no settings source is read
 
 
-def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
+def dry_run_preview(
+    cell: Cell, choice: ProviderChoice, call_timeout: str, rate_limit_per_s: Decimal | None = None
+) -> list[str]:
     """What a dry run prints before its cell: the oracle's calls and the hard bounds."""
     if cell.profile is Profile.EXTRACT:
-        return _extract_preview(cell, choice, call_timeout)
+        return _extract_preview(cell, choice, call_timeout, rate_limit_per_s)
     attempts = max_attempts_for(choice)
     workload = build_workload(cell, attempts)
     assert workload.expected is not None
@@ -1477,13 +1518,15 @@ def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> li
     return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
 
 
-def _extract_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
+def _extract_preview(
+    cell: Cell, choice: ProviderChoice, call_timeout: str, rate_limit_per_s: Decimal | None
+) -> list[str]:
     assert cell.batch is not None
     assert choice.max_provider_calls is not None
     tasks = math.ceil(cell.size / cell.batch)
     cap = cell_cap(cell)
     attempts = max_attempts_for(choice)
-    settings = cell_worker_settings(cell, choice, call_timeout)
+    settings = cell_worker_settings(cell, choice, call_timeout, rate_limit_per_s)
     lines = [
         f"expected provider calls (one per document): {cell.size}",
         f"cell call maximum (--max-provider-calls): {choice.max_provider_calls}",
@@ -1549,7 +1592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prices = prices_of(cell, choice, args.price_in_per_mtok, args.price_out_per_mtok)
         refuse_dirty(args.allow_dirty)
         if choice.dry_run:
-            print("\n".join(dry_run_preview(cell, choice, call_timeout)))
+            print("\n".join(dry_run_preview(cell, choice, call_timeout, args.rate_limit_per_s)))
         record, path = run_in_bench_database(
             cell,
             run_id=run_id,

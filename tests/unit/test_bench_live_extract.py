@@ -442,18 +442,23 @@ def test_the_double_keeps_the_bench_settings_exactly() -> None:
     )
 
 
-def test_a_dry_invoice_cell_at_the_default_timeout_keeps_two_minutes() -> None:
+def test_a_dry_invoice_cell_runs_on_the_live_settings() -> None:
     cell = run.Cell(run.Profile.INVOICE, 100, 25, 2)
-    assert run.cell_worker_settings(cell, DRY, "PT0.1S") == dict(run.BENCH_WORKER_SETTINGS)
+    # 16 x (0.1 + 2 x 3 x 3) + 2 = 291.6, rounded up: past the bench's own two minutes
+    assert run.cell_worker_settings(cell, DRY, "PT0.1S") == {
+        **run.LIVE_WORKER_SETTINGS,
+        "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT292S",
+    }
 
 
 @pytest.mark.parametrize(
     ("profile", "batch", "timeout", "expected"),
     [
-        (run.Profile.INVOICE, 25, "PT30S", "PT578S"),  # 16 x (30 + 6) + 2
-        (run.Profile.EXTRACT, 100, "PT30S", "PT3602S"),  # 100 x (30 + 6) + 2
-        (run.Profile.EXTRACT, 5, "PT30S", "PT182S"),
-        (run.Profile.EXTRACT, 1, "PT1S", "PT2M"),  # never below the bench's own
+        # the live bounds' handoff is 3 x 3 s, so each call takes its timeout + 18 s
+        (run.Profile.INVOICE, 25, "PT30S", "PT770S"),  # 16 x (30 + 18) + 2
+        (run.Profile.EXTRACT, 100, "PT30S", "PT5762S"),  # extract_cap 120 x (30 + 18) + 2
+        (run.Profile.EXTRACT, 5, "PT30S", "PT482S"),  # extract_cap 10 x (30 + 18) + 2
+        (run.Profile.EXTRACT, 1, "PT1S", "PT2M"),  # 6 x 19 + 2 = 116: never below two minutes
     ],
 )
 def test_an_openrouter_cell_gets_an_execution_timeout_that_fits_its_cap(
@@ -462,9 +467,9 @@ def test_an_openrouter_cell_gets_an_execution_timeout_that_fits_its_cap(
     cell = run.Cell(profile, 100, batch, 2)
     settings = run.cell_worker_settings(cell, DRY, timeout)
     assert settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == expected
-    changed = {k for k in settings if settings[k] != run.BENCH_WORKER_SETTINGS[k]}
+    changed = {k for k in settings if settings[k] != run.LIVE_WORKER_SETTINGS[k]}
     assert changed <= {"ORQESTRA_WORKER_EXECUTION_TIMEOUT"}
-    cap = batch if profile is run.Profile.EXTRACT else worker.DEFAULT_CAP
+    cap = run.extract_cap(batch) if profile is run.Profile.EXTRACT else worker.DEFAULT_CAP
     check_provider_call_budget(
         validated(settings),
         max_provider_calls_per_attempt=cap,
@@ -561,5 +566,6 @@ def test_the_extract_dry_run_preview_states_the_calls_and_the_timeout() -> None:
     cell = run.Cell(run.Profile.EXTRACT, 100, 25, 2)
     lines = run.dry_run_preview(cell, DRY, "PT30S")
     assert "expected provider calls (one per document): 100" in lines[0]
-    assert lines[2].endswith(f": {25 * 3 * 4}")
-    assert lines[3].endswith(": PT902S")  # 25 x 36 + 2
+    # extract_cap(25) = 30 calls an attempt, 8 attempts, 4 tasks
+    assert lines[2].endswith(f": {30 * run.LIVE_MAX_ATTEMPTS * 4}")
+    assert lines[3].endswith(": PT1442S")  # 30 x (30 + 18) + 2

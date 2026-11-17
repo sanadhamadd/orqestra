@@ -4,9 +4,11 @@ No database, worker or network: the fleet tests start plain Python processes tha
 with a chosen code, in place of benchmark workers.
 """
 
+import importlib
 import subprocess
 import sys
 import time
+import types
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -305,3 +307,47 @@ def test_settle_waits_only_for_running_workers_that_have_not_started(tmp_path: P
     fleet.settle(timeout=5)
     assert time.monotonic() - began < 1
     fleet.stop(timeout=10)
+
+
+# --- a paced cell's execution timeout -------------------------------------------------------
+
+
+def test_a_paced_cell_gives_every_call_of_its_cap_the_limiters_longest_wait() -> None:
+    unpaced = cell_worker_settings(EXTRACT, DRY, "PT30S")
+    paced = cell_worker_settings(
+        EXTRACT, DRY, "PT30S", Decimal(10), pacing_wait=timedelta(seconds=5)
+    )
+    assert unpaced["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == "PT1442S"  # 30 x (30 + 18) + 2
+    assert paced["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == "PT1592S"  # 30 x (30 + 18 + 5) + 2
+    assert {k: v for k, v in paced.items() if k != "ORQESTRA_WORKER_EXECUTION_TIMEOUT"} == {
+        k: v for k, v in unpaced.items() if k != "ORQESTRA_WORKER_EXECUTION_TIMEOUT"
+    }
+    # the pacing wait is the extract workers' alone, and the double has no limiter
+    assert cell_worker_settings(INVOICE, DRY, "PT30S", None) == cell_worker_settings(
+        INVOICE, DRY, "PT30S"
+    )
+    assert cell_worker_settings(INVOICE, DOUBLE, "PT0.1S") == dict(BENCH_WORKER_SETTINGS)
+
+
+@pytest.mark.parametrize("wait", [timedelta(seconds=5), 5, 5.0])
+def test_the_pacing_wait_is_read_from_the_workers_limiter(
+    monkeypatch: pytest.MonkeyPatch, wait: object
+) -> None:
+    monkeypatch.setitem(
+        sys.modules, "benchmarks.ratelimit", types.SimpleNamespace(LIMITER_MAX_WAIT=wait)
+    )
+    assert run.limiter_max_wait() == timedelta(seconds=5)
+    settings = cell_worker_settings(EXTRACT, LIVE, "PT30S", Decimal(10))
+    assert settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] == "PT1592S"
+
+
+def test_without_the_workers_limiter_a_paced_cell_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(name: str) -> object:
+        raise ImportError(name)
+
+    monkeypatch.setattr(importlib, "import_module", missing)
+    with pytest.raises(ValueError, match="rate limiter"):
+        cell_worker_settings(EXTRACT, LIVE, "PT30S", Decimal(10))
+    assert cell_worker_settings(EXTRACT, LIVE, "PT30S")  # unpaced needs no limiter
