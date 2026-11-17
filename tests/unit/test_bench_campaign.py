@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,7 @@ from benchmarks.campaign import (
 )
 from benchmarks.live import API_KEY_ENV, BUDGET_FILE_NAME
 from benchmarks.result import Status
+from benchmarks.run import extract_cap
 from benchmarks.worker import DEFAULT_CAP
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
@@ -178,7 +179,14 @@ def test_the_approved_plan_runs_its_cells_in_order() -> None:
         (1, 2),
     ]
     assert len(scaling) == 15
-    assert {(cell.size, cell.batch) for cell in scaling} == {(2_000, 25)}
+    # One worker reads 2,000 documents in about 85 minutes, past the 60-minute limit.
+    assert {(cell.workers, cell.size, cell.batch) for cell in scaling} == {
+        (1, 1_000, 25),
+        (4, 2_000, 25),
+        (8, 2_000, 25),
+        (16, 2_000, 25),
+        (32, 2_000, 25),
+    }
     assert [cell.batch for cell in cells if cell.step is Step.TASK_SIZE] == [5, 25, 100]
     rules_first = [cell for cell in cells if cell.step is Step.RULES_FIRST]
     assert [(c.workload, c.size, c.batch, c.workers, c.repetition) for c in rules_first] == [
@@ -212,7 +220,12 @@ def test_a_cells_call_maximum_covers_one_repeated_task_per_worker() -> None:
         step=Step.SCALING, tool=Tool.RUN, workload=Workload.EXTRACT, size=2_000, batch=25, workers=8
     )
     assert extract.expected_calls == 2_000
-    assert extract.call_maximum == 2_200 + 25 * 8
+    # an attempt may call up to extract_cap(25) = 30: a throttled document is retried in it
+    assert extract.call_maximum == 2_200 + 30 * 8
+    drill = replace(extract, step=Step.FAILURES, tool=Tool.DRILL, batch=25, workers=32)
+    assert drill.call_maximum == 2_200 + 25 * 32  # the drill's cap is its batch
+    baseline = replace(extract, step=Step.BASELINE, tool=Tool.BASELINE, batch=1, workers=4)
+    assert baseline.call_maximum == 2_200 + 1 * 4
     mix = PlannedCell(
         step=Step.RULES_FIRST,
         tool=Tool.RUN,
@@ -601,6 +614,47 @@ def test_a_live_command_passes_prices_only_where_the_model_reads_every_document(
     assert drill[drill.index("--workload") + 1] == "extract"
     assert drill[drill.index("--price-in-per-mtok") + 1] == "0.31"
     assert drill[drill.index("--price-out-per-mtok") + 1] == "1.17"
+
+
+def test_the_throttle_probe_is_unpaced_and_gets_a_call_per_invoice_for_throttled_tries() -> None:
+    (probe,) = [cell for cell in APPROVED_PLAN.cells() if cell.throttle_probe]
+    assert (probe.step, probe.tool, probe.size, probe.batch, probe.workers) == (
+        Step.FAILURES,
+        Tool.RUN,
+        2_000,
+        5,
+        32,
+    )
+    assert not probe.paced
+    assert probe.call_maximum == 2_200 + extract_cap(5) * 32 + 2_000
+    assert probe.headroom_reason is not None
+    paced = {cell.key for cell in APPROVED_PLAN.cells() if cell.paced}
+    assert paced == {
+        cell.key
+        for cell in APPROVED_PLAN.cells()
+        if cell.tool is Tool.RUN and cell.workload is Workload.EXTRACT and cell.key != probe.key
+    }
+    assert APPROVED_PLAN.large(1_000, 16).paced
+
+
+def test_only_live_paced_cells_pass_the_rate_limit(tmp_path: Path) -> None:
+    for live in (True, False):
+        for cell in APPROVED_PLAN.cells():
+            argv = command_for(cell, settings(tmp_path, live=live), 10)
+            if live and cell.paced:
+                assert argv[argv.index("--rate-limit-per-s") + 1] == "10"
+            else:
+                assert "--rate-limit-per-s" not in argv, cell.key
+
+
+def test_the_probes_budget_event_names_its_extra_headroom(tmp_path: Path) -> None:
+    assert new_campaign(tmp_path, FakeRunner(good_records), live=True).execute() == 0
+    started = {event["cell"]: event for event in events(tmp_path, "cell_started")}
+    (probe,) = [cell for cell in APPROVED_PLAN.cells() if cell.throttle_probe]
+    assert started[probe.key]["call_headroom"].startswith("throttle probe")
+    assert started[probe.key]["call_maximum"] == probe.call_maximum
+    others = [event for key, event in started.items() if key != probe.key]
+    assert all(event["call_headroom"] is None for event in others)
 
 
 def test_a_dry_runs_children_never_see_the_key() -> None:

@@ -19,7 +19,7 @@ profile    worker process                                  task payload
 
 The ``extract`` profile (``benchmarks.extract``) sends every generated document
 (``benchmarks.documents``) to the model and needs ``--provider openrouter``. Its
-workers get their own settings (``extract_worker_settings``): an execution timeout
+workers get their own settings (``cell_worker_settings``): an execution timeout
 that fits one call per document of a batch. Its gate adds ``extraction_complete``
 and ``extraction_usage`` to the engine checks, and its record adds an
 ``extraction`` block (latency, time split, accuracy, tokens and cost, retries and
@@ -27,9 +27,17 @@ errors by code). A live run needs the model's price per million tokens
 (``--price-in-per-mtok``, ``--price-out-per-mtok``); a dry run uses synthetic ones.
 
 The job is submitted through ``orqestra job submit`` from a task file, every
-task with ``max_attempts`` 3. Workers start first and are waited for until
-each has logged ``worker_started`` (its signal handlers are installed by
-then), so a SIGTERM at the end always finds a worker that can stop gracefully.
+task with ``max_attempts`` 3 (8 with OpenRouter, below). Workers start first and
+are waited for until each has logged ``worker_started`` (its signal handlers are
+installed by then), so a SIGTERM at the end always finds a worker that can stop
+gracefully.
+
+**Supervision.** A worker that exits while the job still has queued or running
+tasks is recorded in ``failures.exits_while_running`` and replaced with the same
+command, up to ``max(2, workers)`` replacements a cell, so one death does not end
+the cell. The work it held comes back through lease expiry and recovery. Before
+the fleet is stopped, every running worker, replacements included, is waited for
+until it has logged ``worker_started``.
 
 **The correctness gate** (plan 2.6) decides whether the cell counts. A cell
 that fails any check is ``failed_correctness`` and reports no throughput:
@@ -37,7 +45,10 @@ that fails any check is ``failed_correctness`` and reports no throughput:
 1. ``terminal``: every task is terminal and the job has the expected status;
 2. ``one_succeeded_attempt``, ``no_double_running``, ``nothing_running`` and
    ``failed_tasks``: the SQL invariants of the attempt history;
-3. ``worker_exits``: every worker exits 0 after SIGTERM;
+3. ``worker_exits``: every worker stopped at the end exits 0 after SIGTERM, and
+   every worker that exited mid-cell exited 4 (``STALLED``: the watchdog's
+   designed fail-fast for a database call past its bound, DEC-045); any other
+   mid-cell exit fails the check, although the worker was replaced;
 4. ``results_exact`` (``echo``, ``wait``): every stored result is the handler's
    exact answer, checked in SQL;
 5. ``summary`` (``invoice``): ``summarize_invoice_job`` against the oracle;
@@ -57,9 +68,20 @@ maximum is a counter file in the cell's raw directory, created before any worker
 starts; ``ORQESTRA_OPENROUTER_API_KEY`` is passed to the workers only for a live
 run. With OpenRouter the usage check compares the calls with the oracle, and the
 credits only for a dry run, whose canned usage is known.
+
+**OpenRouter cells** (live and dry run alike, so a dry run rehearses a live one)
+run with ``LIVE_WORKER_SETTINGS``: database bounds with room for a hiccup of a few
+seconds and a retry budget that outlasts a provider's throttling, with
+``max_attempts`` ``LIVE_MAX_ATTEMPTS`` in the task file. An extract cell's
+per-attempt call cap is ``extract_cap(batch)``, a little above the batch, so a
+throttled document can be retried inside its attempt. ``--rate-limit-per-s``
+(extract only) paces the cell's calls across its workers through one limiter file
+in the cell's raw directory, which the workers create. The double keeps
+``BENCH_WORKER_SETTINGS`` and ``max_attempts`` 3.
 """
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -70,6 +92,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from enum import StrEnum
 from functools import partial
@@ -136,6 +159,7 @@ from orqestra.domain.states import AttemptState, TaskState
 from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.migrate import migrate
 from orqestra.worker.builtin import ECHO, WAIT
+from orqestra.worker.fence import ExitCode
 from orqestra.worker.settings import WorkerSettings
 from orqestra.worker.usage import check_provider_call_budget, usage_handoff_bound
 from orqestra.workloads.invoice.handler import JOB_KIND
@@ -167,6 +191,38 @@ BENCH_WORKER_SETTINGS: Mapping[str, str] = {
     "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
     "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
 }
+
+
+# OpenRouter cells: roomier database bounds and a longer retry budget, so a database
+# call of a few seconds no longer stops a worker and a throttling episode of tens of
+# seconds no longer exhausts a task. They pass WorkerSettings' relationships and
+# DEC-070's: 6 s >= 2 x 3 s (and 20 s >= 3 x 3 s + 2 s); 6 + 3 + 2 = 11 s < 20 s;
+# 1.5 s < 3 s. With 8 attempts the backoff after attempts 1 to 7 totals 91 to 182 s.
+LIVE_WORKER_SETTINGS: Mapping[str, str] = {
+    **BENCH_WORKER_SETTINGS,
+    "ORQESTRA_WORKER_LEASE": "PT20S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT6S",
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT3S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT1.5S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT2S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT60S",
+}
+LIVE_MAX_ATTEMPTS = 8
+RATE_LIMIT_FILE_NAME = "provider-rate-limit"
+
+
+def extract_cap(batch: int) -> int:
+    """An extract attempt's call cap: its batch plus room to retry throttled documents."""
+    return batch + max(5, batch // 5)
+
+
+def max_attempts_for(provider: ProviderChoice) -> int:
+    return LIVE_MAX_ATTEMPTS if provider.openrouter else MAX_ATTEMPTS
+
+
+def replacement_limit(workers: int) -> int:
+    """How many dead workers a cell replaces before it lets its fleet run down."""
+    return max(2, workers)
 
 
 class Profile(StrEnum):
@@ -227,16 +283,16 @@ class Workload:
     documents: list[Document] | None = None
 
 
-def build_workload(cell: Cell) -> Workload:
+def build_workload(cell: Cell, max_attempts: int = MAX_ATTEMPTS) -> Workload:
     if cell.profile is Profile.EXTRACT:
         assert cell.batch is not None
         documents = generate_documents(cell.size, cell.seed)
-        tasks = build_tasks(document_texts(documents), cell.batch, MAX_ATTEMPTS)
+        tasks = build_tasks(document_texts(documents), cell.batch, max_attempts)
         return Workload(tasks, cell.size, None, documents)
     if cell.profile is Profile.INVOICE:
         assert cell.batch is not None
         invoices = generate_invoices(cell.size, cell.seed)
-        tasks = build_tasks(invoices, cell.batch, MAX_ATTEMPTS)
+        tasks = build_tasks(invoices, cell.batch, max_attempts)
         expected = expected_outcome(invoices, cell.batch, DEFAULT_CAP)
         return Workload(tasks, cell.size, expected)
     payload: Callable[[int], JsonValue] = (
@@ -245,7 +301,7 @@ def build_workload(cell: Cell) -> Workload:
         else (lambda _: {"seconds": WAIT_SECONDS})
     )
     tasks = [
-        {"task_key": f"task-{index:07d}", "payload": payload(index), "max_attempts": MAX_ATTEMPTS}
+        {"task_key": f"task-{index:07d}", "payload": payload(index), "max_attempts": max_attempts}
         for index in range(cell.size)
     ]
     return Workload(tasks, cell.size, None)
@@ -325,7 +381,9 @@ class WorkerHandle:
     process: subprocess.Popen[bytes]
     log_path: Path
     log: IO[bytes]
+    number: int = 0  # 1-based, in start order: its log is worker-<number>.log
     exited: dict[str, Any] | None = None  # its accounting, once it has been reaped
+    died: bool = False  # it exited while the cell's job still had work
 
     def running(self) -> bool:
         """Whether the worker still runs; reaps it, keeping its accounting, once it has exited."""
@@ -348,6 +406,7 @@ class Fleet:
     call_timeout: str = DEFAULT_CALL_TIMEOUT
     cap: int = DEFAULT_CAP
     extra: tuple[str, ...] = ()
+    replaced: int = 0  # workers started in place of one that died
 
     def start(self) -> WorkerHandle:
         """Start one more worker. Every worker runs from ``ROOT``, where the harness lives."""
@@ -369,9 +428,47 @@ class Fleet:
             stdout=log,
             stderr=log,
         )
-        handle = WorkerHandle(process, path, log)
+        handle = WorkerHandle(process, path, log, self.started)
         self.workers.append(handle)
         return handle
+
+    def supervise(self, elapsed: float, limit: int) -> list[dict[str, Any]]:
+        """Record every worker that has exited since the last call and replace it while
+        fewer than ``limit`` have been replaced; the new records, in start order."""
+        found = []
+        for handle in list(self.workers):
+            if handle.died or handle.running():
+                continue
+            assert handle.exited is not None
+            handle.died = True
+            replace = self.replaced < limit
+            found.append(
+                {
+                    "worker": handle.number,
+                    "pid": handle.process.pid,
+                    "exit_code": handle.exited["exit_code"],
+                    "at_s": round(elapsed, 3),
+                    "replaced": replace,
+                }
+            )
+            if replace:
+                self.replaced += 1
+                self.start()
+        return found
+
+    def settle(self, timeout: float = STARTUP_TIMEOUT) -> None:
+        """Wait, at most ``timeout``, until every worker still running has logged
+        ``worker_started``, so a SIGTERM finds its handlers installed. Never raises."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pending = [
+                handle
+                for handle in self.workers
+                if handle.running() and not _logged(handle.log_path, "worker_started")
+            ]
+            if not pending:
+                return
+            time.sleep(0.05)
 
     def wait_started(self, timeout: float = STARTUP_TIMEOUT) -> None:
         """Wait until every running worker has logged ``worker_started``; raise otherwise."""
@@ -638,10 +735,13 @@ def run_gate(
     expected_exit_codes: Sequence[int] | None = None,
     provider: ProviderChoice = DOUBLE,
     documents: int | None = None,
+    exits_while_running: Sequence[int] = (),
 ) -> list[dict[str, Any]]:
     """Every gate check of plan 2.6 that applies to ``profile``, in order.
 
-    For ``extract``, ``documents`` is the cell's document count.
+    For ``extract``, ``documents`` is the cell's document count. ``exit_codes`` are the
+    workers stopped at the end; ``exits_while_running`` the codes of the ones that
+    exited mid-cell and were replaced, each of which must be ``STALLED``.
     """
     progress = get_job_progress(conn, job_id)
     checks: list[dict[str, Any]] = []
@@ -665,8 +765,7 @@ def run_gate(
     checks.append(
         _check("failed_tasks", failed == sorted(expected_failed), {"failed": failed[:20]})
     )
-    wanted = [0] * len(exit_codes) if expected_exit_codes is None else list(expected_exit_codes)
-    checks.append(_check("worker_exits", list(exit_codes) == wanted, {"exit_codes": exit_codes}))
+    checks.append(worker_exits_check(exit_codes, expected_exit_codes, exits_while_running))
     if profile is Profile.EXTRACT:
         assert documents is not None
         attempts = _count(
@@ -691,6 +790,22 @@ def run_gate(
         wrong = _count(conn, _RESULT_MISMATCH[profile], job_id)
         checks.append(_check("results_exact", wrong == 0, {"mismatches": wrong}))
     return checks
+
+
+def worker_exits_check(
+    exit_codes: Sequence[int],
+    expected_exit_codes: Sequence[int] | None,
+    exits_while_running: Sequence[int],
+) -> dict[str, Any]:
+    """``worker_exits``: the stopped workers' codes are the expected ones (0 each unless
+    given), and every worker that exited mid-cell stopped itself for a stalled database
+    call (``STALLED``), the watchdog's designed fail-fast; any other code fails."""
+    wanted = [0] * len(exit_codes) if expected_exit_codes is None else list(expected_exit_codes)
+    stalled = all(code == ExitCode.STALLED for code in exits_while_running)
+    detail: dict[str, Any] = {"exit_codes": list(exit_codes)}
+    if exits_while_running:
+        detail["exits_while_running"] = list(exits_while_running)
+    return _check("worker_exits", list(exit_codes) == wanted and stalled, detail)
 
 
 # --- failures and usage figures ----------------------------------------------------------
@@ -793,6 +908,7 @@ def run_cell(
     provider: ProviderChoice = DOUBLE,
     call_timeout: str = DEFAULT_CALL_TIMEOUT,
     prices: extract.Prices | None = None,
+    rate_limit_per_s: Decimal | None = None,
 ) -> dict[str, Any]:
     """Run ``cell`` against the migrated schema ``url`` and return its result record.
 
@@ -804,7 +920,9 @@ def run_cell(
     unless ``benchmarks.run`` was given ``--provider openrouter`` (DEC-071); then
     the cell's call counter is created in ``raw_dir`` before any worker starts. An
     ``extract`` cell needs OpenRouter and ``prices`` (``CANNED_PRICES`` for a dry run);
-    its per-attempt cap is its batch size.
+    its per-attempt cap is ``extract_cap(batch)``. Its tasks get ``max_attempts_for``
+    the provider. ``rate_limit_per_s`` (extract only) is passed to every worker with
+    the cell's limiter file. A worker that exits mid-cell is replaced (module docstring).
     """
     run_id = run_id or uuid.uuid4().hex[:12]
     refusal = provider.refusal(os.environ)
@@ -817,17 +935,16 @@ def run_cell(
     if extracting and (not provider.openrouter or prices is None):
         msg = "the extract profile needs --provider openrouter and the model's prices"
         raise ValueError(msg)
+    if rate_limit_per_s is not None and not extracting:
+        msg = "--rate-limit-per-s applies only to the extract profile"
+        raise ValueError(msg)
     raw_dir.mkdir(parents=True, exist_ok=True)
-    workload = build_workload(cell)
+    max_attempts = max_attempts_for(provider)
+    workload = build_workload(cell, max_attempts)
     env = process_environment(url, worker_settings, provider)
     budget_file = create_budget_file(raw_dir / BUDGET_FILE_NAME) if provider.openrouter else None
-    cap = DEFAULT_CAP
-    extra: tuple[str, ...] = ()
-    if extracting:
-        assert cell.batch is not None
-        cap = cell.batch
-        if provider.dry_run:
-            extra = ("--documents", str(cell.size), "--seed", str(cell.seed))
+    cap = cell_cap(cell)
+    extra = extract_worker_extra(cell, provider, raw_dir, rate_limit_per_s)
     fleet = Fleet(
         cell.profile,
         env,
@@ -860,6 +977,7 @@ def run_cell(
             lambda: [h.process.pid for h in fleet.workers if h.exited is None], sysload_connect
         )
         load: dict[str, Any] | None = None
+        exits_while_running: list[dict[str, Any]] = []
         try:
             for _ in range(cell.workers):
                 fleet.start()
@@ -889,6 +1007,9 @@ def run_cell(
                     break
                 if hook is not None:
                     hook(Running(conn, job_id, fleet, time.monotonic() - began, counts))
+                exits_while_running += fleet.supervise(
+                    time.monotonic() - began, replacement_limit(cell.workers)
+                )
                 if fleet.alive() == 0:
                     wait_ended = WaitEnded.NO_WORKERS
                     break
@@ -926,6 +1047,7 @@ def run_cell(
             if load is None:
                 load = sysload.stop()  # idempotent; only an exception reaches here running
             shutdown = _shutdown_seconds(worker_settings)
+            fleet.settle()  # a replacement still starting would die of the SIGTERM
             reaped = fleet.stop(timeout=shutdown + 10.0)
             for sampler in (contention, docker):
                 if sampler is not None:
@@ -934,6 +1056,11 @@ def run_cell(
         assert contention is not None  # the wait ran, so its sampler did
         contention_errors = contention.errors
         exit_codes = [worker["exit_code"] for worker in reaped]
+        stopped_codes = [
+            handle.exited["exit_code"]
+            for handle in fleet.workers
+            if not handle.died and handle.exited is not None
+        ]
         times = metrics.read_stored_times(conn, job_id)
         figures = metrics.timing_figures(times)
         gate = run_gate(
@@ -941,11 +1068,14 @@ def run_cell(
             job_id,
             cell.profile,
             workload.expected,
-            exit_codes,
+            stopped_codes,
             provider=provider,
             documents=workload.items if extracting else None,
+            exits_while_running=[died["exit_code"] for died in exits_while_running],
         )
         failures = failure_figures(conn, job_id, exit_codes)
+        failures["exits_while_running"] = exits_while_running
+        failures["replacements"] = fleet.replaced
         usage = (
             usage_figures(conn, job_id, DEFAULT_CAP) if cell.profile is Profile.INVOICE else None
         )
@@ -998,6 +1128,11 @@ def run_cell(
                     else usage["calls"]
                 ),
             )
+            | (
+                {"max_attempts": max_attempts, "rate_limit_per_s": _text(rate_limit_per_s)}
+                if provider.openrouter
+                else {}  # the double's block is unchanged
+            )
             if cell.profile in BATCHED
             else None
         ),
@@ -1048,6 +1183,10 @@ def run_cell(
     return record
 
 
+def _text(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
 def implied_idle_rate(workers: int, worker_settings: Mapping[str, str]) -> float:
     """The idle commits a second the settings imply: each idle worker claims once per
     poll interval and runs one recovery sweep step per recovery interval, each its own
@@ -1080,12 +1219,13 @@ def run_in_bench_database(
     provider: ProviderChoice = DOUBLE,
     call_timeout: str = DEFAULT_CALL_TIMEOUT,
     prices: extract.Prices | None = None,
+    rate_limit_per_s: Decimal | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Run ``cell`` in a fresh run schema of the benchmark database; write its result file.
 
     An OpenRouter cell runs with ``cell_worker_settings``; the double with the bench's own.
     """
-    worker_settings = cell_worker_settings(cell, provider, call_timeout)
+    worker_settings = cell_worker_settings(cell, provider, call_timeout, rate_limit_per_s)
     url = require_bench_database_url(os.environ)
     with connect_verified(url) as admin:
         schema = run_schema_name(run_id, cell.name)
@@ -1106,6 +1246,7 @@ def run_in_bench_database(
                 provider=provider,
                 call_timeout=call_timeout,
                 prices=prices,
+                rate_limit_per_s=rate_limit_per_s,
             )
             path = write_result(record, out_dir, allow_dirty=allow_dirty)
         finally:
@@ -1170,6 +1311,11 @@ def add_provider_arguments(parser: argparse.ArgumentParser) -> None:
         type=Decimal,
         help="extract, live: the model's price per million output tokens, from its price list",
     )
+    parser.add_argument(
+        "--rate-limit-per-s",
+        type=Decimal,
+        help="extract: pace the cell's model calls across its workers to this many a second",
+    )
 
 
 def provider_refusal(
@@ -1196,6 +1342,17 @@ def provider_refusal(
             parse_duration(call_timeout)
         except argparse.ArgumentTypeError as exc:
             return f"--call-timeout: {exc}"
+    return None
+
+
+def rate_limit_refusal(cell: Cell, rate: Decimal | None) -> str | None:
+    """Why ``--rate-limit-per-s`` may not be used for ``cell``, or ``None``."""
+    if rate is None:
+        return None
+    if cell.profile is not Profile.EXTRACT:
+        return "--rate-limit-per-s applies only to the extract profile"
+    if not rate.is_finite() or rate <= 0:
+        return "--rate-limit-per-s must be a number above 0"
     return None
 
 
@@ -1229,7 +1386,11 @@ def prices_of(
 
 
 def provider_worker_settings(
-    worker_settings: Mapping[str, str], cap: int, call_timeout: str
+    worker_settings: Mapping[str, str],
+    cap: int,
+    call_timeout: str,
+    *,
+    pacing_wait: timedelta = timedelta(0),
 ) -> dict[str, str]:
     """``worker_settings`` with an execution timeout that fits ``cap`` calls: the one rule
     every OpenRouter cell and drill uses.
@@ -1241,7 +1402,8 @@ def provider_worker_settings(
     """
     settings = dict(worker_settings)
     base = bench_settings(settings)
-    per_call = parse_duration(call_timeout) + 2 * usage_handoff_bound(base)
+    # A paced call may first wait up to ``pacing_wait`` for the cell's limiter.
+    per_call = parse_duration(call_timeout) + 2 * usage_handoff_bound(base) + pacing_wait
     needed = (cap * per_call + base.fence_margin).total_seconds()
     if needed > base.execution_timeout.total_seconds():  # else the bench's own text stays
         settings["ORQESTRA_WORKER_EXECUTION_TIMEOUT"] = f"PT{math.ceil(needed)}S"
@@ -1253,13 +1415,67 @@ def provider_worker_settings(
     return settings
 
 
-def cell_worker_settings(cell: Cell, provider: ProviderChoice, call_timeout: str) -> dict[str, str]:
+def extract_worker_extra(
+    cell: Cell, provider: ProviderChoice, raw_dir: Path, rate_limit_per_s: Decimal | None
+) -> tuple[str, ...]:
+    """An extract worker's flags beyond the provider's: a dry run's documents, and the
+    cell's pacing with its limiter file, which the workers create in ``raw_dir``."""
+    if cell.profile is not Profile.EXTRACT:
+        return ()
+    extra: tuple[str, ...] = ()
+    if provider.dry_run:
+        extra = ("--documents", str(cell.size), "--seed", str(cell.seed))
+    if rate_limit_per_s is not None:
+        limiter = raw_dir / RATE_LIMIT_FILE_NAME
+        extra += ("--rate-limit-per-s", str(rate_limit_per_s), "--rate-limit-file", str(limiter))
+    return extra
+
+
+def cell_cap(cell: Cell) -> int:
+    """A cell's per-attempt call cap: ``extract_cap`` of its batch, or the invoice cap."""
+    if cell.profile is Profile.EXTRACT and cell.batch:
+        return extract_cap(cell.batch)
+    return DEFAULT_CAP
+
+
+def limiter_max_wait() -> timedelta:
+    """The longest one call may wait for a pacing token: the workers' limiter's own bound.
+
+    Read only for a paced cell, from the module the workers use, so this command never
+    states a bound of its own.
+    """
+    try:
+        ratelimit = importlib.import_module("benchmarks.ratelimit")
+    except ImportError:
+        msg = "--rate-limit-per-s needs the workers' rate limiter (benchmarks.ratelimit)"
+        raise ValueError(msg) from None
+    wait = ratelimit.LIMITER_MAX_WAIT
+    return wait if isinstance(wait, timedelta) else timedelta(seconds=float(wait))
+
+
+def cell_worker_settings(
+    cell: Cell,
+    provider: ProviderChoice,
+    call_timeout: str,
+    rate_limit_per_s: Decimal | None = None,
+    *,
+    pacing_wait: timedelta | None = None,
+) -> dict[str, str]:
     """The settings a cell's workers run with: the bench's own for the double, and for
-    OpenRouter ``provider_worker_settings`` at the cell's per-attempt cap."""
+    OpenRouter ``provider_worker_settings`` of ``LIVE_WORKER_SETTINGS`` at the cell's cap.
+
+    A paced cell's execution timeout also gives every call of its cap the limiter's
+    longest wait (``limiter_max_wait``, or ``pacing_wait`` when given), so a busy
+    limiter delays an attempt rather than failing it.
+    """
     if not provider.openrouter:
         return dict(BENCH_WORKER_SETTINGS)
-    cap = cell.batch if cell.profile is Profile.EXTRACT and cell.batch else DEFAULT_CAP
-    return provider_worker_settings(BENCH_WORKER_SETTINGS, cap, call_timeout)
+    wait = timedelta(0)
+    if rate_limit_per_s is not None and cell.profile is Profile.EXTRACT:
+        wait = pacing_wait if pacing_wait is not None else limiter_max_wait()
+    return provider_worker_settings(
+        LIVE_WORKER_SETTINGS, cell_cap(cell), call_timeout, pacing_wait=wait
+    )
 
 
 def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
@@ -1271,15 +1487,18 @@ def bench_settings(worker_settings: Mapping[str, str]) -> WorkerSettings:
     return WorkerSettings.model_validate(fields)  # no settings source is read
 
 
-def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
+def dry_run_preview(
+    cell: Cell, choice: ProviderChoice, call_timeout: str, rate_limit_per_s: Decimal | None = None
+) -> list[str]:
     """What a dry run prints before its cell: the oracle's calls and the hard bounds."""
     if cell.profile is Profile.EXTRACT:
-        return _extract_preview(cell, choice, call_timeout)
-    workload = build_workload(cell)
+        return _extract_preview(cell, choice, call_timeout, rate_limit_per_s)
+    attempts = max_attempts_for(choice)
+    workload = build_workload(cell, attempts)
     assert workload.expected is not None
     assert choice.max_provider_calls is not None
     calls = workload.expected.calls
-    bound = DEFAULT_CAP * MAX_ATTEMPTS * len(workload.tasks)
+    bound = DEFAULT_CAP * attempts * len(workload.tasks)
     execution = "?"
     try:
         settings = cell_worker_settings(cell, choice, call_timeout)
@@ -1299,17 +1518,21 @@ def dry_run_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> li
     return [f"{DRY_RUN_LABEL}: {line}" for line in lines]
 
 
-def _extract_preview(cell: Cell, choice: ProviderChoice, call_timeout: str) -> list[str]:
+def _extract_preview(
+    cell: Cell, choice: ProviderChoice, call_timeout: str, rate_limit_per_s: Decimal | None
+) -> list[str]:
     assert cell.batch is not None
     assert choice.max_provider_calls is not None
     tasks = math.ceil(cell.size / cell.batch)
-    settings = provider_worker_settings(BENCH_WORKER_SETTINGS, cell.batch, call_timeout)
+    cap = cell_cap(cell)
+    attempts = max_attempts_for(choice)
+    settings = cell_worker_settings(cell, choice, call_timeout, rate_limit_per_s)
     lines = [
         f"expected provider calls (one per document): {cell.size}",
         f"cell call maximum (--max-provider-calls): {choice.max_provider_calls}",
-        f"call budget bound (cap {cell.batch} x max_attempts x tasks): "
-        f"{cell.batch * MAX_ATTEMPTS * tasks}",
-        f"execution timeout for a batch of {cell.batch} at {call_timeout} a call: "
+        f"call budget bound (cap {cap} x max_attempts {attempts} x tasks): "
+        f"{cap * attempts * tasks}",
+        f"execution timeout for a cap of {cap} at {call_timeout} a call: "
         f"{settings['ORQESTRA_WORKER_EXECUTION_TIMEOUT']}",
     ]
     if cell.size > choice.max_provider_calls:
@@ -1361,13 +1584,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_id = uuid.uuid4().hex[:12]
     try:
         cell = Cell(args.profile, args.size, args.batch, args.workers, args.repetition, args.seed)
-        refusal = provider_refusal(choice, cell, args.call_timeout, os.environ)
+        refusal = provider_refusal(
+            choice, cell, args.call_timeout, os.environ
+        ) or rate_limit_refusal(cell, args.rate_limit_per_s)
         if refusal is not None:
             raise ValueError(refusal)
         prices = prices_of(cell, choice, args.price_in_per_mtok, args.price_out_per_mtok)
         refuse_dirty(args.allow_dirty)
         if choice.dry_run:
-            print("\n".join(dry_run_preview(cell, choice, call_timeout)))
+            print("\n".join(dry_run_preview(cell, choice, call_timeout, args.rate_limit_per_s)))
         record, path = run_in_bench_database(
             cell,
             run_id=run_id,
@@ -1381,6 +1606,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider=choice,
             call_timeout=call_timeout,
             prices=prices,
+            rate_limit_per_s=args.rate_limit_per_s,
         )
     except (ValueError, DirtyTreeError, UnsafeBenchDatabaseError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
