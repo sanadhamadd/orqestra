@@ -34,10 +34,20 @@ gracefully.
 
 **Supervision.** A worker that exits while the job still has queued or running
 tasks is recorded in ``failures.exits_while_running`` and replaced with the same
-command, up to ``max(2, workers)`` replacements a cell, so one death does not end
-the cell. The work it held comes back through lease expiry and recovery. Before
-the fleet is stopped, every running worker, replacements included, is waited for
-until it has logged ``worker_started``.
+command, up to ``replacement_limit(workers)`` (4 x workers) replacements a cell, so
+one death does not end the cell. A worker that stopped itself for a stalled
+database call (exit 4) is replaced ``STALL_REPLACEMENT_DELAY`` (1 s) later, so its
+replacement does not walk into the same slowdown; any other exit is replaced at
+once. A long pause (the campaign saw a 58 s checkpoint) can still use up the bound,
+because a replacement can stall again every few seconds: the engine riding out an
+idle stall is what keeps a fleet whole, and this is the backstop that keeps the
+cell going and records it. The work a dead worker held comes back through lease
+expiry and recovery. Before the fleet is stopped, every running worker,
+replacements included, is waited for until it has logged ``worker_started``.
+
+**Checkpoints.** The harness reads the server's checkpoint counters while it waits
+(``CheckpointWatch``) and records each checkpoint that ended during the cell in
+``database_stats.checkpoints``, so a slowdown can be set beside them.
 
 **The correctness gate** (plan 2.6) decides whether the cell counts. A cell
 that fails any check is ``failed_correctness`` and reports no throughput:
@@ -81,7 +91,7 @@ in the cell's raw directory, which the workers create. The double keeps
 """
 
 import argparse
-import importlib
+import itertools
 import json
 import math
 import os
@@ -101,7 +111,7 @@ from typing import IO, Any
 
 import psycopg
 
-from benchmarks import extract, metrics
+from benchmarks import extract, metrics, ratelimit
 from benchmarks.database import (
     UnsafeBenchDatabaseError,
     connect_verified,
@@ -222,7 +232,11 @@ def max_attempts_for(provider: ProviderChoice) -> int:
 
 def replacement_limit(workers: int) -> int:
     """How many dead workers a cell replaces before it lets its fleet run down."""
-    return max(2, workers)
+    return 4 * workers
+
+
+# How long after a stalled worker's exit its replacement starts.
+STALL_REPLACEMENT_DELAY = 1.0
 
 
 class Profile(StrEnum):
@@ -407,6 +421,9 @@ class Fleet:
     cap: int = DEFAULT_CAP
     extra: tuple[str, ...] = ()
     replaced: int = 0  # workers started in place of one that died
+    scheduled: int = 0  # replacements granted, started or still due
+    # Replacements not started yet: (due, in seconds of the wait, the dead worker's record).
+    pending: list[tuple[float, dict[str, Any]]] = field(default_factory=list)
 
     def start(self) -> WorkerHandle:
         """Start one more worker. Every worker runs from ``ROOT``, where the harness lives."""
@@ -432,29 +449,47 @@ class Fleet:
         self.workers.append(handle)
         return handle
 
-    def supervise(self, elapsed: float, limit: int) -> list[dict[str, Any]]:
-        """Record every worker that has exited since the last call and replace it while
-        fewer than ``limit`` have been replaced; the new records, in start order."""
+    def supervise(
+        self, elapsed: float, limit: int, delay: float = STALL_REPLACEMENT_DELAY
+    ) -> list[dict[str, Any]]:
+        """Record every worker that has exited since the last call, grant it a replacement
+        while fewer than ``limit`` have been granted, and start every replacement that is
+        due: ``delay`` after a ``STALLED`` exit, at once after any other. ``elapsed`` is the
+        time into the wait; the new records, in start order."""
         found = []
         for handle in list(self.workers):
             if handle.died or handle.running():
                 continue
             assert handle.exited is not None
             handle.died = True
-            replace = self.replaced < limit
-            found.append(
-                {
-                    "worker": handle.number,
-                    "pid": handle.process.pid,
-                    "exit_code": handle.exited["exit_code"],
-                    "at_s": round(elapsed, 3),
-                    "replaced": replace,
-                }
-            )
-            if replace:
-                self.replaced += 1
-                self.start()
+            code = handle.exited["exit_code"]
+            record: dict[str, Any] = {
+                "worker": handle.number,
+                "pid": handle.process.pid,
+                "exit_code": code,
+                "at_s": round(elapsed, 3),
+                "replaced": False,
+                "replacement_at_s": None,
+            }
+            if self.scheduled < limit:
+                self.scheduled += 1
+                wait = delay if code == ExitCode.STALLED else 0.0
+                self.pending.append((elapsed + wait, record))
+            found.append(record)
+        self._start_due(elapsed)
         return found
+
+    def _start_due(self, elapsed: float) -> None:
+        still = []
+        for due, record in self.pending:
+            if due > elapsed:
+                still.append((due, record))
+                continue
+            self.start()
+            self.replaced += 1
+            record["replaced"] = True
+            record["replacement_at_s"] = round(elapsed, 3)
+        self.pending = still
 
     def settle(self, timeout: float = STARTUP_TIMEOUT) -> None:
         """Wait, at most ``timeout``, until every worker still running has logged
@@ -868,6 +903,128 @@ def usage_figures(conn: metrics.Conn, job_id: uuid.UUID, cap: int) -> dict[str, 
 # --- one cell ----------------------------------------------------------------------------
 
 
+# --- checkpoints during a cell ------------------------------------------------------------
+
+# The server's cumulative checkpoint counters: (view, timed, requested, write ms, sync ms).
+# PostgreSQL 17 moved them from pg_stat_bgwriter to pg_stat_checkpointer.
+_CHECKPOINT_SOURCES = (
+    ("pg_stat_checkpointer", "num_timed", "num_requested", "write_time", "sync_time"),
+    (
+        "pg_stat_bgwriter",
+        "checkpoints_timed",
+        "checkpoints_req",
+        "checkpoint_write_time",
+        "checkpoint_sync_time",
+    ),
+)
+CHECKPOINT_SAMPLE_INTERVAL = 1.0
+
+# One reading: (seconds into the wait, timed, requested, write ms, sync ms).
+CheckpointSample = tuple[float, float, float, float, float]
+
+
+def checkpoint_source(conn: metrics.Conn) -> tuple[str, ...] | None:
+    """The view this server keeps its checkpoint counters in, or ``None``. Asked with
+    ``to_regclass``, so no query on a missing view is ever sent."""
+    for source in _CHECKPOINT_SOURCES:
+        row = conn.execute("SELECT to_regclass(%s) IS NOT NULL", (f"pg_catalog.{source[0]}",))
+        found = row.fetchone()
+        if found is not None and found[0]:
+            return source
+    return None
+
+
+class CheckpointWatch:
+    """Reads the server's checkpoint counters while a cell waits, each reading in its own
+    read-only transaction (so a fresh statistics snapshot, and never the job-progress
+    read's). A reading that fails is counted and skipped: it never ends a cell."""
+
+    def __init__(self, conn: metrics.Conn) -> None:
+        self._conn = conn
+        self.samples: list[CheckpointSample] = []
+        self.lost = 0
+        self.last: float | None = None
+        try:
+            self.source = metrics.read_only(conn, checkpoint_source)
+        except Exception:  # an unreadable catalog: not measured, never a failed cell
+            self.source = None
+
+    def sample(self, at: float) -> None:
+        self.last = at
+        if self.source is None:
+            return
+        view, *columns = self.source
+        query = f"SELECT {', '.join(f'{c}::float8' for c in columns)} FROM pg_catalog.{view}"
+        try:
+            row = metrics.read_only(self._conn, lambda conn: conn.execute(query).fetchone())
+        except Exception:  # a lost reading, never a failed cell
+            self.lost += 1
+            return
+        if row is not None:
+            timed, requested, write, sync = (float(value) for value in row)
+            self.samples.append((at, timed, requested, write, sync))
+
+    def due(self, at: float) -> bool:
+        return self.last is None or at - self.last >= CHECKPOINT_SAMPLE_INTERVAL
+
+    def summary(self) -> dict[str, Any] | str:
+        source = None if self.source is None else self.source[0]
+        return summarize_checkpoints(source, self.samples, self.lost)
+
+
+def summarize_checkpoints(
+    source: str | None, samples: Sequence[CheckpointSample], lost: int = 0
+) -> dict[str, Any] | str:
+    """The checkpoints that ended between the first and the last reading.
+
+    PostgreSQL publishes a checkpoint's counts and times when it ends, so a reading whose
+    count rose marks the checkpoints that ended since the one before: an event, with the
+    seconds into the wait at which it was first seen (``ended_by_s``) and their write and
+    sync time. ``longest_ms`` is the largest write + sync of an event of exactly one
+    checkpoint (two ending within one interval are counted together). A checkpoint still
+    running at the last reading is not seen. A counter that falls (a statistics reset)
+    starts a new baseline. ``not_measured`` without a view or two readings.
+    """
+    if source is None or len(samples) < 2:
+        return metrics.NOT_MEASURED
+    events: list[dict[str, Any]] = []
+    timed = requested = 0
+    write = sync = 0.0
+    for previous, current in itertools.pairwise(samples):
+        deltas = [now - before for now, before in zip(current[1:], previous[1:], strict=True)]
+        if any(delta < 0 for delta in deltas):
+            continue  # reset: this reading is the new baseline
+        more_timed, more_requested, more_write, more_sync = deltas
+        ended = int(more_timed + more_requested)
+        if not ended:
+            continue
+        timed += int(more_timed)
+        requested += int(more_requested)
+        write += more_write
+        sync += more_sync
+        events.append(
+            {
+                "ended_by_s": round(current[0], 3),
+                "checkpoints": ended,
+                "write_ms": round(more_write, 3),
+                "sync_ms": round(more_sync, 3),
+            }
+        )
+    single = [event["write_ms"] + event["sync_ms"] for event in events if event["checkpoints"] == 1]
+    return {
+        "source": source,
+        "count": timed + requested,
+        "timed": timed,
+        "requested": requested,
+        "write_ms": round(write, 3),
+        "sync_ms": round(sync, 3),
+        "longest_ms": round(max(single), 3) if single else None,
+        "events": events,
+        "samples": len(samples),
+        "lost_samples": lost,
+    }
+
+
 @dataclass(slots=True)
 class Running:
     """What a hook sees while the cell waits for its job: called every poll."""
@@ -983,6 +1140,7 @@ def run_cell(
                 fleet.start()
             fleet.wait_started()
             before = metrics.read_only(conn, metrics.database_counters)
+            checkpoints = CheckpointWatch(conn)
             counted = time.monotonic()
             job_id, submission = submit(url, KIND_OF[cell.profile], workload.tasks, raw_dir)
             # The samplers cover the job alone: from the submission to the end of the wait.
@@ -996,9 +1154,12 @@ def run_cell(
                 docker = metrics.Sampler(lambda: metrics.docker_stats_sample(container)).start()
             sysload.start()
             began = time.monotonic()
+            checkpoints.sample(0.0)
             before_job = began - counted
             wait_ended = WaitEnded.STOP_AFTER
             while time.monotonic() - began < stop_after:
+                if checkpoints.due(time.monotonic() - began):
+                    checkpoints.sample(time.monotonic() - began)
                 progress = metrics.read_only(conn, partial(get_job_progress, job_id=job_id))
                 assert progress is not None
                 counts = progress.task_counts
@@ -1010,7 +1171,7 @@ def run_cell(
                 exits_while_running += fleet.supervise(
                     time.monotonic() - began, replacement_limit(cell.workers)
                 )
-                if fleet.alive() == 0:
+                if fleet.alive() == 0 and not fleet.pending:
                     wait_ended = WaitEnded.NO_WORKERS
                     break
                 time.sleep(POLL)
@@ -1024,6 +1185,7 @@ def run_cell(
             docker_window = time.monotonic() - began
             time.sleep(STATS_SETTLE)
             after = metrics.read_only(conn, metrics.database_counters)
+            checkpoints.sample(time.monotonic() - began)
             after_job = time.monotonic() - ended
             idle_rate: dict[str, Any] | None = None
             if wait_ended is WaitEnded.FINISHED:  # otherwise work may still be running
@@ -1101,6 +1263,7 @@ def run_cell(
         implied_idle_rate(cell.workers, worker_settings),
     )
     database_stats["commits"] = commits
+    database_stats["checkpoints"] = checkpoints.summary()
     database_stats["commits_per_task"] = (
         None if commits["job_commits"] is None else metrics.rate(commits["job_commits"], tasks)
     )
@@ -1351,8 +1514,10 @@ def rate_limit_refusal(cell: Cell, rate: Decimal | None) -> str | None:
         return None
     if cell.profile is not Profile.EXTRACT:
         return "--rate-limit-per-s applies only to the extract profile"
-    if not rate.is_finite() or rate <= 0:
-        return "--rate-limit-per-s must be a number above 0"
+    try:
+        ratelimit.check_rate(float(rate))  # the workers' own rule, so it is refused up front
+    except ValueError as exc:
+        return f"--rate-limit-per-s: {exc}"
     return None
 
 
@@ -1439,18 +1604,9 @@ def cell_cap(cell: Cell) -> int:
 
 
 def limiter_max_wait() -> timedelta:
-    """The longest one call may wait for a pacing token: the workers' limiter's own bound.
-
-    Read only for a paced cell, from the module the workers use, so this command never
-    states a bound of its own.
-    """
-    try:
-        ratelimit = importlib.import_module("benchmarks.ratelimit")
-    except ImportError:
-        msg = "--rate-limit-per-s needs the workers' rate limiter (benchmarks.ratelimit)"
-        raise ValueError(msg) from None
-    wait = ratelimit.LIMITER_MAX_WAIT
-    return wait if isinstance(wait, timedelta) else timedelta(seconds=float(wait))
+    """The longest one call may wait for a pacing token: the workers' limiter's own bound,
+    so this command never states a bound of its own."""
+    return timedelta(seconds=ratelimit.LIMITER_MAX_WAIT)
 
 
 def cell_worker_settings(
