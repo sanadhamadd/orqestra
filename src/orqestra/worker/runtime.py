@@ -103,7 +103,7 @@ from orqestra.persistence.lifecycle import (
     claim_next_attempt,
     complete_attempt,
     read_completion_evidence,
-    renew_lease,
+    renew_lease_at,
     revoke_next_expired,
 )
 from orqestra.persistence.provider_usage import (
@@ -171,14 +171,16 @@ class Backend:
 class OperationAbandoned(Exception):  # noqa: N818 - it names what happened, not an error kind
     """An idle call ran past its bound and its connection was shut (DEC-074).
 
-    ``backend`` is set only when the call itself had been sent and failed after the
-    abort: its statement may still be running on that server process.
+    ``sent`` says the call itself had been sent and failed after the abort: its
+    statement may still be running on the server process ``backend`` (``None`` if that
+    process could not be identified).
     """
 
-    def __init__(self, operation: str, backend: Backend | None) -> None:
+    def __init__(self, operation: str, backend: Backend | None, *, sent: bool = False) -> None:
         super().__init__(operation)
         self.operation = operation
         self.backend = backend
+        self.sent = sent
 
 
 # The calls that are idle when no handler runs or awaits settlement (DEC-074): past
@@ -509,12 +511,19 @@ class _Running:
     uncertain: bool = False
     # Set for an attempt of a usage sink's kind: its confirmed records (DEC-059).
     usage: _Usage | None = None
+    # The latest confirmed exchange with the database: the local clock read before it
+    # was sent and the database instant it answered with. None: the claim (DEC-075).
+    reference: tuple[float, datetime] | None = None
 
     def local(self, instant: datetime) -> float:
-        """A database instant of this attempt on the local clock, never later than it."""
-        return local_deadline(
-            anchor=self.anchor, started_at=self.attempt.started_at, instant=instant
-        )
+        """A database instant of this attempt on the local clock, never later than it.
+
+        It is mapped from the latest confirmed exchange: the claim, then each confirmed
+        renewal or cancellation. A database clock step or drift before that exchange
+        therefore never carries into the mapping (DEC-075).
+        """
+        anchor, database = self.reference or (self.anchor, self.attempt.started_at)
+        return local_deadline(anchor=anchor, started_at=database, instant=instant)
 
 
 @dataclass(frozen=True, slots=True)
@@ -840,7 +849,15 @@ class Worker:
                 {},
             )
         except OperationAbandoned as abandoned:
-            self._abandoned = abandoned.backend  # None: the claim was never sent
+            if abandoned.sent and abandoned.backend is None:
+                # Sent, but its server process is unknown, so it cannot be ended: take
+                # the lost-claim hold, as for a lost claim answer (DEC-046, DEC-074).
+                self._event(logging.WARNING, "claim_uncertain", "abandoned; backend unknown")
+                until = self._clock() + self._policy.lease.total_seconds()
+                self._held = _Held(None, until)
+                self._schedule.claim_due = until
+            else:
+                self._abandoned = abandoned.backend  # None: the claim was never sent
             self._idle_stall("claim")
             return
         # No ValueError is caught here, on purpose. The claim's only ValueError sources are
@@ -1092,9 +1109,9 @@ class Worker:
         attempt = running.attempt
         sent = self._clock()
         try:
-            renewed = self._call(
+            renewal = self._call(
                 "renew_lease",
-                lambda conn: renew_lease(
+                lambda conn: renew_lease_at(
                     conn,
                     attempt.id,
                     generation=attempt.attempt_number,
@@ -1110,6 +1127,8 @@ class Worker:
             # exactly there first, so fencing holds whatever follows; then tell the
             # handler. False means the handler has ended: the completion decides.
             running.heartbeat_due = None
+            if exc.now is not None:
+                running.reference = (sent, exc.now)  # map from this exchange (DEC-075)
             self._watchdog.move_to(
                 running.token, running.local(exc.lease_expires_at) - self._margin()
             )
@@ -1140,9 +1159,12 @@ class Worker:
                 logging.WARNING, "heartbeat_unconfirmed", type(exc).__name__, running.context
             )
             return
-        running.attempt = renewed
-        lease_expires_at, _ = _lease(renewed)
-        self._watchdog.extend(running.token, running.local(lease_expires_at) - self._margin())
+        running.attempt = renewal.attempt
+        # Map the renewed lease from this renewal, not the claim, and set the fence
+        # exactly there: earlier too, if a clock step made the old one late (DEC-075).
+        running.reference = (sent, renewal.now)
+        lease_expires_at, _ = _lease(renewal.attempt)
+        self._watchdog.move_to(running.token, running.local(lease_expires_at) - self._margin())
         running.heartbeat_due = sent + self._settings.heartbeat_interval.total_seconds()
         self._event(logging.DEBUG, "lease_renewed", "", running.context)
 
@@ -1580,7 +1602,7 @@ class Worker:
                 return call(self._conn)
             except Exception as exc:
                 if abort is not None and abort.fired:
-                    raise OperationAbandoned(operation, backend) from exc
+                    raise OperationAbandoned(operation, backend, sent=True) from exc
                 raise
         finally:
             self._watchdog.disarm(token)

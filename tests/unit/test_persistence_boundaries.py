@@ -38,7 +38,7 @@ OWNED = frozenset(
         "start_attempt",
         "claim_next_attempt",
         "complete_attempt",
-        "renew_lease",
+        "renew_lease_at",  # renew_lease is its wrapper and owns no transaction itself
         "revoke_next_expired",
         "request_cancellation",
     }

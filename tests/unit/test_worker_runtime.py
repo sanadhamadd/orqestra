@@ -31,6 +31,7 @@ from orqestra.persistence.lifecycle import (
     CancellationRequestedError,
     CompletionEvidence,
     LeaseExpiredError,
+    LeaseRenewal,
     NotFoundError,
     StaleAttemptError,
 )
@@ -573,8 +574,16 @@ class Harness:
         assert running is not None
         return running
 
-    def renew(self, result: Callable[..., Attempt]) -> None:
-        self.monkeypatch.setattr(runtime, "renew_lease", result)
+    def renew(self, result: Callable[..., Attempt], *, step: float = 0.0) -> None:
+        """Answer each heartbeat with ``result``. The database's ``now`` is read before it
+        runs: the claim's instant plus the local time since the claim (a clock in step
+        with the local one), plus ``step`` seconds (a database clock that jumped)."""
+
+        def renewal(*args: Any, **kwargs: Any) -> LeaseRenewal:
+            now = T0 + timedelta(seconds=self.clock.now - 100.0 + step)
+            return LeaseRenewal(result(*args, **kwargs), now)
+
+        self.monkeypatch.setattr(runtime, "renew_lease_at", renewal)
 
     def finish_handler(self, running: runtime._Running) -> None:
         self.gate.set()
@@ -654,7 +663,7 @@ def test_a_failed_connect_is_an_unconfirmed_heartbeat(harness: Harness) -> None:
     assert running.heartbeat_due == 102.0
 
 
-def test_a_renewed_fence_is_early_by_the_claims_latency(harness: Harness) -> None:
+def test_a_renewed_fence_no_longer_carries_the_claims_latency(harness: Harness) -> None:
     # Settings the check accepts, at its edge (DEC-044 note): heartbeat 5 s + database
     # 2 s + margin 3 s = 10 s, under a 10.5 s lease.
     tight = WorkerSettings(
@@ -662,27 +671,26 @@ def test_a_renewed_fence_is_early_by_the_claims_latency(harness: Harness) -> Non
     )
     harness.worker._settings = tight
     # The claim was sent at local 100.0 and reached the database 1 s later: its
-    # instant T0 is really local 101.0, but every deadline is mapped from 100.0.
+    # instant T0 is really local 101.0, but the claim's fence is mapped from 100.0.
     harness.worker._start(attempt(lease_seconds=10.5), 100.0, {"worker_id": "worker-1"}, {}, "k")
     running = running_of(harness.worker)
     assert harness.deadline() == 100.0 + 10.5 - 3.0
     assert running.heartbeat_due == 105.0  # same clock read as the fence: the latency cancels
 
-    # Sent at 105.0 and answered at once: renewed at T0 + 4 s, lease to T0 + 14.5 s.
+    # Sent at 105.0 and answered at once: the database's now is T0 + 4 s (local 105.0),
+    # lease to T0 + 14.5 s. Mapped from this renewal (DEC-075), not the claim, the fence
+    # is the real lease end less the margin: the claim's 1 s is gone.
     harness.clock.now = 105.0
-    harness.renew(lambda *a, **k: attempt(lease_seconds=14.5))
+    harness.renew(lambda *a, **k: attempt(lease_seconds=14.5), step=-1.0)
     harness.worker._heartbeat(running)
     assert running.heartbeat_due == 110.0
-    # The real lease ends at local 115.5 (margin from 112.5); the fence is 1 s earlier.
-    assert harness.deadline() == 100.0 + 14.5 - 3.0
+    assert harness.deadline() == 105.0 + 10.5 - 3.0  # 112.5, from the renewal's own mapping
 
-    # The next heartbeat, sent on time at 110.0 and taking its full 2 s, would be
-    # confirmed at 112.0: inside the real lease, but after the fence.
+    # The next heartbeat, sent on time at 110.0 and taking its full 2 s, is confirmed at
+    # 112.0: inside the real lease and now before the fence too.
     harness.clock.now = 111.5
-    expiry = harness.watchdog.check()
-    assert expiry is not None
-    assert expiry.guard is Guard.OWNERSHIP
-    assert harness.expiries == [expiry]
+    assert harness.watchdog.check() is None
+    assert harness.expiries == []
 
 
 def test_the_handler_thread_disarms_and_a_later_renewal_cannot_rearm(harness: Harness) -> None:
@@ -1125,7 +1133,7 @@ def test_a_retry_time_recovery_cannot_represent_ends_the_process_as_a_defect(
 def test_a_supervisor_failing_while_a_handler_runs_ends_the_process(harness: Harness) -> None:
     harness.start()
     harness.clock.now = 106.0  # the first heartbeat is due
-    harness.monkeypatch.setattr(runtime, "renew_lease", raising(KeyError("unexpected")))
+    harness.monkeypatch.setattr(runtime, "renew_lease_at", raising(KeyError("unexpected")))
     with pytest.raises(Terminated) as info:
         harness.worker.run()
     assert (info.value.code, info.value.event) == (ExitCode.FENCED, "supervisor_failed")
@@ -1730,3 +1738,117 @@ def test_the_idle_backstop_is_a_bound_and_never_shorter_than_the_connect_timeout
         update={"db_operation_timeout": timedelta(seconds=bound)}
     )
     assert harness.worker._idle_backstop() == backstop
+
+
+# --- the fence is mapped from each renewal, not from the claim (DEC-075) ------------------
+
+
+def renewed_to(lease_seconds: float) -> Callable[..., Attempt]:
+    """A confirmed renewal whose lease ends ``lease_seconds`` after the claim's instant T0."""
+    return lambda *a, **k: attempt(lease_seconds=lease_seconds)
+
+
+def test_a_database_clock_step_forward_after_the_claim_never_moves_the_fence_later(
+    harness: Harness,
+) -> None:
+    running = harness.start()
+    # Sent at local 110.0 (T0 + 10 s in step). The database's clock has jumped 60 s
+    # ahead: it answers now = T0 + 70 s and a lease to now + 30 s = T0 + 100 s.
+    harness.clock.now = 110.0
+    harness.renew(renewed_to(100.0), step=60.0)
+    harness.worker._heartbeat(running)
+    # The lease really ends 30 s after this renewal: local 140.0. The claim's mapping
+    # would have put it at 200.0, 60 s too late.
+    assert harness.deadline() == 110.0 + 30.0 - 3.0
+    assert running.local(T0 + timedelta(seconds=100)) == 140.0
+
+
+def test_a_database_clock_step_back_maps_the_lease_end_from_the_renewal(
+    harness: Harness,
+) -> None:
+    running = harness.start()
+    # Sent at 110.0; the database's clock went 20 s back: now = T0 - 10 s. The lease
+    # never shortens, so it still ends at T0 + 30 s, 40 s of database time away.
+    harness.clock.now = 110.0
+    harness.renew(renewed_to(30.0), step=-20.0)
+    harness.worker._heartbeat(running)
+    assert harness.deadline() == 110.0 + 40.0 - 3.0  # when the database will reach it
+
+
+def test_without_a_clock_step_the_fence_is_the_claims_mapping(harness: Harness) -> None:
+    running = harness.start()
+    harness.clock.now = 110.0
+    harness.renew(renewed_to(40.0))
+    harness.worker._heartbeat(running)
+    assert harness.deadline() == 100.0 + 40.0 - 3.0  # as before E1, on a sane clock
+
+
+def test_a_renewal_moves_the_fence_earlier_when_a_step_makes_the_deadline_cap_bite(
+    harness: Harness,
+) -> None:
+    running = harness.start()
+    harness.clock.now = 110.0
+    harness.renew(renewed_to(40.0))
+    harness.worker._heartbeat(running)
+    assert harness.deadline() == 137.0
+    # The database's clock then jumps 9.5 minutes ahead: its now is T0 + 585 s, so the
+    # attempt's deadline (T0 + 10 min) is 15 s away and caps the lease there.
+    harness.clock.now = 115.0
+    harness.renew(renewed_to(600.0), step=570.0)
+    harness.worker._heartbeat(running)
+    assert harness.deadline() == 115.0 + 15.0 - 3.0  # earlier than the 137.0 armed before
+
+
+def test_an_unconfirmed_heartbeat_keeps_the_last_mapping(harness: Harness) -> None:
+    running = harness.start()
+    harness.clock.now = 110.0
+    harness.renew(renewed_to(100.0), step=60.0)
+    harness.worker._heartbeat(running)
+    mapped = running.reference
+    harness.clock.now = 115.0
+    harness.renew(raising(psycopg.OperationalError("lost")))
+    harness.worker._heartbeat(running)
+    assert running.reference == mapped
+    assert harness.deadline() == 137.0
+
+
+def test_a_cancellation_s_grace_end_is_mapped_from_its_own_answer(harness: Harness) -> None:
+    running = harness.start()
+    harness.clock.now = 110.0
+    now = T0 + timedelta(seconds=70)  # the database's clock jumped 60 s ahead
+    grace_end = now + timedelta(seconds=12)
+    harness.renew(raising(CancellationRequestedError(uuid.UUID(int=1), T0, grace_end, now=now)))
+    harness.worker._heartbeat(running)
+    assert harness.deadline() == 110.0 + 12.0 - 3.0
+    assert running.cancel.is_set()
+
+
+def test_the_deadline_give_up_follows_the_latest_mapping(harness: Harness) -> None:
+    running = harness.start()
+    harness.clock.now = 110.0
+    harness.renew(renewed_to(100.0), step=60.0)
+    harness.worker._heartbeat(running)
+    _, deadline_at = runtime._lease(running.attempt)  # T0 + 10 min, in database time
+    # 600 s after T0 is 530 s after this renewal's now (T0 + 70 s): local 640.0, not 700.0.
+    assert running.local(deadline_at) == 110.0 + 530.0
+
+
+def test_a_sent_claim_abandoned_with_no_known_backend_takes_the_lost_claim_hold(
+    harness: Harness,
+) -> None:
+    class Anonymous(FakeConn):
+        def execute(self, query: str, params: Any = None) -> FakeRows:
+            if query == runtime._BACKEND:
+                self.queries.append(query)
+                return FakeRows(None)  # the identity read found no row
+            return super().execute(query, params)
+
+    harness.conn = Anonymous()
+    harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, broken))
+    harness.worker._claim()
+    assert harness.worker._abandoned is None  # nothing it could end
+    held = harness.worker._held
+    assert held is not None
+    assert held.attempt is None
+    assert held.until == harness.worker._schedule.claim_due  # no claim for one lease
+    assert held.until >= harness.clock.now + 30.0 - 0.001
