@@ -7,6 +7,8 @@ from typing import Any, NoReturn
 
 import pytest
 
+import benchmarks.extract
+import benchmarks.ratelimit
 import benchmarks.worker
 from benchmarks.live import (
     API_KEY_ENV,
@@ -139,3 +141,107 @@ def test_the_double_is_still_the_default(tmp_path: Path) -> None:
         wiring=wiring,
     )
     assert wiring == []
+
+
+# --- the per-document retry and the shared pace (DEC-073) ----------------------------------
+
+
+def _extract_dry(budget: Path, *extra: str) -> list[str]:
+    return _openrouter(
+        budget, "--dry-run", "--workload", "extract", "--documents", "10", "--seed", "7", *extra
+    )
+
+
+@pytest.mark.usefixtures("bench_settings")
+@pytest.mark.parametrize(
+    ("flags", "refusal"),
+    [
+        (["--rate-limit-per-s", "10"], "go together"),
+        (["--rate-limit-file", "{dir}/pace"], "go together"),
+        (["--rate-limit-per-s", "0", "--rate-limit-file", "{dir}/pace"], "--rate-limit-per-s:"),
+        (["--rate-limit-per-s", "nan", "--rate-limit-file", "{dir}/pace"], "--rate-limit-per-s:"),
+        (["--rate-limit-per-s", "5000", "--rate-limit-file", "{dir}/pace"], "--rate-limit-per-s:"),
+        (["--rate-limit-per-s", "10", "--rate-limit-file", "{dir}/no/pace"], "existing directory"),
+    ],
+)
+def test_the_pace_flags_are_refused_before_anything_is_built(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, flags: list[str], refusal: str
+) -> None:
+    budget = create_budget_file(tmp_path / "budget")
+    given = [flag.format(dir=tmp_path) for flag in flags]
+    assert benchmarks.worker.main(_extract_dry(budget, *given)) == 1
+    assert refusal in _error(capsys)
+    assert not (tmp_path / "pace").exists()
+
+
+@pytest.mark.usefixtures("bench_settings")
+def test_the_pace_applies_to_the_extract_workload_only(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    budget = create_budget_file(tmp_path / "budget")
+    pace = ["--rate-limit-per-s", "10", "--rate-limit-file", str(tmp_path / "pace")]
+    assert benchmarks.worker.main(_openrouter(budget, "--dry-run", *pace)) == 1
+    assert "only to --workload extract" in _error(capsys)
+    assert benchmarks.worker.main(_extract_dry(budget, *pace)) == 1
+    assert _error(capsys) == "ORQESTRA_DATABASE_URL is not set"  # valid: as far as the URL
+    assert not (tmp_path / "pace").exists()  # created on the first slot, not before
+
+
+def _captured_extract_handler(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pace: Any
+) -> dict[str, Any]:
+    tmp_path.mkdir()
+    seen: dict[str, Any] = {}
+    real = benchmarks.extract.extraction_handler
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(benchmarks.extract, "extraction_handler", capture)
+    choice = ProviderChoice(
+        name=ProviderName.OPENROUTER, model=MODEL, max_provider_calls=50, dry_run=True
+    )
+    benchmarks.worker.build_worker(
+        "postgresql:///never-connected",
+        WorkerSettings(_env_file=None),
+        cap=12,
+        call_timeout=benchmarks.worker.parse_duration("PT30S"),
+        choice=choice,
+        budget_file=create_budget_file(tmp_path / "budget"),
+        environ={},
+        workload=benchmarks.worker.WorkloadName.EXTRACT,
+        documents=10,
+        seed=7,
+        pace=pace,
+    )
+    return seen
+
+
+@pytest.mark.usefixtures("bench_settings")
+def test_the_extract_handler_gets_the_retry_the_attempt_time_and_the_pace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = WorkerSettings(_env_file=None)
+    handoff = 3 * settings.db_operation_timeout
+    unpaced = _captured_extract_handler(monkeypatch, tmp_path / "a", None)
+    assert unpaced["retry"] == benchmarks.extract.DocumentRetry()
+    assert unpaced["pace"] is None
+    assert unpaced["attempt_time"] == benchmarks.extract.AttemptTime(
+        budget=settings.execution_timeout - settings.fence_margin - handoff,
+        per_call=benchmarks.worker.parse_duration("PT30S") + 2 * handoff,
+    )
+    pace = benchmarks.ratelimit.RateLimiter(tmp_path / "pace", 10.0)
+    assert _captured_extract_handler(monkeypatch, tmp_path / "b", pace)["pace"] is pace
+
+
+@pytest.mark.usefixtures("bench_settings")
+def test_the_mix_workload_is_never_paced(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="only the extract workload"):
+        benchmarks.worker.build_worker(
+            "postgresql:///never-connected",
+            WorkerSettings(_env_file=None),
+            cap=16,
+            call_timeout=benchmarks.worker.parse_duration("PT0.1S"),
+            pace=benchmarks.ratelimit.RateLimiter(tmp_path / "pace", 10.0),
+        )
