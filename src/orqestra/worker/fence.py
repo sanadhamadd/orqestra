@@ -32,7 +32,13 @@ watchdog thread then cannot run), or processes a handler started and detached.
 
 Ending the process never depends on stderr: the last log line is written by a
 short-lived writer, and the process ends after at most ``_LINE_WRITE_BOUND``
-even if that write never returns (a pipe nobody reads). The watchdog thread's
+(0.1 s) even if that write never returns (a pipe nobody reads). When the
+watchdog thread ends the process, the writer may get up to
+``_WATCHDOG_LINE_WRITE_BOUND`` (1 s): that thread is never a signal handler, and
+on a loaded machine a 0.1 s bound lost the one line naming the stalled
+operation. It never gets more than an armed OWNERSHIP deadline has left (nor
+less than 0.1 s), so waiting for a log line cannot let a handler outlive its
+lease (``_line_bound_for``). The watchdog thread's
 own wait is cut to ``_LONGEST_WAIT``, so no deadline, however distant, can end
 that thread (DEC-045 notes).
 """
@@ -44,7 +50,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from typing import NoReturn
@@ -81,19 +87,37 @@ _EXIT_FOR = {
 
 @dataclass(frozen=True, slots=True)
 class Expiry:
-    """A guard whose deadline passed while armed."""
+    """A guard whose deadline passed while armed.
+
+    ``ownership_deadline`` is the OWNERSHIP deadline armed when it fired, if any: while
+    the watchdog waits for its last line nothing else is checked, so that wait must not
+    run past the lease (``_line_bound_for``).
+    """
 
     guard: Guard
     deadline: float
     now: float
     context: Mapping[str, str]
+    # Read for the line's wait only, not part of what expired: left out of equality.
+    ownership_deadline: float | None = field(default=None, compare=False)
+    # The watchdog's clock, read again just before the wait (``_line_bound_for``).
+    clock: Callable[[], float] | None = field(default=None, compare=False, repr=False)
 
 
-# How long the process waits for its last log line before it ends anyway.
+# How long the process waits for its last log line before it ends anyway: short, for a
+# signal handler; longer when the watchdog thread ends it, so the reason is not lost.
 _LINE_WRITE_BOUND = 0.1
+_WATCHDOG_LINE_WRITE_BOUND = 1.0
 
 
-def end_process(code: ExitCode, event: str, message: str, context: Mapping[str, str]) -> NoReturn:
+def end_process(
+    code: ExitCode,
+    event: str,
+    message: str,
+    context: Mapping[str, str],
+    *,
+    line_write_bound: float = _LINE_WRITE_BOUND,
+) -> NoReturn:
     """Write one JSON log line to stderr, best effort, and end the process at once with ``code``.
 
     ``os._exit`` ends every thread, including a handler that is still running;
@@ -103,8 +127,9 @@ def end_process(code: ExitCode, event: str, message: str, context: Mapping[str, 
 
     The line is written with ``os.write`` by a writer started with
     ``_thread.start_new_thread``, and the process waits at most
-    ``_LINE_WRITE_BOUND`` for it: a blocking write to a full pipe nobody reads
-    must not keep a fence from ending the process. The writer is started
+    ``line_write_bound`` for it (``_LINE_WRITE_BOUND`` unless the caller is the
+    watchdog thread): a blocking write to a full pipe nobody reads must not keep
+    a fence from ending the process. The writer is started
     without the ``threading`` module, so ending the process depends on none of
     its locks or bookkeeping: this function also runs in a signal handler on
     the main thread, which may be inside ``threading``'s own code (for example
@@ -133,17 +158,36 @@ def end_process(code: ExitCode, event: str, message: str, context: Mapping[str, 
                 written.release()
 
         _thread.start_new_thread(write, ())
-        written.acquire(timeout=_LINE_WRITE_BOUND)
+        written.acquire(timeout=line_write_bound)
     finally:
         os._exit(int(code))
 
 
+def _line_bound_for(expiry: Expiry) -> float:
+    """How long the watchdog waits for its last line: up to 1 s, never past the lease.
+
+    While it waits nothing else is checked and a handler may still run, so the wait
+    is cut to what an armed OWNERSHIP deadline has left, and never below the 0.1 s
+    every exit already allows: 0.1 s for an OWNERSHIP expiry, 1 s with nothing owned.
+    """
+    if expiry.guard is Guard.OWNERSHIP:
+        return _LINE_WRITE_BOUND
+    if expiry.ownership_deadline is None:
+        return _WATCHDOG_LINE_WRITE_BOUND
+    # A fresh reading, so the time since the check is not counted as ownership left.
+    now = expiry.clock() if expiry.clock is not None else expiry.now
+    left = expiry.ownership_deadline - now
+    return max(_LINE_WRITE_BOUND, min(_WATCHDOG_LINE_WRITE_BOUND, left))
+
+
 def _end_for_expiry(expiry: Expiry) -> None:
+    """The watchdog thread's ending: never a signal handler (``_line_bound_for``)."""
     end_process(
         _EXIT_FOR[expiry.guard],
         f"{expiry.guard.value}_deadline_passed",
         f"watchdog: the {expiry.guard.value} deadline passed; ending the process",
         expiry.context,
+        line_write_bound=_line_bound_for(expiry),
     )
 
 
@@ -305,7 +349,15 @@ class Watchdog:
         if not due:
             return None
         _, guard = min(due)
-        expiry = Expiry(guard, self._armed[guard].deadline, now, self._armed[guard].context)
+        owned = self._armed.get(Guard.OWNERSHIP)
+        expiry = Expiry(
+            guard,
+            self._armed[guard].deadline,
+            now,
+            self._armed[guard].context,
+            None if owned is None else owned.deadline,
+            self._clock,
+        )
         self._armed.clear()
         self._terminate(expiry)  # under the lock: a racing disarm or extend waits for it
         return expiry
