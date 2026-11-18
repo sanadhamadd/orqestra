@@ -13,9 +13,10 @@ It holds at most one deadline per ``Guard``; the earliest expiry ends the proces
 - ``OWNERSHIP``: armed while a handler runs. Its deadline is the attempt's
   lease, mapped to the local clock so that it is never later than the lease
   really ends (``local_deadline``), minus the fencing margin. It moves only on
-  a confirmed heartbeat answer: later to a renewed lease, or to the end of the
-  grace period a confirmed cancellation request set, which may be earlier or
-  later (DEC-040, DEC-048, DEC-068). It is disarmed by the handler thread the
+  a confirmed heartbeat answer, mapped from that answer itself (DEC-075): to the
+  renewed lease, or to the end of the grace period a confirmed cancellation
+  request set, either of which may be earlier or later (DEC-040, DEC-048,
+  DEC-068). It is disarmed by the handler thread the
   moment the handler's work has ended.
 - ``OPERATION``: armed around each supervisor database call, so a stalled call
   ends the process instead of hanging it. It says nothing about ownership.
@@ -324,8 +325,9 @@ class Watchdog:
     def move_to(self, token: int, deadline: float) -> bool:
         """Move the ownership deadline of ``token`` to exactly ``deadline``, earlier or later.
 
-        Only for a deadline the database confirmed and will not change again: the
-        end of a cancellation's grace period (DEC-040, DEC-048, DEC-068). One update
+        Only for a deadline the database just confirmed, mapped from that same answer:
+        a renewed lease (DEC-075) or the end of a cancellation's grace period (DEC-040,
+        DEC-048, DEC-068). One update
         under the lock, so the watchdog never acts on a deadline in between.
         Returns ``False``, changing nothing, if ``token`` is no longer armed. The
         drain and operation guards never move this way: they only end the process

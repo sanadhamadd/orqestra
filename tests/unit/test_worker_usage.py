@@ -1022,7 +1022,7 @@ def test_a_confirmed_cancellation_withdraws_the_waiting_intent(make: Any) -> Non
     harness.posted()
     harness.monkeypatch.setattr(
         runtime,
-        "renew_lease",
+        "renew_lease_at",
         raising(CancellationRequestedError(ATTEMPT, T0, T0 + timedelta(seconds=12))),
     )
     harness.worker._heartbeat(running)

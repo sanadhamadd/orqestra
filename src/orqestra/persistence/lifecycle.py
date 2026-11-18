@@ -322,10 +322,18 @@ class CancellationRequestedError(OrqestraError):
     The worker should stop and complete the attempt as cancelled before
     ``lease_expires_at``, the end of its grace period: it still owns the task
     until recovery commits a revocation, but it can no longer extend that.
+
+    ``now`` is the database instant the heartbeat read the request at, in the same
+    transaction: a worker maps ``lease_expires_at`` to its own clock from it (DEC-075).
     """
 
     def __init__(
-        self, attempt_id: uuid.UUID, cancel_requested_at: datetime, lease_expires_at: datetime
+        self,
+        attempt_id: uuid.UUID,
+        cancel_requested_at: datetime,
+        lease_expires_at: datetime,
+        *,
+        now: datetime | None = None,
     ) -> None:
         super().__init__(
             f"cancellation of attempt {attempt_id}'s task was requested at "
@@ -335,6 +343,7 @@ class CancellationRequestedError(OrqestraError):
         self.attempt_id = attempt_id
         self.cancel_requested_at = cancel_requested_at
         self.lease_expires_at = lease_expires_at
+        self.now = now
 
 
 class WorkerMismatchError(OrqestraError):
@@ -668,6 +677,15 @@ def _log_closure(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class LeaseRenewal:
+    """A confirmed heartbeat: the renewed attempt, and the database instant ``now`` its new
+    lease was computed from, read in the same transaction (DEC-075)."""
+
+    attempt: Attempt
+    now: datetime
+
+
 def renew_lease(
     conn: Conn,
     attempt_id: uuid.UUID,
@@ -677,6 +695,23 @@ def renew_lease(
     policy: LeasePolicy,
 ) -> Attempt:
     """Extend a running attempt's lease (a heartbeat) and return the attempt.
+
+    ``renew_lease_at`` with only the attempt; see it for the rules.
+    """
+    return renew_lease_at(
+        conn, attempt_id, generation=generation, worker_id=worker_id, policy=policy
+    ).attempt
+
+
+def renew_lease_at(
+    conn: Conn,
+    attempt_id: uuid.UUID,
+    *,
+    generation: int,
+    worker_id: str,
+    policy: LeasePolicy,
+) -> LeaseRenewal:
+    """Extend a running attempt's lease (a heartbeat); the attempt and the instant used.
 
     The new lease is ``policy.lease`` from now, capped at the attempt's
     deadline, and never shorter than the current one; the deadline itself
@@ -690,9 +725,10 @@ def renew_lease(
     when it already ended otherwise; ``LeaseExpiredError`` when its lease has
     expired, including at the deadline or at the end of a cancellation grace
     period; ``CancellationRequestedError`` when cancellation of its task was
-    requested (DEC-040). A heartbeat therefore cannot revive an expired lease
-    or a revoked attempt, nor extend a lease once a cancellation request has
-    committed.
+    requested (DEC-040), carrying the same ``now``. A heartbeat therefore cannot
+    revive an expired lease or a revoked attempt, nor extend a lease once a
+    cancellation request has committed. ``now`` is returned so a worker can map
+    the new lease to its own clock from this renewal, not from its claim (DEC-075).
     """
     with owned_transaction(conn, "renew_lease") as cur:
         current = attempt_from_row(_locked(cur, _LOCK_ATTEMPT, attempt_id, "attempt"))
@@ -714,7 +750,9 @@ def renew_lease(
         if reason is not None:
             raise LeaseExpiredError(attempt_id, reason, lease_expires_at, deadline_at)
         if cancel_requested_at is not None:
-            raise CancellationRequestedError(attempt_id, cancel_requested_at, lease_expires_at)
+            raise CancellationRequestedError(
+                attempt_id, cancel_requested_at, lease_expires_at, now=now
+            )
         renewed = renewed_lease(
             policy, now=now, lease_expires_at=lease_expires_at, deadline_at=deadline_at
         )
@@ -723,7 +761,7 @@ def renew_lease(
         "lease renewed",
         extra={"task_id": str(attempt.task_id), "attempt_id": str(attempt_id)},
     )
-    return attempt
+    return LeaseRenewal(attempt, now)
 
 
 def revoke_next_expired(
