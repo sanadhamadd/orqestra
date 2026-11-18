@@ -16,7 +16,7 @@ import math
 import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, NoReturn
@@ -256,6 +256,20 @@ def _worker_run(kinds: Sequence[str]) -> int:
 
 # --- job submit / job status (DEC-064) ------------------------------------------------------
 
+
+def utc_text(instant: datetime) -> str:
+    """``instant`` in ISO 8601 at ``+00:00``: every timestamp the CLI prints, whatever the
+    server's or the session's TimeZone, so the same row reads the same from every command.
+
+    A database ``timestamptz`` always decodes with its offset; a naive value would be read
+    as local time, so it is refused rather than guessed (as ``local_deadline`` does, DEC-067).
+    """
+    if instant.utcoffset() is None:
+        msg = "a timestamp to print must be timezone-aware"
+        raise TypeError(msg)
+    return instant.astimezone(UTC).isoformat()
+
+
 _TASK_FIELDS = frozenset({"task_key", "payload", "max_attempts"})
 
 
@@ -422,7 +436,7 @@ def _submit(conn: psycopg.Connection[TupleRow], submission: JobSubmission) -> di
         "kind": result.job.kind,
         "idempotency_key": result.job.idempotency_key,
         "created": result.created,
-        "created_at": result.job.created_at.isoformat(),
+        "created_at": utc_text(result.job.created_at),
     }
 
 
@@ -442,7 +456,7 @@ def _status(conn: psycopg.Connection[TupleRow], job_id: uuid.UUID) -> dict[str, 
         "job_id": str(job.id),
         "kind": job.kind,
         "idempotency_key": job.idempotency_key,
-        "created_at": job.created_at.isoformat(),
+        "created_at": utc_text(job.created_at),
         "job_status": progress.status.value,
         "task_counts": {state.value: progress.task_counts[state] for state in TaskState},
     }
@@ -468,7 +482,7 @@ def _job_head(job: Job, observed_at: datetime, job_status: JobStatus) -> dict[st
     return {
         "job_id": str(job.id),
         "kind": job.kind,
-        "observed_at": observed_at.isoformat(),
+        "observed_at": utc_text(observed_at),
         "job_status": job_status.value,
     }
 
