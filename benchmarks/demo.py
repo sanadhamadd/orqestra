@@ -88,6 +88,7 @@ from benchmarks.run import (
     Cell,
     Profile,
     add_common_arguments,
+    bench_settings,
     cell_status,
     failure_figures,
     process_environment,
@@ -96,7 +97,7 @@ from benchmarks.run import (
     usage_figures,
     worker_command,
 )
-from benchmarks.worker import DEFAULT_CALL_TIMEOUT, DEFAULT_CAP, parse_duration
+from benchmarks.worker import DEFAULT_CALL_TIMEOUT, DEFAULT_CAP
 from orqestra.aggregation.budget import call_bound
 from orqestra.domain.states import AttemptState, TaskState
 from orqestra.workloads.invoice.handler import JOB_KIND
@@ -502,9 +503,10 @@ def run_demo(
     harness = Harness(url)
     drill = KillDrill(1, at_call_boundary=True)
     watch = VictimWatch()
-    operation = parse_duration(worker_settings["ORQESTRA_WORKER_DB_OPERATION_TIMEOUT"])
+    validated = bench_settings(worker_settings)  # once: every value below comes from here
+    operation = validated.db_operation_timeout
     quiet = 2 * operation.total_seconds() + 1.0  # as run_drill: a statement outlives its bound
-    shutdown = parse_duration(worker_settings["ORQESTRA_WORKER_SHUTDOWN_TIMEOUT"])
+    shutdown = validated.shutdown_timeout
     harness_start = metrics.harness_usage()
     wait_ended = WaitEnded.STOP_AFTER
     waited = 0.0

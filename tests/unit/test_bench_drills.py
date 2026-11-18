@@ -31,8 +31,11 @@ from benchmarks.drills import (
 )
 from benchmarks.generate import generate_invoices
 from benchmarks.live import BUDGET_FILE_NAME, DOUBLE, ProviderChoice, ProviderName
-from benchmarks.run import BENCH_WORKER_SETTINGS, Cell, Profile
+from benchmarks.run import BENCH_WORKER_SETTINGS, Cell, Profile, bench_settings
+from benchmarks.worker import parse_duration
+from orqestra.domain.retry import RetryPolicy
 from orqestra.domain.states import TaskState
+from tests.integration.test_worker_process import ENVIRONMENT
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
@@ -623,3 +626,28 @@ def test_the_extract_drill_cell_and_its_call_timeout() -> None:
     assert workload.expected is None
     with pytest.raises(ValueError, match="no invoice oracle"):
         _ = workload.oracle
+
+
+# --- settings read once, through bench_settings ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "settings", [BENCH_WORKER_SETTINGS, ENVIRONMENT], ids=["bench", "test-profile"]
+)
+def test_the_drills_retry_policy_is_the_validated_settings_own(settings: dict[str, str]) -> None:
+    policy = benchmarks.drills.retry_policy(settings)
+    assert policy == RetryPolicy(
+        parse_duration(settings["ORQESTRA_WORKER_RETRY_BASE_DELAY"]),
+        parse_duration(settings["ORQESTRA_WORKER_RETRY_MAX_DELAY"]),
+    )
+    assert policy == bench_settings(settings).retry_policy
+
+
+def test_the_freeze_drill_holds_a_worker_past_the_benchs_own_lease() -> None:
+    lease = bench_settings(BENCH_WORKER_SETTINGS).lease
+    assert (
+        lease
+        == parse_duration(BENCH_WORKER_SETTINGS["ORQESTRA_WORKER_LEASE"])
+        == timedelta(seconds=10)
+    )
+    assert lease.total_seconds() + benchmarks.drills.FREEZE_EXTRA == 12.0

@@ -141,6 +141,7 @@ from benchmarks.run import (
     WorkerHandle,
     add_common_arguments,
     add_provider_arguments,
+    bench_settings,
     build_workload,
     failure_figures,
     prices_of,
@@ -154,7 +155,7 @@ from benchmarks.run import (
     worker_command,
 )
 from benchmarks.sysload import SysloadSampler
-from benchmarks.worker import DEFAULT_CALL_TIMEOUT, DEFAULT_CAP, parse_duration
+from benchmarks.worker import DEFAULT_CALL_TIMEOUT, DEFAULT_CAP
 from orqestra.aggregation.usage import AttemptCapture, attempt_capture
 from orqestra.domain.jobs import JobProgress, JobStatus, JsonValue
 from orqestra.domain.retry import RetryPolicy, retry_delay
@@ -1171,10 +1172,8 @@ def retry_workload(invoices: Sequence[JsonValue], batch: int) -> tuple[DrillWork
 
 
 def retry_policy(worker_settings: Mapping[str, str]) -> RetryPolicy:
-    return RetryPolicy(
-        base_delay=parse_duration(worker_settings["ORQESTRA_WORKER_RETRY_BASE_DELAY"]),
-        max_delay=parse_duration(worker_settings["ORQESTRA_WORKER_RETRY_MAX_DELAY"]),
-    )
+    """The retry policy the workers record requeues with: their validated settings' own."""
+    return bench_settings(worker_settings).retry_policy
 
 
 # --- one drill run -----------------------------------------------------------------------
@@ -1280,6 +1279,8 @@ def run_drill(
     cap = cell.batch if extracting and cell.batch else DEFAULT_CAP
     if provider.openrouter:
         worker_settings = provider_worker_settings(worker_settings, cap, call_timeout)
+    # Validated once, before any worker starts: every value read below comes from here.
+    validated = bench_settings(worker_settings)
     raw_dir.mkdir(parents=True, exist_ok=True)
     env = process_environment(drill.worker_url(url), worker_settings, provider)
     if provider.openrouter:
@@ -1303,7 +1304,7 @@ def run_drill(
         lambda: [h.process.pid for h in fleet.workers if h.exited is None],
         partial(psycopg.connect, url, autocommit=True),
     )
-    operation = parse_duration(worker_settings["ORQESTRA_WORKER_DB_OPERATION_TIMEOUT"])
+    operation = validated.db_operation_timeout
     quiet = 2 * operation.total_seconds() + 1.0  # a statement outlives its bound by little
     seen: set[int] = set()
     due: list[float] = []
@@ -1341,8 +1342,7 @@ def run_drill(
         finally:
             try:
                 _await_started(fleet)
-                shutdown = parse_duration(worker_settings["ORQESTRA_WORKER_SHUTDOWN_TIMEOUT"])
-                reaped = fleet.stop(timeout=shutdown.total_seconds() + 10.0)
+                reaped = fleet.stop(timeout=validated.shutdown_timeout.total_seconds() + 10.0)
             finally:
                 drill.close()
     try:
@@ -1475,7 +1475,7 @@ def _jobs(
             expected_calls=expected_calls_by_item(args.invoices, args.batch, DEFAULT_CAP),
         )
     elif name == "d2":
-        lease = parse_duration(BENCH_WORKER_SETTINGS["ORQESTRA_WORKER_LEASE"])
+        lease = bench_settings(BENCH_WORKER_SETTINGS).lease
         drill = FreezeDrill(lease.total_seconds() + FREEZE_EXTRA)
     elif name == "d3a":
         drill = OutageDrill(url_for_proxy)
