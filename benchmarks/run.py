@@ -1082,6 +1082,8 @@ def run_cell(
     the cell's limiter file. A worker that exits mid-cell is replaced (module docstring).
     """
     run_id = run_id or uuid.uuid4().hex[:12]
+    # Validated once, before any worker starts: every value read below comes from here.
+    validated = bench_settings(worker_settings)
     refusal = provider.refusal(os.environ)
     if refusal is not None:
         raise ValueError(refusal)
@@ -1208,7 +1210,7 @@ def run_cell(
         finally:
             if load is None:
                 load = sysload.stop()  # idempotent; only an exception reaches here running
-            shutdown = _shutdown_seconds(worker_settings)
+            shutdown = validated.shutdown_timeout.total_seconds()
             fleet.settle()  # a replacement still starting would die of the SIGTERM
             reaped = fleet.stop(timeout=shutdown + 10.0)
             for sampler in (contention, docker):
@@ -1260,7 +1262,7 @@ def run_cell(
         None if idle_rate is None else idle_rate["per_s"],
         before_job + after_job,
         None if idle_rate is None else idle_rate["window_s"],
-        implied_idle_rate(cell.workers, worker_settings),
+        implied_idle_rate(cell.workers, validated),
     )
     database_stats["commits"] = commits
     database_stats["checkpoints"] = checkpoints.summary()
@@ -1350,19 +1352,14 @@ def _text(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
 
-def implied_idle_rate(workers: int, worker_settings: Mapping[str, str]) -> float:
+def implied_idle_rate(workers: int, settings: WorkerSettings) -> float:
     """The idle commits a second the settings imply: each idle worker claims once per
     poll interval and runs one recovery sweep step per recovery interval, each its own
     transaction. An upper estimate, not a floor: each call takes time, so the real
     rate runs a little lower (metrics.job_commits uses the larger of the two)."""
-    poll = parse_duration(worker_settings["ORQESTRA_WORKER_POLL_INTERVAL"]).total_seconds()
-    sweep = parse_duration(worker_settings["ORQESTRA_WORKER_RECOVERY_INTERVAL"]).total_seconds()
+    poll = settings.poll_interval.total_seconds()
+    sweep = settings.recovery_interval.total_seconds()
     return workers * (1 / poll + 1 / sweep)
-
-
-def _shutdown_seconds(worker_settings: Mapping[str, str]) -> float:
-    text = worker_settings.get("ORQESTRA_WORKER_SHUTDOWN_TIMEOUT", "PT5S")
-    return parse_duration(text).total_seconds()
 
 
 # --- the command -------------------------------------------------------------------------

@@ -11,7 +11,7 @@ import sys
 import time
 import types
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -44,9 +44,11 @@ from benchmarks.run import (
     replacement_limit,
     worker_exits_check,
 )
-from benchmarks.worker import DEFAULT_CAP
+from benchmarks.worker import DEFAULT_CAP, parse_duration
 from orqestra.domain.retry import RetryPolicy, retry_delay
 from orqestra.worker.fence import ExitCode
+from tests.integration.test_bench_smoke_pg import DRILL_SETTINGS
+from tests.integration.test_worker_process import ENVIRONMENT
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
 
@@ -518,3 +520,54 @@ def test_the_watch_reads_at_most_once_an_interval() -> None:
     watch.sample(0.0)
     assert not watch.due(0.5)
     assert watch.due(run.CHECKPOINT_SAMPLE_INTERVAL)
+
+
+# --- settings read once, through bench_settings ---------------------------------------------
+
+
+def seconds(settings: Mapping[str, str], name: str) -> float:
+    """A value as the harness parsed it field by field before: the string, read alone."""
+    return parse_duration(settings[f"ORQESTRA_WORKER_{name}"]).total_seconds()
+
+
+SETTINGS_IN_USE = [
+    pytest.param(BENCH_WORKER_SETTINGS, id="bench"),
+    pytest.param(LIVE_WORKER_SETTINGS, id="live"),
+    pytest.param(cell_worker_settings(EXTRACT, DRY, "PT30S"), id="extract-cell"),
+    pytest.param(cell_worker_settings(INVOICE, DRY, "PT30S"), id="invoice-cell"),
+    pytest.param(ENVIRONMENT, id="test-profile"),
+    pytest.param(DRILL_SETTINGS, id="drill"),
+]
+
+
+@pytest.mark.parametrize("settings", SETTINGS_IN_USE)
+def test_every_derived_value_is_todays_for_the_settings_the_harness_uses(
+    settings: Mapping[str, str],
+) -> None:
+    validated = bench_settings(settings)
+    for workers in (1, 4, 32):
+        poll, sweep = seconds(settings, "POLL_INTERVAL"), seconds(settings, "RECOVERY_INTERVAL")
+        assert run.implied_idle_rate(workers, validated) == workers * (1 / poll + 1 / sweep)
+    assert validated.shutdown_timeout.total_seconds() == seconds(settings, "SHUTDOWN_TIMEOUT")
+    operation = validated.db_operation_timeout.total_seconds()
+    assert operation == seconds(settings, "DB_OPERATION_TIMEOUT")
+    assert validated.lease.total_seconds() == seconds(settings, "LEASE")
+    assert validated.retry_policy == RetryPolicy(
+        timedelta(seconds=seconds(settings, "RETRY_BASE_DELAY")),
+        timedelta(seconds=seconds(settings, "RETRY_MAX_DELAY")),
+    )
+
+
+def test_a_cell_refuses_settings_a_worker_would_refuse_before_any_worker_starts(
+    tmp_path: Path,
+) -> None:
+    broken = {**BENCH_WORKER_SETTINGS, "ORQESTRA_WORKER_LEASE": "PT1S"}  # shorter than heartbeat
+    with pytest.raises(ValueError, match="lease"):
+        run.run_cell(
+            "postgresql:///unused",
+            INVOICE,
+            worker_settings=broken,
+            raw_dir=tmp_path,
+            stop_after=1.0,
+        )
+    assert list(tmp_path.iterdir()) == []  # refused before the raw directory or a worker
