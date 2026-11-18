@@ -844,6 +844,18 @@ METERED = {
     "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT0.4S",
     "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.2S",
 }
+# The mid-batch kill test only. METERED's 0.4 s bound leaves 60% of each 1 s heartbeat
+# interval open to usage records (DEC-070), so its calls flow steadily; on a loaded runner
+# a record outliving 0.4 s ended the worker (exit 4) before its 20 calls. These keep that
+# 60% ((4 s - 1.6 s) / 4 s) with four times the room per record. Test values (DEC-034),
+# DEC-070-valid: heartbeat 4 s + bound 1.6 s + margin 1 s = 6.6 s < lease 8 s;
+# 4 s >= 2 x 1.6 s; lock 0.8 s < 1.6 s.
+MID_BATCH = {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1.6S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.8S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT4S",
+    "ORQESTRA_WORKER_LEASE": "PT8S",
+}
 T3 = {"metered": CaptureTier.T3}
 ENDLESS = 1_000_000  # calls in a first attempt: it is still calling when it is stopped
 INTENT_WRITE = b"INSERT INTO provider_calls ("
@@ -1046,7 +1058,7 @@ def test_a_killed_worker_mid_batch_leaves_no_call_without_its_row(
     usage_db: Conn, start: Any
 ) -> None:
     (task,) = submit(usage_db, "metered", {"calls": 1, "first_attempt_calls": ENDLESS})
-    worker = start(overrides=METERED)
+    worker = start(overrides=MID_BATCH)
     eventually(lambda: calling(worker, usage_db, 20), "calls under way")
     worker.pump()
     assert worker.process.poll() is None  # the kill lands on a worker still calling
