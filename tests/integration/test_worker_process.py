@@ -5,7 +5,11 @@ Each test starts ``python -m tests.integration.worker_process``, whose default
 exit code, the event it logged last, and what PostgreSQL recorded. A handler
 waits on an advisory lock the test holds; the process may reach the database
 through a ``PgProxy`` the test can stall or cut. "Before its lease ended" is
-checked against PostgreSQL's own clock and the stored ``lease_expires_at``.
+checked against PostgreSQL's own clock and the stored ``lease_expires_at``,
+after the process has ended, so those tests give the fence a 3 s margin
+(``FENCING``) for the exit and the log to be read. A completion the database
+rejects ends the process as a defect (7), and one that cannot be recorded before
+the attempt's deadline as unrecorded (8).
 Graceful shutdown (DEC-049) is driven with real SIGTERM and SIGINT, sent only
 once the worker has logged that its handlers are installed, and timed from
 the worker's own log timestamps. The worker writes the provider usage of its
@@ -84,6 +88,15 @@ ENVIRONMENT = {
     "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.1S",
     "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT0.5S",
 }
+
+
+# The tests that check "before its lease ended" after the process has exited (DEC-045).
+# That check reads PostgreSQL's clock, the clock lease_expires_at is in, but only after the
+# exit and the log have been read, so the fence margin is the time those may take: 3 s,
+# not 1 s, so a loaded machine cannot fail it. Still DEC-070-valid: heartbeat 1 s +
+# database bound 0.8 s + margin 3 s = 4.8 s < lease 6 s, and 6 s >= 3 x 0.8 s + 3 s.
+FENCING = {"ORQESTRA_WORKER_LEASE": "PT6S", "ORQESTRA_WORKER_FENCE_MARGIN": "PT3S"}
+FENCING_LEASE = timedelta(seconds=6)
 
 
 class WorkerProcess:
@@ -200,14 +213,14 @@ def runs(db: Conn) -> int:
     return int(rows(db, "SELECT count(*) FROM handler_runs")[0][0])
 
 
-def renewed(db: Conn, task: Task) -> Any:
-    """The running attempt once its lease was renewed at least once, else None."""
+def renewed(db: Conn, task: Task, lease: timedelta = LEASE) -> Any:
+    """The running attempt once its ``lease`` was renewed at least once, else None."""
     found = rows(
         db,
         "SELECT id, lease_expires_at FROM attempts WHERE task_id = %s AND state = 'running' "
         "AND lease_expires_at > started_at + %s",
         task.id,
-        LEASE,
+        lease,
     )
     return found[0] if found else None
 
@@ -241,8 +254,8 @@ def test_a_stalled_supervisor_call_ends_the_process_before_its_lease_ends(
 ) -> None:
     (task,) = submit(handler_db, "gated", {"gate": gate.key})
     with PgProxy(schema_url) as proxy:
-        worker = start(proxy.url(schema_url))
-        eventually(lambda: renewed(handler_db, task), "a renewal")
+        worker = start(proxy.url(schema_url), FENCING)
+        eventually(lambda: renewed(handler_db, task, FENCING_LEASE), "a renewal")
         proxy.stall()  # the next supervisor call never gets an answer
         code, lines = worker.exit()
     assert before_lease_end(handler_db, task)
@@ -259,8 +272,8 @@ def test_refused_connections_fence_the_process_before_its_lease_ends(
 ) -> None:
     (task,) = submit(handler_db, "gated", {"gate": gate.key})
     with PgProxy(schema_url) as proxy:
-        worker = start(proxy.url(schema_url))
-        eventually(lambda: renewed(handler_db, task), "a renewal")
+        worker = start(proxy.url(schema_url), FENCING)
+        eventually(lambda: renewed(handler_db, task, FENCING_LEASE), "a renewal")
         proxy.refuse()  # every heartbeat now fails at once: none is confirmed
         code, lines = worker.exit()
     assert before_lease_end(handler_db, task)
@@ -289,9 +302,10 @@ def test_a_cancellation_request_fences_the_process_at_the_end_of_its_grace(
     handler_db: Conn, start: Any, gate: Gate
 ) -> None:
     (task,) = submit(handler_db, "gated", {"gate": gate.key})
-    worker = start()
-    eventually(lambda: renewed(handler_db, task), "a renewal")
-    request_cancellation(handler_db, task.id, grace=timedelta(seconds=3))
+    worker = start(overrides=FENCING)
+    eventually(lambda: renewed(handler_db, task, FENCING_LEASE), "a renewal")
+    # The fence comes the 3 s margin before the grace ends: after the request.
+    request_cancellation(handler_db, task.id, grace=timedelta(seconds=5))
     code, lines = worker.exit()
     assert before_lease_end(handler_db, task)  # the lease now ends with the grace period
     assert code == ExitCode.FENCED
@@ -310,12 +324,15 @@ def test_a_grace_longer_than_the_lease_fences_the_process_at_the_grace_end_not_t
     handler_db: Conn, start: Any, gate: Gate
 ) -> None:
     (task,) = submit(handler_db, "gated", {"gate": gate.key})  # ignores the signal
-    worker = start()
-    eventually(lambda: renewed(handler_db, task), "a renewal")
+    worker = start(overrides=FENCING)
+    eventually(lambda: renewed(handler_db, task, FENCING_LEASE), "a renewal")
     request_cancellation(handler_db, task.id, grace=timedelta(seconds=12))
     # Any lease held at the request has ended by now; a fence restricted to it would
     # have ended the process (DEC-068).
-    eventually(lambda: past(handler_db, task, LEASE + timedelta(milliseconds=500)), "the old lease")
+    eventually(
+        lambda: past(handler_db, task, FENCING_LEASE + timedelta(milliseconds=500)),
+        "the old lease",
+    )
     assert worker.process.poll() is None
     code, lines = worker.exit()
     assert code == ExitCode.FENCED
@@ -328,6 +345,57 @@ def test_a_grace_longer_than_the_lease_fences_the_process_at_the_grace_end_not_t
     assert revocation.attempt.revoked_reason is not None
     assert revocation.attempt.revoked_reason.value == "cancellation_grace_expired"
     assert task_states(handler_db, [task]) == [("cancelled", 1)]
+
+
+def test_a_valid_outcome_the_database_rejects_ends_the_process_as_a_defect(
+    handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    # A test-only constraint makes the database reject the succeeded outcome (23514):
+    # never a retry, never the handler's failure, but a defect (exit 7, DEC-046).
+    handler_db.execute(
+        "ALTER TABLE attempts ADD CONSTRAINT test_rejects_success "
+        "CHECK (state <> 'succeeded') NOT VALID"
+    )
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})
+    worker = start()
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    gate.release()
+    code, lines = worker.exit()
+    assert code == ExitCode.DEFECT
+    assert lines[-1]["event"] == "completion_rejected"
+    assert "23514" in lines[-1]["message"]
+    (attempt_id,) = rows(handler_db, "SELECT id FROM attempts WHERE task_id = %s", task.id)[0]
+    assert (lines[-1]["task_id"], lines[-1]["attempt_id"]) == (str(task.id), str(attempt_id))
+    assert task_states(handler_db, [task]) == [("running", 1)]  # left to recovery
+    assert no_failure_recorded(handler_db, task)
+    assert runs(handler_db) == 1
+    handler_db.execute("ALTER TABLE attempts DROP CONSTRAINT test_rejects_success")
+
+
+def test_an_outcome_that_cannot_be_recorded_by_the_deadline_ends_the_process_unrecorded(
+    schema_url: str, handler_db: Conn, start: Any, gate: Gate
+) -> None:
+    # The completion locks the task row first; the test holds that lock, so every try
+    # fails with 55P03 inside its bound and is retried until the attempt's deadline
+    # (exit 8). A held answer would instead outlive the bound: exit 4, as for any call
+    # made while the task is owned (DEC-045, DEC-074). The heartbeat locks only the
+    # attempt row, so the handler stays renewed until it ends.
+    (task,) = submit(handler_db, "gated", {"gate": gate.key})
+    worker = start(overrides={"ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT6S"})
+    eventually(lambda: runs(handler_db) == 1, "the handler")
+    with psycopg.connect(schema_url) as holder:
+        holder.execute("SELECT 1 FROM tasks WHERE id = %s FOR UPDATE", (task.id,))
+        gate.release()
+        code, lines = worker.exit()
+        holder.rollback()
+    assert code == ExitCode.UNRECORDED
+    assert lines[-1]["event"] == "completion_unrecorded"
+    events = [line.get("event") for line in lines]
+    assert "completion_retry" in events
+    assert "completion_ambiguous" not in events  # it certainly was not recorded
+    assert task_states(handler_db, [task]) == [("running", 1)]  # left to recovery
+    assert no_failure_recorded(handler_db, task)
+    assert runs(handler_db) == 1
 
 
 def test_a_control_plane_signal_ends_the_process_without_recording_anything(
@@ -440,18 +508,18 @@ def test_a_lost_connection_is_never_mistaken_for_a_cancellation(
 
 # --- a handler that outlives its execution timeout ----------------------------------------
 
-# Test values only (DEC-034): lease 4 s <= execution timeout 6 s, and the lease is capped at
-# the deadline by the heartbeats at about 1 s and 2 s, so the ownership watchdog sits at
-# about deadline minus the 1 s fence margin.
-DEADLINE = timedelta(seconds=6)
-MARGIN = timedelta(seconds=1)
+# Test values only (DEC-034), with FENCING: lease 6 s <= execution timeout 8 s, and the lease
+# is capped at the deadline by the heartbeats from about 2 s on, so the ownership watchdog
+# sits at about deadline minus the 3 s fence margin.
+DEADLINE = timedelta(seconds=8)
+MARGIN = timedelta(seconds=3)
 
 
 def test_a_handler_outliving_the_execution_timeout_is_fenced_and_revoked_as_deadline_exceeded(
     handler_db: Conn, start: Any, gate: Gate
 ) -> None:
     (task,) = submit(handler_db, "gated", {"gate": gate.key}, max_attempts=3)
-    worker = start(overrides={"ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT6S"})
+    worker = start(overrides=FENCING | {"ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT8S"})
     eventually(lambda: runs(handler_db) == 1, "the handler")
     code, lines = worker.exit()
     events = [line.get("event") for line in lines]
