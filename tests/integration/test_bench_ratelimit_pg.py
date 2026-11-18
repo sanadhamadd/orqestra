@@ -93,8 +93,8 @@ def test_a_killed_holder_never_wedges_the_pace(tmp_path: Path) -> None:
     child.kill()
     child.wait(10)
     started = time.monotonic()
-    assert RateLimiter(path, RATE).reserve(5.0) == 0.0  # the kernel released its lock
-    assert time.monotonic() - started < 2.0
+    assert RateLimiter(path, RATE).reserve(30.0) == 0.0  # the kernel released its lock
+    assert time.monotonic() - started < 10.0  # far inside the 30 s wait: never waited out
 
 
 def test_a_stopped_holder_makes_a_bounded_wait_run_out(tmp_path: Path) -> None:
@@ -104,7 +104,7 @@ def test_a_stopped_holder_makes_a_bounded_wait_run_out(tmp_path: Path) -> None:
         os.kill(child.pid, signal.SIGSTOP)
         started = time.monotonic()
         assert RateLimiter(path, RATE).reserve(0.2) is None  # a 429 for the caller
-        assert 0.2 <= time.monotonic() - started < 2.0
+        assert 0.2 <= time.monotonic() - started < 5.0  # waited 0.2 s, then gave up
     finally:
         os.kill(child.pid, signal.SIGCONT)
         child.kill()

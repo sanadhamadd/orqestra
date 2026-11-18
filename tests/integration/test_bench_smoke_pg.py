@@ -4,8 +4,15 @@ Each test runs one cell through ``benchmarks.run.run_cell``: real worker
 processes (the benchmark worker for ``invoice``, the installed ``orqestra worker
 run`` for ``echo``), a job submitted through ``orqestra job submit``, and the
 profile's correctness gate (plan 2.6). Only the gate is asserted, never a
-timing: ``STOP`` is a bound on a hung run, not an expectation. The workers use
-the short test profile of the process-level tests (lease ``PT4S``).
+measured timing: ``STOP`` is a bound on a hung run, not an expectation.
+
+A worker's database bound is still a requirement on the machine: a call that
+outlives it stops the worker (exit 4), which fails ``worker_exits``. The cells
+use the short test profile of the process-level tests (lease ``PT4S``, database
+calls within 0.8 s). The drills that inject no database fault run the longest
+here and use ``DRILL_SETTINGS`` instead: the live cells' database bounds (3 s), so
+a slow call under load does not end a worker. The outage drill keeps the short
+profile, whose bound its outage is meant to break.
 """
 
 import json
@@ -39,9 +46,11 @@ from benchmarks.faults import Fault, FaultingReader, create_fault_table, poison_
 from benchmarks.generate import generate_invoices
 from benchmarks.result import ROOT, Status, validate_result, write_result
 from benchmarks.run import (
+    LIVE_WORKER_SETTINGS,
     STATS_SETTLE,
     Cell,
     Profile,
+    bench_settings,
     process_environment,
     run_cell,
     worker_command,
@@ -65,6 +74,26 @@ INVOICE_CHECKS = (
 ECHO_CHECKS = (*INVOICE_CHECKS[:6], "results_exact")
 # The drills run 2,000 invoices at batch 100, so a job outlasts several polls.
 DRILL_CELL = Cell(Profile.INVOICE, size=2_000, batch=100, workers=1)
+# The live cells' database bounds (benchmarks.run.LIVE_WORKER_SETTINGS), with the smallest
+# heartbeat and lease that WorkerSettings and DEC-070 then accept at the 1 s fence margin:
+# 6 s >= 2 x 3 s; 6 + 3 + 1 = 10 s < 12 s; 3 x 3 + 1 = 10 s <= 12 s.
+DRILL_SETTINGS = {
+    **ENVIRONMENT,
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": LIVE_WORKER_SETTINGS[
+        "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT"
+    ],
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": LIVE_WORKER_SETTINGS["ORQESTRA_WORKER_LOCK_TIMEOUT"],
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT6S",
+    "ORQESTRA_WORKER_LEASE": "PT12S",
+}
+
+
+def test_the_drill_settings_are_settings_a_worker_accepts() -> None:
+    settings = bench_settings(
+        {key: value for key, value in DRILL_SETTINGS.items() if key.startswith("ORQESTRA_WORKER_")}
+    )
+    assert settings.db_operation_timeout == timedelta(seconds=3)
+    assert settings.lock_timeout == timedelta(seconds=1.5)
 
 
 def _passes_gate(record: dict[str, Any], names: Sequence[str]) -> None:
@@ -229,7 +258,7 @@ def test_d1_kill_with_one_worker_recovers_and_passes_the_gate(
         DRILL_CELL,
         KillDrill(victims=1),
         standard_workload(generate_invoices(DRILL_CELL.size), 100),
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path / "raw",
         stop_after=STOP,
     )
@@ -286,7 +315,7 @@ def test_d3b_counts_no_injection_when_the_server_did_not_restart(
         DRILL_CELL,
         RestartDrill(command=(sys.executable, "-c", "pass")),
         standard_workload(generate_invoices(DRILL_CELL.size), 100),
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path / "raw",
         stop_after=STOP,
     )
