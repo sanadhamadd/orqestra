@@ -1,8 +1,9 @@
 """The cell's shared pace across real processes (``benchmarks.ratelimit``, DEC-073).
 
 No database is needed: the lane is the integration one because these tests start
-processes. Every slot is read back from the processes that reserved it, so the spacing
-is asserted from the slots themselves, never from how the scheduler ran them.
+processes. The ``_pg`` suffix in the file's name does not mean PostgreSQL. Every slot
+is read back from the processes that reserved it, so the spacing is asserted from the
+slots themselves, never from how the scheduler ran them.
 """
 
 import itertools
