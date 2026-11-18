@@ -26,19 +26,19 @@ does not exceed its maximum (DEC-053); and an ``execution_timeout`` and a
 at least a century from now. Nothing here bounds how quickly expired attempts
 are recovered.
 
-The worker's local fence comes earlier than the lease by the attempt's claim
-latency: the time from the local clock read just before the claim was sent to
-the claim's database instant, which the operation guard keeps to about
-``db_operation_timeout``. Every ownership deadline is mapped from the claim
-(``local_deadline``). The first heartbeat is scheduled from the same clock
-read, so the latency cancels out; each later one is scheduled from when the
-previous one was sent, so it does not, and the checks above leave it out.
-Settings they accept can therefore fence a healthy worker (exit 3) whose claim
-took longer than ``lease - (heartbeat_interval + db_operation_timeout +
-fence_margin)``. ``heartbeat_interval + 2 * db_operation_timeout +
-fence_margin < lease`` leaves room for any claim the operation guard lets
-through; it is not checked (DEC-044 note). A fence that comes early never lets
-a handler outlive its lease. The database connection itself is the existing
+The worker's local fence is mapped from the latest confirmed exchange with the
+database: the claim, then each confirmed renewal (DEC-075). It therefore comes
+earlier than the lease by that exchange's latency, the time from the local
+clock read just before it was sent to its database instant, which the operation
+guard keeps to about ``db_operation_timeout``. The next heartbeat is scheduled
+from that same clock read, so the latency cancels out, and a heartbeat sent on
+time that takes its full bound is confirmed before the fence whenever
+``heartbeat_interval + db_operation_timeout + fence_margin < lease``. DEC-044's
+claim-latency caveat for later heartbeats no longer applies. After an
+unconfirmed heartbeat the retry is scheduled from that moment while the fence
+stays at the last confirmed lease, so repeated failures can still fence a
+healthy worker (exit 3), by design. A fence that comes early never lets a
+handler outlive its lease. The database connection itself is the existing
 ``ORQESTRA_DATABASE_URL`` (``Settings.database_url``).
 """
 

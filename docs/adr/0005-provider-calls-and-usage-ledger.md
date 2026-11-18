@@ -49,10 +49,11 @@ crash cannot hide it, and what a report of those calls can honestly claim.
   same `REPEATABLE READ, READ ONLY` snapshot as its tasks, with exact per-unit totals summed
   in PostgreSQL, and a finality of `open`, `lower_bound` or `closed`. Unknown usage is never
   read as zero.
-- **A real provider adapter exists but is not wired in** (DEC-060). The OpenRouter adapter
-  has no third-party dependency, works over an injected transport, has no default model, makes
-  one POST per call with a deadline checked before every blocking step, and logs nothing.
-  No other module imports it.
+- **A real provider adapter is wired into the unpackaged benchmarks only** (DEC-060,
+  DEC-071). The OpenRouter adapter has no third-party dependency, works over an injected
+  transport, has no default model, makes one POST per call with a deadline checked before
+  every blocking step, and logs nothing. No other `src` module imports it; its only users are
+  `benchmarks/live.py`, `benchmarks/extract.py` and `benchmarks/baseline.py`, opt-in.
 - **Live use is gated** (DEC-062). There is no inbound API. Every live provider call needs
   the maintainer's separate authorization; only synthetic data is recorded until a retention
   policy is accepted; and invoice verification is registered with a worker only when a
@@ -100,3 +101,9 @@ versioning, and the provider would decide statuses that deterministic checks can
   module imports the adapter, invoice verification is still not registered with
   `orqestra worker run`, and no live provider call has been made; each one still needs the
   owner's separate authorization (DEC-062). The text above is unchanged.
+- **2026-11-18, DEC-072 and DEC-073.** A live campaign ran on 2026-11-17 (DEC-072), through
+  the unpackaged benchmarks only; its results are kept outside the repository. The adapter's
+  users are now `benchmarks/live.py`, `benchmarks/extract.py` and `benchmarks/baseline.py`,
+  each opt-in, and the bullet on the adapter above was reworded to say so (audit M7). No `src`
+  module imports the adapter, and invoice verification is still not registered with
+  `orqestra worker run`.

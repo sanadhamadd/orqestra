@@ -1,4 +1,8 @@
-"""An OpenRouter chat-completions adapter for the ``Provider`` contract. Not wired in.
+"""An OpenRouter chat-completions adapter for the ``Provider`` contract.
+
+It is used only by the unpackaged benchmarks (``benchmarks/live.py``,
+``benchmarks/extract.py`` and ``benchmarks/baseline.py``), each opt-in and behind a hard
+call maximum (DEC-071, DEC-072, DEC-073); no packaged worker, handler or command imports it.
 
 ``OpenRouterProvider(config, transport)`` answers one ``ProviderRequest`` with one
 non-streaming POST through the injected ``HttpTransport``. It never retries, logs
