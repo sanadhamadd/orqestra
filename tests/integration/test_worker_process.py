@@ -871,6 +871,29 @@ def no_call_without_its_row(db: Conn) -> bool:
     )
 
 
+def calling(worker: WorkerProcess, db: Conn, calls: int) -> bool:
+    """Whether the worker is alive and the provider double has seen ``calls`` calls.
+
+    Every poll drains the worker's stderr: each usage record is logged, and an unread
+    pipe fills after about 150 calls, blocking the worker in a log write until its
+    operation guard ends it. A worker that has ended fails the wait at once, naming its
+    exit code and last event, instead of being polled until the wait runs out.
+    """
+    worker.pump()
+    code = worker.process.poll()
+    if code is not None:
+        events = [
+            json.loads(line).get("event")
+            for line in worker._read.splitlines()
+            if line.startswith("{")
+        ]
+        pytest.fail(
+            f"the worker ended (exit {code}, last event {events[-1] if events else None}) "
+            f"after {invocations(db)} calls"
+        )
+    return invocations(db) >= calls
+
+
 def usage_of(db: Conn, task: Task, generation: int = 1) -> AttemptUsage:
     ((attempt_id,),) = rows(
         db,
@@ -1024,7 +1047,9 @@ def test_a_killed_worker_mid_batch_leaves_no_call_without_its_row(
 ) -> None:
     (task,) = submit(usage_db, "metered", {"calls": 1, "first_attempt_calls": ENDLESS})
     worker = start(overrides=METERED)
-    eventually(lambda: invocations(usage_db) >= 20, "calls under way")
+    eventually(lambda: calling(worker, usage_db, 20), "calls under way")
+    worker.pump()
+    assert worker.process.poll() is None  # the kill lands on a worker still calling
     worker.kill()  # SIGKILL: no exit path runs
     revocation = eventually(
         lambda: revoke_next_expired(usage_db, retry_policy=RETRY, usage_capture=T3),
