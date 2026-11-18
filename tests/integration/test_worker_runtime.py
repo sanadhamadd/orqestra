@@ -1323,8 +1323,10 @@ def test_an_abandoned_supervisor_transaction_is_ended_and_its_lock_released(
         conn.execute("SELECT id FROM attempts WHERE id = %s FOR UPDATE", (attempt.id,))
         time.sleep(bound / 2)  # idle, but well inside the bound: the session survives
         conn.execute("SELECT 1")
+        # Now abandoned, as a frozen worker would leave it: the server's idle timer starts
+        # when this answer is sent, so the clock is read here, not after the check below.
+        idle_from = time.monotonic()
         assert row_locked(checked, "attempts", attempt.id)
-        idle_from = time.monotonic()  # now abandoned, as a frozen worker would leave it
         eventually(lambda: not backend_alive(checked, pid), "the session to be ended", 10)
         ended_after = time.monotonic() - idle_from
         assert bound * 0.9 <= ended_after < bound + 3.0

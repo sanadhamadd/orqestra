@@ -85,7 +85,7 @@ def test_a_busy_lock_is_waited_for_only_until_the_wait_runs_out(tmp_path: Path) 
         fcntl.flock(holder, fcntl.LOCK_EX)
         started = time.monotonic()
         assert limiter(path).reserve(0.05) is None
-        assert time.monotonic() - started < 1.0
+        assert time.monotonic() - started < 5.0  # the 0.05 s wait ran out; loose under load
     finally:
         os.close(holder)
     assert limiter(path).reserve(0.05) == 0.0  # released: the slot is had

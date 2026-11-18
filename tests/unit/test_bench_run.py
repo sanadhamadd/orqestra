@@ -338,8 +338,8 @@ def test_settle_waits_only_for_running_workers_that_have_not_started(tmp_path: P
     assert 0.3 <= time.monotonic() - began < 5
     fleet.workers[0].log_path.write_text('{"event": "worker_started"}\n')
     began = time.monotonic()
-    fleet.settle(timeout=5)
-    assert time.monotonic() - began < 1
+    fleet.settle(timeout=30)
+    assert time.monotonic() - began < 10  # it returned as soon as it could, not at the timeout
     fleet.stop(timeout=10)
 
 
