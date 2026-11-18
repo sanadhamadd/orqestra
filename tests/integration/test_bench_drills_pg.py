@@ -2,9 +2,12 @@
 
 Marked ``integration`` and ``performance``, so no default lane runs them: they
 are run by hand, and their output recorded. Each runs 1,000 invoices at batch
-100 on the short test profile of the process-level tests (lease ``PT4S``).
-Only outcomes and the order of stored timestamps are asserted, never a
-duration: ``STOP`` bounds a hung run.
+100 on the smoke drills' ``DRILL_SETTINGS``: the live cells' database bounds
+(3 s, lease ``PT12S``), so a slow call on a loaded machine does not end a worker.
+None of these drills injects a database fault (the outage drill is in the smoke
+tests, on the short profile its outage is meant to break). Only outcomes and the
+order of stored timestamps are asserted, never a duration: ``STOP`` bounds a hung
+run.
 """
 
 from pathlib import Path
@@ -32,7 +35,7 @@ from benchmarks.generate import generate_invoices
 from benchmarks.result import Status
 from benchmarks.run import Cell, Profile
 from benchmarks.worker import parse_duration
-from tests.integration.test_worker_process import ENVIRONMENT
+from tests.integration.test_bench_smoke_pg import DRILL_SETTINGS
 
 pytestmark = [pytest.mark.integration, pytest.mark.performance]
 
@@ -59,7 +62,7 @@ def test_d1_kills_two_of_four_workers_holding_attempts(
         CELL,
         KillDrill(victims=2),
         standard_workload(INVOICES, CELL.batch or 0),
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path,
         stop_after=STOP,
     )
@@ -72,13 +75,13 @@ def test_d1_kills_two_of_four_workers_holding_attempts(
 def test_d2_a_frozen_worker_never_records_a_stale_completion(
     db: psycopg.Connection[TupleRow], schema_url: str, tmp_path: Path
 ) -> None:
-    lease = parse_duration(ENVIRONMENT["ORQESTRA_WORKER_LEASE"]).total_seconds()
+    lease = parse_duration(DRILL_SETTINGS["ORQESTRA_WORKER_LEASE"]).total_seconds()
     record = run_drill(
         schema_url,
         CELL,
         FreezeDrill(lease + FREEZE_EXTRA),
         standard_workload(INVOICES, CELL.batch or 0),
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path,
         stop_after=STOP,
     )
@@ -101,7 +104,7 @@ def test_d4_payload_job_fails_only_the_extra_task(
         PayloadDrill(workload.oracle),
         workload,
         command=FAULTS_COMMAND,
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path,
         stop_after=STOP,
     )
@@ -119,10 +122,10 @@ def test_d4_retry_job_fails_the_always_batch_and_retries_the_once_batch(
     record = run_drill(
         schema_url,
         CELL,
-        RetryDrill(workload.oracle, poison, retry_policy(ENVIRONMENT)),
+        RetryDrill(workload.oracle, poison, retry_policy(DRILL_SETTINGS)),
         workload,
         command=FAULTS_COMMAND,
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path,
         stop_after=STOP,
     )
