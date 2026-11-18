@@ -248,15 +248,12 @@ def test_a_short_cells_commits_are_not_measured_within_their_uncertainty() -> No
 
 
 def test_the_implied_idle_rate_counts_polls_and_sweeps() -> None:
-    settings = {
-        "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
-        "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
-    }
+    settings = run.bench_settings(run.BENCH_WORKER_SETTINGS)  # poll 0.05 s, recovery 2 s
     # Each idle worker: 20 claims and half a sweep step a second.
     assert run.implied_idle_rate(2, settings) == pytest.approx(2 * (20 + 0.5))
     # The campaign's measured idle rate at one worker, 17.4 a second, sits below it:
     # an upper estimate, since each call takes time.
-    assert run.implied_idle_rate(1, run.BENCH_WORKER_SETTINGS) > 17.4
+    assert run.implied_idle_rate(1, settings) > 17.4
 
 
 def test_an_idle_window_that_counted_nothing_still_bounds_the_estimate() -> None:
