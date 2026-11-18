@@ -26,12 +26,9 @@ No credential, prompt or response is ever logged or written: refusals name flags
 never values, and the result records only the choice and the call counts.
 """
 
-import contextlib
-import fcntl
 import hashlib
 import json
 import os
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -41,6 +38,7 @@ from typing import Any
 
 from pydantic import SecretStr
 
+from benchmarks import filelock
 from benchmarks.documents import generate_documents
 from benchmarks.extract import KEYS as EXTRACTION_KEYS
 from benchmarks.extract import canonical_reply
@@ -178,50 +176,15 @@ def credential_from(environ: Mapping[str, str]) -> SecretStr | None:
 # --- the cell's call maximum ---------------------------------------------------------------
 
 
-# The counter is replaced whole, never edited in place, so a reader or a process that
-# outlives a killed one always finds a complete count. Updates are serialized by a lock
-# held on a separate file: the counter itself is swapped by each update, so a lock on it
-# would not be held on the file the next updater opens.
-LOCK_SUFFIX = ".lock"
-
-
-def lock_path(path: Path) -> Path:
-    """The lock file every update of the counter ``path`` holds while it runs."""
-    return path.with_name(path.name + LOCK_SUFFIX)
-
-
-def _open_lock(path: Path) -> int:
-    """A descriptor of ``path``'s lock file, created if missing (a counter made before it)."""
-    # Never O_TRUNC, O_EXCL, unlink, rename or replace: every process must lock the same
-    # inode, so the lock file's identity may never change while a cell can run.
-    return os.open(lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
+# The counter is replaced whole, never edited in place, under a lock held on a separate
+# file, so a reader or a process that outlives a killed one always finds a complete count
+# (benchmarks.filelock, shared with the cell's pace). Kept importable from here.
+LOCK_SUFFIX = filelock.LOCK_SUFFIX
+lock_path = filelock.lock_path
 
 
 class CallCounterUnavailableError(ValueError):
     """The cell's call counter could not be published; the cell must not start."""
-
-
-def _write_temporary(path: Path, count: int) -> Path:
-    """``count`` in a new, synced file beside ``path``, named so no counter glob matches it."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    with temporary.open("x", encoding="ascii") as file:
-        file.write(f"{count}\n")
-        file.flush()
-        os.fsync(file.fileno())
-    return temporary
-
-
-def _sync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _discard(temporary: Path) -> None:
-    with contextlib.suppress(FileNotFoundError):
-        temporary.unlink()
 
 
 def create_budget_file(path: Path) -> Path:
@@ -230,7 +193,7 @@ def create_budget_file(path: Path) -> Path:
     The 0 is written to a temporary file first and published with ``os.link``, which is
     atomic and fails if ``path`` exists, so the counter is never seen empty.
     """
-    temporary = _write_temporary(path, 0)
+    temporary = filelock.write_temporary(path, "0\n")
     failure: OSError | None = None
     try:
         os.link(temporary, path)
@@ -239,11 +202,11 @@ def create_budget_file(path: Path) -> Path:
     except OSError as exc:
         failure = exc
     finally:
-        _discard(temporary)
+        filelock.discard(temporary)
     if failure is None:
         try:
-            _sync_directory(path.parent)
-            os.close(_open_lock(path))
+            filelock.sync_directory(path.parent)
+            os.close(filelock.open_lock(path))
         except OSError as exc:
             failure = exc
     if failure is not None:  # fail closed: never fall back to an in-place write
@@ -286,21 +249,12 @@ class CallBudget:
 
     def reserve(self) -> None:
         """Count one call, or raise ``ProviderCallBudgetExhausted`` if none is left."""
-        lock = _open_lock(self.path)
-        try:  # the lock is released on every way out: refused, invalid, an OSError
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        # The lock is released on every way out: refused, invalid, an OSError.
+        with filelock.locked(self.path):
             count = read_budget_file(self.path)
             if count >= self.maximum:
                 raise ProviderCallBudgetExhausted
-            temporary = _write_temporary(self.path, count + 1)
-            try:
-                os.replace(temporary, self.path)
-            except BaseException:
-                _discard(temporary)
-                raise
-            _sync_directory(self.path.parent)
-        finally:
-            os.close(lock)  # closing the descriptor releases the flock
+            filelock.publish(self.path, f"{count + 1}\n")
 
 
 class BudgetedRecorder:

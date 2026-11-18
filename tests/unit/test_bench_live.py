@@ -27,6 +27,7 @@ from pydantic import SecretStr
 
 import benchmarks
 import benchmarks.drills
+import benchmarks.filelock
 import benchmarks.ladder
 import benchmarks.live
 import benchmarks.worker
@@ -568,8 +569,8 @@ live.CallBudget(Path(sys.argv[1]), 10**6).reserve()
 DIE_AFTER = """
 import os, sys
 from pathlib import Path
-from benchmarks import live
-live._sync_directory = lambda directory: os._exit(9)
+from benchmarks import filelock, live
+filelock.sync_directory = lambda directory: os._exit(9)
 live.CallBudget(Path(sys.argv[1]), 10**6).reserve()
 """
 LOOPER = """
@@ -746,10 +747,10 @@ def test_the_lock_is_released_on_every_way_out(
         CallBudget(path, 1).reserve()
     assert _lock_is_free(path)
 
-    def fail(path: Path, count: int) -> Path:
+    def fail(path: Path, text: str) -> Path:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(benchmarks.live, "_write_temporary", fail)
+    monkeypatch.setattr(benchmarks.filelock, "write_temporary", fail)
     with pytest.raises(OSError, match="No space"):
         CallBudget(path, 5).reserve()
     assert _lock_is_free(path)
@@ -793,7 +794,7 @@ def test_a_counter_that_cannot_be_published_fails_closed(
     def unsynced(directory: Path) -> None:
         raise OSError(5, "Input/output error")
 
-    monkeypatch.setattr(benchmarks.live, "_sync_directory", unsynced)
+    monkeypatch.setattr(benchmarks.filelock, "sync_directory", unsynced)
     with pytest.raises(benchmarks.live.CallCounterUnavailableError, match="could not create"):
         create_budget_file(tmp_path / "other")
 
