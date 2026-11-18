@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks import filelock
 from benchmarks.ratelimit import HORIZON, RateLimiter, check_rate, lock_path, read_slot
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
@@ -96,3 +97,14 @@ def test_a_rate_out_of_range_is_refused(rate: object) -> None:
     with pytest.raises(ValueError, match="rate"):
         check_rate(rate)  # type: ignore[arg-type]
     assert check_rate(1000) == 1000.0
+
+
+def test_a_reservation_syncs_the_directory_after_its_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The audit's M11: the counter synced its directory after os.replace and the pace did
+    # not; both now publish through benchmarks.filelock, which does.
+    synced: list[Path] = []
+    monkeypatch.setattr(filelock, "sync_directory", synced.append)
+    limiter(tmp_path / "pace").reserve(10.0)
+    assert synced == [tmp_path]
