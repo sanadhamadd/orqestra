@@ -874,7 +874,7 @@ def test_a_retryable_completion_is_retried_until_the_attempts_deadline(harness: 
     harness.clock.now = 100.0 + 600.0  # the attempt's deadline, mapped to the local clock
     with pytest.raises(Terminated) as info:
         harness.worker._complete(running)
-    assert info.value.code is ExitCode.UNRECORDED
+    assert (info.value.code, info.value.event) == (ExitCode.UNRECORDED, "completion_unrecorded")
 
 
 def test_a_failed_connect_before_completion_is_retried(harness: Harness) -> None:
@@ -910,7 +910,7 @@ def test_a_handler_thread_without_an_outcome_is_a_defect(harness: Harness) -> No
     running.outcome.clear()
     with pytest.raises(Terminated) as info:
         harness.worker._complete(running)
-    assert info.value.code is ExitCode.DEFECT
+    assert (info.value.code, info.value.event) == (ExitCode.DEFECT, "handler_thread_unsettled")
 
 
 def test_a_lease_too_short_to_run_is_never_started(harness: Harness) -> None:
@@ -942,14 +942,24 @@ def test_handler_failures_are_classified_as_before(monkeypatch: pytest.MonkeyPat
 # --- claims, sweeps and a failing supervisor --------------------------------------------
 
 
-def test_a_failed_claim_is_retried_after_the_poll_interval(harness: Harness) -> None:
+def logged(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The worker events logged so far: the names operators read."""
+    return [getattr(record, "event", "") for record in caplog.records]
+
+
+def test_a_failed_claim_is_retried_after_the_poll_interval(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
     harness.monkeypatch.setattr(runtime, "claim_next_attempt", raising(errors.QueryCanceled()))
     harness.worker._claim()
     assert harness.worker._schedule.running is None
     assert harness.worker._schedule.claim_due == 101.0
+    assert logged(caplog) == ["claim_failed"]
 
 
-def test_an_ambiguous_claim_holds_further_claims_for_a_full_lease(harness: Harness) -> None:
+def test_an_ambiguous_claim_holds_further_claims_for_a_full_lease(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
     def lost(*args: Any, **kwargs: Any) -> Any:
         harness.conn.closed = True  # the connection broke: the claim may have committed
         raise psycopg.OperationalError("lost")
@@ -958,6 +968,7 @@ def test_an_ambiguous_claim_holds_further_claims_for_a_full_lease(harness: Harne
     harness.worker._claim()
     assert harness.worker._schedule.running is None
     assert harness.worker._schedule.claim_due == 130.0  # now + the 30 s lease
+    assert logged(caplog) == ["claim_uncertain"]
 
 
 def test_a_claim_whose_task_cannot_be_read_is_held_until_its_lease_ends(harness: Harness) -> None:
@@ -1344,7 +1355,7 @@ def test_without_a_lost_answer_a_retryable_error_ends_as_unrecorded(harness: Har
     harness.monkeypatch.setattr(runtime, "complete_attempt", raising(errors.DeadlockDetected()))
     with pytest.raises(Terminated) as info:
         harness.worker._complete(running)
-    assert info.value.code is ExitCode.UNRECORDED
+    assert (info.value.code, info.value.event) == (ExitCode.UNRECORDED, "completion_unrecorded")
 
 
 # --- cooperative cancellation (DEC-048) ------------------------------------------------
@@ -1834,7 +1845,7 @@ def test_the_deadline_give_up_follows_the_latest_mapping(harness: Harness) -> No
 
 
 def test_a_sent_claim_abandoned_with_no_known_backend_takes_the_lost_claim_hold(
-    harness: Harness,
+    harness: Harness, caplog: pytest.LogCaptureFixture
 ) -> None:
     class Anonymous(FakeConn):
         def execute(self, query: str, params: Any = None) -> FakeRows:
@@ -1852,3 +1863,4 @@ def test_a_sent_claim_abandoned_with_no_known_backend_takes_the_lost_claim_hold(
     assert held.attempt is None
     assert held.until == harness.worker._schedule.claim_due  # no claim for one lease
     assert held.until >= harness.clock.now + 30.0 - 0.001
+    assert "claim_uncertain" in logged(caplog)

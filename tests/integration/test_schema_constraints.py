@@ -247,7 +247,7 @@ def test_terminal_task_states_with_their_required_fields_are_accepted(db: Conn) 
     assert task_row(db, cancelled) == ("cancelled", 0)
 
 
-def test_running_task_may_carry_a_cancellation_request(db: Conn) -> None:
+def test_a_running_task_with_a_cancellation_request_cannot_be_requeued(db: Conn) -> None:
     task_id = new_task(db, new_job(db))
     claim(db, task_id)
     db.execute("UPDATE tasks SET cancel_requested_at = now() WHERE id = %s", (task_id,))
