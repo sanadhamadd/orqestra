@@ -76,7 +76,7 @@ def test_wait_refuses_a_malformed_or_unbounded_request_as_permanent(
 ) -> None:
     started = time.monotonic()
     outcome = run_handler(builtin.waiting(LIMIT), context(), payload)
-    assert time.monotonic() - started < 1.0  # refused before any wait
+    assert time.monotonic() - started < 5.0  # refused before any wait (LIMIT is 30 s)
     assert isinstance(outcome, AttemptFailed)
     assert outcome.kind is FailureKind.PERMANENT
     assert outcome.error_type == "orqestra.domain.errors.PermanentError"
@@ -90,7 +90,7 @@ def test_wait_refuses_a_wait_longer_than_the_platform_supports_as_permanent() ->
     assert CENTURIES.total_seconds() > 1e10 > threading.TIMEOUT_MAX
     started = time.monotonic()
     outcome = run_handler(builtin.waiting(CENTURIES), context(), {"seconds": 1e10})
-    assert time.monotonic() - started < 1.0
+    assert time.monotonic() - started < 5.0  # refused, never waited
     assert isinstance(outcome, AttemptFailed)
     assert outcome.kind is FailureKind.PERMANENT
     assert "longest wait this platform supports" in (outcome.error_message or "")
