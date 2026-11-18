@@ -42,7 +42,7 @@ Reconciliation (DEC-047): when a completion's answer is lost,
 and says whether that completion committed, the attempt is still running, or
 recovery revoked it, comparing a result with PostgreSQL's ``jsonb`` equality.
 
-Usage closure (DEC-057): ``complete_attempt`` and ``revoke_next_expired`` can
+Usage closure (DEC-058): ``complete_attempt`` and ``revoke_next_expired`` can
 close the attempt's provider usage capture as the last write of the transaction
 that ends it, after the attempt row is locked, so the closure commits or rolls
 back with the transition. The lock order is unchanged: task, attempt, then the
@@ -226,7 +226,7 @@ _RECOVER_TASK = (
     f"WHERE id = %s RETURNING {TASK_COLUMNS}"
 )
 # Recovery reads the revoked attempt's job kind without a lock, to choose its capture
-# tier (DEC-057). Like discovery, it relies on a job's kind never changing.
+# tier (DEC-058). Like discovery, it relies on a job's kind never changing.
 _JOB_KIND = "SELECT kind FROM jobs WHERE id = %s"
 
 
@@ -541,7 +541,7 @@ def complete_attempt(
     cancellation request, or when the retry time of a requeued task is not a
     representable timestamp.
 
-    Usage closure (DEC-057). With ``usage_closure``, the attempt's provider usage
+    Usage closure (DEC-058). With ``usage_closure``, the attempt's provider usage
     capture is closed in the same transaction, after the attempt and the task are
     written, whatever the outcome (a requeued attempt is closed too). It is checked
     before anything is sent: ``TypeError`` if it is not a ``UsageClosure``,
@@ -790,7 +790,7 @@ def revoke_next_expired(
     renewed before it could be locked. It revokes at most one attempt;
     sweeping repeatedly is the caller's job.
 
-    Usage closure (DEC-057). ``usage_capture`` maps job kinds to the capture tier
+    Usage closure (DEC-058). ``usage_capture`` maps job kinds to the capture tier
     their handlers record at. It is checked and copied before anything is sent:
     ``TypeError`` if it is not a mapping or a tier is not a ``CaptureTier``, and
     the kinds as ``claim_next_attempt`` checks them (so an empty mapping is a

@@ -34,7 +34,7 @@ accepted, so a report must re-check completeness (``capture_of``). Nothing here
 changes a task or an attempt. No write locks a task row; an intent waits only for
 a lifecycle ``FOR UPDATE`` lock on its own attempt row.
 
-Closures written by the lifecycle (DEC-057). ``complete_attempt`` can close the
+Closures written by the lifecycle (DEC-058). ``complete_attempt`` can close the
 capture with the worker's closure, and ``revoke_next_expired`` with a closure it
 derives for the kinds it is told about, each in the transaction that ends the
 attempt (``close_capture`` and ``close_capture_on_recovery``). That transaction
@@ -839,7 +839,7 @@ def _insert_closure(
         raise
 
 
-# --- closures written by the lifecycle (DEC-057) -----------------------------------------
+# --- closures written by the lifecycle (DEC-058) -----------------------------------------
 #
 # Both run on the lifecycle's cursor, inside the transaction that ends the attempt and
 # after it has locked the attempt row FOR UPDATE. No intent of the attempt can commit

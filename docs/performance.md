@@ -11,7 +11,7 @@ harness is in the README, [Running the benchmarks](../README.md#running-the-benc
 The workloads are synthetic.
 - **`invoice`:** the invoice verification workload, with tasks of 10, 100 or 1,000 invoices. It
   runs on an offline provider double, so nothing here measures a real provider's latency, cost
-  or reliability.
+  or reliability. Results against a real provider exist (DEC-072) and are not yet published.
 - **`echo`:** a task that returns its payload, so a cell measures the engine alone.
 - **`wait`:** a task that sleeps 50 ms, so a cell is handler-bound.
 
@@ -513,7 +513,9 @@ every state change of a queued task. Medians of three repetitions:
   - Every cell is `complete` with an exact result.
 - **Database load.**
   - Commits per task are unchanged at 4.0.
-  - Sequential scans of `tasks` per task fall from about 1.03 to at most 0.013.
+  - Sequential scans of `tasks` per task fall from about 1.03 (1.018 to 1.061) to at most
+    0.016, and to none in five of the six four- and eight-worker cells. Derived:
+    `database_stats.tables.tasks.seq_scan` ÷ 10,000 tasks.
   - Database CPU p50 is higher with the index at two to eight workers, as above.
   - The growth of `n_dead_tup` over a cell is larger: 18,703 to 30,000 with the index, 7,008 to
     12,578 without.
