@@ -6,7 +6,10 @@ answers before it has checked, on its own connection, whether its intent row has
 committed, and records what it saw, so "no call without a row" is read from
 PostgreSQL, not inferred. Database trouble is injected with test triggers or the
 ``PgProxy``. As in ``test_worker_runtime.py``, the watchdog only records and
-``terminate`` raises; the real exits are in ``test_worker_process.py``.
+``terminate`` raises. The real process exits are in ``test_worker_process.py``,
+codes 3 to 9, the completion's 7 and 8 included; the usage ledger's own exit 8
+(``usage_intent_unrecorded``, ``usage_result_unrecorded``) is asserted only here,
+through that recording ``terminate``.
 """
 
 import functools
