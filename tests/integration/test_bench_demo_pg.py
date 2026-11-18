@@ -2,9 +2,11 @@
 
 ``run_demo`` migrates the empty schema through the installed ``orqestra``,
 submits twice, starts real benchmark workers, kills one at a call boundary and
-checks everything it prints. Only the checks are asserted, never a timing:
-``STOP`` bounds a hung run. The workers use the short test profile of the
-process-level tests (lease ``PT4S``).
+checks everything it prints. Only the checks are asserted, never a measured
+timing: ``STOP`` bounds a hung run. The workers use the smoke drills'
+``DRILL_SETTINGS``: the live cells' database bounds (3 s), so a slow call on a
+loaded machine does not end a worker, which the demo, unlike a cell, does not
+replace. A database bound is a requirement on the machine, not a measurement.
 """
 
 from pathlib import Path
@@ -13,8 +15,7 @@ import pytest
 
 from benchmarks.demo import TAGS, DemoConfig, run_demo
 from benchmarks.result import validate_result
-from tests.integration.test_bench_smoke_pg import INVOICE_CHECKS
-from tests.integration.test_worker_process import ENVIRONMENT
+from tests.integration.test_bench_smoke_pg import DRILL_SETTINGS, INVOICE_CHECKS
 
 pytestmark = pytest.mark.integration
 
@@ -44,7 +45,7 @@ def test_the_demo_passes_every_check_and_prints_every_step(schema_url: str, tmp_
     outcome = run_demo(
         schema_url,
         DemoConfig(invoices=2_000, batch=100, workers=2, stop_after=STOP),
-        worker_settings=ENVIRONMENT,
+        worker_settings=DRILL_SETTINGS,
         raw_dir=tmp_path / "raw",
         out_dir=tmp_path / "results",
         allow_dirty=True,
