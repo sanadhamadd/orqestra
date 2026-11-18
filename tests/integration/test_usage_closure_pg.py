@@ -1,4 +1,4 @@
-"""Usage closure written by the lifecycle, against real PostgreSQL (DEC-057).
+"""Usage closure written by the lifecycle, against real PostgreSQL (DEC-058).
 
 ``complete_attempt`` closes an attempt's capture with the worker's closure and
 ``revoke_next_expired`` with one it derives for the kinds it is told about, each in
