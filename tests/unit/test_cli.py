@@ -3,7 +3,7 @@ import io
 import json
 import sys
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -1354,3 +1354,39 @@ def test_summary_and_usage_report_database_errors_by_type_and_sqlstate(
         job_env.setattr(cli, name, broken)
     error = job_output(capsys, ["job", *command], 1)["error"]
     assert error == "the database request failed (UndefinedTable, SQLSTATE 42P01)"
+
+
+# --- every printed timestamp in UTC ------------------------------------------------------------
+
+PARIS_WINTER = timezone(timedelta(hours=1))
+NEW_YORK_WINTER = timezone(timedelta(hours=-5))
+
+
+@pytest.mark.parametrize(
+    "instant",
+    [
+        datetime(2026, 11, 7, 10, 30, tzinfo=PARIS_WINTER),
+        datetime(2026, 11, 7, 4, 30, tzinfo=NEW_YORK_WINTER),
+        datetime(2026, 11, 7, 9, 30, tzinfo=UTC),
+    ],
+)
+def test_a_timestamp_is_printed_as_the_same_instant_at_utc(instant: datetime) -> None:
+    assert cli.utc_text(instant) == "2026-11-07T09:30:00+00:00"
+
+
+def test_a_utc_timestamp_prints_as_isoformat_does_and_keeps_its_microseconds() -> None:
+    instant = datetime(2026, 11, 7, 9, 30, 1, 250_000, tzinfo=UTC)
+    assert cli.utc_text(instant) == instant.isoformat() == "2026-11-07T09:30:01.250000+00:00"
+
+
+def test_a_naive_timestamp_is_refused_rather_than_read_as_local_time() -> None:
+    with pytest.raises(TypeError, match="timezone-aware"):
+        cli.utc_text(datetime(2026, 11, 7, 9, 30))  # naive: the case refused
+
+
+def test_summary_and_usage_print_observed_at_in_utc_whatever_the_session_zone() -> None:
+    paris = OBSERVED_AT.astimezone(PARIS_WINTER)
+    assert paris.isoformat() == "2026-11-07T10:30:00+01:00"  # what the session gave
+    summary = cli.summary_document(dataclasses.replace(SUMMARY, observed_at=paris))
+    usage = cli.usage_document(dataclasses.replace(REPORT, observed_at=paris))
+    assert summary["observed_at"] == usage["observed_at"] == "2026-11-07T09:30:00+00:00"
