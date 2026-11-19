@@ -4,7 +4,35 @@ Orqestra is a Python-based distributed AI workload execution platform built with
 
 The broader vision is to build a general-purpose execution engine for computational and AI-assisted workflows, including background automation, parallel processing, and large-scale data analytics. Whether coordinating thousands of independent operations or processing datasets that require consistent, trustworthy results, Orqestra focuses on the infrastructure that makes these workflows reliable and scalable.
 
-Its first demonstration uses synthetic invoice verification to test these capabilities. In an initial local benchmark, Orqestra processed 50,000 basic, structured synthetic invoices in 4.867 seconds across eight independent workers, with all benchmark correctness checks passing. This benchmark used an offline simulated AI provider, and testing with a live provider API is planned as the next stage, to measure performance on real requests. See [Performance](#performance) for the methodology and full results.
+Its first demonstration uses synthetic invoice processing. In a 10-hour stress test against a real AI model (Claude Haiku 5.5, through OpenRouter), Orqestra made **76,001 live model calls** and processed about 76,000 invoices with **99.9–100% accuracy**, **no lost work**, and cost tracking that matched the provider's bill to within **0.07%**. Without the model, it processed 50,000 invoices in 4.867 seconds across eight workers. See [Real-model benchmark](#real-model-benchmark) below.
+
+## Real-model benchmark
+
+17 November 2026. One 8-core Apple M3 laptop, PostgreSQL in Docker. Claude Haiku 5.5, called through OpenRouter
+at temperature 0, read each synthetic invoice and returned its fields as JSON. Every answer was checked against the
+known-correct one.
+
+| | |
+| --- | --- |
+| Live model calls | **76,001** across 32 runs, in 10 hours |
+| Accuracy | **99.9–100%** on every completed run (99.97% in the 30,150-invoice run) |
+| Largest run | **30,150 invoices in 88.5 minutes** at 16 workers: 30,141 exactly right, 0 lost |
+| Scaling | 0.4 → 1.6 → 3.1 → 6.1 invoices/s at 1, 4, 8 and 16 workers |
+| Crash recovery | 5 of 16 workers stopped mid-run; their work was picked up automatically, with nothing lost |
+| Cost tracking | Orqestra's own count matched the provider's bill to within **0.07%** |
+| Cost | **$0.33 per 1,000 invoices** ($23.75 for the whole test) |
+| Overhead | Only 5–10% slower than a plain multi-threaded script, while adding durability and crash recovery |
+
+- About 90% of each worker's time was spent waiting for the model. Without the model, the same jobs ran at about
+  153 invoices per second.
+- Deliberately broken invoices (2% with a missing field, 2% with a wrong total) were all flagged in every completed
+  run.
+- **What it found, and what was fixed.** At 32 workers the provider throttled requests and about two thirds of the
+  invoices failed. Orqestra now retries only the refused call, with backoff, and paces calls across workers. In a
+  re-check after the fix, all 2,000 invoices finished at 32 workers with 100% accuracy (7.6 invoices/s), and all
+  204 throttled calls were absorbed.
+
+The method, every run and the analysis are in [docs/performance.md](docs/performance.md#real-model-benchmark).
 
 ## Status
 
@@ -28,7 +56,7 @@ implemented; do not read it as a claim about shipped behaviour.
 | CLI | `orqestra version`, `orqestra health`, `orqestra migrate`, `orqestra worker run` with built-in diagnostic handlers only (DEC-051); `orqestra job submit` from a JSON file of tasks and `orqestra job status` (DEC-064, Accepted); `orqestra job summary` and `orqestra job usage` for an invoice job, with an optional call budget check (DEC-066, Accepted) | — |
 | Persistence | PostgreSQL schema for jobs, tasks and attempts with named constraints and an ownership-generation (fencing) guard; forward-only migration runner with checksums, advisory locking and rejection of transaction control; atomic job submission with idempotency keys; job, task and attempt reads; starting an identified task's attempt; discovering and atomically claiming the next queued task with `FOR UPDATE SKIP LOCKED`; generation-checked completion that rejects stale and duplicate results; bounded retries; cooperative cancellation writes; derived job progress; attempt leases and non-renewable execution deadlines set at claim; generation-fenced lease renewal; revocation of expired attempts; bounded cancellation grace periods; quiescent-upgrade migration 0002, additive migration 0003 and additive migration 0004 (`tasks.available_at`, PR #17); concurrency tests between separate connections | — |
 | Queue and workers | PostgreSQL is the queue: task discovery without a broker, filtered by job kind (DEC-033); the operations a worker runtime needs to renew leases, recover expired attempts and enforce cancellation grace periods (DEC-034 … DEC-041); worker contracts: the handler protocol, the job-kind handler registry, handler-outcome mapping and validated worker settings (DEC-042 … DEC-044); a first single-slot worker runtime: claims, a handler thread, heartbeats, recovery sweeps while idle or busy, completion, and a local watchdog that ends the process when ownership cannot be established or a database call stalls (DEC-045, DEC-046); reconciliation of a completion whose answer was lost, from PostgreSQL's evidence (DEC-047); cooperative cancellation: a handler is told of a confirmed cancellation request through its read-only signal (DEC-048); graceful, bounded shutdown on SIGTERM or SIGINT: no new work, the running task drained within `shutdown_timeout`, otherwise exit 9 (DEC-049); durable retry scheduling: a requeued task waits a bounded, jittered delay, stored in PostgreSQL, before any claim may take it (DEC-053, PR #17); independent single-slot processes and no Orqestra-owned service (DEC-054, Accepted); subprocess integration coverage for a handler exceeding its execution deadline, worker fencing, and `deadline_exceeded` recovery (PR #18) | — |
-| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Accepted); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Accepted); an OpenRouter adapter over an injected HTTP transport (DEC-060, Accepted), wired only into the benchmark worker behind an opt-in and never into `orqestra worker run` (DEC-071, Accepted) | a live provider run (it needs the owner's separate approval); wiring a provider into a packaged worker; registering the invoice handler with a worker and its usage sink |
+| Invoice rules and provider adapters | Strict normalization of a synthetic invoice and two arithmetic checks; a provider contract with a deterministic mock; pure cost-aware route choice; a batch handler built by a factory and not registered with `orqestra worker run` (DEC-055, Accepted); a required per-attempt provider call cap, and a call recorder interface with an in-memory, non-durable implementation (DEC-057, Accepted); an OpenRouter adapter over an injected HTTP transport (DEC-060, Accepted), wired only into the benchmark worker behind an opt-in and never into `orqestra worker run` (DEC-071, Accepted) | wiring a provider into a packaged worker; registering the invoice handler with a worker and its usage sink |
 | Aggregation and usage ledger | An in-process summary of an invoice job's stored item results, read from one consistent snapshot, with anomaly reporting and a strict completeness rule (DEC-056, Accepted); an append-only provider usage ledger (`orqestra.persistence.provider_usage`, migration 0005), with an optional usage closure at completion and a recovery tier map (DEC-058, Accepted); a durable worker usage sink that writes a kind's provider calls to it, each intent committed before its call, and wires that kind's closure and T3 tier (DEC-059, Accepted); an in-process provider usage report of the same job from its ledger, read from the same kind of snapshot, with exact per-unit totals, per-attempt finality and a cross-check against the summary (DEC-061, Accepted) | prices, currencies or cost accounting; no inbound API is planned (DEC-062) |
 | Benchmarks | An unpackaged harness in `benchmarks/` ([Running the benchmarks](#running-the-benchmarks)): seeded synthetic workloads, a guarded `orqestra_bench` database, single cells and named ladders with a correctness gate, claim cost against queue depth, failure drills d1–d4, a generator for the tables of `docs/performance.md` and of [Performance](#performance), and an end-to-end demonstration ([Demonstration](#demonstration)) | — |
 | CI | Fast lane (format, lint, type check, unit tests) and PostgreSQL `verify` lane, both passing on GitHub since PR #2 | security scans, load lane |
@@ -68,7 +96,8 @@ the same committed result files as [docs/performance.md](docs/performance.md), w
 every table, the method and the analysis. Each figure is the median over a cell's
 repetitions with the minimum and maximum in brackets, and each table names its commit,
 machine and PostgreSQL server. The invoice cells use the offline provider double, so no
-figure says anything about a real provider.
+figure says anything about a real provider. The real-model results are in
+[Real-model benchmark](#real-model-benchmark).
 
 <!-- BEGIN GENERATED: python -m benchmarks.report --readme -->
 Generated by `python -m benchmarks.report --write --readme README.md` from the result files under `benchmarks/results/`. Do not edit by hand.
