@@ -10,9 +10,9 @@ harness is in the README, [Running the benchmarks](../README.md#running-the-benc
 
 The workloads are synthetic.
 - **`invoice`:** the invoice verification workload, with tasks of 10, 100 or 1,000 invoices. It
-  runs on an offline provider double, so nothing in these tables measures a real provider's
-  latency, cost or reliability. The run against a real model (DEC-072) is reported separately,
-  in [Real-model benchmark](#real-model-benchmark).
+  runs on an offline provider double, so nothing in these tables outside the Real-provider runs
+  section measures a real provider's latency, cost or reliability. The run against a real model
+  (DEC-072) is reported separately, in [Real-model benchmark](#real-model-benchmark).
 - **`echo`:** a task that returns its payload, so a cell measures the engine alone.
 - **`wait`:** a task that sleeps 50 ms, so a cell is handler-bound.
 
@@ -699,7 +699,8 @@ in `partial/` and left out of the tables. Each ran into the campaign's 60-minute
 were done, and the second one's only worker also stopped itself (exit 4) after 46 minutes. Their files were written
 before the extraction block counted processed invoices (DEC-073). Their `per_1000_invoices`, `accuracy.overall` and
 `retries` therefore divide by all 2,000 invoices or all tasks, and `retries` is negative (−22, −36 and −23), which the
-report's checks refuse. The figures are unchanged in the files. Derived per processed invoice from the same files (the
+report's checks refuse. The figures are unchanged in the files, and `campaign.json`, `campaign-log.jsonl` and
+`billing-check.json` still name them at their paths from before the move to `partial/`. Derived per processed invoice from the same files (the
 statuses' total, `waited_s` and `cost.total`):
 
 | Run | Processed | Seconds per invoice | Exactly right | Cost per 1,000 processed | Call latency p50 |
@@ -711,8 +712,8 @@ statuses' total, `waited_s` and `cost.total`):
 **What the runs show.** Each figure comes from the table above or a named file.
 - **Scaling, 2,000 invoices in batches of 25:** median 1.58, 3.11 and 6.09 invoices/s at 4, 8 and 16 workers, and
   about 0.40/s at 1 worker (derived: 1,425 / 3,600 s and 1,400 / 3,600 s). Derived: documents / `timing.makespan_s`.
-  The plain thread pool was 5–10% faster at the same count (1.67, 3.37, 6.75), which is Orqestra's cost for durable,
-  recoverable work.
+  Orqestra was 5–10% slower than the plain thread pool at the same count (1.67, 3.37, 6.75), which is its cost for
+  durable, recoverable work.
 - **Accuracy:** every completed run got 99.90–100% of its invoices exactly right, and 99.92–100% of fields
   (`accuracy.overall`). In every completed run, each deliberately broken invoice got its expected status: 40
   `field_missing` and 40 `rejected` per 2,000. The few misses were replies cut off at the 1,024-token limit
@@ -720,8 +721,9 @@ statuses' total, `waited_s` and `cost.total`):
 - **The large run:** 30,150 invoices at 16 workers in 5,312.6 s (88.5 min), 30,141 exactly right (99.97%), field
   accuracy 99.98%, 30,143 with the expected status, and no invoice lost. 5 of the 16 workers stopped themselves (exit 4); their batches were run again
   by the others, which cost 51 extra calls. The cell is `failed_correctness` only because of those exits.
-- **Where the time goes:** the provider's share of handler time was 86–92% in every campaign run. Without the model, the
-  rules-first mix ran 2,000 invoices in about 13 s (about 153/s) and 10,000 in 65 s at 8 workers.
+- **Where the time goes:** the provider's share of handler time was 86–92% in every Orqestra `extract` run. With the
+  model asked only about ambiguous amounts (100 calls per 2,000 invoices), the rules-first mix ran 2,000 invoices in
+  about 13 s (about 153/s) and 10,000 in 65 s at 8 workers.
 - **Cost:** $0.32–0.33 per 1,000 invoices in every completed run, and $9.80 for the large run. Output tokens were 81%
   of the cost.
 - **Billing:** the provider reported $23.7464 for the campaign's window. Orqestra's own token count gives $23.7299, so

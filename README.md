@@ -23,8 +23,8 @@ known-correct one.
 | Cost | **$0.33 per 1,000 invoices** ($23.75 for the whole test) |
 | Overhead | Only 5–10% slower than a plain multi-threaded script, while adding durability and crash recovery |
 
-- About 90% of each worker's time was spent waiting for the model. Without the model, the same jobs ran at about
-  153 invoices per second.
+- About 90% of each worker's time was spent waiting for the model. In a rules-first mix that asks the model only
+  about ambiguous amounts (1 call per 20 invoices), Orqestra ran at about 153 invoices per second.
 - Deliberately broken invoices (2% with a missing field, 2% with a wrong total) were all flagged in every completed
   run.
 - **What it found, and what was fixed.** At 32 workers the provider throttled requests and about two thirds of the
