@@ -2,6 +2,9 @@
 /tasks.json
 /echo-tasks.json
 
+# Each child's stdout and stderr from a live benchmark campaign, written beside the committed results
+benchmarks/results/campaigns/*/logs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -155,6 +158,8 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
