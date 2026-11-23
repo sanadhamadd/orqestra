@@ -1,0 +1,1614 @@
+{
+  "cell": {
+    "batch": 25,
+    "profile": "extract",
+    "repetition": 1,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 32
+  },
+  "claim_gap": {
+    "max": 109.26233386993408,
+    "n": 73,
+    "p50": 0.03758096694946289,
+    "p95": 95.00911498069763,
+    "p99": 109.26233386993408
+  },
+  "contention": {
+    "by_state": {
+      "active/Client": {
+        "max": 3,
+        "mean": 0.02145922746781116
+      },
+      "active/IO": {
+        "max": 1,
+        "mean": 0.05436337625178827
+      },
+      "active/LWLock": {
+        "max": 15,
+        "mean": 0.28183118741058655
+      },
+      "active/Timeout": {
+        "max": 1,
+        "mean": 0.001430615164520744
+      },
+      "active/none": {
+        "max": 4,
+        "mean": 0.07010014306151645
+      },
+      "idle in transaction/Client": {
+        "max": 25,
+        "mean": 0.9170243204577968
+      },
+      "idle in transaction/none": {
+        "max": 3,
+        "mean": 0.02145922746781116
+      },
+      "idle/Client": {
+        "max": 33,
+        "mean": 17.216022889842634
+      },
+      "idle/none": {
+        "max": 1,
+        "mean": 0.00715307582260372
+      }
+    },
+    "sample_errors": 0,
+    "samples": 699,
+    "window_s": 703.576415959018
+  },
+  "database_stats": {
+    "commits": {
+      "estimate_commits": 33571.4551843802,
+      "expected_idle_rate_per_s": 656.0,
+      "idle_rate_per_s": 72.85054710317324,
+      "idle_seconds": 3.178353832976427,
+      "idle_window_s": 2.0041029999847524,
+      "job_commits": 33571.4551843802,
+      "method": "xact_commit delta from just before the submission to STATS_SETTLE after the wait, less idle_rate_per_s x idle_seconds (the submission and the settle); the harness's reads roll back and never commit; it includes the submit command's own few commits (its schema check and the submission), fixed per job; each end may be off by up to about 1 s of idle claims, because counters are published at most once a second; that uncertainty (uncertainty_commits) uses the larger of the measured idle rate and the rate the settings imply (expected_idle_rate_per_s: workers x (1/poll_interval + 1/recovery_interval), an upper estimate, not a floor, since each call takes time), and a figure is kept only at twice that uncertainty or more",
+      "uncertainty_commits": 3392.7314937888914,
+      "xact_commit_delta": 33803.0
+    },
+    "commits_per_task": 419.64318980475247,
+    "database": {
+      "blks_hit": 369672.0,
+      "blks_read": 8.0,
+      "deadlocks": 0.0,
+      "temp_bytes": 0.0,
+      "tup_fetched": 180772.0,
+      "tup_inserted": 5520.0,
+      "tup_updated": 2359.0,
+      "xact_commit": 33803.0,
+      "xact_rollback": 4602.0
+    },
+    "tables": {
+      "attempts": {
+        "idx_scan": 8778.0,
+        "n_dead_tup": 27.0,
+        "n_tup_upd": 1811.0,
+        "seq_scan": 7463.0
+      },
+      "provider_calls": {
+        "idx_scan": 7006.0,
+        "n_dead_tup": 0.0,
+        "n_tup_upd": 0.0,
+        "seq_scan": 0.0
+      },
+      "tasks": {
+        "idx_scan": 2356.0,
+        "n_dead_tup": 52.0,
+        "n_tup_upd": 257.0,
+        "seq_scan": 32238.0
+      }
+    }
+  },
+  "drill": null,
+  "environment": {
+    "compose_project": "not_measured",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "98f6b7ca021d032f064a2937c865498e2b6306cb",
+    "memory_bytes": 8589934592,
+    "note": "recheck w32 paced 10/s",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "extraction": {
+    "accuracy": {
+      "exact_documents": 2000,
+      "expected": 42646,
+      "matched": 42646,
+      "overall": 1.0,
+      "per_field": {
+        "currency": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "due_date": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "invoice_number": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "issue_date": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "line_items.description": {
+          "expected": 8882,
+          "matched": 8882
+        },
+        "line_items.quantity": {
+          "expected": 8882,
+          "matched": 8882
+        },
+        "line_items.unit_price": {
+          "expected": 8882,
+          "matched": 8882
+        },
+        "subtotal": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "tax": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "total": {
+          "expected": 2000,
+          "matched": 2000
+        },
+        "vendor_name": {
+          "expected": 2000,
+          "matched": 2000
+        }
+      },
+      "status_matched": 2000
+    },
+    "calls": {
+      "answered": 2244,
+      "failed": 6,
+      "latency_ms": {
+        "max": 6600,
+        "n": 2244,
+        "p50": 2427,
+        "p95": 3305,
+        "p99": 3797
+      },
+      "other_attempts": 270,
+      "retried_in_attempt": 6,
+      "succeeded_attempts": 2006,
+      "total": 2276,
+      "unresolved": 26
+    },
+    "cost": {
+      "currency": "USD",
+      "other_attempts": "0.081313",
+      "per_1000_invoices": "0.37447975",
+      "per_1000_invoices_succeeded": "0.33382325",
+      "prices": {
+        "canned": false,
+        "in_per_mtok": "0.10",
+        "out_per_mtok": "0.50"
+      },
+      "reported": {
+        "openrouter_credits": "0"
+      },
+      "succeeded_attempts": "0.6676465",
+      "total": "0.7489595"
+    },
+    "documents": 2000,
+    "documents_processed": 2000,
+    "needs_review": {
+      "by_reason": {
+        "field_missing": 40,
+        "provider_call_cap_reached": 0,
+        "reply_incomplete": 0,
+        "reply_not_json": 0,
+        "reply_schema_invalid": 0
+      },
+      "count": 40
+    },
+    "permanent_errors": {
+      "rejected": 0,
+      "unsupported_request": 0
+    },
+    "retries": 48,
+    "statuses": {
+      "malformed": 0,
+      "needs_review": 40,
+      "rejected": 40,
+      "verified": 1920
+    },
+    "time_split": {
+      "handler_s": 11193.371691,
+      "provider_s": 5430.411,
+      "provider_share": 0.48514524040743745
+    },
+    "tokens": {
+      "answered_without_counts": 0,
+      "input": 1482665,
+      "max_per_call": {
+        "input": 860,
+        "output": 1060
+      },
+      "other_attempts": {
+        "input": 160060,
+        "output": 130614
+      },
+      "output": 1201386,
+      "succeeded_attempts": {
+        "input": 1322605,
+        "output": 1070772
+      }
+    },
+    "transient_errors": {
+      "rate_limited": 6,
+      "timeout": 0,
+      "unavailable": 0
+    }
+  },
+  "failures": {
+    "attempts_by_state": {
+      "revoked/lease_expired": 48,
+      "succeeded": 80
+    },
+    "exits_while_running": [
+      {
+        "at_s": 291.19,
+        "exit_code": 4,
+        "pid": 60125,
+        "replaced": true,
+        "worker": 13
+      },
+      {
+        "at_s": 291.19,
+        "exit_code": 4,
+        "pid": 60126,
+        "replaced": true,
+        "worker": 14
+      },
+      {
+        "at_s": 291.19,
+        "exit_code": 4,
+        "pid": 60139,
+        "replaced": true,
+        "worker": 27
+      },
+      {
+        "at_s": 292.171,
+        "exit_code": 4,
+        "pid": 60114,
+        "replaced": true,
+        "worker": 2
+      },
+      {
+        "at_s": 292.171,
+        "exit_code": 4,
+        "pid": 60123,
+        "replaced": true,
+        "worker": 11
+      },
+      {
+        "at_s": 293.693,
+        "exit_code": 4,
+        "pid": 60118,
+        "replaced": true,
+        "worker": 6
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60113,
+        "replaced": true,
+        "worker": 1
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60117,
+        "replaced": true,
+        "worker": 5
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60121,
+        "replaced": true,
+        "worker": 9
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60127,
+        "replaced": true,
+        "worker": 15
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60129,
+        "replaced": true,
+        "worker": 17
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60130,
+        "replaced": true,
+        "worker": 18
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60133,
+        "replaced": true,
+        "worker": 21
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60138,
+        "replaced": true,
+        "worker": 26
+      },
+      {
+        "at_s": 293.921,
+        "exit_code": 4,
+        "pid": 60142,
+        "replaced": true,
+        "worker": 30
+      },
+      {
+        "at_s": 305.623,
+        "exit_code": 4,
+        "pid": 61257,
+        "replaced": true,
+        "worker": 33
+      },
+      {
+        "at_s": 305.623,
+        "exit_code": 4,
+        "pid": 61282,
+        "replaced": true,
+        "worker": 46
+      },
+      {
+        "at_s": 305.623,
+        "exit_code": 4,
+        "pid": 61283,
+        "replaced": true,
+        "worker": 47
+      },
+      {
+        "at_s": 305.863,
+        "exit_code": 4,
+        "pid": 60140,
+        "replaced": true,
+        "worker": 28
+      },
+      {
+        "at_s": 305.863,
+        "exit_code": 4,
+        "pid": 61280,
+        "replaced": true,
+        "worker": 44
+      },
+      {
+        "at_s": 311.036,
+        "exit_code": 4,
+        "pid": 61278,
+        "replaced": true,
+        "worker": 42
+      },
+      {
+        "at_s": 311.335,
+        "exit_code": 4,
+        "pid": 60128,
+        "replaced": true,
+        "worker": 16
+      },
+      {
+        "at_s": 311.335,
+        "exit_code": 4,
+        "pid": 60131,
+        "replaced": true,
+        "worker": 19
+      },
+      {
+        "at_s": 311.335,
+        "exit_code": 4,
+        "pid": 61259,
+        "replaced": true,
+        "worker": 35
+      },
+      {
+        "at_s": 311.621,
+        "exit_code": 4,
+        "pid": 61275,
+        "replaced": true,
+        "worker": 39
+      },
+      {
+        "at_s": 320.564,
+        "exit_code": 4,
+        "pid": 60132,
+        "replaced": true,
+        "worker": 20
+      },
+      {
+        "at_s": 320.564,
+        "exit_code": 4,
+        "pid": 60134,
+        "replaced": true,
+        "worker": 22
+      },
+      {
+        "at_s": 320.564,
+        "exit_code": 4,
+        "pid": 60135,
+        "replaced": true,
+        "worker": 23
+      },
+      {
+        "at_s": 320.564,
+        "exit_code": 4,
+        "pid": 61258,
+        "replaced": true,
+        "worker": 34
+      },
+      {
+        "at_s": 321.765,
+        "exit_code": 4,
+        "pid": 61279,
+        "replaced": true,
+        "worker": 43
+      },
+      {
+        "at_s": 321.98,
+        "exit_code": 4,
+        "pid": 60122,
+        "replaced": true,
+        "worker": 10
+      },
+      {
+        "at_s": 322.207,
+        "exit_code": 4,
+        "pid": 60143,
+        "replaced": true,
+        "worker": 31
+      },
+      {
+        "at_s": 322.207,
+        "exit_code": 4,
+        "pid": 60144,
+        "replaced": false,
+        "worker": 32
+      },
+      {
+        "at_s": 322.207,
+        "exit_code": 4,
+        "pid": 61263,
+        "replaced": false,
+        "worker": 37
+      },
+      {
+        "at_s": 322.207,
+        "exit_code": 4,
+        "pid": 61276,
+        "replaced": false,
+        "worker": 40
+      },
+      {
+        "at_s": 322.207,
+        "exit_code": 4,
+        "pid": 61324,
+        "replaced": false,
+        "worker": 52
+      },
+      {
+        "at_s": 322.904,
+        "exit_code": 4,
+        "pid": 60141,
+        "replaced": false,
+        "worker": 29
+      },
+      {
+        "at_s": 322.904,
+        "exit_code": 4,
+        "pid": 61354,
+        "replaced": false,
+        "worker": 56
+      },
+      {
+        "at_s": 328.077,
+        "exit_code": 4,
+        "pid": 61262,
+        "replaced": false,
+        "worker": 36
+      },
+      {
+        "at_s": 343.874,
+        "exit_code": 4,
+        "pid": 61277,
+        "replaced": false,
+        "worker": 41
+      },
+      {
+        "at_s": 343.874,
+        "exit_code": 4,
+        "pid": 61353,
+        "replaced": false,
+        "worker": 55
+      },
+      {
+        "at_s": 343.874,
+        "exit_code": 4,
+        "pid": 61399,
+        "replaced": false,
+        "worker": 61
+      },
+      {
+        "at_s": 343.874,
+        "exit_code": 4,
+        "pid": 61408,
+        "replaced": false,
+        "worker": 63
+      },
+      {
+        "at_s": 344.591,
+        "exit_code": 4,
+        "pid": 60137,
+        "replaced": false,
+        "worker": 25
+      },
+      {
+        "at_s": 345.136,
+        "exit_code": 4,
+        "pid": 60115,
+        "replaced": false,
+        "worker": 3
+      },
+      {
+        "at_s": 345.136,
+        "exit_code": 4,
+        "pid": 61266,
+        "replaced": false,
+        "worker": 38
+      },
+      {
+        "at_s": 345.864,
+        "exit_code": 4,
+        "pid": 60136,
+        "replaced": false,
+        "worker": 24
+      },
+      {
+        "at_s": 345.864,
+        "exit_code": 4,
+        "pid": 61320,
+        "replaced": false,
+        "worker": 48
+      },
+      {
+        "at_s": 345.864,
+        "exit_code": 4,
+        "pid": 61348,
+        "replaced": false,
+        "worker": 53
+      },
+      {
+        "at_s": 346.719,
+        "exit_code": 4,
+        "pid": 61352,
+        "replaced": false,
+        "worker": 54
+      },
+      {
+        "at_s": 346.719,
+        "exit_code": 4,
+        "pid": 61356,
+        "replaced": false,
+        "worker": 57
+      },
+      {
+        "at_s": 346.924,
+        "exit_code": 4,
+        "pid": 61322,
+        "replaced": false,
+        "worker": 50
+      },
+      {
+        "at_s": 372.952,
+        "exit_code": 4,
+        "pid": 60120,
+        "replaced": false,
+        "worker": 8
+      },
+      {
+        "at_s": 372.952,
+        "exit_code": 4,
+        "pid": 61321,
+        "replaced": false,
+        "worker": 49
+      },
+      {
+        "at_s": 373.231,
+        "exit_code": 4,
+        "pid": 61323,
+        "replaced": false,
+        "worker": 51
+      },
+      {
+        "at_s": 373.652,
+        "exit_code": 4,
+        "pid": 60116,
+        "replaced": false,
+        "worker": 4
+      },
+      {
+        "at_s": 373.652,
+        "exit_code": 4,
+        "pid": 60119,
+        "replaced": false,
+        "worker": 7
+      },
+      {
+        "at_s": 373.652,
+        "exit_code": 4,
+        "pid": 61396,
+        "replaced": false,
+        "worker": 59
+      },
+      {
+        "at_s": 373.652,
+        "exit_code": 4,
+        "pid": 61397,
+        "replaced": false,
+        "worker": 60
+      },
+      {
+        "at_s": 373.652,
+        "exit_code": 4,
+        "pid": 61407,
+        "replaced": false,
+        "worker": 62
+      }
+    ],
+    "extra_attempts_per_task": 0.6,
+    "failed_tasks": 0,
+    "replacements": 32,
+    "worker_exit_codes": [
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      0,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      0,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      0,
+      4,
+      4,
+      4,
+      4,
+      4,
+      0
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "succeeded",
+        "unfinished_tasks": 0
+      },
+      "name": "terminal",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 0
+      },
+      "name": "nothing_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "failed": []
+      },
+      "name": "failed_tasks",
+      "passed": true
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "exits_while_running": [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      },
+      "name": "worker_exits",
+      "passed": true
+    },
+    {
+      "detail": {
+        "missing": [],
+        "repeated": [],
+        "unknown": []
+      },
+      "name": "extraction_complete",
+      "passed": true
+    },
+    {
+      "detail": {
+        "calls": 2276,
+        "documents_called": 2000,
+        "open_closures": 0,
+        "succeeded_answered": 2000,
+        "succeeded_calls": 2006,
+        "succeeded_retried": 6,
+        "succeeded_unresolved": 0
+      },
+      "name": "extraction_usage",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": {
+    "commits": 146.0,
+    "formula": "pg_stat_database xact_commit delta over an idle window after the finished job; the harness's reads roll back and never commit",
+    "per_s": 72.85054710317324,
+    "window_s": 2.0041029999847524
+  },
+  "ladder": "single",
+  "latency": {
+    "end_to_end_s": {
+      "max": 703.7116060256958,
+      "n": 80,
+      "p50": 227.2002899646759,
+      "p95": 623.1343080997467,
+      "p99": 703.7116060256958
+    },
+    "queue_wait_s": {
+      "max": 243.11848616600037,
+      "n": 80,
+      "p50": 122.40059113502502,
+      "p95": 231.29013013839722,
+      "p99": 243.11848616600037
+    },
+    "service_s": {
+      "max": 152.5753059387207,
+      "n": 80,
+      "p50": 116.57735300064087,
+      "p95": 150.17708110809326,
+      "p99": 152.5753059387207
+    }
+  },
+  "provider": {
+    "call_timeout": "PT30S",
+    "calls_made": 2276,
+    "cap": 30,
+    "dry_run": false,
+    "max_attempts": 8,
+    "max_provider_calls": 2800,
+    "model": "anthropic/claude-haiku-5.5",
+    "name": "openrouter",
+    "rate_limit_per_s": "10",
+    "route": "route-a",
+    "usage_unit": "openrouter_credits"
+  },
+  "recorded_at": "20261117T155510Z",
+  "resources": {
+    "database": "not_measured",
+    "harness": {
+      "process_maxrss_bytes": 68042752,
+      "scope": "cell",
+      "sys_s": 4.955278,
+      "user_s": 2.707458
+    },
+    "sysload": {
+      "cpu_count": 8,
+      "errors": 0,
+      "interval_s": 1.0,
+      "methods": {
+        "db_connections": "pg_stat_activity rows of the run's database, the sampler's own connection excluded",
+        "db_connections_active": "the same rows whose state is 'active'",
+        "load_1m": "the one-minute load average (os.getloadavg)",
+        "machine_memory_used_bytes": "Linux: MemTotal - MemAvailable (/proc/meminfo); macOS: (pages active + wired down + occupied by compressor) x page size (vm_stat)",
+        "worker_cpu_cores": "sum over the worker processes of the growth of their cumulative CPU time (ps time) since the previous sample, divided by the wall time between the samples",
+        "worker_rss_bytes": "sum of the worker processes' resident set size (ps rss, KiB x 1024)"
+      },
+      "metrics": {
+        "db_connections": {
+          "mean": 20.59684361549498,
+          "n": 697,
+          "peak": 36.0
+        },
+        "db_connections_active": {
+          "mean": 0.46628407460545196,
+          "n": 697,
+          "peak": 16.0
+        },
+        "load_1m": {
+          "mean": 5.444125773403874,
+          "n": 697,
+          "peak": 14.29833984375
+        },
+        "machine_memory_used_bytes": {
+          "mean": 6754064257.652798,
+          "n": 697,
+          "peak": 7268532224.0
+        },
+        "worker_cpu_cores": {
+          "mean": 0.14300149861883632,
+          "n": 696,
+          "peak": 2.74820233213829
+        },
+        "worker_rss_bytes": {
+          "mean": 388459327.5408895,
+          "n": 697,
+          "peak": 1219837952.0
+        }
+      },
+      "samples": 697
+    },
+    "workers": [
+      {
+        "cpu_utilization": 0.003434439590458807,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 51478528,
+        "pid": 60113,
+        "sys_s": 1.347319,
+        "user_s": 1.069536
+      },
+      {
+        "cpu_utilization": 0.0035244693689326988,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 51920896,
+        "pid": 60114,
+        "sys_s": 1.379226,
+        "user_s": 1.100984
+      },
+      {
+        "cpu_utilization": 0.00410024785053018,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 50675712,
+        "pid": 60115,
+        "sys_s": 1.480001,
+        "user_s": 1.405391
+      },
+      {
+        "cpu_utilization": 0.0044022280909871495,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54673408,
+        "pid": 60116,
+        "sys_s": 1.5456159999999999,
+        "user_s": 1.552283
+      },
+      {
+        "cpu_utilization": 0.003564015398530204,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 53198848,
+        "pid": 60117,
+        "sys_s": 1.401407,
+        "user_s": 1.106632
+      },
+      {
+        "cpu_utilization": 0.0037392164310899798,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54870016,
+        "pid": 60118,
+        "sys_s": 1.483569,
+        "user_s": 1.147761
+      },
+      {
+        "cpu_utilization": 0.004680926066579212,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 51249152,
+        "pid": 60119,
+        "sys_s": 1.629821,
+        "user_s": 1.664201
+      },
+      {
+        "cpu_utilization": 0.004421986184900827,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 57589760,
+        "pid": 60120,
+        "sys_s": 1.579591,
+        "user_s": 1.532212
+      },
+      {
+        "cpu_utilization": 0.0035123223474443424,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 53575680,
+        "pid": 60121,
+        "sys_s": 1.367187,
+        "user_s": 1.104475
+      },
+      {
+        "cpu_utilization": 0.0043640164148264216,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55263232,
+        "pid": 60122,
+        "sys_s": 1.524128,
+        "user_s": 1.546881
+      },
+      {
+        "cpu_utilization": 0.0034776248949781275,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 52576256,
+        "pid": 60123,
+        "sys_s": 1.3647449999999999,
+        "user_s": 1.0825
+      },
+      {
+        "cpu_utilization": 0.008069919483170549,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51691520,
+        "pid": 60124,
+        "sys_s": 3.008715,
+        "user_s": 2.670181
+      },
+      {
+        "cpu_utilization": 0.003520538781492737,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 53952512,
+        "pid": 60125,
+        "sys_s": 1.3899839999999999,
+        "user_s": 1.08746
+      },
+      {
+        "cpu_utilization": 0.0034661997601201045,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 52920320,
+        "pid": 60126,
+        "sys_s": 1.342052,
+        "user_s": 1.097153
+      },
+      {
+        "cpu_utilization": 0.003546070547412402,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54001664,
+        "pid": 60127,
+        "sys_s": 1.3862619999999999,
+        "user_s": 1.109149
+      },
+      {
+        "cpu_utilization": 0.003390110351417009,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 52215808,
+        "pid": 60128,
+        "sys_s": 1.221976,
+        "user_s": 1.163684
+      },
+      {
+        "cpu_utilization": 0.0034864623220530093,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 53903360,
+        "pid": 60129,
+        "sys_s": 1.37922,
+        "user_s": 1.074244
+      },
+      {
+        "cpu_utilization": 0.003524175214341205,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 57753600,
+        "pid": 60130,
+        "sys_s": 1.406267,
+        "user_s": 1.073736
+      },
+      {
+        "cpu_utilization": 0.0038984649059487387,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 52412416,
+        "pid": 60131,
+        "sys_s": 1.503109,
+        "user_s": 1.240286
+      },
+      {
+        "cpu_utilization": 0.0036374645210932224,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 53395456,
+        "pid": 60132,
+        "sys_s": 1.342801,
+        "user_s": 1.216925
+      },
+      {
+        "cpu_utilization": 0.003545888654718145,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54591488,
+        "pid": 60133,
+        "sys_s": 1.408466,
+        "user_s": 1.086817
+      },
+      {
+        "cpu_utilization": 0.004351627817103505,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54722560,
+        "pid": 60134,
+        "sys_s": 1.510933,
+        "user_s": 1.551358
+      },
+      {
+        "cpu_utilization": 0.004327978924776735,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55590912,
+        "pid": 60135,
+        "sys_s": 1.511265,
+        "user_s": 1.534384
+      },
+      {
+        "cpu_utilization": 0.004328811652267631,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54362112,
+        "pid": 60136,
+        "sys_s": 1.558708,
+        "user_s": 1.487527
+      },
+      {
+        "cpu_utilization": 0.0046380334956147105,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54116352,
+        "pid": 60137,
+        "sys_s": 1.579398,
+        "user_s": 1.68444
+      },
+      {
+        "cpu_utilization": 0.0033914688624772427,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54673408,
+        "pid": 60138,
+        "sys_s": 1.300986,
+        "user_s": 1.08563
+      },
+      {
+        "cpu_utilization": 0.0033423777295412617,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 52477952,
+        "pid": 60139,
+        "sys_s": 1.322125,
+        "user_s": 1.0299449999999999
+      },
+      {
+        "cpu_utilization": 0.003612910428405189,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54820864,
+        "pid": 60140,
+        "sys_s": 1.339709,
+        "user_s": 1.202738
+      },
+      {
+        "cpu_utilization": 0.003842065381398975,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 50741248,
+        "pid": 60141,
+        "sys_s": 1.372849,
+        "user_s": 1.330857
+      },
+      {
+        "cpu_utilization": 0.0034068430582519884,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54280192,
+        "pid": 60142,
+        "sys_s": 1.3221559999999999,
+        "user_s": 1.075279
+      },
+      {
+        "cpu_utilization": 0.0037309857866748464,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 53673984,
+        "pid": 60143,
+        "sys_s": 1.35457,
+        "user_s": 1.270968
+      },
+      {
+        "cpu_utilization": 0.004471885887704248,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54919168,
+        "pid": 60144,
+        "sys_s": 1.518267,
+        "user_s": 1.628651
+      },
+      {
+        "cpu_utilization": 0.0010638235799860663,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54378496,
+        "pid": 61257,
+        "sys_s": 0.146061,
+        "user_s": 0.602564
+      },
+      {
+        "cpu_utilization": 0.001200623938507487,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 56016896,
+        "pid": 61258,
+        "sys_s": 0.20920999999999998,
+        "user_s": 0.635683
+      },
+      {
+        "cpu_utilization": 0.0011190464861698544,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55951360,
+        "pid": 61259,
+        "sys_s": 0.164325,
+        "user_s": 0.623161
+      },
+      {
+        "cpu_utilization": 0.0012003709939795357,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55099392,
+        "pid": 61262,
+        "sys_s": 0.209057,
+        "user_s": 0.635658
+      },
+      {
+        "cpu_utilization": 0.0011916870388654335,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54853632,
+        "pid": 61263,
+        "sys_s": 0.205535,
+        "user_s": 0.633069
+      },
+      {
+        "cpu_utilization": 0.0015267163292469127,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 56000512,
+        "pid": 61266,
+        "sys_s": 0.293051,
+        "user_s": 0.7813169999999999
+      },
+      {
+        "cpu_utilization": 0.0011266618217051967,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54165504,
+        "pid": 61275,
+        "sys_s": 0.143058,
+        "user_s": 0.649787
+      },
+      {
+        "cpu_utilization": 0.001188985648148381,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 56180736,
+        "pid": 61276,
+        "sys_s": 0.18284599999999998,
+        "user_s": 0.653857
+      },
+      {
+        "cpu_utilization": 0.0015763076670921004,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 57786368,
+        "pid": 61277,
+        "sys_s": 0.291203,
+        "user_s": 0.818063
+      },
+      {
+        "cpu_utilization": 0.0010814927499891343,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54722560,
+        "pid": 61278,
+        "sys_s": 0.140778,
+        "user_s": 0.620281
+      },
+      {
+        "cpu_utilization": 0.0011901494771842914,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55345152,
+        "pid": 61279,
+        "sys_s": 0.187351,
+        "user_s": 0.6501709999999999
+      },
+      {
+        "cpu_utilization": 0.001039287960774793,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55099392,
+        "pid": 61280,
+        "sys_s": 0.119666,
+        "user_s": 0.6116929999999999
+      },
+      {
+        "cpu_utilization": 0.0066562480423677465,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55001088,
+        "pid": 61281,
+        "sys_s": 2.029328,
+        "user_s": 2.654751
+      },
+      {
+        "cpu_utilization": 0.0009635097591032793,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 55066624,
+        "pid": 61282,
+        "sys_s": 0.111845,
+        "user_s": 0.566188
+      },
+      {
+        "cpu_utilization": 0.0009723514492881827,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 56279040,
+        "pid": 61283,
+        "sys_s": 0.108637,
+        "user_s": 0.575618
+      },
+      {
+        "cpu_utilization": 0.001620658221684006,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54394880,
+        "pid": 61320,
+        "sys_s": 0.28552299999999997,
+        "user_s": 0.854953
+      },
+      {
+        "cpu_utilization": 0.0019539794259834774,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54394880,
+        "pid": 61321,
+        "sys_s": 0.373967,
+        "user_s": 1.001071
+      },
+      {
+        "cpu_utilization": 0.0015799597313439814,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54591488,
+        "pid": 61322,
+        "sys_s": 0.27138,
+        "user_s": 0.840456
+      },
+      {
+        "cpu_utilization": 0.0017828695580078123,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54034432,
+        "pid": 61323,
+        "sys_s": 0.413788,
+        "user_s": 0.840838
+      },
+      {
+        "cpu_utilization": 0.0012118302337177326,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 54378496,
+        "pid": 61324,
+        "sys_s": 0.16961099999999998,
+        "user_s": 0.683168
+      },
+      {
+        "cpu_utilization": 0.0013409569942001822,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 58392576,
+        "pid": 61348,
+        "sys_s": 0.228687,
+        "user_s": 0.7149599999999999
+      },
+      {
+        "cpu_utilization": 0.0013827937349159877,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 58998784,
+        "pid": 61352,
+        "sys_s": 0.218407,
+        "user_s": 0.7546809999999999
+      },
+      {
+        "cpu_utilization": 0.001324390548656048,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 58425344,
+        "pid": 61353,
+        "sys_s": 0.21065,
+        "user_s": 0.721339
+      },
+      {
+        "cpu_utilization": 0.0010239478698802203,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 59342848,
+        "pid": 61354,
+        "sys_s": 0.129376,
+        "user_s": 0.5911879999999999
+      },
+      {
+        "cpu_utilization": 0.001355444463090425,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 58408960,
+        "pid": 61356,
+        "sys_s": 0.214417,
+        "user_s": 0.739425
+      },
+      {
+        "cpu_utilization": 0.00504953871667458,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 49168384,
+        "pid": 61395,
+        "sys_s": 1.771474,
+        "user_s": 1.781945
+      },
+      {
+        "cpu_utilization": 0.001823005317824979,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 48562176,
+        "pid": 61396,
+        "sys_s": 0.37501799999999996,
+        "user_s": 0.907852
+      },
+      {
+        "cpu_utilization": 0.0018469028915696786,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 49168384,
+        "pid": 61397,
+        "sys_s": 0.372948,
+        "user_s": 0.926739
+      },
+      {
+        "cpu_utilization": 0.0014392188381258818,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 49152000,
+        "pid": 61399,
+        "sys_s": 0.259899,
+        "user_s": 0.752896
+      },
+      {
+        "cpu_utilization": 0.001615791171075955,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 49315840,
+        "pid": 61407,
+        "sys_s": 0.355817,
+        "user_s": 0.781234
+      },
+      {
+        "cpu_utilization": 0.001326148371021642,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 48906240,
+        "pid": 61408,
+        "sys_s": 0.210314,
+        "user_s": 0.722912
+      },
+      {
+        "cpu_utilization": 0.004602023005261828,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 61194240,
+        "pid": 61409,
+        "sys_s": 1.5886259999999999,
+        "user_s": 1.6498709999999999
+      }
+    ]
+  },
+  "run_id": "0638b99032fc",
+  "status": "complete",
+  "throughput": {
+    "makespan_items_per_s": 2.842073347767083,
+    "makespan_tasks_per_s": 0.11368293391068333,
+    "processing_items_per_s": 2.8430407210453037,
+    "steady": {
+      "completions": 64,
+      "items_per_s": 3.753203806535657,
+      "seconds": 419.64147996902466
+    }
+  },
+  "timing": {
+    "items": 2000,
+    "makespan_s": 703.7116060256958,
+    "processing_s": 703.4721610546112,
+    "stop_after_s": 1800.0,
+    "submission": {
+      "file_bytes": 1494277,
+      "seconds": 0.9293032089772169,
+      "tasks": 80
+    },
+    "tasks": 80,
+    "wait_ended": "finished",
+    "waited_s": 703.5117890840047
+  },
+  "usage": null,
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT3S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT1742S",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT6S",
+    "ORQESTRA_WORKER_LEASE": "PT20S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT1.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT2S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT60S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}

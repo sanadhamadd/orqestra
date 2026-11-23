@@ -10,8 +10,9 @@ harness is in the README, [Running the benchmarks](../README.md#running-the-benc
 
 The workloads are synthetic.
 - **`invoice`:** the invoice verification workload, with tasks of 10, 100 or 1,000 invoices. It
-  runs on an offline provider double, so nothing here measures a real provider's latency, cost
-  or reliability. Results against a real provider exist (DEC-072) and are not yet published.
+  runs on an offline provider double, so nothing in these tables outside the Real-provider runs
+  section measures a real provider's latency, cost or reliability. The run against a real model
+  (DEC-072) is reported separately, in [Real-model benchmark](#real-model-benchmark).
 - **`echo`:** a task that returns its payload, so a cell measures the engine alone.
 - **`wait`:** a task that sleeps 50 ms, so a cell is handler-bound.
 
@@ -299,6 +300,41 @@ Commit `c410ac6141c4` · machine: Apple M3, 8 cores, 8.0 GiB memory · server: P
 | d3b | invoice 2000 b100 w4 | complete | all passed | 0, 0, 0, 0 | `drills/20261109T011255Z-c410ac6-invoice-2000-b100-w4-r1.json` |
 | d4-payload | invoice 2000 b100 w4 | complete | all passed | 0, 0, 0, 0 | `drills/20261109T011249Z-c410ac6-invoice-2000-b100-w4-r1.json` |
 | d4-retry | invoice 2000 b100 w4 | complete | all passed | 0, 0, 0, 0 | `drills/20261109T011251Z-c410ac6-invoice-2000-b100-w4-r1.json` |
+
+## Real-provider runs
+
+Each row is one result file, shown as written: nothing is pooled across files or recomputed. A dry run answered every call with canned responses and says nothing about a real provider. The model, the prices and the provider's own usage are in each file.
+
+| File | Mode | Cell | Status | Calls | Call latency p50 / p95 / p99 (ms) | Provider share of handler time | Field accuracy | Needs review | Cost per 1,000 invoices | Retries | 429s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `campaigns/20261117T014319Z-63ade1a/20261117T014434Z-63ade1a-extract-100-b25-w4-r1.json` | live | extract 100 b25 w4 | complete | 100 | 2327 / 2932 / 3136 | 90.1 % | 1.000 | 2 | 0.3283070 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T030547Z-63ade1a-extract-2000-b25-w4-r1.json` | live | extract 2000 b25 w4 | complete | 2000 | 2272 / 3053 / 3416 | 90.8 % | 1.000 | 40 | 0.3231395 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T031637Z-63ade1a-extract-2000-b25-w8-r1.json` | live | extract 2000 b25 w8 | complete | 2000 | 2285 / 3146 / 3939 | 91.0 % | 1.000 | 40 | 0.32339925 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T032206Z-63ade1a-extract-2000-b25-w16-r1.json` | live | extract 2000 b25 w16 | complete | 2000 | 2274 / 3084 / 3592 | 91.2 % | 1.000 | 40 | 0.3235385 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T032409Z-63ade1a-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | failed_correctness | 1286 | 2267 / 3086 / 3644 | 88.1 % | 0.326 | 12 | 0.17568675 USD | 142 | 196 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T043125Z-63ade1a-extract-2000-b25-w4-r2.json` | live | extract 2000 b25 w4 | complete | 2000 | 2295 / 3061 / 3447 | 90.8 % | 1.000 | 40 | 0.3236485 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T044215Z-63ade1a-extract-2000-b25-w8-r2.json` | live | extract 2000 b25 w8 | complete | 2000 | 2280 / 3187 / 3967 | 91.3 % | 1.000 | 40 | 0.32345575 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T044752Z-63ade1a-extract-2000-b25-w16-r2.json` | live | extract 2000 b25 w16 | complete | 2000 | 2286 / 3068 / 3438 | 90.8 % | 0.999 | 41 | 0.3227555 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T045005Z-63ade1a-extract-2000-b25-w32-r2.json` | live | extract 2000 b25 w32 | failed_correctness | 1363 | 2261 / 3077 / 3477 | 88.6 % | 0.339 | 16 | 0.1889148 USD | 139 | 192 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T061222Z-63ade1a-extract-2000-b25-w4-r3.json` | live | extract 2000 b25 w4 | complete | 2000 | 2335 / 3169 / 3813 | 90.6 % | 1.000 | 40 | 0.3244125 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T062312Z-63ade1a-extract-2000-b25-w8-r3.json` | live | extract 2000 b25 w8 | complete | 2000 | 2304 / 3103 / 3452 | 90.6 % | 0.999 | 41 | 0.3236835 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T062848Z-63ade1a-extract-2000-b25-w16-r3.json` | live | extract 2000 b25 w16 | complete | 2000 | 2303 / 3093 / 3427 | 90.7 % | 0.999 | 41 | 0.32401325 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T063118Z-63ade1a-extract-2000-b25-w32-r3.json` | live | extract 2000 b25 w32 | failed_correctness | 1419 | 2302 / 3113 / 3482 | 88.0 % | 0.323 | 17 | 0.19918375 USD | 136 | 190 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T063642Z-63ade1a-extract-1000-b5-w8-r1.json` | live | extract 1000 b5 w8 | complete | 1000 | 2290 / 3096 / 3441 | 91.1 % | 1.000 | 20 | 0.3210369 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T064208Z-63ade1a-extract-1000-b25-w8-r1.json` | live | extract 1000 b25 w8 | complete | 1000 | 2290 / 3036 / 3368 | 90.9 % | 1.000 | 20 | 0.3189014 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065038Z-63ade1a-extract-1000-b100-w8-r1.json` | live | extract 1000 b100 w8 | complete | 1000 | 2317 / 3093 / 3489 | 91.1 % | 1.000 | 20 | 0.3221194 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065058Z-63ade1a-invoice-2000-b25-w8-r1.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065118Z-63ade1a-invoice-2000-b25-w8-r2.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065138Z-63ade1a-invoice-2000-b25-w8-r3.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065249Z-63ade1a-invoice-10000-b100-w8-r1.json` | live | invoice 10000 b100 w8 | complete | 500 | — | — | — | — | — | — | — |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065742Z-63ade1a-extract-2000-b5-w32-r1.json` | live | extract 2000 b5 w32 | failed_correctness | 2360 | 2269 / 3098 / 3511 | 86.2 % | 0.503 | 21 | 0.2941235 USD | 416 | 530 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T114003Z-63ade1a-extract-30150-b25-w16-r1.json` | live | extract 30150 b25 w16 | failed_correctness | 30201 | 2399 / 3220 / 3662 | 90.5 % | 1.000 | 607 | 0.3251070713101160862354892206 USD | 5 | 0 |
+| `campaigns/recheck-98f6b7c/20261117T155510Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2276 | 2427 / 3305 / 3797 | 48.5 % | 1.000 | 40 | 0.37447975 USD | 48 | 6 |
+| `campaigns/recheck-98f6b7c/20261117T155949Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2342 | 2373 / 3185 / 3569 | 67.0 % | 1.000 | 40 | 0.3573173 USD | 10 | 204 |
+
+| File | Mode | Drill | Cell | Status | Gate | Kill to next attempt p50 (s) | Lost tasks | Duplicate calls | Calls repeated after recovery | Calls |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065459Z-63ade1a-extract-2000-b25-w32-r1.json` | live | d1 | extract 2000 b25 w32 | failed_correctness | failed: terminal, failed_tasks, extraction_complete, no_lost_tasks | — | 56 | 0 | 101 | 1308 |
 
 ## Not in the tables
 
@@ -628,3 +664,82 @@ Demonstrated: the 50,000-invoice cell at eight workers is `complete`, and every 
 - The rung ran because its gate passed: every 10,000-invoice scale cell of this commit was
   complete. Eight workers had the highest median throughput at 10,000 invoices.
 - File: `20261109T011321Z-c410ac6-invoice-50000-b100-w8-r1.json`.
+
+## Real-model benchmark
+
+**Method.** One campaign, `20261117T014319Z-63ade1a`, ran on 17 November 2026 from 01:43 to 11:40 UTC on commit
+`63ade1a` (DEC-072), on the same Apple M3 Mac with 8 cores and PostgreSQL in Docker. The model was Claude Haiku 5.5
+(`anthropic/claude-haiku-5.5`), called through OpenRouter at temperature 0 with a 1,024-token reply limit. In the
+`extract` workload the model read each synthetic invoice and returned its fields as JSON. Each reply was parsed strictly
+and checked against the generator's known-correct fields. 2% of the invoices were built with a missing field and 2%
+with a wrong total, so the expected status of those is `needs_review` and `rejected`. A few `invoice` cells ran the
+rules-first mix, where the model is asked only about ambiguous amounts. The campaign's files are under
+`benchmarks/results/campaigns/20261117T014319Z-63ade1a/`: one record per run, `campaign.json`, the campaign log and
+`billing-check.json`.
+
+**Runs.** 32 runs made 76,001 live model calls (`billing-check.json`, `totals.calls`):
+- 22 `extract` runs and 1 crash drill, listed in [Real-provider runs](#real-provider-runs) above, except the three
+  partial runs below;
+- 4 rules-first `invoice` runs, also in that table;
+- 6 runs of a plain script with no queue, no durability and no recovery, given the same 2,000 invoices: a sequential
+  loop, and a thread pool at 1, 4, 8, 16 and 32 threads. These are `*-baseline-*.json`. The report does not render
+  them, so their figures are here:
+
+| Plain script | Invoices/s | Exactly right | Throttled calls |
+| --- | --- | --- | --- |
+| loop, 1 | 0.42 | 1,999 / 2,000 | 0 |
+| threads, 1 | 0.43 | 2,000 / 2,000 | 0 |
+| threads, 4 | 1.67 | 1,999 / 2,000 | 0 |
+| threads, 8 | 3.37 | 1,999 / 2,000 | 0 |
+| threads, 16 | 6.75 | 2,000 / 2,000 | 0 |
+| threads, 32 | 14.20 | 1,627 / 2,000 | 605 |
+
+**The three partial 1-worker runs.** The 1-worker scaling runs (`partial/*-extract-2000-b25-w1-r{1,2,3}.json`) are kept
+in `partial/` and left out of the tables. Each ran into the campaign's 60-minute cell limit before its 2,000 invoices
+were done, and the second one's only worker also stopped itself (exit 4) after 46 minutes. Their files were written
+before the extraction block counted processed invoices (DEC-073). Their `per_1000_invoices`, `accuracy.overall` and
+`retries` therefore divide by all 2,000 invoices or all tasks, and `retries` is negative (−22, −36 and −23), which the
+report's checks refuse. The figures are unchanged in the files, and `campaign.json`, `campaign-log.jsonl` and
+`billing-check.json` still name them at their paths from before the move to `partial/`. Derived per processed invoice from the same files (the
+statuses' total, `waited_s` and `cost.total`):
+
+| Run | Processed | Seconds per invoice | Exactly right | Cost per 1,000 processed | Call latency p50 |
+| --- | --- | --- | --- | --- | --- |
+| w1-r1 | 1,425 in 3,600 s | 2.53 | 1,425 / 1,425 | $0.3264 | 2,294 ms |
+| w1-r2 | 1,075 in 2,760 s | 2.57 | 1,074 / 1,075 | $0.3281 | 2,304 ms |
+| w1-r3 | 1,400 in 3,600 s | 2.57 | 1,400 / 1,400 | $0.3244 | 2,332 ms |
+
+**What the runs show.** Each figure comes from the table above or a named file.
+- **Scaling, 2,000 invoices in batches of 25:** median 1.58, 3.11 and 6.09 invoices/s at 4, 8 and 16 workers, and
+  about 0.40/s at 1 worker (derived: 1,425 / 3,600 s and 1,400 / 3,600 s). Derived: documents / `timing.makespan_s`.
+  Orqestra was 5–10% slower than the plain thread pool at the same count (1.67, 3.37, 6.75), which is its cost for
+  durable, recoverable work.
+- **Accuracy:** every completed run got 99.90–100% of its invoices exactly right, and 99.92–100% of fields
+  (`accuracy.overall`). In every completed run, each deliberately broken invoice got its expected status: 40
+  `field_missing` and 40 `rejected` per 2,000. The few misses were replies cut off at the 1,024-token limit
+  (`reply_incomplete`) and single misread fields.
+- **The large run:** 30,150 invoices at 16 workers in 5,312.6 s (88.5 min), 30,141 exactly right (99.97%), field
+  accuracy 99.98%, 30,143 with the expected status, and no invoice lost. 5 of the 16 workers stopped themselves (exit 4); their batches were run again
+  by the others, which cost 51 extra calls. The cell is `failed_correctness` only because of those exits.
+- **Where the time goes:** the provider's share of handler time was 86–92% in every Orqestra `extract` run. With the
+  model asked only about ambiguous amounts (100 calls per 2,000 invoices), the rules-first mix ran 2,000 invoices in
+  about 13 s (about 153/s) and 10,000 in 65 s at 8 workers.
+- **Cost:** $0.32–0.33 per 1,000 invoices in every completed run, and $9.80 for the large run. Output tokens were 81%
+  of the cost.
+- **Billing:** the provider reported $23.7464 for the campaign's window. Orqestra's own token count gives $23.7299, so
+  they differ by $0.0164 (0.07%) (`billing-check.json`; the provider's figure is provider-reported, read from its
+  dashboard).
+
+**What it found, and what was fixed.**
+- **At 32 workers the provider throttled** (HTTP 429) for tens of seconds, and about two thirds of the invoices
+  failed. Each task had 3 attempts with at most about 1.5 s of backoff, and one refused call failed its whole batch,
+  whose retry called the model again for invoices already answered. Fixed in DEC-073: a refused call is retried for
+  its own invoice inside the attempt, calls can be paced across workers, and live cells get a longer retry budget.
+- **Workers stopped themselves (exit 4)** when one database call outlived the benchmark's 1-second bound, without
+  logging why. Fixed: roomier bounds for live cells, the reason line always written, dead workers replaced, and an
+  idle worker now waits out a slow database (DEC-074).
+- **Re-check after the fixes** (`benchmarks/results/campaigns/recheck-98f6b7c/`), at 32 workers on 2,000 invoices:
+  - unpaced, all 2,000 invoices finished, 2,000 exactly right, at 7.57 invoices/s, with all 204 throttled calls
+    absorbed;
+  - paced at 10 calls/s, also 2,000 of 2,000, at 2.84 invoices/s: during a long database pause 60 worker processes
+    stopped themselves (exit 4), and the cell finished on fewer workers.

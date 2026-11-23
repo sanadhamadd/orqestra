@@ -1,0 +1,918 @@
+{
+  "cell": {
+    "batch": 25,
+    "profile": "extract",
+    "repetition": 1,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 32
+  },
+  "claim_gap": {
+    "max": 6.501760959625244,
+    "n": 186,
+    "p50": 0.017210960388183594,
+    "p95": 0.4304211139678955,
+    "p99": 3.6040260791778564
+  },
+  "contention": null,
+  "database_stats": null,
+  "drill": {
+    "exits_while_running": [
+      {
+        "exit_code": -9,
+        "pid": 93858
+      },
+      {
+        "exit_code": -9,
+        "pid": 93879
+      }
+    ],
+    "injected": true,
+    "injections": [
+      {
+        "attempt_id": "010abf8e-33e8-4aa0-b69b-b8b2581a01c7",
+        "killed_at": "2026-11-17T06:54:50.249683+00:00",
+        "ledger_rows_at_kill": 24,
+        "pid": 93879
+      },
+      {
+        "attempt_id": "184b45a1-568b-4565-ba43-ca7074685575",
+        "killed_at": "2026-11-17T06:54:50.263596+00:00",
+        "ledger_rows_at_kill": 23,
+        "pid": 93858
+      }
+    ],
+    "measured": {
+      "calls_formula": "duplicate: calls beyond the oracle's per invoice in succeeded attempts; repeated: calls of attempts that did not succeed, in tasks that succeeded",
+      "duplicate_calls": 0,
+      "lost_tasks": 56,
+      "recovery_delay_formula": "next attempt's started_at - revoked attempt's lease_expires_at",
+      "recovery_delay_s": {
+        "max": null,
+        "n": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null
+      },
+      "recovery_from_kill_formula": "next attempt's started_at - the kill (clock_timestamp() read just before it)",
+      "recovery_from_kill_s": {
+        "max": null,
+        "n": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null
+      },
+      "repeated_calls_after_recovery": 101,
+      "revocation_after_lease_s": {
+        "max": 0.057803,
+        "n": 2,
+        "p50": 0.050072,
+        "p95": 0.057803,
+        "p99": 0.057803
+      },
+      "victims": [
+        {
+          "attempt_id": "010abf8e-33e8-4aa0-b69b-b8b2581a01c7",
+          "killed_at": "2026-11-17T06:54:50.249683+00:00",
+          "lease_expires_at": "2026-11-17T06:54:58.310891+00:00",
+          "next_started_at": null,
+          "revoked_at": "2026-11-17T06:54:58.360963+00:00",
+          "unresolved_calls": 1
+        },
+        {
+          "attempt_id": "184b45a1-568b-4565-ba43-ca7074685575",
+          "killed_at": "2026-11-17T06:54:50.263596+00:00",
+          "lease_expires_at": "2026-11-17T06:54:58.225269+00:00",
+          "next_started_at": null,
+          "revoked_at": "2026-11-17T06:54:58.283072+00:00",
+          "unresolved_calls": 1
+        }
+      ]
+    },
+    "name": "d1",
+    "restarts": 2
+  },
+  "environment": {
+    "compose_project": "not_measured",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "63ade1acb9d2bdcd10fe5d0a89c719ecfa814a3d",
+    "memory_bytes": 8589934592,
+    "note": "campaign 20261117T014319Z-63ade1a step 5 s5-drills-extract-2000-b25-w32-r1",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "extraction": {
+    "accuracy": {
+      "exact_documents": 600,
+      "expected": 42646,
+      "matched": 12897,
+      "overall": 0.3024199221497913,
+      "per_field": {
+        "currency": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "due_date": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "invoice_number": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "issue_date": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "line_items.description": {
+          "expected": 8882,
+          "matched": 2699
+        },
+        "line_items.quantity": {
+          "expected": 8882,
+          "matched": 2699
+        },
+        "line_items.unit_price": {
+          "expected": 8882,
+          "matched": 2699
+        },
+        "subtotal": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "tax": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "total": {
+          "expected": 2000,
+          "matched": 600
+        },
+        "vendor_name": {
+          "expected": 2000,
+          "matched": 600
+        }
+      },
+      "status_matched": 600
+    },
+    "calls": {
+      "answered": 1114,
+      "failed": 192,
+      "latency_ms": {
+        "max": 5572,
+        "n": 1114,
+        "p50": 2294,
+        "p95": 3080,
+        "p99": 3458
+      },
+      "other_attempts": 708,
+      "succeeded_attempts": 600,
+      "total": 1308,
+      "unresolved": 2
+    },
+    "cost": {
+      "currency": "USD",
+      "other_attempts": "0.1643051",
+      "per_1000_invoices": "0.18029225",
+      "per_1000_invoices_succeeded": "0.0981397",
+      "prices": {
+        "canned": false,
+        "in_per_mtok": "0.10",
+        "out_per_mtok": "0.50"
+      },
+      "reported": {
+        "openrouter_credits": "0"
+      },
+      "succeeded_attempts": "0.1962794",
+      "total": "0.3605845"
+    },
+    "documents": 2000,
+    "needs_review": {
+      "by_reason": {
+        "field_missing": 14,
+        "provider_call_cap_reached": 0,
+        "reply_incomplete": 0,
+        "reply_not_json": 0,
+        "reply_schema_invalid": 0
+      },
+      "count": 14
+    },
+    "permanent_errors": {
+      "rejected": 0,
+      "unsupported_request": 0
+    },
+    "retries": 138,
+    "statuses": {
+      "malformed": 0,
+      "needs_review": 14,
+      "rejected": 14,
+      "verified": 572
+    },
+    "time_split": {
+      "handler_s": 2901.305264,
+      "provider_s": 2547.054,
+      "provider_share": 0.8778993481328479
+    },
+    "tokens": {
+      "answered_without_counts": 0,
+      "input": 687805,
+      "max_per_call": {
+        "input": 801,
+        "output": 988
+      },
+      "other_attempts": {
+        "input": 316621,
+        "output": 265286
+      },
+      "output": 583608,
+      "succeeded_attempts": {
+        "input": 371184,
+        "output": 318322
+      }
+    },
+    "transient_errors": {
+      "rate_limited": 192,
+      "timeout": 0,
+      "unavailable": 0
+    }
+  },
+  "failures": {
+    "attempts_by_state": {
+      "failed": 192,
+      "revoked/lease_expired": 2,
+      "succeeded": 24
+    },
+    "extra_attempts_per_task": 1.725,
+    "failed_tasks": 56,
+    "worker_exit_codes": [
+      0,
+      0,
+      0,
+      -9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      -9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "failed",
+        "unfinished_tasks": 0
+      },
+      "name": "terminal",
+      "passed": false
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 0
+      },
+      "name": "nothing_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "failed": [
+          "batch-00",
+          "batch-01",
+          "batch-02",
+          "batch-03",
+          "batch-04",
+          "batch-05",
+          "batch-06",
+          "batch-11",
+          "batch-13",
+          "batch-15",
+          "batch-16",
+          "batch-17",
+          "batch-18",
+          "batch-19",
+          "batch-21",
+          "batch-22",
+          "batch-23",
+          "batch-26",
+          "batch-27",
+          "batch-28"
+        ]
+      },
+      "name": "failed_tasks",
+      "passed": false
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          0,
+          0,
+          0,
+          -9,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          -9,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "name": "worker_exits",
+      "passed": true
+    },
+    {
+      "detail": {
+        "missing": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "repeated": [],
+        "unknown": []
+      },
+      "name": "extraction_complete",
+      "passed": false
+    },
+    {
+      "detail": {
+        "calls": 1308,
+        "documents_called": 600,
+        "open_closures": 0,
+        "succeeded_answered": 600,
+        "succeeded_calls": 600,
+        "succeeded_unresolved": 0
+      },
+      "name": "extraction_usage",
+      "passed": true
+    },
+    {
+      "detail": {
+        "injections": 2
+      },
+      "name": "injected",
+      "passed": true
+    },
+    {
+      "detail": {
+        "victims": [
+          [
+            "revoked",
+            "lease_expired"
+          ],
+          [
+            "revoked",
+            "lease_expired"
+          ]
+        ]
+      },
+      "name": "victims_revoked_lease_expired",
+      "passed": true
+    },
+    {
+      "detail": {
+        "closures": [
+          [
+            "recovery",
+            "t3"
+          ],
+          [
+            "recovery",
+            "t3"
+          ]
+        ]
+      },
+      "name": "victims_closed_by_recovery_t3",
+      "passed": true
+    },
+    {
+      "detail": {
+        "expected": [
+          "lower_bound",
+          "lower_bound"
+        ],
+        "read": [
+          "lower_bound",
+          "lower_bound"
+        ]
+      },
+      "name": "victims_capture",
+      "passed": true
+    },
+    {
+      "detail": {
+        "rows": [
+          [
+            24,
+            24
+          ],
+          [
+            23,
+            23
+          ]
+        ]
+      },
+      "name": "victims_ledger_kept",
+      "passed": true
+    },
+    {
+      "detail": {
+        "lost_tasks": 56
+      },
+      "name": "no_lost_tasks",
+      "passed": false
+    },
+    {
+      "detail": {
+        "duplicate_calls": 0
+      },
+      "name": "no_duplicate_calls",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": null,
+  "ladder": "drill",
+  "latency": {
+    "end_to_end_s": {
+      "max": 127.43822121620178,
+      "n": 80,
+      "p50": 39.90771007537842,
+      "p95": 115.6838071346283,
+      "p99": 127.43822121620178
+    },
+    "queue_wait_s": {
+      "max": 42.558959007263184,
+      "n": 80,
+      "p50": 7.959119081497192,
+      "p95": 42.0661940574646,
+      "p99": 42.558959007263184
+    },
+    "service_s": {
+      "max": 66.87309980392456,
+      "n": 24,
+      "p50": 63.01874113082886,
+      "p95": 66.40101504325867,
+      "p99": 66.87309980392456
+    }
+  },
+  "provider": {
+    "call_timeout": "PT30S",
+    "calls_made": 1308,
+    "cap": 25,
+    "dry_run": false,
+    "max_provider_calls": 3000,
+    "model": "anthropic/claude-haiku-5.5",
+    "name": "openrouter",
+    "route": "route-a",
+    "usage_unit": "openrouter_credits"
+  },
+  "recorded_at": "20261117T065459Z",
+  "resources": {
+    "harness": {
+      "process_maxrss_bytes": 80183296,
+      "scope": "cell",
+      "sys_s": 1.8270499999999998,
+      "user_s": 2.885075
+    },
+    "sysload": {
+      "cpu_count": 8,
+      "errors": 0,
+      "interval_s": 1.0,
+      "methods": {
+        "db_connections": "pg_stat_activity rows of the run's database, the sampler's own connection excluded",
+        "db_connections_active": "the same rows whose state is 'active'",
+        "load_1m": "the one-minute load average (os.getloadavg)",
+        "machine_memory_used_bytes": "Linux: MemTotal - MemAvailable (/proc/meminfo); macOS: (pages active + wired down + occupied by compressor) x page size (vm_stat)",
+        "worker_cpu_cores": "sum over the worker processes of the growth of their cumulative CPU time (ps time) since the previous sample, divided by the wall time between the samples",
+        "worker_rss_bytes": "sum of the worker processes' resident set size (ps rss, KiB x 1024)"
+      },
+      "metrics": {
+        "db_connections": {
+          "mean": 32.07086614173228,
+          "n": 127,
+          "peak": 34.0
+        },
+        "db_connections_active": {
+          "mean": 0.09448818897637795,
+          "n": 127,
+          "peak": 2.0
+        },
+        "load_1m": {
+          "mean": 9.157549520177165,
+          "n": 127,
+          "peak": 16.2734375
+        },
+        "machine_memory_used_bytes": {
+          "mean": 6779531876.787401,
+          "n": 127,
+          "peak": 6852526080.0
+        },
+        "worker_cpu_cores": {
+          "mean": 0.4981078979384046,
+          "n": 126,
+          "peak": 6.082089103354178
+        },
+        "worker_rss_bytes": {
+          "mean": 868156295.0551181,
+          "n": 127,
+          "peak": 1477525504.0
+        }
+      },
+      "samples": 127
+    },
+    "workers": [
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53182464,
+        "pid": 93855,
+        "sys_s": 0.7712319999999999,
+        "user_s": 1.276733
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52641792,
+        "pid": 93856,
+        "sys_s": 0.788818,
+        "user_s": 1.538127
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52658176,
+        "pid": 93857,
+        "sys_s": 0.839128,
+        "user_s": 1.7043949999999999
+      },
+      {
+        "exit_code": -9,
+        "killed": false,
+        "maxrss_bytes": 51920896,
+        "pid": 93858,
+        "sys_s": 0.720429,
+        "user_s": 0.9378019999999999
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55803904,
+        "pid": 93859,
+        "sys_s": 0.793956,
+        "user_s": 1.317177
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54132736,
+        "pid": 93860,
+        "sys_s": 0.775131,
+        "user_s": 1.159544
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54394880,
+        "pid": 93861,
+        "sys_s": 0.7751979999999999,
+        "user_s": 1.252715
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53559296,
+        "pid": 93862,
+        "sys_s": 0.8658199999999999,
+        "user_s": 1.7440579999999999
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56688640,
+        "pid": 93863,
+        "sys_s": 0.7655069999999999,
+        "user_s": 1.187983
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 50200576,
+        "pid": 93864,
+        "sys_s": 0.805008,
+        "user_s": 1.737244
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53592064,
+        "pid": 93865,
+        "sys_s": 0.8003509999999999,
+        "user_s": 1.432846
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 58572800,
+        "pid": 93866,
+        "sys_s": 0.813898,
+        "user_s": 1.299992
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56311808,
+        "pid": 93867,
+        "sys_s": 0.7844,
+        "user_s": 1.180509
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51937280,
+        "pid": 93868,
+        "sys_s": 0.8294659999999999,
+        "user_s": 1.7319039999999999
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 50675712,
+        "pid": 93869,
+        "sys_s": 0.891281,
+        "user_s": 1.485998
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55623680,
+        "pid": 93870,
+        "sys_s": 0.844741,
+        "user_s": 1.839332
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54935552,
+        "pid": 93871,
+        "sys_s": 0.7757569999999999,
+        "user_s": 1.399947
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53346304,
+        "pid": 93872,
+        "sys_s": 0.849962,
+        "user_s": 1.17194
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53755904,
+        "pid": 93873,
+        "sys_s": 0.8340879999999999,
+        "user_s": 1.314722
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52789248,
+        "pid": 93874,
+        "sys_s": 0.8395119999999999,
+        "user_s": 1.189972
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52150272,
+        "pid": 93875,
+        "sys_s": 0.7923199999999999,
+        "user_s": 1.206614
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51920896,
+        "pid": 93876,
+        "sys_s": 0.810705,
+        "user_s": 1.185156
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53297152,
+        "pid": 93877,
+        "sys_s": 0.77996,
+        "user_s": 1.209574
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55984128,
+        "pid": 93878,
+        "sys_s": 0.843152,
+        "user_s": 1.537694
+      },
+      {
+        "exit_code": -9,
+        "killed": false,
+        "maxrss_bytes": 54870016,
+        "pid": 93879,
+        "sys_s": 0.757087,
+        "user_s": 1.025652
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53182464,
+        "pid": 93880,
+        "sys_s": 0.8193349999999999,
+        "user_s": 1.259325
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54444032,
+        "pid": 93881,
+        "sys_s": 0.8047869999999999,
+        "user_s": 1.190431
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51216384,
+        "pid": 93882,
+        "sys_s": 0.804152,
+        "user_s": 1.295051
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51118080,
+        "pid": 93883,
+        "sys_s": 0.777368,
+        "user_s": 1.237055
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56557568,
+        "pid": 93884,
+        "sys_s": 0.787835,
+        "user_s": 1.427464
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53542912,
+        "pid": 93885,
+        "sys_s": 0.7945,
+        "user_s": 1.6403189999999999
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52346880,
+        "pid": 93886,
+        "sys_s": 0.763784,
+        "user_s": 1.136668
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 66306048,
+        "pid": 94277,
+        "sys_s": 0.109806,
+        "user_s": 0.502007
+      },
+      {
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 69009408,
+        "pid": 94278,
+        "sys_s": 0.10477399999999999,
+        "user_s": 0.5019049999999999
+      }
+    ]
+  },
+  "run_id": "bd9fd5d82874",
+  "status": "failed_correctness",
+  "throughput": null,
+  "timing": {
+    "items": 2000,
+    "makespan_s": 127.43822121620178,
+    "processing_s": 124.23619103431702,
+    "stop_after_s": 3600.0,
+    "submission": {
+      "file_bytes": 1494277,
+      "seconds": 0.5892702499986626,
+      "tasks": 80
+    },
+    "tasks": 80
+  },
+  "usage": null,
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT902S",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}
