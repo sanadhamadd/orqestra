@@ -411,11 +411,21 @@ class Victim:
     attempt_id: uuid.UUID
 
 
+# Two waits on a stopped client cannot end in a commit, so they do not count:
+# - ``ClientRead``: the backend waits for the rest of the client's message, so
+#   nothing it was sent has started;
+# - ``ClientWrite`` inside a transaction the client opened earlier (``xact_start``
+#   before ``query_start``): the statement waits to send its result, and the
+#   transaction commits only once the client reads it and then sends COMMIT,
+#   never while the client is stopped and never once it is killed.
+# Every other active worker statement counts.
 _ACTIVE_WORKER_STATEMENTS = (
     "SELECT coalesce(wait_event_type, '') || ':' || coalesce(wait_event, '') "
     "FROM pg_stat_activity WHERE datname = current_database() "
     "AND backend_type = 'client backend' AND state = 'active' "
-    "AND application_name = %s AND pid <> pg_backend_pid() ORDER BY 1"
+    "AND application_name = %s AND pid <> pg_backend_pid() "
+    "AND wait_event IS DISTINCT FROM 'ClientRead' "
+    "AND NOT (wait_event = 'ClientWrite' AND xact_start < query_start) ORDER BY 1"
 )
 
 
@@ -432,8 +442,14 @@ def _await_quiet(poll: Poll, deadline: float) -> list[str]:
 
     A statement waiting only to send its result (``ClientWrite``) has not
     committed, and a stopped client never reads it, so it stays active until that
-    worker is continued. Once every active worker statement has waited so for
-    ``CLIENT_WRITE_GRACE``, the wait ends at once: waiting longer gains nothing.
+    worker is continued. Inside a transaction the client opened earlier (a
+    completion's ``UPDATE ... RETURNING`` with its large result, the task lock
+    before it) it also cannot commit before the client sends COMMIT, so it does
+    not count as active, nor does a backend still reading a stopped client's
+    message (``ClientRead``, ``_ACTIVE_WORKER_STATEMENTS``). One that is its own
+    transaction could commit once sent, so it counts; once every active worker
+    statement has waited so for ``CLIENT_WRITE_GRACE``, the wait ends at once:
+    waiting longer gains nothing.
     """
     writing_since: float | None = None
     while True:

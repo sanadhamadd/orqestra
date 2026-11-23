@@ -11,6 +11,7 @@ in the last test, which bounds how long the drill's freeze keeps workers stopped
 (DEC-076).
 """
 
+import contextlib
 import json
 import subprocess
 import threading
@@ -239,6 +240,11 @@ _SLOW_COMPLETION = """
         WHEN (NEW.state = 'succeeded' AND OLD.state <> NEW.state)
         EXECUTE FUNCTION test_slow_completion();
 """
+_NO_SLOW_COMPLETION = """
+    DROP TRIGGER IF EXISTS test_slow_completion ON tasks;
+    DROP FUNCTION IF EXISTS test_slow_completion();
+    DROP TABLE IF EXISTS test_slow_completion;
+"""
 _WORKER_ACTIVE = (
     "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
     "AND state = 'active' AND application_name = 'orqestra-worker' AND wait_event = 'PgSleep' "
@@ -270,12 +276,15 @@ class ActiveFreeze(Drill):
         super().__init__()
         self.url = url
         self.sleeper: threading.Thread | None = None
+        self.busy: psycopg.Connection[Any] | None = None
         self.took: float | None = None
         self.states: list[str] = []
 
     def _busy(self) -> None:
         with psycopg.connect(self.url, application_name="orqestra-worker", autocommit=True) as busy:
-            busy.execute("SELECT pg_sleep(%s)", (BUSY,))
+            self.busy = busy
+            with contextlib.suppress(psycopg.errors.QueryCanceled):  # cancelled by close()
+                busy.execute("SELECT pg_sleep(%s)", (BUSY,))
 
     def step(self, poll: Poll) -> None:
         if self.injected or not poll.reached():
@@ -288,7 +297,8 @@ class ActiveFreeze(Drill):
             self.sleeper.start()
             _await_active(conn, _WORKER_ACTIVE.format("LIKE"))
             began = time.monotonic()
-            freeze_victims(poll, 0, set())  # no victim: only the freeze itself is measured
+            # No victim: only the freeze itself is measured.
+            freeze_victims(poll, 0, set(), freezes=self.freezes)
             self.took = time.monotonic() - began
             self.states = [_process_state(h.process.pid) for h in poll.fleet.workers]
         finally:
@@ -297,6 +307,9 @@ class ActiveFreeze(Drill):
         self.injections.append({"freeze_s": self.took})
 
     def close(self) -> None:
+        if self.busy is not None:
+            with contextlib.suppress(psycopg.Error):  # already closed once its sleep ended
+                self.busy.cancel_safe()
         if self.sleeper is not None:
             self.sleeper.join(timeout=BUSY + 10.0)
 
@@ -308,16 +321,19 @@ def test_a_freeze_on_a_busy_database_continues_a_worker_inside_its_bound(
     assert settings.db_operation_timeout.total_seconds() == BOUND
     db.execute(_SLOW_COMPLETION)
     drill = ActiveFreeze(schema_url)
-
-    record = run_drill(
-        schema_url,
-        CELL,
-        drill,
-        standard_workload(INVOICES, CELL.batch or 0),
-        worker_settings=DRILL_SETTINGS,
-        raw_dir=tmp_path / "raw",
-        stop_after=STOP,
-    )
+    try:
+        record = run_drill(
+            schema_url,
+            CELL,
+            drill,
+            standard_workload(INVOICES, CELL.batch or 0),
+            worker_settings=DRILL_SETTINGS,
+            raw_dir=tmp_path / "raw",
+            stop_after=STOP,
+        )
+    finally:
+        drill.close()  # run_drill closes it too; again here if it raised before that
+        db.execute(_NO_SLOW_COMPLETION)
 
     # No worker stopped itself: the completing worker was continued inside its bound.
     exits = [check for check in record["gate"] if check["name"] == "worker_exits"]
@@ -326,5 +342,9 @@ def test_a_freeze_on_a_busy_database_continues_a_worker_inside_its_bound(
     # The database stayed busy for 2 x the bound, yet everyone was continued within the window.
     assert drill.took < WINDOW + SLACK < BOUND
     assert [state for state in drill.states if state.startswith("T")] == []
+    # The freeze took the not-quiet path: the busy statement was what it waited on.
+    [freeze] = drill.freezes.log
+    assert freeze["quiet"] is False
+    assert "Timeout:PgSleep" in freeze["waits"]
     assert [check for check in record["gate"] if not check["passed"]] == []
     assert record["status"] == Status.COMPLETE
