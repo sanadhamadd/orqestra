@@ -1983,11 +1983,11 @@ recorded on PR #17.
   - **The margin.** The other half of the bound covers the part of a guarded call that ran before its SIGSTOP and the reads and SIGCONTs that end a freeze. A worker frozen more than half way into a slow call can still pass its bound before it is continued; that risk is accepted, not removed.
   - **Quiet means no worker statement.** Only connections named `orqestra-worker` (every worker connection, `runtime.supervisor_conninfo`) are counted, because only a worker can end this job's attempts; another client of the same database no longer keeps it busy.
   - **A stopped client blocks its own statement.** A statement that must still send a large result waits in `ClientWrite` until its client reads, and has not committed; a stopped worker never reads, so it stays active. This is what kept J1's completions active for the full `statement_timeout`. The drill's freeze log, which records each failed freeze's wait events, showed it on almost every failed freeze: the completion's `UPDATE tasks … RETURNING result` and the task lock before it, both carrying a whole batch's payload or result.
-  - **Which waits on a stopped client count.** Two cannot end in a commit and do not count as active:
-    - `ClientRead`: the backend waits for the rest of the client's message, so nothing it was sent has started;
-    - `ClientWrite` inside a transaction the client opened earlier (`xact_start` before `query_start`, as `owned_transaction` does for every completion): it commits only once the client has read the result and sent `COMMIT`, never while the client is stopped and never once it is killed, when the server rolls it back.
+  - **A backend waiting on its stopped client does not count.** One waiting to send its result (`ClientWrite`) or for more input from its client (`ClientRead`) cannot commit until that worker runs again, and rolls back if it is killed, so it does not keep a freeze busy. The reason is an invariant of the worker, not of the wait:
+    - every worker write that can end an attempt or record a call runs inside an explicit transaction (`owned_transaction` in `orqestra.persistence.lifecycle` for start, claim, completion, renewal, revocation and cancellation, and in `orqestra.persistence.provider_usage`);
+    - psycopg, used without a pipeline, sends `COMMIT` only after it has read the statement's result.
 
-    A `ClientWrite` statement that is its own transaction could commit once sent, so it still counts. Once only such statements have stayed active for 20 ms, the freeze ends at once instead of waiting.
+    So the transaction ends only on a message that a stopped worker cannot send, and a killed one never sends. Timestamps cannot tell an explicit transaction from an implicit one: under the extended protocol `query_start` follows `xact_start` either way, so the rule does not use them.
   - **Pacing.** After every freeze the workers run at least as long as they were stopped (20 ms at least) before the next one, so they are never stopped more than half the time, and a call whose answer arrived while it was stopped is read before the next freeze. A database that is never quiet leaves the drill not injected: its `injected` check fails, and its detail counts the freezes that did not reach a quiet database (`freezes_not_quiet`).
   - **Unchanged:** the guarantee that no attempt ends while the owners are read; D2's planned freeze of its own victim; every check, gate and expected exit; the result format, apart from the new detail key.
 - **WHY:** a drill must inject the failure it names and no other. Holding healthy workers past their own bound turned a crash drill into a stall drill under load.
@@ -1995,16 +1995,16 @@ recorded on PR #17.
   - (a) freezing only workers that are not inside a database call;
   - (b) a longer quiet wait;
   - (c) one operation bound of rest after a freeze that was not quiet;
-  - (d) counting every `ClientWrite` statement as active and retrying.
+  - (d) counting a backend that waits on its client as active, and retrying.
 - **WHY NOT:**
   - (a) it needs a per-worker "inside a database call" signal: matching a worker's backend to its process is not possible behind `PgProxy`, and a log reader would lag.
   - (b) a statement waiting on a stopped client never ends by waiting, and a longer wait is exactly what passes the bound.
   - (c) measured on the four-worker d1 drill, whose 1,000-invoice job on the double ends about 0.1 s after the trigger when no kill comes: with a full window of waiting and one bound of rest, 1 of 4 runs was not injected; with the rest cut to the stopped time, 2 of 6, both after a `ClientWrite` freeze.
-  - (d) a batch's completion is caught mid-transfer so often that, with every `ClientWrite` statement counted, the demo missed its injection in 6 of 8 runs when it waited out the window, and in 2 of 6 alongside a full suite when it ended such freezes early and retried; the four-worker d1 drill missed 1 of 28. With the two waits above not counted, both injected in 12 of 12 runs, each on its first freeze.
+  - (d) a batch's completion is caught mid-transfer so often that, with every `ClientWrite` statement counted, the demo missed its injection in 6 of 8 runs when it waited out the window, and in 2 of 6 alongside a full suite when it ended such freezes after 20 ms and retried; the four-worker d1 drill missed 1 of 28. With client waits not counted, both injected in 12 of 12 runs, each on its first freeze.
 - **TRADE-OFF:**
   - A freeze may still fail and retry where the old wait would have got through, so a very short job can end before any retry: the drill is then not injected, and says so.
-  - The rule on `ClientWrite` rests on how PostgreSQL commits: a transaction the client opened ends only on a message from that client. A driver that pipelined `COMMIT` before reading a result would break it; psycopg as used here does not.
-  - The 20 ms grace and rest are tuned for the double's short calls, not derived from a bound.
+  - The client-wait rule holds only while its invariant does. A worker write that can end an attempt outside an explicit transaction, or a driver that pipelines `COMMIT` before reading a result, would break it; neither exists today (no `pipeline()` under `src/` or `benchmarks/`).
+  - The 20 ms rest is tuned for the double's short calls, not derived from a bound.
 - **Published results.** The crash-drill results stay valid. The d1 to d4 rows in `docs/performance.md` (commit `c410ac6`) are `complete`, with every gate passed and no exit 4, so no worker was held past its bound in them. The live campaign's d1 (DEC-072) failed through throttling, with exits `-9, -9` and no 4. The change shortens how long non-victims stay stopped while a victim is chosen, not what is killed or checked, so `docs/performance.md` does not change.
 - **VERIFICATION:**
   - `tests/unit/test_bench_drills.py`: real stopped processes and a fake database. A database never quiet ends the freeze within the window and continues everyone; a second freeze inside the rest stops no one; `ClientWrite` alone ends a freeze at once; a quiet database gives the owner and continues the others; an owner read past the window continues everyone; a chosen victim past the window is continued without a read.

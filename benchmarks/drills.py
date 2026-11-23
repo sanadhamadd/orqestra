@@ -286,8 +286,6 @@ class Harness:
 
 FREEZE_SHARE = 0.5  # of db_operation_timeout: the longest a freeze keeps any worker stopped
 FREEZE_REST = 0.02  # the shortest time the workers run between two freezes
-CLIENT_WRITE = "Client:ClientWrite"  # a statement done on the server, sending to its client
-CLIENT_WRITE_GRACE = 0.02  # how long only such statements may stay active before a freeze ends
 WORKER_APPLICATION = "orqestra-worker"  # every worker connection's application_name
 
 
@@ -411,21 +409,22 @@ class Victim:
     attempt_id: uuid.UUID
 
 
-# Two waits on a stopped client cannot end in a commit, so they do not count:
-# - ``ClientRead``: the backend waits for the rest of the client's message, so
-#   nothing it was sent has started;
-# - ``ClientWrite`` inside a transaction the client opened earlier (``xact_start``
-#   before ``query_start``): the statement waits to send its result, and the
-#   transaction commits only once the client reads it and then sends COMMIT,
-#   never while the client is stopped and never once it is killed.
-# Every other active worker statement counts.
+# A backend waiting on its stopped client does not count (DEC-076). Every worker
+# write that can end an attempt or record a call runs inside an explicit
+# transaction (``owned_transaction`` in ``orqestra.persistence.lifecycle`` and
+# ``provider_usage``), and psycopg, used without a pipeline, sends COMMIT only
+# after it has read the statement's result. So a statement waiting to send its
+# result (``ClientWrite``) or for more input (``ClientRead``) cannot commit until
+# that worker runs again, and rolls back if it is killed. That holds only while
+# both stay true: no such write outside an explicit transaction, and no driver
+# that pipelines COMMIT.
 _ACTIVE_WORKER_STATEMENTS = (
     "SELECT coalesce(wait_event_type, '') || ':' || coalesce(wait_event, '') "
     "FROM pg_stat_activity WHERE datname = current_database() "
     "AND backend_type = 'client backend' AND state = 'active' "
     "AND application_name = %s AND pid <> pg_backend_pid() "
     "AND wait_event IS DISTINCT FROM 'ClientRead' "
-    "AND NOT (wait_event = 'ClientWrite' AND xact_start < query_start) ORDER BY 1"
+    "AND wait_event IS DISTINCT FROM 'ClientWrite' ORDER BY 1"
 )
 
 
@@ -440,31 +439,18 @@ def _await_quiet(poll: Poll, deadline: float) -> list[str]:
     by ``deadline``; returns the wait events of the worker statements still
     active then, empty if it became quiet.
 
-    A statement waiting only to send its result (``ClientWrite``) has not
-    committed, and a stopped client never reads it, so it stays active until that
-    worker is continued. Inside a transaction the client opened earlier (a
-    completion's ``UPDATE ... RETURNING`` with its large result, the task lock
-    before it) it also cannot commit before the client sends COMMIT, so it does
-    not count as active, nor does a backend still reading a stopped client's
-    message (``ClientRead``, ``_ACTIVE_WORKER_STATEMENTS``). One that is its own
-    transaction could commit once sent, so it counts; once every active worker
-    statement has waited so for ``CLIENT_WRITE_GRACE``, the wait ends at once:
-    waiting longer gains nothing.
+    A backend waiting on its stopped client does not count: one sending a result
+    (a completion's ``UPDATE ... RETURNING`` with a whole batch's result, the task
+    lock before it) or reading more input cannot commit until that worker runs
+    again (``_ACTIVE_WORKER_STATEMENTS``). Without that, a worker stopped
+    mid-transfer would keep the database busy until it was continued.
     """
-    writing_since: float | None = None
     while True:
         waits = [
             row[0] for row in poll.conn.execute(_ACTIVE_WORKER_STATEMENTS, (WORKER_APPLICATION,))
         ]
-        now = time.monotonic()
-        if not waits or now >= deadline:
+        if not waits or time.monotonic() >= deadline:
             return waits
-        if all(wait == CLIENT_WRITE for wait in waits):
-            writing_since = now if writing_since is None else writing_since
-            if now - writing_since >= CLIENT_WRITE_GRACE:
-                return waits
-        else:
-            writing_since = None
         time.sleep(0.01)
 
 
@@ -485,9 +471,7 @@ def freeze_victims(
     a freeze is logged and the next one waits until the workers have run at least
     as long as they were stopped (``FREEZE_REST`` at least): they are never stopped
     more than half the time, and a call whose answer arrived while it was stopped
-    is read before the next freeze. A database that is not quiet is usually a
-    stopped worker's statement waiting to send its result (``ClientWrite``), which
-    ends once that worker is continued.
+    is read before the next freeze.
     """
     if freezes is not None and time.monotonic() < freezes.not_before:
         return []

@@ -541,22 +541,6 @@ def test_a_database_that_is_never_quiet_ends_the_freeze_within_the_window(fleet:
     assert len(freezes.log) == 1
 
 
-def test_statements_only_sending_to_stopped_workers_end_the_freeze_at_once(fleet: Any) -> None:
-    # A result a stopped worker never reads keeps its statement active: waiting gains nothing.
-    conn = ActivityConn(waits=["Client:ClientWrite", "Client:ClientWrite"])
-    freezes = Freezes()
-
-    began = time.monotonic()
-    assert freeze_victims(_freeze_poll(conn, fleet), 1, set(), freezes=freezes) == []
-
-    assert time.monotonic() - began < WINDOW
-    assert _stopped(fleet) == [False, False]
-    [entry] = freezes.log
-    assert entry["quiet"] is False
-    assert entry["waits"] == ["Client:ClientWrite", "Client:ClientWrite"]
-    assert freezes.not_before - began < WINDOW + SLACK  # retried soon, after a short rest
-
-
 def test_a_quiet_database_gives_the_owner_and_continues_the_others(fleet: Any) -> None:
     owner = fleet.workers[0].process.pid
     attempt = uuid.uuid4()
