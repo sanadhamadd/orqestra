@@ -1,0 +1,861 @@
+{
+  "cell": {
+    "batch": 25,
+    "profile": "extract",
+    "repetition": 3,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 32
+  },
+  "claim_gap": {
+    "max": 18.046514987945557,
+    "n": 184,
+    "p50": 0.019259214401245117,
+    "p95": 0.4665040969848633,
+    "p99": 14.725996971130371
+  },
+  "contention": {
+    "by_state": {
+      "active/Client": {
+        "max": 2,
+        "mean": 0.06428571428571428
+      },
+      "active/IO": {
+        "max": 1,
+        "mean": 0.014285714285714285
+      },
+      "active/LWLock": {
+        "max": 1,
+        "mean": 0.007142857142857143
+      },
+      "active/none": {
+        "max": 3,
+        "mean": 0.12857142857142856
+      },
+      "idle in transaction/Client": {
+        "max": 23,
+        "mean": 1.3357142857142856
+      },
+      "idle in transaction/none": {
+        "max": 2,
+        "mean": 0.05714285714285714
+      },
+      "idle/Client": {
+        "max": 33,
+        "mean": 31.37857142857143
+      },
+      "idle/none": {
+        "max": 1,
+        "mean": 0.014285714285714285
+      }
+    },
+    "sample_errors": 0,
+    "samples": 140,
+    "window_s": 140.73493795798277
+  },
+  "database_stats": {
+    "commits": {
+      "estimate_commits": 29800.968117682576,
+      "expected_idle_rate_per_s": 656.0,
+      "idle_rate_per_s": 561.6500180243488,
+      "idle_seconds": 2.70992937500705,
+      "idle_window_s": 2.013709541002754,
+      "job_commits": 29800.968117682576,
+      "method": "xact_commit delta from just before the submission to STATS_SETTLE after the wait, less idle_rate_per_s x idle_seconds (the submission and the settle); the harness's reads roll back and never commit; it includes the submit command's own few commits (its schema check and the submission), fixed per job; each end may be off by up to about 1 s of idle claims, because counters are published at most once a second; that uncertainty (uncertainty_commits) uses the larger of the measured idle rate and the rate the settings imply (expected_idle_rate_per_s: workers x (1/poll_interval + 1/recovery_interval), an upper estimate, not a floor, since each call takes time), and a figure is kept only at twice that uncertainty or more",
+      "uncertainty_commits": 3077.6108130861694,
+      "xact_commit_delta": 31323.0
+    },
+    "commits_per_task": 372.5121014710322,
+    "database": {
+      "blks_hit": 295226.0,
+      "blks_read": 8.0,
+      "deadlocks": 0.0,
+      "temp_bytes": 0.0,
+      "tup_fetched": 130889.0,
+      "tup_inserted": 3824.0,
+      "tup_updated": 2349.0,
+      "xact_commit": 31323.0,
+      "xact_rollback": 949.0
+    },
+    "tables": {
+      "attempts": {
+        "idx_scan": 9387.0,
+        "n_dead_tup": 118.0,
+        "n_tup_upd": 1772.0,
+        "seq_scan": 1560.0
+      },
+      "provider_calls": {
+        "idx_scan": 4689.0,
+        "n_dead_tup": 0.0,
+        "n_tup_upd": 0.0,
+        "seq_scan": 0.0
+      },
+      "tasks": {
+        "idx_scan": 3291.0,
+        "n_dead_tup": 21.0,
+        "n_tup_upd": 432.0,
+        "seq_scan": 25508.0
+      }
+    }
+  },
+  "drill": null,
+  "environment": {
+    "compose_project": "not_measured",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "63ade1acb9d2bdcd10fe5d0a89c719ecfa814a3d",
+    "memory_bytes": 8589934592,
+    "note": "campaign 20261117T014319Z-63ade1a step 2 s2-run-extract-2000-b25-w32-r3",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "extraction": {
+    "accuracy": {
+      "exact_documents": 650,
+      "expected": 42646,
+      "matched": 13777,
+      "overall": 0.3230549172255311,
+      "per_field": {
+        "currency": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "due_date": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "invoice_number": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "issue_date": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "line_items.description": {
+          "expected": 8882,
+          "matched": 2859
+        },
+        "line_items.quantity": {
+          "expected": 8882,
+          "matched": 2859
+        },
+        "line_items.unit_price": {
+          "expected": 8882,
+          "matched": 2859
+        },
+        "subtotal": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "tax": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "total": {
+          "expected": 2000,
+          "matched": 650
+        },
+        "vendor_name": {
+          "expected": 2000,
+          "matched": 650
+        }
+      },
+      "status_matched": 650
+    },
+    "calls": {
+      "answered": 1229,
+      "failed": 190,
+      "latency_ms": {
+        "max": 4589,
+        "n": 1229,
+        "p50": 2302,
+        "p95": 3113,
+        "p99": 3482
+      },
+      "other_attempts": 769,
+      "succeeded_attempts": 650,
+      "total": 1419,
+      "unresolved": 0
+    },
+    "cost": {
+      "currency": "USD",
+      "other_attempts": "0.1874498",
+      "per_1000_invoices": "0.19918375",
+      "per_1000_invoices_succeeded": "0.10545885",
+      "prices": {
+        "canned": false,
+        "in_per_mtok": "0.10",
+        "out_per_mtok": "0.50"
+      },
+      "reported": {
+        "openrouter_credits": "0"
+      },
+      "succeeded_attempts": "0.2109177",
+      "total": "0.3983675"
+    },
+    "documents": 2000,
+    "needs_review": {
+      "by_reason": {
+        "field_missing": 17,
+        "provider_call_cap_reached": 0,
+        "reply_incomplete": 0,
+        "reply_not_json": 0,
+        "reply_schema_invalid": 0
+      },
+      "count": 17
+    },
+    "permanent_errors": {
+      "rejected": 0,
+      "unsupported_request": 0
+    },
+    "retries": 136,
+    "statuses": {
+      "malformed": 0,
+      "needs_review": 17,
+      "rejected": 17,
+      "verified": 616
+    },
+    "time_split": {
+      "handler_s": 3211.801887,
+      "provider_s": 2825.665,
+      "provider_share": 0.8797756211044906
+    },
+    "tokens": {
+      "answered_without_counts": 0,
+      "input": 759620,
+      "max_per_call": {
+        "input": 801,
+        "output": 997
+      },
+      "other_attempts": {
+        "input": 358323,
+        "output": 303235
+      },
+      "output": 644811,
+      "succeeded_attempts": {
+        "input": 401297,
+        "output": 341576
+      }
+    },
+    "transient_errors": {
+      "rate_limited": 190,
+      "timeout": 0,
+      "unavailable": 0
+    }
+  },
+  "failures": {
+    "attempts_by_state": {
+      "failed": 190,
+      "succeeded": 26
+    },
+    "extra_attempts_per_task": 1.7,
+    "failed_tasks": 54,
+    "worker_exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "failed",
+        "unfinished_tasks": 0
+      },
+      "name": "terminal",
+      "passed": false
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 0
+      },
+      "name": "nothing_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "failed": [
+          "batch-00",
+          "batch-02",
+          "batch-03",
+          "batch-07",
+          "batch-09",
+          "batch-11",
+          "batch-12",
+          "batch-13",
+          "batch-14",
+          "batch-17",
+          "batch-19",
+          "batch-21",
+          "batch-22",
+          "batch-23",
+          "batch-24",
+          "batch-25",
+          "batch-26",
+          "batch-27",
+          "batch-29",
+          "batch-32"
+        ]
+      },
+      "name": "failed_tasks",
+      "passed": false
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "name": "worker_exits",
+      "passed": true
+    },
+    {
+      "detail": {
+        "missing": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "repeated": [],
+        "unknown": []
+      },
+      "name": "extraction_complete",
+      "passed": false
+    },
+    {
+      "detail": {
+        "calls": 1419,
+        "documents_called": 650,
+        "open_closures": 0,
+        "succeeded_answered": 650,
+        "succeeded_calls": 650,
+        "succeeded_unresolved": 0
+      },
+      "name": "extraction_usage",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": {
+    "commits": 1131.0,
+    "formula": "pg_stat_database xact_commit delta over an idle window after the finished job; the harness's reads roll back and never commit",
+    "per_s": 561.6500180243488,
+    "window_s": 2.013709541002754
+  },
+  "ladder": "single",
+  "latency": {
+    "end_to_end_s": {
+      "max": 140.81590485572815,
+      "n": 80,
+      "p50": 46.43142795562744,
+      "p95": 118.40421795845032,
+      "p99": 140.81590485572815
+    },
+    "queue_wait_s": {
+      "max": 46.99302887916565,
+      "n": 80,
+      "p50": 1.4334900379180908,
+      "p95": 46.48056888580322,
+      "p99": 46.99302887916565
+    },
+    "service_s": {
+      "max": 68.13382720947266,
+      "n": 26,
+      "p50": 62.908348083496094,
+      "p95": 66.88847184181213,
+      "p99": 68.13382720947266
+    }
+  },
+  "provider": {
+    "call_timeout": "PT30S",
+    "calls_made": 1419,
+    "cap": 25,
+    "dry_run": false,
+    "max_provider_calls": 3000,
+    "model": "anthropic/claude-haiku-5.5",
+    "name": "openrouter",
+    "route": "route-a",
+    "usage_unit": "openrouter_credits"
+  },
+  "recorded_at": "20261117T063118Z",
+  "resources": {
+    "database": "not_measured",
+    "harness": {
+      "process_maxrss_bytes": 73531392,
+      "scope": "cell",
+      "sys_s": 1.1983119999999998,
+      "user_s": 0.6677059999999999
+    },
+    "sysload": {
+      "cpu_count": 8,
+      "errors": 0,
+      "interval_s": 1.0,
+      "methods": {
+        "db_connections": "pg_stat_activity rows of the run's database, the sampler's own connection excluded",
+        "db_connections_active": "the same rows whose state is 'active'",
+        "load_1m": "the one-minute load average (os.getloadavg)",
+        "machine_memory_used_bytes": "Linux: MemTotal - MemAvailable (/proc/meminfo); macOS: (pages active + wired down + occupied by compressor) x page size (vm_stat)",
+        "worker_cpu_cores": "sum over the worker processes of the growth of their cumulative CPU time (ps time) since the previous sample, divided by the wall time between the samples",
+        "worker_rss_bytes": "sum of the worker processes' resident set size (ps rss, KiB x 1024)"
+      },
+      "metrics": {
+        "db_connections": {
+          "mean": 35.00709219858156,
+          "n": 141,
+          "peak": 36.0
+        },
+        "db_connections_active": {
+          "mean": 0.28368794326241137,
+          "n": 141,
+          "peak": 9.0
+        },
+        "load_1m": {
+          "mean": 8.279999861480496,
+          "n": 141,
+          "peak": 15.06103515625
+        },
+        "machine_memory_used_bytes": {
+          "mean": 6785155188.198582,
+          "n": 141,
+          "peak": 6874071040.0
+        },
+        "worker_cpu_cores": {
+          "mean": 0.39610772710874903,
+          "n": 140,
+          "peak": 0.702592276638745
+        },
+        "worker_rss_bytes": {
+          "mean": 789378563.6312057,
+          "n": 141,
+          "peak": 1181712384.0
+        }
+      },
+      "samples": 141
+    },
+    "workers": [
+      {
+        "cpu_utilization": 0.01696848805856182,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55754752,
+        "pid": 89548,
+        "sys_s": 1.016509,
+        "user_s": 1.372924
+      },
+      {
+        "cpu_utilization": 0.01713136738688413,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52035584,
+        "pid": 89549,
+        "sys_s": 0.939329,
+        "user_s": 1.47304
+      },
+      {
+        "cpu_utilization": 0.016954910046887928,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51314688,
+        "pid": 89550,
+        "sys_s": 0.9577549999999999,
+        "user_s": 1.4297659999999999
+      },
+      {
+        "cpu_utilization": 0.016462778138414944,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52559872,
+        "pid": 89551,
+        "sys_s": 0.966884,
+        "user_s": 1.351337
+      },
+      {
+        "cpu_utilization": 0.01674832116738739,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55164928,
+        "pid": 89552,
+        "sys_s": 0.9649179999999999,
+        "user_s": 1.393512
+      },
+      {
+        "cpu_utilization": 0.017073128226979557,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 51560448,
+        "pid": 89553,
+        "sys_s": 0.9466819999999999,
+        "user_s": 1.457486
+      },
+      {
+        "cpu_utilization": 0.016792399995033732,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56967168,
+        "pid": 89554,
+        "sys_s": 0.964691,
+        "user_s": 1.399946
+      },
+      {
+        "cpu_utilization": 0.021509573106129068,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54280192,
+        "pid": 89555,
+        "sys_s": 0.993142,
+        "user_s": 2.035748
+      },
+      {
+        "cpu_utilization": 0.02004593872327181,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 58474496,
+        "pid": 89556,
+        "sys_s": 0.976715,
+        "user_s": 1.846072
+      },
+      {
+        "cpu_utilization": 0.020935795590849245,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53641216,
+        "pid": 89557,
+        "sys_s": 0.969433,
+        "user_s": 1.9786599999999999
+      },
+      {
+        "cpu_utilization": 0.017371979411745342,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 50593792,
+        "pid": 89558,
+        "sys_s": 0.976136,
+        "user_s": 1.470115
+      },
+      {
+        "cpu_utilization": 0.016442531845903302,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54247424,
+        "pid": 89559,
+        "sys_s": 0.924369,
+        "user_s": 1.391001
+      },
+      {
+        "cpu_utilization": 0.016882389829725935,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54018048,
+        "pid": 89560,
+        "sys_s": 0.948932,
+        "user_s": 1.428377
+      },
+      {
+        "cpu_utilization": 0.019568705699993288,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 52477952,
+        "pid": 89561,
+        "sys_s": 1.01078,
+        "user_s": 1.744805
+      },
+      {
+        "cpu_utilization": 0.01698774014519775,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 50921472,
+        "pid": 89562,
+        "sys_s": 0.993259,
+        "user_s": 1.398885
+      },
+      {
+        "cpu_utilization": 0.017608110408695345,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54657024,
+        "pid": 89563,
+        "sys_s": 0.985444,
+        "user_s": 1.4940579999999999
+      },
+      {
+        "cpu_utilization": 0.020698769808611107,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 58327040,
+        "pid": 89564,
+        "sys_s": 0.991475,
+        "user_s": 1.923241
+      },
+      {
+        "cpu_utilization": 0.0163032933130111,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53116928,
+        "pid": 89565,
+        "sys_s": 0.9079229999999999,
+        "user_s": 1.38784
+      },
+      {
+        "cpu_utilization": 0.016417797424009922,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 53346304,
+        "pid": 89566,
+        "sys_s": 0.947062,
+        "user_s": 1.364825
+      },
+      {
+        "cpu_utilization": 0.018463496738268043,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 54312960,
+        "pid": 89567,
+        "sys_s": 0.9809399999999999,
+        "user_s": 1.619014
+      },
+      {
+        "cpu_utilization": 0.01681108396402641,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55508992,
+        "pid": 89568,
+        "sys_s": 0.96346,
+        "user_s": 1.403808
+      },
+      {
+        "cpu_utilization": 0.016473799620694164,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56066048,
+        "pid": 89569,
+        "sys_s": 0.918172,
+        "user_s": 1.4016009999999999
+      },
+      {
+        "cpu_utilization": 0.0159294079905119,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56377344,
+        "pid": 89570,
+        "sys_s": 0.938476,
+        "user_s": 1.304638
+      },
+      {
+        "cpu_utilization": 0.017708219838908097,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55377920,
+        "pid": 89571,
+        "sys_s": 1.026507,
+        "user_s": 1.467092
+      },
+      {
+        "cpu_utilization": 0.017219148664238165,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 50774016,
+        "pid": 89572,
+        "sys_s": 0.9491379999999999,
+        "user_s": 1.475592
+      },
+      {
+        "cpu_utilization": 0.017696935602218865,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56410112,
+        "pid": 89573,
+        "sys_s": 0.991339,
+        "user_s": 1.500671
+      },
+      {
+        "cpu_utilization": 0.01761550303952825,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 56868864,
+        "pid": 89574,
+        "sys_s": 0.962306,
+        "user_s": 1.518237
+      },
+      {
+        "cpu_utilization": 0.017399483407149606,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 58949632,
+        "pid": 89575,
+        "sys_s": 0.9890009999999999,
+        "user_s": 1.461123
+      },
+      {
+        "cpu_utilization": 0.021811783286460617,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 58441728,
+        "pid": 89576,
+        "sys_s": 1.008151,
+        "user_s": 2.063295
+      },
+      {
+        "cpu_utilization": 0.017196771930564306,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 55705600,
+        "pid": 89577,
+        "sys_s": 0.995188,
+        "user_s": 1.426391
+      },
+      {
+        "cpu_utilization": 0.019512277415076603,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 57049088,
+        "pid": 89578,
+        "sys_s": 1.026931,
+        "user_s": 1.720708
+      },
+      {
+        "cpu_utilization": 0.01759174862056949,
+        "exit_code": 0,
+        "killed": false,
+        "maxrss_bytes": 57196544,
+        "pid": 89579,
+        "sys_s": 1.006611,
+        "user_s": 1.470587
+      }
+    ]
+  },
+  "run_id": "e491342e570b",
+  "status": "failed_correctness",
+  "throughput": null,
+  "timing": {
+    "items": 2000,
+    "makespan_s": 140.81590485572815,
+    "processing_s": 140.61978578567505,
+    "stop_after_s": 3600.0,
+    "submission": {
+      "file_bytes": 1494277,
+      "seconds": 0.6822998340066988,
+      "tasks": 80
+    },
+    "tasks": 80,
+    "wait_ended": "finished",
+    "waited_s": 140.73255483299727
+  },
+  "usage": null,
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT902S",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}

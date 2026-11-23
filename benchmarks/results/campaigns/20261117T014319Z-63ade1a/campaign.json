@@ -1,0 +1,274 @@
+{
+  "budget": "45",
+  "campaign_id": "20261117T014319Z-63ade1a",
+  "cells": {
+    "s1-run-extract-100-b25-w4-r1": {
+      "call_maximum": 210,
+      "ceiling": "0.0008195",
+      "charge": "0.0328307",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T014434Z-63ade1a-extract-100-b25-w4-r1.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w1-r1": {
+      "call_maximum": 2225,
+      "ceiling": "0.0008325",
+      "charge": "0.4659857",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T024443Z-63ade1a-extract-2000-b25-w1-r1.json",
+      "status": "incomplete"
+    },
+    "s2-run-extract-2000-b25-w1-r2": {
+      "call_maximum": 2225,
+      "ceiling": "0.0008325",
+      "charge": "0.3527318",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T041013Z-63ade1a-extract-2000-b25-w1-r2.json",
+      "status": "failed_correctness"
+    },
+    "s2-run-extract-2000-b25-w1-r3": {
+      "call_maximum": 2225,
+      "ceiling": "0.0008325",
+      "charge": "0.4549360",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T055015Z-63ade1a-extract-2000-b25-w1-r3.json",
+      "status": "incomplete"
+    },
+    "s2-run-extract-2000-b25-w16-r1": {
+      "call_maximum": 2600,
+      "ceiling": "0.0008325",
+      "charge": "0.6470770",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T032206Z-63ade1a-extract-2000-b25-w16-r1.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w16-r2": {
+      "call_maximum": 2600,
+      "ceiling": "0.0008325",
+      "charge": "0.6455110",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T044752Z-63ade1a-extract-2000-b25-w16-r2.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w16-r3": {
+      "call_maximum": 2600,
+      "ceiling": "0.0008325",
+      "charge": "0.6480265",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T062848Z-63ade1a-extract-2000-b25-w16-r3.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w32-r1": {
+      "call_maximum": 3000,
+      "ceiling": "0.0008325",
+      "charge": "0.5145435",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T032409Z-63ade1a-extract-2000-b25-w32-r1.json",
+      "status": "failed_correctness"
+    },
+    "s2-run-extract-2000-b25-w32-r2": {
+      "call_maximum": 3000,
+      "ceiling": "0.0008325",
+      "charge": "0.5376696",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T045005Z-63ade1a-extract-2000-b25-w32-r2.json",
+      "status": "failed_correctness"
+    },
+    "s2-run-extract-2000-b25-w32-r3": {
+      "call_maximum": 3000,
+      "ceiling": "0.0008325",
+      "charge": "0.5565425",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T063118Z-63ade1a-extract-2000-b25-w32-r3.json",
+      "status": "failed_correctness"
+    },
+    "s2-run-extract-2000-b25-w4-r1": {
+      "call_maximum": 2300,
+      "ceiling": "0.0008325",
+      "charge": "0.6462790",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T030547Z-63ade1a-extract-2000-b25-w4-r1.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w4-r2": {
+      "call_maximum": 2300,
+      "ceiling": "0.0008325",
+      "charge": "0.6472970",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T043125Z-63ade1a-extract-2000-b25-w4-r2.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w4-r3": {
+      "call_maximum": 2300,
+      "ceiling": "0.0008325",
+      "charge": "0.6488250",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T061222Z-63ade1a-extract-2000-b25-w4-r3.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w8-r1": {
+      "call_maximum": 2400,
+      "ceiling": "0.0008325",
+      "charge": "0.6467985",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T031637Z-63ade1a-extract-2000-b25-w8-r1.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w8-r2": {
+      "call_maximum": 2400,
+      "ceiling": "0.0008325",
+      "charge": "0.6469115",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T044215Z-63ade1a-extract-2000-b25-w8-r2.json",
+      "status": "complete"
+    },
+    "s2-run-extract-2000-b25-w8-r3": {
+      "call_maximum": 2400,
+      "ceiling": "0.0008325",
+      "charge": "0.6473670",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T062312Z-63ade1a-extract-2000-b25-w8-r3.json",
+      "status": "complete"
+    },
+    "s3-run-extract-1000-b100-w8-r1": {
+      "call_maximum": 1900,
+      "ceiling": "0.0008265",
+      "charge": "0.3221194",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065038Z-63ade1a-extract-1000-b100-w8-r1.json",
+      "status": "complete"
+    },
+    "s3-run-extract-1000-b25-w8-r1": {
+      "call_maximum": 1300,
+      "ceiling": "0.0008265",
+      "charge": "0.3189014",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T064208Z-63ade1a-extract-1000-b25-w8-r1.json",
+      "status": "complete"
+    },
+    "s3-run-extract-1000-b5-w8-r1": {
+      "call_maximum": 1140,
+      "ceiling": "0.0008265",
+      "charge": "0.3210369",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T063642Z-63ade1a-extract-1000-b5-w8-r1.json",
+      "status": "complete"
+    },
+    "s4-run-invoice-10000-b100-w8-r1": {
+      "call_maximum": 678,
+      "ceiling": "0.0018",
+      "charge": "0.9000",
+      "charge_basis": "calls",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065249Z-63ade1a-invoice-10000-b100-w8-r1.json",
+      "status": "complete"
+    },
+    "s4-run-invoice-2000-b25-w8-r1": {
+      "call_maximum": 238,
+      "ceiling": "0.0018",
+      "charge": "0.1800",
+      "charge_basis": "calls",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065058Z-63ade1a-invoice-2000-b25-w8-r1.json",
+      "status": "complete"
+    },
+    "s4-run-invoice-2000-b25-w8-r2": {
+      "call_maximum": 238,
+      "ceiling": "0.0018",
+      "charge": "0.1800",
+      "charge_basis": "calls",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065118Z-63ade1a-invoice-2000-b25-w8-r2.json",
+      "status": "complete"
+    },
+    "s4-run-invoice-2000-b25-w8-r3": {
+      "call_maximum": 238,
+      "ceiling": "0.0018",
+      "charge": "0.1800",
+      "charge_basis": "calls",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065138Z-63ade1a-invoice-2000-b25-w8-r3.json",
+      "status": "complete"
+    },
+    "s5-drills-extract-2000-b25-w32-r1": {
+      "call_maximum": 3000,
+      "ceiling": "0.0008325",
+      "charge": "0.5220895",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065459Z-63ade1a-extract-2000-b25-w32-r1.json",
+      "status": "failed_correctness"
+    },
+    "s5-run-extract-2000-b5-w32-r1": {
+      "call_maximum": 2360,
+      "ceiling": "0.0008325",
+      "charge": "1.0294720",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T065742Z-63ade1a-extract-2000-b5-w32-r1.json",
+      "status": "failed_correctness"
+    },
+    "s7-baseline-loop-extract-2000-b1-w1-r1": {
+      "call_maximum": 2201,
+      "ceiling": "0.0008325",
+      "charge": "0.6471485",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T081627Z-63ade1a-baseline-loop-2000-w1.json",
+      "status": "complete"
+    },
+    "s7-baseline-threads-extract-2000-b1-w1-r1": {
+      "call_maximum": 2201,
+      "ceiling": "0.0008325",
+      "charge": "0.6446800",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T093358Z-63ade1a-baseline-threads-2000-w1.json",
+      "status": "complete"
+    },
+    "s7-baseline-threads-extract-2000-b1-w16-r1": {
+      "call_maximum": 2216,
+      "ceiling": "0.0008325",
+      "charge": "0.6468915",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T100847Z-63ade1a-baseline-threads-2000-w16.json",
+      "status": "complete"
+    },
+    "s7-baseline-threads-extract-2000-b1-w32-r1": {
+      "call_maximum": 2232,
+      "ceiling": "0.0008325",
+      "charge": "1.0310202",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T101109Z-63ade1a-baseline-threads-2000-w32.json",
+      "status": "failed"
+    },
+    "s7-baseline-threads-extract-2000-b1-w4-r1": {
+      "call_maximum": 2204,
+      "ceiling": "0.0008325",
+      "charge": "0.6483980",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T095355Z-63ade1a-baseline-threads-2000-w4.json",
+      "status": "complete"
+    },
+    "s7-baseline-threads-extract-2000-b1-w8-r1": {
+      "call_maximum": 2208,
+      "ceiling": "0.0008325",
+      "charge": "0.6461115",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T100350Z-63ade1a-baseline-threads-2000-w8.json",
+      "status": "complete"
+    },
+    "s8-run-extract-30150-b25-w16-r1": {
+      "call_maximum": 33565,
+      "ceiling": "0.0008333",
+      "charge": "9.8044781",
+      "charge_basis": "tokens",
+      "result": "benchmarks/results/campaigns/20261117T014319Z-63ade1a/20261117T114003Z-63ade1a-extract-30150-b25-w16-r1.json",
+      "status": "failed_correctness"
+    }
+  },
+  "live": true,
+  "model": "anthropic/claude-haiku-5.5",
+  "pilot_passed": true,
+  "prices_per_mtok": {
+    "input": "0.10",
+    "output": "0.50",
+    "synthetic": false
+  },
+  "remaining": "18.2383207",
+  "skipped": [],
+  "spent": "26.7616793",
+  "stopped": null
+}

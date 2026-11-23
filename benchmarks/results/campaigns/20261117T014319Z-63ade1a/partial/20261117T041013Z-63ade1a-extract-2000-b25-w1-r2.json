@@ -1,0 +1,482 @@
+{
+  "cell": {
+    "batch": 25,
+    "profile": "extract",
+    "repetition": 2,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 1
+  },
+  "claim_gap": {
+    "max": 0.058465003967285156,
+    "n": 43,
+    "p50": 0.030476093292236328,
+    "p95": 0.044344186782836914,
+    "p99": 0.058465003967285156
+  },
+  "contention": {
+    "by_state": {
+      "active/IO": {
+        "max": 1,
+        "mean": 0.001093693036820999
+      },
+      "active/none": {
+        "max": 1,
+        "mean": 0.002187386073641998
+      },
+      "idle in transaction/Client": {
+        "max": 1,
+        "mean": 0.012030623405030989
+      },
+      "idle in transaction/none": {
+        "max": 1,
+        "mean": 0.001093693036820999
+      },
+      "idle/Client": {
+        "max": 2,
+        "mean": 1.983594604447685
+      }
+    },
+    "sample_errors": 0,
+    "samples": 2743,
+    "window_s": 2759.815155249991
+  },
+  "database_stats": {
+    "commits": {
+      "estimate_commits": null,
+      "expected_idle_rate_per_s": 20.5,
+      "idle_rate_per_s": null,
+      "idle_seconds": 2.6629934159864206,
+      "idle_window_s": null,
+      "job_commits": null,
+      "method": "not measured: the job did not finish, so no idle claim rate was measured",
+      "uncertainty_commits": null,
+      "xact_commit_delta": 5320.0
+    },
+    "commits_per_task": null,
+    "database": {
+      "blks_hit": 153124.0,
+      "blks_read": 8.0,
+      "deadlocks": 0.0,
+      "temp_bytes": 0.0,
+      "tup_fetched": 78652.0,
+      "tup_inserted": 2874.0,
+      "tup_updated": 2154.0,
+      "xact_commit": 5320.0,
+      "xact_rollback": 18498.0
+    },
+    "tables": {
+      "attempts": {
+        "idx_scan": 389.0,
+        "n_dead_tup": 45.0,
+        "n_tup_upd": 1412.0,
+        "seq_scan": 7303.0
+      },
+      "provider_calls": {
+        "idx_scan": 3047.0,
+        "n_dead_tup": 0.0,
+        "n_tup_upd": 0.0,
+        "seq_scan": 306.0
+      },
+      "tasks": {
+        "idx_scan": 604.0,
+        "n_dead_tup": 20.0,
+        "n_tup_upd": 87.0,
+        "seq_scan": 16549.0
+      }
+    }
+  },
+  "drill": null,
+  "environment": {
+    "compose_project": "not_measured",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "63ade1acb9d2bdcd10fe5d0a89c719ecfa814a3d",
+    "memory_bytes": 8589934592,
+    "note": "campaign 20261117T014319Z-63ade1a step 2 s2-run-extract-2000-b25-w1-r2",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "extraction": {
+    "accuracy": {
+      "exact_documents": 1074,
+      "expected": 42646,
+      "matched": 22879,
+      "overall": 0.5364864231111944,
+      "per_field": {
+        "currency": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "due_date": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "invoice_number": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "issue_date": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "line_items.description": {
+          "expected": 8882,
+          "matched": 4760
+        },
+        "line_items.quantity": {
+          "expected": 8882,
+          "matched": 4760
+        },
+        "line_items.unit_price": {
+          "expected": 8882,
+          "matched": 4760
+        },
+        "subtotal": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "tax": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "total": {
+          "expected": 2000,
+          "matched": 1075
+        },
+        "vendor_name": {
+          "expected": 2000,
+          "matched": 1074
+        }
+      },
+      "status_matched": 1075
+    },
+    "calls": {
+      "answered": 1089,
+      "failed": 0,
+      "latency_ms": {
+        "max": 4080,
+        "n": 1089,
+        "p50": 2304,
+        "p95": 3084,
+        "p99": 3354
+      },
+      "other_attempts": 14,
+      "succeeded_attempts": 1075,
+      "total": 1089,
+      "unresolved": 0
+    },
+    "cost": {
+      "currency": "USD",
+      "other_attempts": "0.0047858",
+      "per_1000_invoices": "0.1763659",
+      "per_1000_invoices_succeeded": "0.173973",
+      "prices": {
+        "canned": false,
+        "in_per_mtok": "0.10",
+        "out_per_mtok": "0.50"
+      },
+      "reported": {
+        "openrouter_credits": "0"
+      },
+      "succeeded_attempts": "0.347946",
+      "total": "0.3527318"
+    },
+    "documents": 2000,
+    "needs_review": {
+      "by_reason": {
+        "field_missing": 23,
+        "provider_call_cap_reached": 0,
+        "reply_incomplete": 0,
+        "reply_not_json": 0,
+        "reply_schema_invalid": 0
+      },
+      "count": 23
+    },
+    "permanent_errors": {
+      "rejected": 0,
+      "unsupported_request": 0
+    },
+    "retries": -36,
+    "statuses": {
+      "malformed": 0,
+      "needs_review": 23,
+      "rejected": 23,
+      "verified": 1029
+    },
+    "time_split": {
+      "handler_s": 2718.350576,
+      "provider_s": 2501.783,
+      "provider_share": 0.9203312560520892
+    },
+    "tokens": {
+      "answered_without_counts": 0,
+      "input": 672908,
+      "max_per_call": {
+        "input": 801,
+        "output": 959
+      },
+      "other_attempts": {
+        "input": 8768,
+        "output": 7818
+      },
+      "output": 570882,
+      "succeeded_attempts": {
+        "input": 664140,
+        "output": 563064
+      }
+    },
+    "transient_errors": {
+      "rate_limited": 0,
+      "timeout": 0,
+      "unavailable": 0
+    }
+  },
+  "failures": {
+    "attempts_by_state": {
+      "running": 1,
+      "succeeded": 43
+    },
+    "extra_attempts_per_task": -0.45,
+    "failed_tasks": 0,
+    "worker_exit_codes": [
+      4
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "running",
+        "unfinished_tasks": 37
+      },
+      "name": "terminal",
+      "passed": false
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 2
+      },
+      "name": "nothing_running",
+      "passed": false
+    },
+    {
+      "detail": {
+        "failed": []
+      },
+      "name": "failed_tasks",
+      "passed": true
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          4
+        ]
+      },
+      "name": "worker_exits",
+      "passed": false
+    },
+    {
+      "detail": {
+        "missing": [
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44
+        ],
+        "repeated": [],
+        "unknown": []
+      },
+      "name": "extraction_complete",
+      "passed": false
+    },
+    {
+      "detail": {
+        "calls": 1089,
+        "documents_called": 1075,
+        "open_closures": 0,
+        "succeeded_answered": 1075,
+        "succeeded_calls": 1075,
+        "succeeded_unresolved": 0
+      },
+      "name": "extraction_usage",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": null,
+  "ladder": "single",
+  "latency": {
+    "end_to_end_s": {
+      "max": 2719.7791430950165,
+      "n": 43,
+      "p50": 1382.270889043808,
+      "p95": 2592.726861000061,
+      "p99": 2719.7791430950165
+    },
+    "queue_wait_s": {
+      "max": 2719.8099620342255,
+      "n": 44,
+      "p50": 1319.7238609790802,
+      "p95": 2592.7563860416412,
+      "p99": 2719.8099620342255
+    },
+    "service_s": {
+      "max": 68.26230597496033,
+      "n": 43,
+      "p50": 62.99332809448242,
+      "p95": 66.39605593681335,
+      "p99": 68.26230597496033
+    }
+  },
+  "provider": {
+    "call_timeout": "PT30S",
+    "calls_made": 1089,
+    "cap": 25,
+    "dry_run": false,
+    "max_provider_calls": 2225,
+    "model": "anthropic/claude-haiku-5.5",
+    "name": "openrouter",
+    "route": "route-a",
+    "usage_unit": "openrouter_credits"
+  },
+  "recorded_at": "20261117T041013Z",
+  "resources": {
+    "database": "not_measured",
+    "harness": {
+      "process_maxrss_bytes": 79347712,
+      "scope": "cell",
+      "sys_s": 23.514914,
+      "user_s": 15.691619
+    },
+    "sysload": {
+      "cpu_count": 8,
+      "errors": 0,
+      "interval_s": 1.0,
+      "methods": {
+        "db_connections": "pg_stat_activity rows of the run's database, the sampler's own connection excluded",
+        "db_connections_active": "the same rows whose state is 'active'",
+        "load_1m": "the one-minute load average (os.getloadavg)",
+        "machine_memory_used_bytes": "Linux: MemTotal - MemAvailable (/proc/meminfo); macOS: (pages active + wired down + occupied by compressor) x page size (vm_stat)",
+        "worker_cpu_cores": "sum over the worker processes of the growth of their cumulative CPU time (ps time) since the previous sample, divided by the wall time between the samples",
+        "worker_rss_bytes": "sum of the worker processes' resident set size (ps rss, KiB x 1024)"
+      },
+      "metrics": {
+        "db_connections": {
+          "mean": 4.0003652300949595,
+          "n": 2738,
+          "peak": 5.0
+        },
+        "db_connections_active": {
+          "mean": 0.023009495982468955,
+          "n": 2738,
+          "peak": 2.0
+        },
+        "load_1m": {
+          "mean": 2.3093682589367237,
+          "n": 2738,
+          "peak": 5.35498046875
+        },
+        "machine_memory_used_bytes": {
+          "mean": 6648268571.114682,
+          "n": 2738,
+          "peak": 7170818048.0
+        },
+        "worker_cpu_cores": {
+          "mean": 0.007994418874097728,
+          "n": 2737,
+          "peak": 0.03998903132903268
+        },
+        "worker_rss_bytes": {
+          "mean": 27582098.980277576,
+          "n": 2738,
+          "peak": 64192512.0
+        }
+      },
+      "samples": 2738
+    },
+    "workers": [
+      {
+        "cpu_utilization": 0.00824539229846449,
+        "exit_code": 4,
+        "killed": false,
+        "maxrss_bytes": 64192512,
+        "pid": 57467,
+        "sys_s": 10.038827,
+        "user_s": 12.386819
+      }
+    ]
+  },
+  "run_id": "0da3080874d0",
+  "status": "failed_correctness",
+  "throughput": null,
+  "timing": {
+    "items": 2000,
+    "makespan_s": 2719.7791430950165,
+    "processing_s": 2719.635365009308,
+    "stop_after_s": 3600.0,
+    "submission": {
+      "file_bytes": 1494277,
+      "seconds": 0.5221776250109542,
+      "tasks": 80
+    },
+    "tasks": 80,
+    "wait_ended": "no_workers",
+    "waited_s": 2759.7189107500017
+  },
+  "usage": null,
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT902S",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}

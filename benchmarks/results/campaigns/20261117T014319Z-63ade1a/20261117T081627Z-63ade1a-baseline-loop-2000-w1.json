@@ -1,0 +1,150 @@
+{
+  "cell": {
+    "invoices": 2000,
+    "mode": "loop",
+    "seed": 20261107,
+    "workers": 1
+  },
+  "environment": {
+    "git_dirty": false,
+    "git_sha": "63ade1acb9d2bdcd10fe5d0a89c719ecfa814a3d",
+    "note": "campaign 20261117T014319Z-63ade1a step 7 s7-baseline-loop-extract-2000-b1-w1-r1",
+    "python": "3.12.12"
+  },
+  "extraction": {
+    "accuracy": {
+      "exact_documents": 1999,
+      "expected": 42646,
+      "matched": 42614,
+      "overall": 0.9992496365427004,
+      "per_field": {
+        "currency": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "due_date": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "invoice_number": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "issue_date": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "line_items.description": {
+          "expected": 8882,
+          "matched": 8874
+        },
+        "line_items.quantity": {
+          "expected": 8882,
+          "matched": 8874
+        },
+        "line_items.unit_price": {
+          "expected": 8882,
+          "matched": 8874
+        },
+        "subtotal": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "tax": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "total": {
+          "expected": 2000,
+          "matched": 1999
+        },
+        "vendor_name": {
+          "expected": 2000,
+          "matched": 1999
+        }
+      },
+      "status_matched": 1999
+    },
+    "calls": {
+      "answered": 2000,
+      "failed": 0,
+      "latency_ms": {
+        "max": 4298,
+        "n": 2000,
+        "p50": 2357,
+        "p95": 3175,
+        "p99": 3478
+      },
+      "total": 2000,
+      "unresolved": 0
+    },
+    "cost": {
+      "currency": "USD",
+      "per_1000_invoices": "0.32357425",
+      "prices": {
+        "canned": false,
+        "in_per_mtok": "0.10",
+        "out_per_mtok": "0.50"
+      },
+      "reported": {
+        "openrouter_credits": "0"
+      },
+      "total": "0.6471485"
+    },
+    "documents": 2000,
+    "needs_review": {
+      "by_reason": {
+        "field_missing": 40,
+        "reply_incomplete": 1
+      },
+      "count": 41
+    },
+    "permanent_errors": {},
+    "retries": 0,
+    "statuses": {
+      "failed": 0,
+      "malformed": 0,
+      "needs_review": 41,
+      "rejected": 40,
+      "verified": 1919
+    },
+    "time_split": {
+      "handler_s": 4724.621081412712,
+      "provider_s": 4717.56,
+      "provider_share": 0.9985054713825643
+    },
+    "tokens": {
+      "answered_without_counts": 0,
+      "input": 1236605,
+      "max_per_call": {
+        "input": 817,
+        "output": 1024
+      },
+      "output": 1046976
+    },
+    "transient_errors": {
+      "rate_limited": 0,
+      "timeout": 0,
+      "unavailable": 0
+    }
+  },
+  "format": "baseline-1",
+  "provider": {
+    "call_timeout": "PT30S",
+    "dry_run": false,
+    "max_attempts": 3,
+    "max_provider_calls": 2201,
+    "model": "anthropic/claude-haiku-5.5",
+    "name": "openrouter"
+  },
+  "recorded_at": "20261117T081627Z",
+  "run_id": "d4292e5aca11",
+  "status": "complete",
+  "throughput": {
+    "makespan_items_per_s": 0.42330455193480754
+  },
+  "timing": {
+    "per_invoice_s": 2.3623653358540033,
+    "total_s": 4724.730671708006
+  }
+}

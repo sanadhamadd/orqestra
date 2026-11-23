@@ -1,0 +1,494 @@
+{
+  "cell": {
+    "batch": 25,
+    "profile": "extract",
+    "repetition": 3,
+    "seed": 20261107,
+    "size": 2000,
+    "workers": 1
+  },
+  "claim_gap": {
+    "max": 0.05610203742980957,
+    "n": 56,
+    "p50": 0.03537607192993164,
+    "p95": 0.04815077781677246,
+    "p99": 0.05610203742980957
+  },
+  "contention": {
+    "by_state": {
+      "active/Client": {
+        "max": 1,
+        "mean": 0.0002796420581655481
+      },
+      "active/IO": {
+        "max": 1,
+        "mean": 0.0005592841163310962
+      },
+      "active/Timeout": {
+        "max": 1,
+        "mean": 0.0002796420581655481
+      },
+      "active/none": {
+        "max": 1,
+        "mean": 0.003635346756152125
+      },
+      "idle in transaction/Client": {
+        "max": 1,
+        "mean": 0.01761744966442953
+      },
+      "idle in transaction/none": {
+        "max": 1,
+        "mean": 0.0005592841163310962
+      },
+      "idle/Client": {
+        "max": 2,
+        "mean": 1.9773489932885906
+      },
+      "none/none": {
+        "max": 1,
+        "mean": 0.0002796420581655481
+      }
+    },
+    "sample_errors": 0,
+    "samples": 3576,
+    "window_s": 3600.2506562080234
+  },
+  "database_stats": {
+    "commits": {
+      "estimate_commits": null,
+      "expected_idle_rate_per_s": 20.5,
+      "idle_rate_per_s": null,
+      "idle_seconds": 2.617364292003913,
+      "idle_window_s": null,
+      "job_commits": null,
+      "method": "not measured: the job did not finish, so no idle claim rate was measured",
+      "uncertainty_commits": null,
+      "xact_commit_delta": 6883.0
+    },
+    "commits_per_task": null,
+    "database": {
+      "blks_hit": 196098.0,
+      "blks_read": 8.0,
+      "deadlocks": 0.0,
+      "temp_bytes": 0.0,
+      "tup_fetched": 109794.0,
+      "tup_inserted": 3578.0,
+      "tup_updated": 2722.0,
+      "xact_commit": 6883.0,
+      "xact_rollback": 24037.0
+    },
+    "tables": {
+      "attempts": {
+        "idx_scan": 505.0,
+        "n_dead_tup": 46.0,
+        "n_tup_upd": 1843.0,
+        "seq_scan": 9463.0
+      },
+      "provider_calls": {
+        "idx_scan": 3948.0,
+        "n_dead_tup": 0.0,
+        "n_tup_upd": 0.0,
+        "seq_scan": 374.0
+      },
+      "tasks": {
+        "idx_scan": 812.0,
+        "n_dead_tup": 46.0,
+        "n_tup_upd": 113.0,
+        "seq_scan": 21437.0
+      }
+    }
+  },
+  "drill": null,
+  "environment": {
+    "compose_project": "not_measured",
+    "cores": 8,
+    "cpu_model": "Apple M3",
+    "docker": "not_measured",
+    "git_dirty": false,
+    "git_sha": "63ade1acb9d2bdcd10fe5d0a89c719ecfa814a3d",
+    "memory_bytes": 8589934592,
+    "note": "campaign 20261117T014319Z-63ade1a step 2 s2-run-extract-2000-b25-w1-r3",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "postgres": {
+      "fsync": "on",
+      "max_connections": "100",
+      "shared_buffers": "128MB",
+      "synchronous_commit": "on",
+      "version": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "work_mem": "4MB"
+    },
+    "python": "3.12.12",
+    "uv_lock_sha256": "2bc4a25a2b6f6e8e52a94ad4b2d1910aad4f7a4042838f0192f24e646b98f519"
+  },
+  "extraction": {
+    "accuracy": {
+      "exact_documents": 1400,
+      "expected": 42646,
+      "matched": 29788,
+      "overall": 0.6984945833137927,
+      "per_field": {
+        "currency": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "due_date": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "invoice_number": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "issue_date": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "line_items.description": {
+          "expected": 8882,
+          "matched": 6196
+        },
+        "line_items.quantity": {
+          "expected": 8882,
+          "matched": 6196
+        },
+        "line_items.unit_price": {
+          "expected": 8882,
+          "matched": 6196
+        },
+        "subtotal": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "tax": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "total": {
+          "expected": 2000,
+          "matched": 1400
+        },
+        "vendor_name": {
+          "expected": 2000,
+          "matched": 1400
+        }
+      },
+      "status_matched": 1400
+    },
+    "calls": {
+      "answered": 1406,
+      "failed": 0,
+      "latency_ms": {
+        "max": 4450,
+        "n": 1406,
+        "p50": 2332,
+        "p95": 3094,
+        "p99": 3525
+      },
+      "other_attempts": 7,
+      "succeeded_attempts": 1400,
+      "total": 1407,
+      "unresolved": 1
+    },
+    "cost": {
+      "currency": "USD",
+      "other_attempts": "0.0021063",
+      "per_1000_invoices": "0.22705175",
+      "per_1000_invoices_succeeded": "0.2259986",
+      "prices": {
+        "canned": false,
+        "in_per_mtok": "0.10",
+        "out_per_mtok": "0.50"
+      },
+      "reported": {
+        "openrouter_credits": "0"
+      },
+      "succeeded_attempts": "0.4519972",
+      "total": "0.4541035"
+    },
+    "documents": 2000,
+    "needs_review": {
+      "by_reason": {
+        "field_missing": 27,
+        "provider_call_cap_reached": 0,
+        "reply_incomplete": 0,
+        "reply_not_json": 0,
+        "reply_schema_invalid": 0
+      },
+      "count": 27
+    },
+    "permanent_errors": {
+      "rejected": 0,
+      "unsupported_request": 0
+    },
+    "retries": -23,
+    "statuses": {
+      "malformed": 0,
+      "needs_review": 27,
+      "rejected": 27,
+      "verified": 1346
+    },
+    "time_split": {
+      "handler_s": 3588.654172,
+      "provider_s": 3265.318,
+      "provider_share": 0.9099004371826108
+    },
+    "tokens": {
+      "answered_without_counts": 0,
+      "input": 868315,
+      "max_per_call": {
+        "input": 817,
+        "output": 1019
+      },
+      "other_attempts": {
+        "input": 3838,
+        "output": 3445
+      },
+      "output": 734544,
+      "succeeded_attempts": {
+        "input": 864477,
+        "output": 731099
+      }
+    },
+    "transient_errors": {
+      "rate_limited": 0,
+      "timeout": 0,
+      "unavailable": 0
+    }
+  },
+  "failures": {
+    "attempts_by_state": {
+      "running": 1,
+      "succeeded": 56
+    },
+    "extra_attempts_per_task": -0.2875,
+    "failed_tasks": 0,
+    "worker_exit_codes": [
+      9
+    ]
+  },
+  "format": 1,
+  "gate": [
+    {
+      "detail": {
+        "job_status": "running",
+        "unfinished_tasks": 24
+      },
+      "name": "terminal",
+      "passed": false
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "one_succeeded_attempt",
+      "passed": true
+    },
+    {
+      "detail": {
+        "violations": 0
+      },
+      "name": "no_double_running",
+      "passed": true
+    },
+    {
+      "detail": {
+        "running": 2
+      },
+      "name": "nothing_running",
+      "passed": false
+    },
+    {
+      "detail": {
+        "failed": []
+      },
+      "name": "failed_tasks",
+      "passed": true
+    },
+    {
+      "detail": {
+        "exit_codes": [
+          9
+        ]
+      },
+      "name": "worker_exits",
+      "passed": false
+    },
+    {
+      "detail": {
+        "missing": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "repeated": [],
+        "unknown": []
+      },
+      "name": "extraction_complete",
+      "passed": false
+    },
+    {
+      "detail": {
+        "calls": 1407,
+        "documents_called": 1400,
+        "open_closures": 0,
+        "succeeded_answered": 1400,
+        "succeeded_calls": 1400,
+        "succeeded_unresolved": 0
+      },
+      "name": "extraction_usage",
+      "passed": true
+    }
+  ],
+  "idle_claim_rate": null,
+  "ladder": "single",
+  "latency": {
+    "end_to_end_s": {
+      "max": 3590.6754121780396,
+      "n": 56,
+      "p50": 1803.2153611183167,
+      "p95": 3455.0909581184387,
+      "p99": 3590.6754121780396
+    },
+    "queue_wait_s": {
+      "max": 3590.7235629558563,
+      "n": 57,
+      "p50": 1803.2490899562836,
+      "p95": 3455.1136450767517,
+      "p99": 3590.7235629558563
+    },
+    "service_s": {
+      "max": 72.48306488990784,
+      "n": 56,
+      "p50": 64.11957693099976,
+      "p95": 69.02213191986084,
+      "p99": 72.48306488990784
+    }
+  },
+  "provider": {
+    "call_timeout": "PT30S",
+    "calls_made": 1407,
+    "cap": 25,
+    "dry_run": false,
+    "max_provider_calls": 2225,
+    "model": "anthropic/claude-haiku-5.5",
+    "name": "openrouter",
+    "route": "route-a",
+    "usage_unit": "openrouter_credits"
+  },
+  "recorded_at": "20261117T055015Z",
+  "resources": {
+    "database": "not_measured",
+    "harness": {
+      "process_maxrss_bytes": 78872576,
+      "scope": "cell",
+      "sys_s": 32.796602,
+      "user_s": 21.289908
+    },
+    "sysload": {
+      "cpu_count": 8,
+      "errors": 0,
+      "interval_s": 1.0,
+      "methods": {
+        "db_connections": "pg_stat_activity rows of the run's database, the sampler's own connection excluded",
+        "db_connections_active": "the same rows whose state is 'active'",
+        "load_1m": "the one-minute load average (os.getloadavg)",
+        "machine_memory_used_bytes": "Linux: MemTotal - MemAvailable (/proc/meminfo); macOS: (pages active + wired down + occupied by compressor) x page size (vm_stat)",
+        "worker_cpu_cores": "sum over the worker processes of the growth of their cumulative CPU time (ps time) since the previous sample, divided by the wall time between the samples",
+        "worker_rss_bytes": "sum of the worker processes' resident set size (ps rss, KiB x 1024)"
+      },
+      "metrics": {
+        "db_connections": {
+          "mean": 4.00028019052956,
+          "n": 3569,
+          "peak": 5.0
+        },
+        "db_connections_active": {
+          "mean": 0.04903334267301765,
+          "n": 3569,
+          "peak": 2.0
+        },
+        "load_1m": {
+          "mean": 3.522207151644368,
+          "n": 3569,
+          "peak": 10.4228515625
+        },
+        "machine_memory_used_bytes": {
+          "mean": 6750258653.139815,
+          "n": 3569,
+          "peak": 7073038336.0
+        },
+        "worker_cpu_cores": {
+          "mean": 0.008602982133983474,
+          "n": 3568,
+          "peak": 0.03990759727123828
+        },
+        "worker_rss_bytes": {
+          "mean": 26300171.548332866,
+          "n": 3569,
+          "peak": 71598080.0
+        }
+      },
+      "samples": 3569
+    },
+    "workers": [
+      {
+        "cpu_utilization": 0.00874983405446345,
+        "exit_code": 9,
+        "killed": false,
+        "maxrss_bytes": 71598080,
+        "pid": 72184,
+        "sys_s": 14.65666,
+        "user_s": 16.761154
+      }
+    ]
+  },
+  "run_id": "896da61c6a9d",
+  "status": "incomplete",
+  "throughput": null,
+  "timing": {
+    "items": 2000,
+    "makespan_s": 3590.6754121780396,
+    "processing_s": 3590.5573620796204,
+    "stop_after_s": 3600.0,
+    "submission": {
+      "file_bytes": 1494277,
+      "seconds": 0.5231119169911835,
+      "tasks": 80
+    },
+    "tasks": 80,
+    "wait_ended": "stop_after",
+    "waited_s": 3600.2077842500003
+  },
+  "usage": null,
+  "worker_settings": {
+    "ORQESTRA_WORKER_DB_OPERATION_TIMEOUT": "PT1S",
+    "ORQESTRA_WORKER_EXECUTION_TIMEOUT": "PT902S",
+    "ORQESTRA_WORKER_FENCE_MARGIN": "PT2S",
+    "ORQESTRA_WORKER_HEARTBEAT_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_LEASE": "PT10S",
+    "ORQESTRA_WORKER_LOCK_TIMEOUT": "PT0.5S",
+    "ORQESTRA_WORKER_POLL_INTERVAL": "PT0.05S",
+    "ORQESTRA_WORKER_RECOVERY_BATCH_LIMIT": "10",
+    "ORQESTRA_WORKER_RECOVERY_INTERVAL": "PT2S",
+    "ORQESTRA_WORKER_RETRY_BASE_DELAY": "PT0.5S",
+    "ORQESTRA_WORKER_RETRY_MAX_DELAY": "PT5S",
+    "ORQESTRA_WORKER_SHUTDOWN_TIMEOUT": "PT5S"
+  }
+}
