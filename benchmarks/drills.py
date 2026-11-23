@@ -33,10 +33,14 @@ The job is submitted before any worker starts, and the harness polls every
 10 ms until the injection, because a job of this size can pass 30 % within one
 ordinary poll. A victim is chosen without racing its own completion: the
 harness stops every live worker, waits until each shows as stopped and until
-no client backend of the database is still running a statement (one a worker
+no worker connection of the database is still running a statement (one a worker
 sent before it stopped could otherwise still commit), and only then reads
 which attempts are running and which PID (from ``worker_id``) owns each. Those
-owners are the candidates; every worker not chosen is continued. Before the
+owners are the candidates; every worker not chosen is continued. No worker stays
+stopped longer than half its ``db_operation_timeout`` from the first SIGSTOP
+(``freeze_window``): a freeze that cannot finish by then continues everyone and is
+tried again once the workers have run at least as long as they were stopped
+(DEC-076). Before the
 workers are stopped at the end, the harness waits until every running worker,
 replacements included, has logged ``worker_started``, so each one stops under
 its own signal handlers.
@@ -280,6 +284,24 @@ class Harness:
         self.conn.close()
 
 
+FREEZE_SHARE = 0.5  # of db_operation_timeout: the longest a freeze keeps any worker stopped
+FREEZE_REST = 0.02  # the shortest time the workers run between two freezes
+CLIENT_WRITE = "Client:ClientWrite"  # a statement done on the server, sending to its client
+CLIENT_WRITE_GRACE = 0.02  # how long only such statements may stay active before a freeze ends
+WORKER_APPLICATION = "orqestra-worker"  # every worker connection's application_name
+
+
+def freeze_window(operation: timedelta) -> float:
+    """The longest ``freeze_victims`` keeps any worker stopped, from the first SIGSTOP (DEC-076).
+
+    Half the workers' ``db_operation_timeout``. The other half is the margin for the
+    part of a guarded call that ran before its SIGSTOP, and for the reads and SIGCONTs
+    that end the freeze: a worker frozen more than half way into a slow call can still
+    pass its bound before it is continued.
+    """
+    return FREEZE_SHARE * operation.total_seconds()
+
+
 @dataclass(slots=True)
 class Poll:
     """What a drill sees on each poll while the job runs."""
@@ -289,7 +311,7 @@ class Poll:
     fleet: DrillFleet
     tasks: int
     succeeded: int
-    quiet_bound: float  # how long a drill waits for in-flight statements to end
+    quiet_bound: float  # the longest a freeze keeps any worker stopped (``freeze_window``)
 
     @property
     def conn(self) -> Conn:
@@ -297,6 +319,35 @@ class Poll:
 
     def reached(self, share: float = TRIGGER_SHARE) -> bool:
         return self.succeeded >= math.ceil(share * self.tasks)
+
+
+@dataclass(slots=True)
+class Freezes:
+    """A drill's freezes: when the next may start, the open freeze's deadline, and a log.
+
+    Kept in memory; the count of freezes that did not reach a quiet database is
+    reported in the drill's ``injected`` check.
+    """
+
+    not_before: float = 0.0
+    started: float = 0.0
+    deadline: float = 0.0
+    log: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def not_quiet(self) -> int:
+        return sum(1 for entry in self.log if not entry["quiet"])
+
+    def continued(self, now: float) -> None:
+        """A worker chosen in the last freeze was continued at ``now``, not killed.
+
+        Its stopped time is logged, and the next freeze waits at least that long, as
+        after every freeze (``freeze_victims``).
+        """
+        stopped = now - self.started
+        if self.log:
+            self.log[-1]["stopped_s"] = max(self.log[-1]["stopped_s"], stopped)
+        self.not_before = max(self.not_before, now + max(stopped, FREEZE_REST))
 
 
 def worker_pid(worker_id: str) -> int | None:
@@ -315,14 +366,37 @@ def _process_state(pid: int) -> str:
     ).stdout.strip()
 
 
-def _wait_stopped(pid: int) -> bool:
-    """Whether ``pid`` shows as stopped within ``STOP_BOUND`` seconds."""
-    deadline = time.monotonic() + STOP_BOUND
-    while time.monotonic() < deadline:
-        if _process_state(pid).startswith("T"):
-            return True
+def _stopped(pids: Sequence[int]) -> set[int]:
+    """The ``pids`` that show as stopped (``ps`` state ``T``), read with one ``ps``.
+
+    A pid missing from the output has exited, so it is not stopped.
+    """
+    listing = subprocess.run(  # a fixed command
+        ["ps", "-o", "pid=,stat=", "-p", ",".join(str(pid) for pid in pids)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    ).stdout
+    found: set[int] = set()
+    for line in listing.splitlines():
+        pid, _, state = line.strip().partition(" ")
+        if pid.isdigit() and state.strip().startswith("T"):
+            found.add(int(pid))
+    return found
+
+
+def _wait_stopped(handles: Sequence[WorkerHandle], deadline: float) -> set[int] | None:
+    """The PIDs of ``handles`` that are stopped, once every one of them is stopped or
+    has exited; None if ``deadline`` passes first."""
+    pids = [handle.process.pid for handle in handles]
+    while True:
+        stopped = _stopped(pids) if pids else set()
+        if all(h.process.pid in stopped or not h.running() for h in handles):
+            return stopped
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.01)
-    return False
 
 
 _RUNNING_ATTEMPTS = (
@@ -337,46 +411,91 @@ class Victim:
     attempt_id: uuid.UUID
 
 
-_ACTIVE_BACKENDS = (
-    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-    "AND backend_type = 'client backend' AND state = 'active' AND pid <> pg_backend_pid()"
+_ACTIVE_WORKER_STATEMENTS = (
+    "SELECT coalesce(wait_event_type, '') || ':' || coalesce(wait_event, '') "
+    "FROM pg_stat_activity WHERE datname = current_database() "
+    "AND backend_type = 'client backend' AND state = 'active' "
+    "AND application_name = %s AND pid <> pg_backend_pid() ORDER BY 1"
 )
 
 
-def _await_quiet(poll: Poll) -> bool:
-    """Wait until no other client backend of this database runs a statement.
+def _await_quiet(poll: Poll, deadline: float) -> list[str]:
+    """Wait until no worker connection of this database runs a statement.
 
     A stopped worker cannot send anything new, but a statement it had already
     sent (a completion, a heartbeat) still runs on the server and may commit.
-    Once no backend is active, nothing a stopped worker sent is still running.
-    Bounded by ``poll.quiet_bound``; whether it became quiet is returned.
+    Once no worker backend is active, nothing a stopped worker sent is still
+    running. Only worker connections count (``application_name``): no other
+    client can end this job's attempts, and a shared database stays busy. Bounded
+    by ``deadline``; returns the wait events of the worker statements still
+    active then, empty if it became quiet.
+
+    A statement waiting only to send its result (``ClientWrite``) has not
+    committed, and a stopped client never reads it, so it stays active until that
+    worker is continued. Once every active worker statement has waited so for
+    ``CLIENT_WRITE_GRACE``, the wait ends at once: waiting longer gains nothing.
     """
-    deadline = time.monotonic() + poll.quiet_bound
+    writing_since: float | None = None
     while True:
-        if _one(poll.conn, _ACTIVE_BACKENDS)[0] == 0:
-            return True
-        if time.monotonic() >= deadline:
-            return False
+        waits = [
+            row[0] for row in poll.conn.execute(_ACTIVE_WORKER_STATEMENTS, (WORKER_APPLICATION,))
+        ]
+        now = time.monotonic()
+        if not waits or now >= deadline:
+            return waits
+        if all(wait == CLIENT_WRITE for wait in waits):
+            writing_since = now if writing_since is None else writing_since
+            if now - writing_since >= CLIENT_WRITE_GRACE:
+                return waits
+        else:
+            writing_since = None
         time.sleep(0.01)
 
 
-def freeze_victims(poll: Poll, count: int, taken: set[int]) -> list[Victim]:
+def freeze_victims(
+    poll: Poll, count: int, taken: set[int], *, freezes: Freezes | None = None
+) -> list[Victim]:
     """Stop up to ``count`` workers, each owning an attempt still running once it is stopped.
 
     Every live worker not in ``taken`` is stopped first, and the owners are read
     only once no statement a stopped worker sent is still running on the server
     (``_await_quiet``), so no attempt can end while they are read. The workers
     that are not chosen are always continued, also when reading fails.
+
+    No worker stays stopped longer than ``poll.quiet_bound`` (``freeze_window``),
+    fixed at the first SIGSTOP: if the workers have not all stopped, the database
+    is not quiet, or the owners are not read by then, everyone is continued and
+    ``[]`` returned, to be tried again on a later poll (DEC-076). With ``freezes``,
+    a freeze is logged and the next one waits until the workers have run at least
+    as long as they were stopped (``FREEZE_REST`` at least): they are never stopped
+    more than half the time, and a call whose answer arrived while it was stopped
+    is read before the next freeze. A database that is not quiet is usually a
+    stopped worker's statement waiting to send its result (``ClientWrite``), which
+    ends once that worker is continued.
     """
+    if freezes is not None and time.monotonic() < freezes.not_before:
+        return []
     live = [h for h in poll.fleet.workers if h.process.pid not in taken and h.running()]
     victims: list[Victim] = []
+    entry: dict[str, Any] = {"quiet": False, "workers": len(live), "stopped_s": 0.0, "waits": []}
+    started = time.monotonic()
+    deadline = started + poll.quiet_bound
+    if freezes is not None:
+        freezes.started, freezes.deadline = started, deadline
     try:
         for handle in live:
             os.kill(handle.process.pid, signal.SIGSTOP)
-        stopped = {h.process.pid for h in live if _wait_stopped(h.process.pid)}
-        if not _await_quiet(poll):
+        stopped = _wait_stopped(live, deadline)
+        if stopped is None:
             return []  # tried again on a later poll
-        for attempt_id, worker_id in poll.conn.execute(_RUNNING_ATTEMPTS, (poll.job_id,)):
+        entry["waits"] = _await_quiet(poll, deadline)
+        if entry["waits"]:
+            return []  # tried again on a later poll
+        owners = poll.conn.execute(_RUNNING_ATTEMPTS, (poll.job_id,)).fetchall()
+        if time.monotonic() >= deadline:
+            return []  # tried again on a later poll
+        entry["quiet"] = True
+        for attempt_id, worker_id in owners:
             pid = worker_pid(worker_id)
             chosen = {victim.pid for victim in victims}
             if pid in stopped and pid not in chosen and len(victims) < count:
@@ -390,6 +509,11 @@ def freeze_victims(poll: Poll, count: int, taken: set[int]) -> list[Victim]:
             if handle.process.pid not in chosen:
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(handle.process.pid, signal.SIGCONT)
+        ended = time.monotonic()
+        entry["stopped_s"] = ended - started
+        if freezes is not None:
+            freezes.log.append(entry)
+            freezes.not_before = ended + max(ended - started, FREEZE_REST)
     return victims
 
 
@@ -406,6 +530,7 @@ class Drill:
         self.injections: list[dict[str, Any]] = []
         self.killed: set[int] = set()  # expected to exit by SIGKILL
         self.recorded: set[int] = set()  # their exit codes are recorded, not predicted
+        self.freezes = Freezes()  # the freezes ``freeze_victims`` made for this drill
 
     def worker_url(self, url: str) -> str:
         return url
@@ -434,7 +559,8 @@ class Drill:
         return 0
 
     def checks(self, conn: Conn, job_id: uuid.UUID, fleet: DrillFleet) -> list[Check]:
-        return [_check("injected", self.injected, {"injections": len(self.injections)})]
+        detail = {"injections": len(self.injections), "freezes_not_quiet": self.freezes.not_quiet}
+        return [_check("injected", self.injected, detail)]
 
     def measured(self, conn: Conn, job_id: uuid.UUID, fleet: DrillFleet) -> dict[str, Any]:
         return {}
@@ -503,8 +629,13 @@ class KillDrill(Drill):
         if self.injected or not poll.reached():
             return
         taken = {entry["pid"] for entry in self.injections}
-        for victim in freeze_victims(poll, self.victims - len(self.injections), taken):
+        wanted = self.victims - len(self.injections)
+        for victim in freeze_victims(poll, wanted, taken, freezes=self.freezes):
             if self.at_call_boundary:
+                if time.monotonic() >= self.freezes.deadline:  # no read past the freeze window
+                    os.kill(victim.pid, signal.SIGCONT)
+                    self.freezes.continued(time.monotonic())
+                    continue
                 try:
                     in_flight = _one(poll.conn, _UNRESOLVED, victim.attempt_id)[0]
                 except BaseException:
@@ -513,6 +644,7 @@ class KillDrill(Drill):
                     raise
                 if in_flight:  # a call is between its intent and its result: try again later
                     os.kill(victim.pid, signal.SIGCONT)
+                    self.freezes.continued(time.monotonic())
                     continue
             os.kill(victim.pid, signal.SIGKILL)
             self.killed.add(victim.pid)
@@ -715,7 +847,7 @@ class FreezeDrill(Drill):
     def step(self, poll: Poll) -> None:
         if self.victim is None:
             if poll.reached():
-                victims = freeze_victims(poll, 1, set())
+                victims = freeze_victims(poll, 1, set(), freezes=self.freezes)
                 self.victim = victims[0] if victims else None
                 if self.victim is not None:
                     self.recorded.add(self.victim.pid)
@@ -1305,7 +1437,7 @@ def run_drill(
         partial(psycopg.connect, url, autocommit=True),
     )
     operation = validated.db_operation_timeout
-    quiet = 2 * operation.total_seconds() + 1.0  # a statement outlives its bound by little
+    quiet = freeze_window(operation)  # no worker stays stopped past half its bound (DEC-076)
     seen: set[int] = set()
     due: list[float] = []
     exits: list[dict[str, Any]] = []

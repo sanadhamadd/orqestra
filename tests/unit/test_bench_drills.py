@@ -20,13 +20,17 @@ from benchmarks.drills import (
     Drill,
     DrillFleet,
     FreezeDrill,
+    Freezes,
     Harness,
     KillDrill,
     Poll,
     RestartDrill,
     RestartRefusedError,
     Victim,
+    _process_state,
     check_restart_target,
+    freeze_victims,
+    freeze_window,
     wait_over,
 )
 from benchmarks.generate import generate_invoices
@@ -369,10 +373,21 @@ class ConnOnly:
     conn = None
 
 
+def _freezing(victim: Victim, window: float) -> Any:
+    """A ``freeze_victims`` that returns ``victim``, its freeze ending ``window`` s from now."""
+
+    def freeze(poll: Poll, count: int, taken: set[int], *, freezes: Freezes) -> list[Victim]:
+        freezes.started = time.monotonic()
+        freezes.deadline = freezes.started + window
+        return [victim]
+
+    return freeze
+
+
 @pytest.fixture
 def one_victim(monkeypatch: pytest.MonkeyPatch) -> Victim:
     victim = Victim(4242, uuid.uuid4())
-    monkeypatch.setattr(benchmarks.drills, "freeze_victims", lambda poll, count, taken: [victim])
+    monkeypatch.setattr(benchmarks.drills, "freeze_victims", _freezing(victim, 60.0))
     return victim
 
 
@@ -404,6 +419,173 @@ def test_a_failed_in_flight_read_continues_the_victim_and_raises(
 
     assert signals == [(4242, signal.SIGCONT)]
     assert drill.killed == set()
+
+
+def test_a_victim_past_the_freeze_window_is_continued_without_a_read(
+    signals: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unread(conn: object, query: str, *params: object) -> NoReturn:
+        raise AssertionError("read after the freeze window")
+
+    monkeypatch.setattr(
+        benchmarks.drills, "freeze_victims", _freezing(Victim(4242, uuid.uuid4()), -1.0)
+    )
+    monkeypatch.setattr(benchmarks.drills, "_one", unread)
+    drill = KillDrill(1, at_call_boundary=True)
+
+    drill.step(_poll(cast(FakeHarness, ConnOnly())))
+
+    assert signals == [(4242, signal.SIGCONT)]
+    assert drill.killed == set()
+    # The workers run at least as long as the victim was stopped before the next try.
+    assert drill.freezes.not_before > drill.freezes.started
+
+
+# --- the freeze window (DEC-076): real stopped processes, a fake database ----------------
+
+WINDOW = 0.3  # seconds; a fake database answers at once
+SLACK = 0.5  # the stop and quiet checks poll; a bound on scheduling, not an expectation
+
+
+class _Rows(list[tuple[Any, ...]]):
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self)
+
+
+class ActivityConn:
+    """Reports ``waits`` as active worker statements and ``owners`` as running attempts."""
+
+    def __init__(self, waits: Sequence[str] = (), owners: Sequence[tuple[Any, ...]] = ()) -> None:
+        self.waits = list(waits)
+        self.owners = list(owners)
+        self.owner_read = 0.0  # seconds the owner read takes
+        self.queries = 0
+
+    def execute(self, query: str, params: Sequence[object]) -> _Rows:
+        self.queries += 1
+        if "pg_stat_activity" in query:
+            return _Rows((wait,) for wait in self.waits)
+        time.sleep(self.owner_read)
+        return _Rows(self.owners)
+
+
+class _Handle:
+    def __init__(self) -> None:
+        self.process = subprocess.Popen(["sleep", "30"])
+
+    def running(self) -> bool:
+        return self.process.poll() is None
+
+
+class _Fleet:
+    def __init__(self, workers: int) -> None:
+        self.workers = [_Handle() for _ in range(workers)]
+
+
+class _Harness:
+    def __init__(self, conn: ActivityConn) -> None:
+        self.conn = conn
+
+
+@pytest.fixture
+def fleet() -> Any:
+    workers = _Fleet(2)
+    yield workers
+    for handle in workers.workers:
+        handle.process.kill()
+        handle.process.wait()
+
+
+def _freeze_poll(conn: ActivityConn, workers: _Fleet) -> Poll:
+    return Poll(
+        cast(Harness, _Harness(conn)),
+        uuid.uuid4(),
+        cast(DrillFleet, workers),
+        10,
+        10,
+        quiet_bound=WINDOW,
+    )
+
+
+def _stopped(workers: _Fleet) -> list[bool]:
+    return [_process_state(h.process.pid).startswith("T") for h in workers.workers]
+
+
+def test_the_freeze_window_is_half_the_operation_bound() -> None:
+    assert freeze_window(timedelta(seconds=3)) == 1.5
+    assert freeze_window(timedelta(milliseconds=800)) == 0.4
+
+
+def test_a_database_that_is_never_quiet_ends_the_freeze_within_the_window(fleet: Any) -> None:
+    conn = ActivityConn(waits=["Timeout:PgSleep"])
+    freezes = Freezes()
+
+    began = time.monotonic()
+    victims = freeze_victims(_freeze_poll(conn, fleet), 1, set(), freezes=freezes)
+    took = time.monotonic() - began
+
+    assert victims == []
+    assert took < WINDOW + SLACK
+    assert _stopped(fleet) == [False, False]  # every worker continued
+    [entry] = freezes.log
+    assert entry["quiet"] is False
+    assert entry["waits"] == ["Timeout:PgSleep"]
+    assert entry["stopped_s"] < WINDOW + SLACK
+    assert freezes.not_quiet == 1
+    # The workers then run at least as long as they were stopped before the next freeze.
+    assert freezes.not_before >= began + 2 * entry["stopped_s"]
+
+    queried = conn.queries
+    assert freeze_victims(_freeze_poll(conn, fleet), 1, set(), freezes=freezes) == []
+    assert conn.queries == queried  # inside the cooldown: nobody stopped, nothing read
+    assert len(freezes.log) == 1
+
+
+def test_statements_only_sending_to_stopped_workers_end_the_freeze_at_once(fleet: Any) -> None:
+    # A result a stopped worker never reads keeps its statement active: waiting gains nothing.
+    conn = ActivityConn(waits=["Client:ClientWrite", "Client:ClientWrite"])
+    freezes = Freezes()
+
+    began = time.monotonic()
+    assert freeze_victims(_freeze_poll(conn, fleet), 1, set(), freezes=freezes) == []
+
+    assert time.monotonic() - began < WINDOW
+    assert _stopped(fleet) == [False, False]
+    [entry] = freezes.log
+    assert entry["quiet"] is False
+    assert entry["waits"] == ["Client:ClientWrite", "Client:ClientWrite"]
+    assert freezes.not_before - began < WINDOW + SLACK  # retried soon, after a short rest
+
+
+def test_a_quiet_database_gives_the_owner_and_continues_the_others(fleet: Any) -> None:
+    owner = fleet.workers[0].process.pid
+    attempt = uuid.uuid4()
+    conn = ActivityConn(owners=[(attempt, f"host:{owner}:abc")])
+    freezes = Freezes()
+
+    victims = freeze_victims(_freeze_poll(conn, fleet), 1, set(), freezes=freezes)
+
+    try:
+        assert victims == [Victim(owner, attempt)]
+        assert _stopped(fleet) == [True, False]  # the victim stays stopped for the drill
+    finally:
+        fleet.workers[0].process.send_signal(signal.SIGCONT)
+    [entry] = freezes.log
+    assert entry["quiet"] is True
+    assert entry["stopped_s"] < WINDOW + SLACK
+    assert freezes.not_quiet == 0
+
+
+def test_an_owner_read_that_ends_past_the_window_continues_everyone(fleet: Any) -> None:
+    owner = fleet.workers[0].process.pid
+    conn = ActivityConn(owners=[(uuid.uuid4(), f"host:{owner}:abc")])
+    conn.owner_read = WINDOW + 0.1
+    freezes = Freezes()
+
+    assert freeze_victims(_freeze_poll(conn, fleet), 1, set(), freezes=freezes) == []
+
+    assert _stopped(fleet) == [False, False]
+    assert freezes.log[-1]["quiet"] is False
 
 
 # --- the crash drill with a live provider (DEC-071, T2) ------------------------------------

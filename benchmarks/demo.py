@@ -60,6 +60,7 @@ from benchmarks.drills import (
     Harness,
     KillDrill,
     Poll,
+    freeze_window,
     wait_over,
     worker_pid,
 )
@@ -505,7 +506,7 @@ def run_demo(
     watch = VictimWatch()
     validated = bench_settings(worker_settings)  # once: every value below comes from here
     operation = validated.db_operation_timeout
-    quiet = 2 * operation.total_seconds() + 1.0  # as run_drill: a statement outlives its bound
+    quiet = freeze_window(operation)  # as run_drill: half the bound at most (DEC-076)
     shutdown = validated.shutdown_timeout
     harness_start = metrics.harness_usage()
     wait_ended = WaitEnded.STOP_AFTER
