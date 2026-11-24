@@ -256,7 +256,8 @@ What Orqestra does not do yet, and the limits of what it does, are listed in
   repository is a proposal, not an accepted decision.
 - Material choices are recorded as WHAT / WHY / RUNNER-UP entries in
   [`docs/decisions.md`](docs/decisions.md); cross-cutting ones become ADRs in
-  [`docs/adr/`](docs/adr/). Entries stay **Proposed** until the owner accepts them.
+  [`docs/adr/`](docs/adr/). Entries stay **Proposed** until the maintainer accepts them.
+  References such as DEC-054 are entries in the [decision log](docs/decisions.md).
 - Short-lived branches, Conventional Commits, one scoped issue per feature, and the
   pull request template's verification section filled with commands actually run.
 - Contributor guidance, scope and engineering standards: [`docs/development.md`](docs/development.md).

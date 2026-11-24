@@ -16,7 +16,7 @@
   `not_captured`, never "zero", and an unrecorded call is not known to the ledger. A
   worker passes a closure and a tier map only for the kinds of its `UsageSink` (DEC-059).
 - The OpenRouter adapter is wired only into the benchmark worker, behind an opt-in, and
-  never into `orqestra worker run` (DEC-071); no live run has been made. Its own limits are
+  never into `orqestra worker run` (DEC-071). Its own limits are
   listed in [OpenRouter adapter](usage.md#openrouter-adapter-benchmark-opt-in-only).
 - Invoice verification has no live provider and no packaged worker: `orqestra worker run`
   builds its worker without a `UsageSink`. Only unpackaged workers wire the ledger: the
@@ -108,7 +108,7 @@
     ends, by a live worker. Handlers are not told about shutdown.
 - Partitioning (DEC-052) has no production batch size and no size limits: a whole job,
   however many batches, is still one submission transaction, and replaying it compares
-  every task. The large-scale benchmark (BS-05) has run
+  every task. The large-scale benchmark has run
   ([docs/performance.md](performance.md)); no bound is decided from it yet.
 - There are no default or maximum lease values: callers choose them. Operational bounds
   and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing

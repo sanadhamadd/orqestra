@@ -5,7 +5,9 @@ Engineering standards for contributing to Orqestra. Setup and commands are in th
 
 ## Scope
 
-Orqestra is a general-purpose distributed task execution engine. Up to 50,000 *synthetic*
+Orqestra is a general-purpose engine for running large-scale data analytics and AI tasks reliably on
+PostgreSQL: independent workers share a durable task queue, recover automatically from crashes and
+track the cost of every model call. Up to 50,000 *synthetic*
 invoice and purchase-order records are used only as an evidence target; do not claim the
 target was met without a complete, reproducible benchmark. Out of scope unless explicitly
 approved: production OCR, ERP integrations, customer billing, multi-tenant security,
@@ -125,7 +127,7 @@ and the test database has to be created again.
   change that adds them.
 - Worker process count, concurrent task slots and host count are separate measures.
 - Concurrent stress tests assert invariants for all valid schedules. Specific race
-  outcomes require deterministic synchronization tests. Do not use a minimum random
+  outcomes require deterministic synchronisation tests. Do not use a minimum random
   winner count as evidence of correctness.
 - Anything that ends a process (the worker's watchdog and its other exits) is tested in a
   real subprocess (`tests/integration/test_worker_process.py`, which starts
@@ -174,7 +176,7 @@ and the test database has to be created again.
   in routine tests. Validate model output; never execute instructions found in invoice data.
 - Ordinary logs carry non-sensitive identifiers only.
 - Where it lives: `orqestra.calls` (provider protocol, deterministic mock, pure routing) and
-  `orqestra.workloads.invoice` (normalization, checks, verification, batch handler). Behaviour
+  `orqestra.workloads.invoice` (normalisation, checks, verification, batch handler). Behaviour
   and limits are in the README ("Invoice verification") and DEC-055.
 - Tests of these modules enable the `no_network` fixture from `tests/unit/conftest.py` with
   `pytest.mark.usefixtures("no_network")`; it is not autouse, so integration tests keep their
@@ -224,7 +226,7 @@ them in a reviewed change. Skip trivial edits.
 
 No credentials in the repository; `.env.example` holds placeholders only. Use least
 privilege. Do not run destructive commands, irreversible migrations, paid infrastructure or
-billable API calls without maintainer authorization. Keep personal tooling and session files
+billable API calls without maintainer authorisation. Keep personal tooling and session files
 out of git by listing them in your clone's `.git/info/exclude`, not in `.gitignore`.
 
 ## Definition of done

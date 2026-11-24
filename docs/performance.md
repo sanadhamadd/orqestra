@@ -25,7 +25,7 @@ each result file too.
 
 Each ladder interleaves its repetitions by worker count. Every figure in the tables is the
 median of three repetitions, with the minimum and maximum. The warm-up and the 50,000-invoice
-rung ran once each, the second by the owner's ruling (OD-2). The campaign's results were measured
+rung ran once each, the second by the maintainer's decision. The campaign's results were measured
 on commit `c410ac6` from a clean tree. Every cell and drill ended `complete`; none was re-run.
 
 **The claim index (DEC-069), measured later.** On 2026-11-09, in one session on a fresh
@@ -399,7 +399,7 @@ Files: `*-invoice-10000-b{10,100,1000}-w4-r{1,2,3}.json`.
 **`echo` is database-bound.**
 - Measured: database container CPU p50 rises from 42.2 % at one worker to 81.2 %, 142.4 % and
   287.8 % at two, four and eight (docker stats, 100 % is one core; 11 to 44 samples per cell).
-- Measured: the mean worker CPU utilization falls from 0.32 of a core at one worker to 0.15 at
+- Measured: the mean worker CPU utilisation falls from 0.32 of a core at one worker to 0.15 at
   eight.
 - Measured: sampled `Lock` and `LWLock` waits stay small, with a mean of at most 0.333 sessions
   per sample (at eight workers) and none at one.
@@ -412,7 +412,7 @@ Files: `*-invoice-10000-b{10,100,1000}-w4-r{1,2,3}.json`.
 - Files: `*-wait-400-b0-w{1,8}-r{1,2,3}.json`.
 
 **`invoice` at batch 100 is low on the worker side, and its database CPU is barely sampled.**
-- Measured: the mean worker utilization is 0.47 to 0.74 of a core at 10,000 invoices, and no
+- Measured: the mean worker utilisation is 0.47 to 0.74 of a core at 10,000 invoices, and no
   `Lock` or `LWLock` wait was sampled.
 - Measured: these jobs last about 1 to 3 s, so docker stats took only one or two samples per cell
   (`resources.database.samples`). The database CPU p50 values, 5.3 % to 76.7 %, rest on those

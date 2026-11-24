@@ -163,7 +163,7 @@ result = submit_job(conn, JobSubmission("invoice_verification", tasks, idempoten
   `TypeError`. `max_attempts` is passed through; the database enforces 1–100.
 - **Not decided yet.** There is no production batch size, and no limit on the number of
   items, the batch size or a payload's size. The `batch` ladder has measured batch sizes
-  ([docs/performance.md](performance.md)), and no value is decided from it yet (BS-05). A job's
+  ([docs/performance.md](performance.md)), and no value is decided from it yet. A job's
   batches are claimed in no particular order (DEC-033).
 
 ## Running attempts
@@ -501,7 +501,7 @@ any thread.
     and job reads; an evidence read and its rewrite) looks for a stop after each one, so
     the lag is at most the one database call in flight. From the latch on it sends
     no claim, starts no handler and starts no sweep. The latch, not the request, is the
-    linearization point: a handler that started after a request was made but before
+    linearisation point: a handler that started after a request was made but before
     the latch was already running, and it is drained like any other.
   - **Draining.** A task held at the latch keeps its heartbeats, completion and
     reconciliation. Once it is settled (recorded, reconciled, or discarded because
@@ -595,7 +595,7 @@ the exit codes above.
      generically);
   4. the database is reachable, and its schema is current. The check is read-only (one
      `READ ONLY` transaction of `SELECT`s, no migration lock) and requires the database's
-     migration history to equal the packaged migrations exactly: an uninitialized, older,
+     migration history to equal the packaged migrations exactly: an uninitialised, older,
      newer, renamed or edited history is refused. Database errors are reported by type
      and SQLSTATE only.
 
@@ -978,7 +978,7 @@ replays are bounded by the attempt's deadline and by the fence, not by these lim
 Diagnostics carry the worker, task and attempt ids, `call_seq`, the exception type and
 the SQLSTATE only: never an amount, a unit, a prompt or provider text.
 
-- **Overhead.** Each call waits for two serialized supervisor round trips, plus at most
+- **Overhead.** Each call waits for two serialised supervisor round trips, plus at most
   one step in progress or a heartbeat. When PostgreSQL is slow, calls are delayed, never
   made unrecorded. Sweeps may be postponed while records wait.
 - **Limits.** `usage_handoff_bound(settings)` is the longest one record may wait.
@@ -996,7 +996,7 @@ one non-streaming request to OpenRouter's chat completions endpoint (DEC-060, Ac
 **Only the benchmark worker uses it, behind an opt-in** (DEC-071; see
 [Running the benchmarks](#running-the-benchmarks)). No `src` module, packaged worker,
 handler or command imports `orqestra.providers`, no test makes a live call or constructs
-`HttpsTransport`, and every live call needs the owner's separate authorization.
+`HttpsTransport`, and every live call needs the maintainer's separate authorisation.
 
 ```python
 from pydantic import SecretStr
@@ -1233,8 +1233,8 @@ and not in its wheel, so it runs only from a clone, as `uv run python -m benchma
     timeout, then the calls actually made;
   - `--allow-live-calls`: real, billable calls. It reads `ORQESTRA_OPENROUTER_API_KEY` from
     the process environment (not `.env`) and passes it to the workers in their
-    environment only, never in an argument, a log or the result. It needs the owner's
-    separate approval and a dollar limit set on the key. No live run has been made.
+    environment only, never in an argument, a log or the result. It needs the maintainer's
+    separate approval and a dollar limit set on the key.
 
   N is a hard limit for the whole cell: every worker reserves a call from a counter file in
   the cell's raw directory before recording its intent, and once N are reserved the next
