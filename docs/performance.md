@@ -4,7 +4,7 @@ This page reports what the benchmark harness (`benchmarks/`) measured on one mac
 the measurements show. The tables are generated from the committed result files under
 `benchmarks/results/`. The analysis cites the files and the metrics behind each statement.
 Values computed from measurements are labelled as derived, with their formula. How to run the
-harness is in the README, [Running the benchmarks](../README.md#running-the-benchmarks).
+harness is in [Running the benchmarks](usage.md#running-the-benchmarks).
 
 ## What was measured and how
 

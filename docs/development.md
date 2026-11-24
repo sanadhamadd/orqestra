@@ -10,7 +10,7 @@ invoice and purchase-order records are used only as an evidence target; do not c
 target was met without a complete, reproducible benchmark. Out of scope unless explicitly
 approved: production OCR, ERP integrations, customer billing, multi-tenant security,
 autonomous agent swarms, a polished dashboard. The benchmark harness and how to run it are in
-the README, [Running the benchmarks](../README.md#running-the-benchmarks).
+[Running the benchmarks](usage.md#running-the-benchmarks).
 
 ## Workflow
 
