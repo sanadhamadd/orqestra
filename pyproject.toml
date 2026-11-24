@@ -21,11 +21,29 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orqestra"]
+exclude = ["**/.env*", "**/*.log"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "README.md", "pyproject.toml"]
+exclude = ["**/.env*", "**/*.log"]
+
+[tool.uv]
+# The build backend and its dependencies, exact. uv sync and uv lock apply this; uv build does
+# not, so make package-check passes the same list with --build-constraint.
+build-constraint-dependencies = [
+    "editables==0.6",
+    "hatchling==1.33.0",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.7.0",
+    "tomlkit==0.15.2",
+    "trove-classifiers==2026.9.21.13",
+]
 
 [tool.ruff]
 line-length = 100
@@ -53,7 +71,7 @@ ignore = ["ANN401"]  # explicit Any is sometimes the honest type at boundaries
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests", "benchmarks"]
+files = ["src", "tests", "benchmarks", "scripts"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 
