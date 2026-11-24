@@ -49,12 +49,18 @@ exits 1 if it differs from what the result files render.
 
 **The README.** ``--readme README.md`` makes the README the document instead:
 between its own pair of markers it holds a short Performance block rendered
-from the same loaded records (``render_readme``): the ``scale`` and ``large``
-ladders with four of the columns above, then the measured limits (the largest
-complete rung, every 50,000-invoice record and the claim cost by depth). Every
-figure in it is a cell string of ``docs/performance.md`` too; the README is
-never read for figures. Each document is written or checked by its own call,
-so the README can be rendered while ``docs/performance.md`` does not exist.
+from the same loaded records (``render_readme``): the headline throughput, the
+cells at the largest size of the ``scale`` and ``large`` ladders with two of the
+columns above, and a link to ``docs/performance.md``, which keeps every ladder,
+the latency, the claim cost by depth and the measured limits. Every figure in it
+is a cell string of ``docs/performance.md`` too; the README is never read for
+figures.
+
+**Costs.** A USD amount is shown to ``USD_DECIMALS`` decimals, rounded half up
+(``usd``); a positive amount below the last shown decimal is shown as ``< 0.0001``,
+never as free. The records keep their exact decimal text. Each document is
+written or checked by its own call, so the README can be rendered while
+``docs/performance.md`` does not exist.
 """
 
 import argparse
@@ -64,6 +70,7 @@ import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -86,8 +93,12 @@ README = ROOT / "README.md"
 README_BEGIN = "<!-- BEGIN GENERATED: python -m benchmarks.report --readme -->"
 README_END = "<!-- END GENERATED README -->"  # neither marker pair contains the other
 README_LADDERS = ("scale", "large")
-README_COLUMNS = (0, 1, 5, 6)  # of COLUMNS: makespan, items/s (makespan), service p50, e2e p95
-LARGE_SIZE = 50_000
+README_COLUMNS = (0, 1)  # of COLUMNS: makespan, items/s (makespan)
+README_LINK = (
+    "Every ladder, the latency, the claim cost against queue depth and the measured limits: "
+    "[docs/performance.md](docs/performance.md)."
+)
+USD_DECIMALS = 4
 
 
 class ReportError(ValueError):
@@ -596,18 +607,26 @@ def _extraction_cells(name: str, record: Mapping[str, Any]) -> list[str]:
         DASH if share is None else f"{100 * share:.1f} %",
         fixed(overall, 3),
         str(block["needs_review"]["count"]),
-        f"{_plain(cost['per_1000_invoices'])} {cost['currency']}"
+        f"{usd(cost['per_1000_invoices'])} {cost['currency']}"
         + (" (canned prices)" if cost["prices"]["canned"] else ""),
         str(block["retries"]),
         str(block["transient_errors"]["rate_limited"]),
     ]
 
 
-def _plain(text: str) -> str:
-    """Checked decimal text in plain notation: ``3E-7`` is shown as ``0.0000003``."""
+def usd(text: str) -> str:
+    """Checked decimal text as a USD amount: ``USD_DECIMALS`` decimals, rounded half up.
+
+    ``0.3251070713101160862354892206`` is shown as ``0.3251``; a positive amount that
+    would round to zero as ``< 0.0001``, so a tiny cost never reads as free.
+    """
     number = metrics.decimal_text(text)
     assert number is not None  # checked by metrics.check_extraction
-    return text if "E" not in text.upper() else format(number, "f")
+    step = Decimal(1).scaleb(-USD_DECIMALS)
+    shown = number.quantize(step, rounding=ROUND_HALF_UP)
+    if number > 0 and shown == 0:
+        return f"< {step}"
+    return f"{shown:f}"
 
 
 def _calls_made(record: Mapping[str, Any]) -> str:
@@ -765,15 +784,18 @@ def render(root: Path = RESULTS_DIR) -> str:
 
 
 def readme_table(loaded: Sequence[Loaded]) -> list[str]:
-    """The ``scale`` and ``large`` ladders, one table per commit, machine and server."""
-    groups = _groups(loaded)
-    lines: list[str] = []
-    for key in sorted(groups, key=lambda k: (_ladder_order(k[0]), k[1:])):
-        ladder, *environment = key
+    """The headline cells: each README ladder's largest size, one table per environment."""
+    by_environment: dict[tuple[str, str, str, str], list[Loaded]] = defaultdict(list)
+    for (ladder, sha, machine, server, vm), items in _groups(loaded).items():
         if ladder not in README_LADDERS:
             continue
-        cells = _by_cell(groups[key])
-        columns = [COLUMNS[index] for index in README_COLUMNS]
+        largest = max(int(item.record["cell"]["size"]) for item in items)
+        at_largest = [i for i in items if int(i.record["cell"]["size"]) == largest]
+        by_environment[(sha, machine, server, vm)] += at_largest
+    columns = [COLUMNS[index] for index in README_COLUMNS]
+    lines: list[str] = []
+    for environment in sorted(by_environment):
+        cells = _by_cell(by_environment[environment])
         rows = [
             [
                 cell_label(cell),
@@ -785,87 +807,8 @@ def readme_table(loaded: Sequence[Loaded]) -> list[str]:
             ]
             for cell in sorted(cells)
         ]
-        lines += [f"Ladder `{ladder}`. {_environment_line(*environment)}", ""]
+        lines += [_environment_line(*environment), ""]
         lines += _table(["Cell", "n", *(column[0] for column in columns)], rows)
-        lines.append("")
-    return lines
-
-
-def measured_limits(cells: Sequence[Loaded], claim_results: Sequence[Loaded]) -> list[str]:
-    """The ``Measured limits`` bullets: every one generated from the records."""
-    complete = [
-        i
-        for i in cells
-        if clean(i.record)
-        and i.record["ladder"] != WARM_UP
-        and i.record["cell"]["profile"] == "invoice"
-    ]
-    lines = ["### Measured limits", ""]
-    if complete:
-        largest = max(int(i.record["cell"]["size"]) for i in complete)
-        at_largest = sorted(
-            {
-                (str(i.record["ladder"]), cell_label(cell_key(i.record)))
-                for i in complete
-                if int(i.record["cell"]["size"]) == largest
-            }
-        )
-        shas = sorted({str(i.record["environment"]["git_sha"])[:12] for i in complete})
-        where = ", ".join(f"{label} (`{ladder}`)" for ladder, label in at_largest)
-        commits = ", ".join(f"`{sha}`" for sha in shas)
-        lines.append(
-            f"- **Largest rung completed:** {largest:,} invoices: {where}; commit {commits}."
-        )
-    else:
-        lines.append("- **Largest rung completed:** _None recorded._")
-    large = sorted(
-        (i for i in cells if int(i.record["cell"]["size"]) == LARGE_SIZE), key=lambda i: i.name
-    )
-    if large:
-        lines.append(f"- **{LARGE_SIZE:,} invoices:** {len(large)} record(s):")
-        for item in large:
-            why = "counts in the tables" if clean(item.record) else reason(item.record)
-            lines.append(f"  - `{item.name}`: {item.record['status']}; {why}.")
-    else:
-        lines.append(
-            f"- **{LARGE_SIZE:,} invoices:** no result is recorded. The `large` rung runs only "
-            "when its gate passes (`benchmarks/ladder.py`)."
-        )
-    lines.append("")
-    clean_claims = [i for i in claim_results if i.record["environment"]["git_dirty"] is False]
-    if not clean_claims:
-        lines += ["Claim cost by depth: _None recorded._", ""]
-    for item in clean_claims:
-        by_depth: dict[int, dict[str, Mapping[str, Any]]] = defaultdict(dict)
-        for m in item.record["measurements"]:
-            by_depth[int(m["depth"])][str(m["variant"])] = m
-        rows = []
-        for depth in sorted(by_depth):
-            variants = by_depth[depth]
-            rows.append(
-                [
-                    depth,
-                    *(
-                        fixed(_number(variants[name], "latency_ms", "p50"), 3)
-                        if name in variants
-                        else DASH
-                        for name in ("ready", "waiting", "unsupported")
-                    ),
-                    " > ".join(str(node) for node in variants["ready"]["explain"]["plan_nodes"])
-                    if "ready" in variants
-                    else DASH,
-                ]
-            )
-        environment = claims_environment(item.record)
-        lines += [f"Claim cost by depth, `{item.name}`. {_environment_line(*environment)}", ""]
-        header = [
-            "Depth",
-            "ready p50 ms",
-            "waiting p50 ms",
-            "unsupported p50 ms",
-            "Plan (ready)",
-        ]
-        lines += _table(header, rows)
         lines.append("")
     return lines
 
@@ -873,17 +816,14 @@ def measured_limits(cells: Sequence[Loaded], claim_results: Sequence[Loaded]) ->
 def render_readme(root: Path = RESULTS_DIR) -> str:
     """The README's generated Performance block for the result files under ``root``."""
     cells = [i for i in _load(root, None, _validate_cell) if double_record(i.record)]
-    claim_results = _load(root, CLAIMS_DIR, claims.validate_result)
     tables = [i for i in cells if clean(i.record)]
     lines = [
         "Generated by `python -m benchmarks.report --write --readme README.md` from the result "
-        "files under `benchmarks/results/`. Do not edit by hand.",
-        "",
+        "files under `benchmarks/results/`. Do not edit by hand. Headline throughput on the "
+        "offline provider double, at the largest size of the `scale` and `large` ladders.",
     ]
-    lines += readme_table(tables) or [NO_RESULTS, ""]
-    lines += measured_limits(cells, claim_results)
-    while lines and lines[-1] == "":
-        lines.pop()
+    lines += readme_table(tables) or ["", NO_RESULTS, ""]
+    lines.append(README_LINK)
     return "\n".join(lines) + "\n"
 
 

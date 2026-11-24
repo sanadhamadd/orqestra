@@ -307,30 +307,30 @@ Each row is one result file, shown as written: nothing is pooled across files or
 
 | File | Mode | Cell | Status | Calls | Call latency p50 / p95 / p99 (ms) | Provider share of handler time | Field accuracy | Needs review | Cost per 1,000 invoices | Retries | 429s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `campaigns/20261117T014319Z-63ade1a/20261117T014434Z-63ade1a-extract-100-b25-w4-r1.json` | live | extract 100 b25 w4 | complete | 100 | 2327 / 2932 / 3136 | 90.1 % | 1.000 | 2 | 0.3283070 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T030547Z-63ade1a-extract-2000-b25-w4-r1.json` | live | extract 2000 b25 w4 | complete | 2000 | 2272 / 3053 / 3416 | 90.8 % | 1.000 | 40 | 0.3231395 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T031637Z-63ade1a-extract-2000-b25-w8-r1.json` | live | extract 2000 b25 w8 | complete | 2000 | 2285 / 3146 / 3939 | 91.0 % | 1.000 | 40 | 0.32339925 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T032206Z-63ade1a-extract-2000-b25-w16-r1.json` | live | extract 2000 b25 w16 | complete | 2000 | 2274 / 3084 / 3592 | 91.2 % | 1.000 | 40 | 0.3235385 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T032409Z-63ade1a-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | failed_correctness | 1286 | 2267 / 3086 / 3644 | 88.1 % | 0.326 | 12 | 0.17568675 USD | 142 | 196 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T043125Z-63ade1a-extract-2000-b25-w4-r2.json` | live | extract 2000 b25 w4 | complete | 2000 | 2295 / 3061 / 3447 | 90.8 % | 1.000 | 40 | 0.3236485 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T044215Z-63ade1a-extract-2000-b25-w8-r2.json` | live | extract 2000 b25 w8 | complete | 2000 | 2280 / 3187 / 3967 | 91.3 % | 1.000 | 40 | 0.32345575 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T044752Z-63ade1a-extract-2000-b25-w16-r2.json` | live | extract 2000 b25 w16 | complete | 2000 | 2286 / 3068 / 3438 | 90.8 % | 0.999 | 41 | 0.3227555 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T045005Z-63ade1a-extract-2000-b25-w32-r2.json` | live | extract 2000 b25 w32 | failed_correctness | 1363 | 2261 / 3077 / 3477 | 88.6 % | 0.339 | 16 | 0.1889148 USD | 139 | 192 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T061222Z-63ade1a-extract-2000-b25-w4-r3.json` | live | extract 2000 b25 w4 | complete | 2000 | 2335 / 3169 / 3813 | 90.6 % | 1.000 | 40 | 0.3244125 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T062312Z-63ade1a-extract-2000-b25-w8-r3.json` | live | extract 2000 b25 w8 | complete | 2000 | 2304 / 3103 / 3452 | 90.6 % | 0.999 | 41 | 0.3236835 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T062848Z-63ade1a-extract-2000-b25-w16-r3.json` | live | extract 2000 b25 w16 | complete | 2000 | 2303 / 3093 / 3427 | 90.7 % | 0.999 | 41 | 0.32401325 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T063118Z-63ade1a-extract-2000-b25-w32-r3.json` | live | extract 2000 b25 w32 | failed_correctness | 1419 | 2302 / 3113 / 3482 | 88.0 % | 0.323 | 17 | 0.19918375 USD | 136 | 190 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T063642Z-63ade1a-extract-1000-b5-w8-r1.json` | live | extract 1000 b5 w8 | complete | 1000 | 2290 / 3096 / 3441 | 91.1 % | 1.000 | 20 | 0.3210369 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T064208Z-63ade1a-extract-1000-b25-w8-r1.json` | live | extract 1000 b25 w8 | complete | 1000 | 2290 / 3036 / 3368 | 90.9 % | 1.000 | 20 | 0.3189014 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T065038Z-63ade1a-extract-1000-b100-w8-r1.json` | live | extract 1000 b100 w8 | complete | 1000 | 2317 / 3093 / 3489 | 91.1 % | 1.000 | 20 | 0.3221194 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T014434Z-63ade1a-extract-100-b25-w4-r1.json` | live | extract 100 b25 w4 | complete | 100 | 2327 / 2932 / 3136 | 90.1 % | 1.000 | 2 | 0.3283 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T030547Z-63ade1a-extract-2000-b25-w4-r1.json` | live | extract 2000 b25 w4 | complete | 2000 | 2272 / 3053 / 3416 | 90.8 % | 1.000 | 40 | 0.3231 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T031637Z-63ade1a-extract-2000-b25-w8-r1.json` | live | extract 2000 b25 w8 | complete | 2000 | 2285 / 3146 / 3939 | 91.0 % | 1.000 | 40 | 0.3234 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T032206Z-63ade1a-extract-2000-b25-w16-r1.json` | live | extract 2000 b25 w16 | complete | 2000 | 2274 / 3084 / 3592 | 91.2 % | 1.000 | 40 | 0.3235 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T032409Z-63ade1a-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | failed_correctness | 1286 | 2267 / 3086 / 3644 | 88.1 % | 0.326 | 12 | 0.1757 USD | 142 | 196 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T043125Z-63ade1a-extract-2000-b25-w4-r2.json` | live | extract 2000 b25 w4 | complete | 2000 | 2295 / 3061 / 3447 | 90.8 % | 1.000 | 40 | 0.3236 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T044215Z-63ade1a-extract-2000-b25-w8-r2.json` | live | extract 2000 b25 w8 | complete | 2000 | 2280 / 3187 / 3967 | 91.3 % | 1.000 | 40 | 0.3235 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T044752Z-63ade1a-extract-2000-b25-w16-r2.json` | live | extract 2000 b25 w16 | complete | 2000 | 2286 / 3068 / 3438 | 90.8 % | 0.999 | 41 | 0.3228 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T045005Z-63ade1a-extract-2000-b25-w32-r2.json` | live | extract 2000 b25 w32 | failed_correctness | 1363 | 2261 / 3077 / 3477 | 88.6 % | 0.339 | 16 | 0.1889 USD | 139 | 192 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T061222Z-63ade1a-extract-2000-b25-w4-r3.json` | live | extract 2000 b25 w4 | complete | 2000 | 2335 / 3169 / 3813 | 90.6 % | 1.000 | 40 | 0.3244 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T062312Z-63ade1a-extract-2000-b25-w8-r3.json` | live | extract 2000 b25 w8 | complete | 2000 | 2304 / 3103 / 3452 | 90.6 % | 0.999 | 41 | 0.3237 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T062848Z-63ade1a-extract-2000-b25-w16-r3.json` | live | extract 2000 b25 w16 | complete | 2000 | 2303 / 3093 / 3427 | 90.7 % | 0.999 | 41 | 0.3240 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T063118Z-63ade1a-extract-2000-b25-w32-r3.json` | live | extract 2000 b25 w32 | failed_correctness | 1419 | 2302 / 3113 / 3482 | 88.0 % | 0.323 | 17 | 0.1992 USD | 136 | 190 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T063642Z-63ade1a-extract-1000-b5-w8-r1.json` | live | extract 1000 b5 w8 | complete | 1000 | 2290 / 3096 / 3441 | 91.1 % | 1.000 | 20 | 0.3210 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T064208Z-63ade1a-extract-1000-b25-w8-r1.json` | live | extract 1000 b25 w8 | complete | 1000 | 2290 / 3036 / 3368 | 90.9 % | 1.000 | 20 | 0.3189 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065038Z-63ade1a-extract-1000-b100-w8-r1.json` | live | extract 1000 b100 w8 | complete | 1000 | 2317 / 3093 / 3489 | 91.1 % | 1.000 | 20 | 0.3221 USD | 0 | 0 |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065058Z-63ade1a-invoice-2000-b25-w8-r1.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065118Z-63ade1a-invoice-2000-b25-w8-r2.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065138Z-63ade1a-invoice-2000-b25-w8-r3.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065249Z-63ade1a-invoice-10000-b100-w8-r1.json` | live | invoice 10000 b100 w8 | complete | 500 | — | — | — | — | — | — | — |
-| `campaigns/20261117T014319Z-63ade1a/20261117T065742Z-63ade1a-extract-2000-b5-w32-r1.json` | live | extract 2000 b5 w32 | failed_correctness | 2360 | 2269 / 3098 / 3511 | 86.2 % | 0.503 | 21 | 0.2941235 USD | 416 | 530 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T114003Z-63ade1a-extract-30150-b25-w16-r1.json` | live | extract 30150 b25 w16 | failed_correctness | 30201 | 2399 / 3220 / 3662 | 90.5 % | 1.000 | 607 | 0.3251070713101160862354892206 USD | 5 | 0 |
-| `campaigns/recheck-98f6b7c/20261117T155510Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2276 | 2427 / 3305 / 3797 | 48.5 % | 1.000 | 40 | 0.37447975 USD | 48 | 6 |
-| `campaigns/recheck-98f6b7c/20261117T155949Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2342 | 2373 / 3185 / 3569 | 67.0 % | 1.000 | 40 | 0.3573173 USD | 10 | 204 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065742Z-63ade1a-extract-2000-b5-w32-r1.json` | live | extract 2000 b5 w32 | failed_correctness | 2360 | 2269 / 3098 / 3511 | 86.2 % | 0.503 | 21 | 0.2941 USD | 416 | 530 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T114003Z-63ade1a-extract-30150-b25-w16-r1.json` | live | extract 30150 b25 w16 | failed_correctness | 30201 | 2399 / 3220 / 3662 | 90.5 % | 1.000 | 607 | 0.3251 USD | 5 | 0 |
+| `campaigns/recheck-98f6b7c/20261117T155510Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2276 | 2427 / 3305 / 3797 | 48.5 % | 1.000 | 40 | 0.3745 USD | 48 | 6 |
+| `campaigns/recheck-98f6b7c/20261117T155949Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2342 | 2373 / 3185 / 3569 | 67.0 % | 1.000 | 40 | 0.3573 USD | 10 | 204 |
 
 | File | Mode | Drill | Cell | Status | Gate | Kill to next attempt p50 (s) | Lost tasks | Duplicate calls | Calls repeated after recovery | Calls |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
