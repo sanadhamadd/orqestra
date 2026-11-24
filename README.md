@@ -195,6 +195,9 @@ uv run orqestra migrate
 uv run orqestra migrate             # again: {"status": "ok", "applied": []}
 ```
 
+This connects as a superuser and is for local use only; for anything else, use the roles in
+[docs/database-roles.md](docs/database-roles.md).
+
 Without a PostgreSQL server on the host, use the Docker Compose server instead
 ([guide](docs/development.md#local-postgresql-with-docker-compose)): `docker compose up -d --wait`,
 then `export ORQESTRA_DATABASE_URL=postgresql://orqestra_local@127.0.0.1:5433/orqestra_local` and run

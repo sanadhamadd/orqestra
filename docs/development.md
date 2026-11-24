@@ -46,7 +46,8 @@ prefix. Never point `ORQESTRA_TEST_DATABASE_URL` at a shared or production datab
 `compose.yaml` runs one PostgreSQL server for local development and the integration
 tests, from the same `postgres:16.15` image digest that CI uses. It is not for production:
 like CI's service container, it accepts the local-only user `orqestra_local` without a
-password, and it has no backups, tuning or restart policy. The port is bound to
+password, and it has no backups, tuning or restart policy. Its user is a superuser; for a real
+database, use the least-privilege roles in [database-roles.md](database-roles.md). The port is bound to
 `127.0.0.1` only, on 5433 so that a server already using 5432 is not in the way, and the
 data lives in the named volume `orqestra_postgres-data`. `compose.yaml` names the Compose project `orqestra` and binds host port 5433, so a second
 checkout's `docker compose` commands reach the same project and its volume: `down -v` there
