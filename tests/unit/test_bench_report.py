@@ -518,16 +518,40 @@ def test_every_readme_cell_string_is_in_the_performance_document(tmp_path: Path)
     assert "`overhead`" not in readme
 
 
-def test_measured_limits_without_results(tmp_path: Path) -> None:
+def test_the_readme_block_without_results_links_the_document(tmp_path: Path) -> None:
     text = report.render_readme(tmp_path / "missing")
     assert report.NO_RESULTS in text
-    assert "### Measured limits" in text
-    assert "**Largest rung completed:** _None recorded._" in text
-    assert "**50,000 invoices:** no result is recorded" in text
-    assert "Claim cost by depth: _None recorded._" in text
+    assert text.rstrip("\n").endswith(report.README_LINK)
+    assert "Measured limits" not in text
 
 
-def test_measured_limits_name_the_largest_rung_and_every_large_record(tmp_path: Path) -> None:
+def test_the_readme_block_is_short_and_shows_each_ladders_largest_size(tmp_path: Path) -> None:
+    _scale(tmp_path)  # 1,000 invoices: not the ladder's largest size once 5,000 exists
+    for workers in (1, 2, 4, 8):
+        write(
+            tmp_path,
+            cell_record(ladder="scale", profile="invoice", size=5000, batch=100, workers=workers),
+        )
+    write(
+        tmp_path,
+        cell_record(ladder="large", profile="invoice", size=50_000, batch=100, workers=8),
+    )
+    write_claims(tmp_path, "claims.json", claims_record())
+    text = report.render_readme(tmp_path)
+    assert rows(text, "invoice 1000 b100 w1") == []
+    assert [row[0] for row in rows(text, "invoice 5000 b100 w8")] == ["invoice 5000 b100 w8"]
+    assert len(rows(text, "invoice 50000 b100 w8")) == 1
+    assert "| Cell | n | Makespan s | Items/s (makespan) |" in text
+    assert text.rstrip("\n").endswith(report.README_LINK)
+    for gone in ("Claim cost", "Measured limits", "Seq Scan", "Service p50"):
+        assert gone not in text
+    assert len(text.splitlines()) <= 12
+
+
+# The measured limits left the README; the performance document keeps them.
+
+
+def test_the_document_keeps_the_largest_rung_and_every_large_record(tmp_path: Path) -> None:
     _scale(tmp_path)
     write(
         tmp_path,
@@ -541,23 +565,27 @@ def test_measured_limits_name_the_largest_rung_and_every_large_record(tmp_path: 
             wait=("stop_after", 7200.0),
         ),
     )
-    text = report.render_readme(tmp_path)
-    assert "**Largest rung completed:** 1,000 invoices:" in text
-    assert "invoice 1000 b100 w1 (`scale`)" in text
-    assert "**50,000 invoices:** 1 record(s):" in text
-    assert "incomplete; incomplete: stopped at the limit after 7200.0 s." in text
-
-
-def test_measured_limits_show_the_claim_plan_by_depth(tmp_path: Path) -> None:
-    write_claims(tmp_path, "claims.json", claims_record())
-    text = report.render_readme(tmp_path)
-    assert rows(text, "100")[0][1:] == [
-        "1.000",
-        "1.000",
-        "—",
-        "LockRows > Sort > Seq Scan on tasks",
+    text = report.render(tmp_path)
+    scale = text.split("### Ladder `scale`", 1)[1]
+    assert rows(scale, "invoice 1000 b100 w1")  # the largest complete rung, in its ladder
+    excluded = text.split("## Not in the tables", 1)[1]
+    (row,) = rows(excluded, "`20261108T000000Z-0123456-invoice-50000-b100-w4-r1.json`")
+    assert row[2:] == [
+        "invoice 50000 b100 w4",
+        "incomplete",
+        "incomplete: stopped at the limit after 7200.0 s",
     ]
-    assert rows(text, "1000")[0][1:] == ["10.000", "—", "—", "LockRows > Sort > Seq Scan on tasks"]
+
+
+def test_the_document_keeps_the_claim_plan_by_depth(tmp_path: Path) -> None:
+    write_claims(tmp_path, "claims.json", claims_record())
+    text = report.render(tmp_path)
+    assert "### Claim cost: `claims/claims.json`" in text
+    ready = rows(text, "ready")
+    assert [row[1] for row in ready] == ["100", "1000"]
+    assert [row[4] for row in ready] == ["1.000", "10.000"]  # latency p50 ms by depth
+    assert {row[8] for row in ready} == {"LockRows > Sort > Seq Scan on tasks"}
+    assert "Claim cost" not in report.render_readme(tmp_path)
 
 
 def _readme(path: Path) -> Path:
@@ -789,12 +817,36 @@ def test_campaign_records_are_read_and_other_campaign_files_skipped(tmp_path: Pa
     assert row[2] == "extract 100 w1"
 
 
-def test_exponent_decimal_text_is_shown_plainly(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        ("0.3251070713101160862354892206", "0.3251"),
+        ("0.32505", "0.3251"),  # half up, not to even
+        ("0.32504999", "0.3250"),
+        ("9.8019782", "9.8020"),
+        ("0", "0.0000"),
+        ("3E-7", "< 0.0001"),  # never shown as free
+        ("0.00005", "0.0001"),
+    ],
+)
+def test_usd_amounts_are_rounded_to_four_decimals(text: str, shown: str) -> None:
+    assert report.usd(text) == shown
+
+
+def test_the_cost_column_is_rounded(tmp_path: Path) -> None:
+    record = real_record()
+    record["extraction"]["cost"]["per_1000_invoices"] = "0.3251070713101160862354892206"
+    write(tmp_path, record)
+    (row,) = real_rows(report.render(tmp_path))
+    assert row[9] == "0.3251 USD"
+
+
+def test_an_exponent_cost_below_the_last_decimal_is_not_shown_as_free(tmp_path: Path) -> None:
     record = real_record()
     record["extraction"]["cost"]["per_1000_invoices"] = "3E-7"
     write(tmp_path, record)
     (row,) = real_rows(report.render(tmp_path))
-    assert row[9] == "0.0000003 USD"
+    assert row[9] == "< 0.0001 USD"
 
 
 def test_a_malformed_extraction_block_stops_the_report(tmp_path: Path) -> None:
