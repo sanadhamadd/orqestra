@@ -1,4 +1,4 @@
-"""The failure drills at fleet size: D1 with four workers, D2 and D4 (plan 2.9 and 2.10).
+"""The failure drills at fleet size: D1 with four workers, D2 and D4.
 
 Marked ``integration`` and ``performance``, so no default lane runs them: they
 are run by hand, and their output recorded. Each runs 1,000 invoices at batch

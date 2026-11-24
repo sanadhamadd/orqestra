@@ -303,7 +303,7 @@ def args(tmp_path: Path, *extra: str) -> list[str]:
         "--max-provider-calls",
         "50",
         "--out-dir",
-        str(tmp_path / "out dir"),  # the owner's workspace path has spaces too
+        str(tmp_path / "out dir"),  # real workspace paths have spaces too
         *extra,
     ]
 
@@ -386,7 +386,7 @@ def test_a_live_run_without_the_key_is_refused(
 def test_a_dry_run_reads_every_document_through_the_extraction_workload(
     command: Path, capsys: pytest.CaptureFixture[str], mode: list[str]
 ) -> None:
-    # The real binding: T1's documents, the adapter's extract call on the canned
+    # The real binding: the extraction documents, the adapter's extract call on the canned
     # transport (which reads each document perfectly), the strict parse and the oracle.
     assert baseline.main(args(command, *mode, "--dry-run")) == 0
     out = capsys.readouterr().out

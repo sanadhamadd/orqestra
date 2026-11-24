@@ -1,7 +1,7 @@
 """Worker runtime settings (DEC-044).
 
 Every timing value is required: there are no defaults, because operational
-values are undecided and need the owner's approval (DEC-034). The one count with
+values are deliberately undecided (DEC-034), so none is invented here. The one count with
 a default, ``idle_stall_limit`` (5, DEC-074), is not a timing value: it bounds
 how many idle calls in a row a worker abandons before it ends itself. Values come
 from the environment with the prefix ``ORQESTRA_WORKER_`` (or a local

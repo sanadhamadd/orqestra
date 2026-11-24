@@ -248,7 +248,7 @@ def test_the_amount_call_is_unchanged_by_an_incomplete_reply() -> None:
     assert defect_of(failure) is ResponseDefect.UNSUPPORTED_CONTENT
 
 
-# --- prompt v2 and the 2,048-token cap (F2) --------------------------------------------------
+# --- prompt v2 and the 2,048-token cap --------------------------------------------------
 
 V1_KEYS = (
     "vendor_name",

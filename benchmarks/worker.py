@@ -16,8 +16,8 @@ cost or reliability.
 
 With ``--provider openrouter`` the route is answered by the OpenRouter adapter
 instead (DEC-071, ``benchmarks.live``): only with ``--dry-run`` (canned responses,
-no network, no cost) or ``--allow-live-calls`` (real, billable calls, which need the
-owner's separate approval), always with ``--model``, ``--max-provider-calls`` and a
+no network, no cost) or ``--allow-live-calls`` (real, billable calls, an explicit
+opt-in that needs a spend-limited key), always with ``--model``, ``--max-provider-calls`` and a
 ``--budget-file`` the harness has already created. Every call then reserves one of
 the cell's calls before its intent is recorded; with none left the attempt fails
 closed (``ProviderCallBudgetExhausted``). A dry run never reads the key; a live run
@@ -136,7 +136,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-live-calls",
         action="store_true",
-        help="openrouter: make real, billable calls (needs the owner's approval)",
+        help="openrouter: real, billable calls (explicit opt-in; use a spend-limited key, DEC-071)",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="openrouter: canned responses, no network, no cost"

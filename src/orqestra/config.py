@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # database requires it. A blank value counts as not set.
     database_url: SecretStr | None = None
     # Concurrent task slots per worker process (not OS threads or hosts). Not read by
-    # anything yet: the worker is single-slot by approved direction (DEC-044).
+    # anything yet: the worker is single-slot by design (DEC-044).
     worker_concurrency: int = Field(default=4, ge=1, le=256)
     # OpenRouter API key. Optional; no packaged command reads it. Only the unpackaged
     # benchmark worker's live mode uses the adapter (orqestra.providers.openrouter), and it

@@ -197,7 +197,7 @@ def test_a_campaign_cells_charge_and_billing_row_match_its_ledger(
     assert SENTINEL not in (out_dir / LOG_NAME).read_text()
 
 
-# --- the whole campaign, as a dry run (T4) -------------------------------------------------
+# --- the whole campaign, as a dry run -------------------------------------------------
 
 # Every step, every tool and both workloads, at sizes that keep the suite short. The
 # approved sizes are pinned by the unit tests; the full-size dry run is one command

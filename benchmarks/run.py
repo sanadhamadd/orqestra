@@ -49,7 +49,7 @@ replacements included, is waited for until it has logged ``worker_started``.
 (``CheckpointWatch``) and records each checkpoint that ended during the cell in
 ``database_stats.checkpoints``, so a slowdown can be set beside them.
 
-**The correctness gate** (plan 2.6) decides whether the cell counts. A cell
+**The correctness gate** decides whether the cell counts. A cell
 that fails any check is ``failed_correctness`` and reports no throughput:
 
 1. ``terminal``: every task is terminal and the job has the expected status;
@@ -72,8 +72,8 @@ job, so their checks refuse a non-invoice profile before reading anything.
 is given, which only this command and the crash drill ``benchmarks.drills d1``
 accept (the other drills refuse it; ``benchmarks.ladder`` has no provider flag). It
 needs ``--model``, ``--max-provider-calls`` and either ``--dry-run`` (canned
-responses, no network, no cost) or ``--allow-live-calls`` (real, billable calls: the
-owner's separate approval, with a dollar limit set on the key, is required first). The cell's call
+responses, no network, no cost) or ``--allow-live-calls`` (real, billable calls: they
+need an explicit opt-in and a key with a dollar limit set on it). The cell's call
 maximum is a counter file in the cell's raw directory, created before any worker
 starts; ``ORQESTRA_OPENROUTER_API_KEY`` is passed to the workers only for a live
 run. With OpenRouter the usage check compares the calls with the oracle, and the
@@ -184,7 +184,7 @@ POLL = 0.2
 STATS_SETTLE = 2.0
 TOKENS = "tokens"
 
-# The measurement timing of plan 2.4: test values recorded in every result, not
+# The measurement timing: test values recorded in every result, not
 # recommendations (DEC-034). They pass WorkerSettings' relationships: 1 s < 2 s;
 # 2 + 1 + 2 = 5 s < 10 s; 500 ms < 1,000 ms.
 BENCH_WORKER_SETTINGS: Mapping[str, str] = {
@@ -624,7 +624,7 @@ def _require_invoice(profile: Profile) -> None:
 def summary_check(
     conn: metrics.Conn, job_id: uuid.UUID, profile: Profile, expected: Expected
 ) -> dict[str, Any]:
-    """Gate item 5: the job's invoice summary against the oracle (plan 2.6)."""
+    """Gate item 5: the job's invoice summary against the oracle."""
     _require_invoice(profile)
     summary = summarize_invoice_job(conn, job_id)
     if summary is None:
@@ -669,7 +669,7 @@ def usage_check(
     clean: bool,
     provider: ProviderChoice = DOUBLE,
 ) -> dict[str, Any]:
-    """Gate item 6: the usage report and call budget against the oracle (plan 2.6).
+    """Gate item 6: the usage report and call budget against the oracle.
 
     The succeeded attempts' calls and tokens are exact in every run. ``clean``
     means no task needed a second attempt, so the job totals must equal them
@@ -772,7 +772,7 @@ def run_gate(
     documents: int | None = None,
     exits_while_running: Sequence[int] = (),
 ) -> list[dict[str, Any]]:
-    """Every gate check of plan 2.6 that applies to ``profile``, in order.
+    """Every gate check that applies to ``profile``, in order.
 
     For ``extract``, ``documents`` is the cell's document count. ``exit_codes`` are the
     workers stopped at the end; ``exits_while_running`` the codes of the ones that
@@ -1449,7 +1449,7 @@ def add_provider_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-live-calls",
         action="store_true",
-        help="openrouter: make real, billable calls (needs the owner's approval, DEC-071)",
+        help="openrouter: real, billable calls (explicit opt-in; use a spend-limited key, DEC-071)",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="openrouter: canned responses, no network, no cost"

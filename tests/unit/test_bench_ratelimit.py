@@ -102,7 +102,7 @@ def test_a_rate_out_of_range_is_refused(rate: object) -> None:
 def test_a_reservation_syncs_the_directory_after_its_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The audit's M11: the counter synced its directory after os.replace and the pace did
+    # The counter once synced its directory after os.replace and the pace did
     # not; both now publish through benchmarks.filelock, which does.
     synced: list[Path] = []
     monkeypatch.setattr(filelock, "sync_directory", synced.append)

@@ -291,7 +291,7 @@ def test_every_call_has_its_intent_and_result_and_the_capture_closes_complete(
     assert capture_of(usage) is AttemptCapture.CLOSED
 
 
-# --- cancellation (O1) ----------------------------------------------------------------------
+# --- cancellation ----------------------------------------------------------------------
 
 
 def test_a_cancellation_while_an_intent_waits_withdraws_it_no_row_and_no_call(
@@ -411,7 +411,7 @@ def test_an_intent_unrecordable_until_the_deadline_ends_as_unrecorded_and_no_cal
     seen: list[list[Expiry]] = []
     with metered_worker(schema_url, metered, SHORT, expiries_seen=seen) as probe:
         eventually(lambda: probe.terminations, "the worker to end", timeout=WAIT + 6)
-    # Exit 8 from the supervisor, never 5 from the handler's later backstop (O2).
+    # Exit 8 from the supervisor, never 5 from the handler's later backstop.
     assert probe.terminations[0] == (ExitCode.UNRECORDED, "usage_intent_unrecorded")
     # The order a real process sees: the ownership fence (lease capped at the deadline,
     # minus the margin) had expired first, which there ends the process as exit 3.

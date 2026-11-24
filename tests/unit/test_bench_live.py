@@ -385,7 +385,7 @@ def test_the_ladder_has_no_provider_flag(capsys: pytest.CaptureFixture[str]) -> 
 def test_only_the_crash_drill_accepts_the_provider(
     drill: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # T2 gives d1 the provider flags (DEC-071's "the drills have no provider flag" is
+    # d1 has the provider flags (DEC-071's "the drills have no provider flag" is
     # narrowed to every drill but d1); the others refuse before any database or schema.
     arguments = [drill, "--provider", "openrouter", "--model", MODEL]
     assert benchmarks.drills.main([*arguments, "--max-provider-calls", "5", "--dry-run"]) == 1
@@ -554,7 +554,7 @@ def test_the_canned_request_carries_the_system_prompt_only_in_memory() -> None:
     assert SYSTEM_PROMPT not in repr(report)
 
 
-# --- a counter no kill can tear (K1) ------------------------------------------------------------
+# --- a counter no kill can tear ------------------------------------------------------------
 
 # Each script runs in its own process, as a worker does. ``DIE_BEFORE`` and ``DIE_AFTER``
 # end the process abruptly (``os._exit``, no cleanup, the lock still held) just before and
@@ -692,7 +692,7 @@ def test_the_dry_run_summary_says_not_measured_for_an_unreadable_counter(
     assert run.dry_run_summary({"provider": {"calls_made": 4}}, tmp_path)[-1].endswith(": 7")
 
 
-# --- A's conditions: the lock's identity, its release, and failing closed (K1) ----------------
+# --- the counter's lock: its identity, its release, and failing closed ----------------
 
 
 def _lock_is_free(path: Path) -> bool:

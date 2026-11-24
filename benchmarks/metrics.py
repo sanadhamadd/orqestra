@@ -574,7 +574,7 @@ def job_commits(
 
 # --- real-provider figures -------------------------------------------------------------------
 
-# The keys of a result's ``extraction`` block (written by the extract workload, T1) that the
+# The keys of a result's ``extraction`` block (written by the extract workload) that the
 # report reads, with their types. The block is shown as written: nothing here recomputes it.
 
 
