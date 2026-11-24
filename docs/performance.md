@@ -721,6 +721,10 @@ statuses' total, `waited_s` and `cost.total`):
 - **The large run:** 30,150 invoices at 16 workers in 5,312.6 s (88.5 min), 30,141 exactly right (99.97%), field
   accuracy 99.98%, 30,143 with the expected status, and no invoice lost. 5 of the 16 workers stopped themselves (exit 4); their batches were run again
   by the others, which cost 51 extra calls. The cell is `failed_correctness` only because of those exits.
+- **The crash drill was not a valid crash test.** The d1 drill at 32 workers
+  (`20261117T065459Z-63ade1a-extract-2000-b25-w32-r1.json`) ran into the provider's throttling: 56 tasks failed after
+  192 rate-limited calls, so the run failed on throttling, not on the kill. The large run above, in which 5 of 16
+  workers stopped and no invoice was lost, served as the crash test instead.
 - **Where the time goes:** the provider's share of handler time was 86–92% in every Orqestra `extract` run. With the
   model asked only about ambiguous amounts (100 calls per 2,000 invoices), the rules-first mix ran 2,000 invoices in
   about 13 s (about 153/s) and 10,000 in 65 s at 8 workers.
