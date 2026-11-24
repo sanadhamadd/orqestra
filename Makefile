@@ -34,15 +34,13 @@ require-test-db:
 test-all:
 	uv run pytest -m "not e2e and not performance" --cov --cov-fail-under=80
 
-# Build the wheel and confirm every migration file is packaged.
+# Build the sdist, then the wheel from it, with the build backend pinned, and check both
+# against the allow-list in scripts/check_package.py (every migration included).
 package-check:
 	rm -rf build/package-check
-	uv build --wheel --out-dir build/package-check
-	@for f in src/orqestra/persistence/migrations/*.sql; do \
-		uv run python -m zipfile -l build/package-check/*.whl \
-			| grep -q "orqestra/persistence/migrations/$$(basename $$f)" \
-			|| { echo "wheel is missing $$f" >&2; exit 1; }; \
-	done
-	@echo "package-check: wheel contains every migration file"
+	mkdir -p build/package-check
+	uv run python scripts/check_package.py constraints > build/package-check/build-constraints.txt
+	uv build --build-constraint build/package-check/build-constraints.txt --out-dir build/package-check
+	uv run python scripts/check_package.py check build/package-check
 
 verify: require-test-db lint type test-all package-check
