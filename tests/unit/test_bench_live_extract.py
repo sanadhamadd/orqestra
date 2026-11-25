@@ -351,7 +351,7 @@ def test_an_unknown_document_gets_nulls_and_needs_review() -> None:
 
 
 def test_the_canned_amount_replies_are_unchanged() -> None:
-    from tests.unit.test_openrouter_adapter import request
+    from tests.unit.test_openrouter_amount import request
 
     provider, _ = dry_provider({})
     assert provider.call(request(raw="1,234")).response.value == "1234"
