@@ -36,7 +36,7 @@ Orqestra is a general-purpose engine for running large-scale data analytics and 
 
 ## Real-model benchmark
 
-Its first demonstration uses synthetic invoice processing. In a 10-hour stress test against a real AI model (Claude Haiku 5.5, through OpenRouter), Orqestra made **76,001 live model calls** and processed about 76,000 invoices with **99.9–100% accuracy**, **no lost work** in any completed run, and cost tracking that matched the provider's bill to within **0.07%**. Without the model, it processed 50,000 invoices in 4.867 seconds across eight workers.
+Orqestra's first demonstration uses synthetic invoice processing. In a 10-hour stress test against a real AI model (Claude Haiku 5.5, through OpenRouter), Orqestra made **76,001 live model calls** and processed about 76,000 invoices with **99.9–100% accuracy**, **no lost work** in any completed run, and cost tracking that matched the provider's bill to within **0.07%**. Without the model, it processed 50,000 invoices in 4.867 seconds across eight workers.
 
 17 November 2026. One 8-core Apple M3 laptop, PostgreSQL in Docker. Claude Haiku 5.5, called through OpenRouter
 at temperature 0, read each synthetic invoice and returned its fields as JSON. Every answer was checked against the
