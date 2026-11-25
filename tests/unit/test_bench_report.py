@@ -521,6 +521,7 @@ def test_every_readme_cell_string_is_in_the_performance_document(tmp_path: Path)
 def test_the_readme_block_without_results_links_the_document(tmp_path: Path) -> None:
     text = report.render_readme(tmp_path / "missing")
     assert report.NO_RESULTS in text
+    assert "\n\n\n" not in text  # no doubled blank line
     assert text.rstrip("\n").endswith(report.README_LINK)
     assert "Measured limits" not in text
 
@@ -545,7 +546,9 @@ def test_the_readme_block_is_short_and_shows_each_ladders_largest_size(tmp_path:
     assert text.rstrip("\n").endswith(report.README_LINK)
     for gone in ("Claim cost", "Measured limits", "Seq Scan", "Service p50"):
         assert gone not in text
-    assert len(text.splitlines()) <= 12
+    assert len(text.splitlines()) <= 13
+    # The note and the environment line are separate Markdown paragraphs.
+    assert text.splitlines()[1] == ""
 
 
 # The measured limits left the README; the performance document keeps them.
