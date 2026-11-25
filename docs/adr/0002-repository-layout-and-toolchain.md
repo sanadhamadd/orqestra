@@ -1,6 +1,6 @@
 # ADR-0002: Repository layout and Python toolchain
 
-- **Status:** Accepted (owner, 2026-11-08; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-08; was Proposed)
 - **Date:** 2026-10-22
 - **Ledger entries:** DEC-001 … DEC-007, DEC-012, DEC-013
 
