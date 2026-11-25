@@ -168,6 +168,7 @@ from orqestra.persistence.jobs import get_job_progress
 from orqestra.persistence.migrate import migrate
 from orqestra.persistence.snapshots import job_batch_snapshot
 from orqestra.worker.fence import ExitCode
+from orqestra.worker.settings import WorkerSettings
 from orqestra.workloads.invoice.handler import BATCH_PAYLOAD_INVALID
 from tests.integration.pg_proxy import PgProxy
 
@@ -1386,6 +1387,33 @@ def run_drill(
     its batch, its gate adds the extraction checks and its record the ``extraction``
     block.
     """
+    _refuse_drill(cell, drill, workload, command, provider, prices, call_timeout)
+    run_id = run_id or uuid.uuid4().hex[:12]
+    setup = _drill_setup(
+        url, cell, drill, command, worker_settings, raw_dir, provider, call_timeout
+    )
+    run = _run_drill_fleet(url, cell, drill, workload, setup, raw_dir, stop_after, note)
+    try:
+        outcome = _drill_outcome(run.harness.conn, cell, drill, workload, setup, run, prices)
+    finally:
+        run.harness.close()
+    record = _drill_record(
+        run_id, cell, drill, workload, setup, run, outcome, stop_after, call_timeout
+    )
+    validate_result({**record, "environment": {**run.record_environment, "dirty_allowed": True}})
+    return record
+
+
+def _refuse_drill(
+    cell: Cell,
+    drill: Drill,
+    workload: DrillWorkload,
+    command: Sequence[str] | None,
+    provider: ProviderChoice,
+    prices: extract.Prices | None,
+    call_timeout: str,
+) -> None:
+    """Raise ``ValueError`` if ``run_drill`` cannot run ``drill`` on ``cell`` as given."""
     extracting = cell.profile is Profile.EXTRACT
     if cell.profile not in {Profile.INVOICE, Profile.EXTRACT}:
         msg = "drills run the invoice or the extract profile"
@@ -1406,7 +1434,31 @@ def run_drill(
     )
     if refusal is not None:
         raise ValueError(refusal)
-    run_id = run_id or uuid.uuid4().hex[:12]
+
+
+@dataclass(frozen=True, slots=True)
+class _DrillSetup:
+    """What ``run_drill`` builds before any worker starts."""
+
+    provider: ProviderChoice
+    worker_settings: Mapping[str, str]
+    validated: WorkerSettings
+    cap: int
+    fleet: DrillFleet
+
+
+def _drill_setup(
+    url: str,
+    cell: Cell,
+    drill: Drill,
+    command: Sequence[str] | None,
+    worker_settings: Mapping[str, str],
+    raw_dir: Path,
+    provider: ProviderChoice,
+    call_timeout: str,
+) -> _DrillSetup:
+    """The workers' settings, the call counter (OpenRouter only), the cap and the fleet."""
+    extracting = cell.profile is Profile.EXTRACT
     budget_file: Path | None = None
     cap = cell.batch if extracting and cell.batch else DEFAULT_CAP
     if provider.openrouter:
@@ -1431,6 +1483,40 @@ def run_drill(
             )
         ),
     )
+    return _DrillSetup(provider, worker_settings, validated, cap, fleet)
+
+
+@dataclass(frozen=True, slots=True)
+class _DrillRun:
+    """The drill's run: the open harness, the job, how the wait ended and the reaped workers."""
+
+    harness: Harness
+    harness_start: dict[str, Any]
+    record_environment: dict[str, Any]
+    job_id: uuid.UUID
+    submission: dict[str, Any]
+    finished: bool
+    exits: list[dict[str, Any]]
+    load: dict[str, Any] | None
+    reaped: list[dict[str, Any]]
+
+
+def _run_drill_fleet(
+    url: str,
+    cell: Cell,
+    drill: Drill,
+    workload: DrillWorkload,
+    setup: _DrillSetup,
+    raw_dir: Path,
+    stop_after: float,
+    note: str,
+) -> _DrillRun:
+    """Submit the job, start the workers and run the drill until the wait ends.
+
+    On any exception the harness is closed. Each stopping step runs even if an earlier
+    one raised; otherwise the harness stays open for the read-back.
+    """
+    fleet, validated = setup.fleet, setup.validated
     harness = Harness(url)
     sysload = SysloadSampler(
         lambda: [h.process.pid for h in fleet.workers if h.exited is None],
@@ -1438,8 +1524,6 @@ def run_drill(
     )
     operation = validated.db_operation_timeout
     quiet = freeze_window(operation)  # no worker stays stopped past half its bound (DEC-076)
-    seen: set[int] = set()
-    due: list[float] = []
     exits: list[dict[str, Any]] = []
     finished = False
     harness_start = metrics.harness_usage()
@@ -1450,18 +1534,7 @@ def run_drill(
         for _ in range(cell.workers):
             fleet.start()
         sysload.start()
-        began = time.monotonic()
-        while time.monotonic() - began < stop_after:
-            counts = harness.progress(job_id).task_counts
-            if wait_over(counts, drill):
-                finished = True
-                break
-            poll = Poll(
-                harness, job_id, fleet, len(workload.tasks), counts[TaskState.SUCCEEDED], quiet
-            )
-            drill.step(poll)
-            _supervise(fleet, seen, due, exits)
-            time.sleep(POLL if drill.injected else INJECTION_POLL)
+        finished = _drill_wait(harness, job_id, drill, workload, fleet, quiet, stop_after, exits)
     except BaseException:
         harness.close()
         raise
@@ -1477,44 +1550,119 @@ def run_drill(
                 reaped = fleet.stop(timeout=validated.shutdown_timeout.total_seconds() + 10.0)
             finally:
                 drill.close()
-    try:
-        conn = harness.conn
-        codes = [worker["exit_code"] for worker in reaped]
-        wanted = [drill.expected_exit(w["pid"], w["exit_code"]) for w in reaped]
-        gate = run_gate(
+    return _DrillRun(
+        harness,
+        harness_start,
+        record_environment,
+        job_id,
+        submission,
+        finished,
+        exits,
+        load,
+        reaped,
+    )
+
+
+def _drill_wait(
+    harness: Harness,
+    job_id: uuid.UUID,
+    drill: Drill,
+    workload: DrillWorkload,
+    fleet: DrillFleet,
+    quiet: float,
+    stop_after: float,
+    exits: list[dict[str, Any]],
+) -> bool:
+    """Poll, letting the drill step and supervising the fleet, until the wait is over or
+    ``stop_after`` has passed; whether it was over. Exits seen are added to ``exits``."""
+    seen: set[int] = set()
+    due: list[float] = []
+    began = time.monotonic()
+    while time.monotonic() - began < stop_after:
+        counts = harness.progress(job_id).task_counts
+        if wait_over(counts, drill):
+            return True
+        poll = Poll(harness, job_id, fleet, len(workload.tasks), counts[TaskState.SUCCEEDED], quiet)
+        drill.step(poll)
+        _supervise(fleet, seen, due, exits)
+        time.sleep(POLL if drill.injected else INJECTION_POLL)
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class _DrillOutcome:
+    """What the drill's database says once its workers have stopped."""
+
+    gate: list[dict[str, Any]]
+    figures: dict[str, Any]
+    failures: dict[str, Any]
+    usage: dict[str, Any] | None
+    extraction: dict[str, Any] | None
+    measured: dict[str, Any]
+
+
+def _drill_outcome(
+    conn: Conn,
+    cell: Cell,
+    drill: Drill,
+    workload: DrillWorkload,
+    setup: _DrillSetup,
+    run: _DrillRun,
+    prices: extract.Prices | None,
+) -> _DrillOutcome:
+    """The gate with the drill's checks, the timing figures, failures, usage and extraction."""
+    extracting = cell.profile is Profile.EXTRACT
+    job_id, fleet = run.job_id, setup.fleet
+    codes = [worker["exit_code"] for worker in run.reaped]
+    wanted = [drill.expected_exit(w["pid"], w["exit_code"]) for w in run.reaped]
+    gate = run_gate(
+        conn,
+        job_id,
+        cell.profile,
+        workload.expected,
+        codes,
+        expected_status=workload.status,
+        expected_failed=workload.failed,
+        expected_exit_codes=wanted,
+        provider=setup.provider,
+        documents=workload.items if extracting else None,
+    )
+    gate += drill.checks(conn, job_id, fleet)
+    figures = metrics.timing_figures(metrics.read_stored_times(conn, job_id))
+    failures = failure_figures(conn, job_id, codes)
+    usage = None if extracting else usage_figures(conn, job_id, DEFAULT_CAP)
+    extraction: dict[str, Any] | None = None
+    if extracting:
+        assert workload.documents is not None
+        assert prices is not None
+        extraction = extract.extraction_block(
             conn,
             job_id,
-            cell.profile,
-            workload.expected,
-            codes,
-            expected_status=workload.status,
-            expected_failed=workload.failed,
-            expected_exit_codes=wanted,
-            provider=provider,
-            documents=workload.items if extracting else None,
+            [document.expected for document in workload.documents],
+            [document.expected_status for document in workload.documents],
+            prices,
         )
-        gate += drill.checks(conn, job_id, fleet)
-        figures = metrics.timing_figures(metrics.read_stored_times(conn, job_id))
-        failures = failure_figures(conn, job_id, codes)
-        usage = None if extracting else usage_figures(conn, job_id, DEFAULT_CAP)
-        extraction: dict[str, Any] | None = None
-        if extracting:
-            assert workload.documents is not None
-            assert prices is not None
-            extraction = extract.extraction_block(
-                conn,
-                job_id,
-                [document.expected for document in workload.documents],
-                [document.expected_status for document in workload.documents],
-                prices,
-            )
-        measured = drill.measured(conn, job_id, fleet)
-    finally:
-        harness.close()
+    measured = drill.measured(conn, job_id, fleet)
+    return _DrillOutcome(gate, figures, failures, usage, extraction, measured)
+
+
+def _drill_record(
+    run_id: str,
+    cell: Cell,
+    drill: Drill,
+    workload: DrillWorkload,
+    setup: _DrillSetup,
+    run: _DrillRun,
+    outcome: _DrillOutcome,
+    stop_after: float,
+    call_timeout: str,
+) -> dict[str, Any]:
+    """The drill's format 1 result record."""
     status = Status.INCOMPLETE
-    if finished:
-        passed = all(check["passed"] for check in gate)
+    if run.finished:
+        passed = all(check["passed"] for check in outcome.gate)
         status = Status.COMPLETE if passed else Status.FAILED_CORRECTNESS
+    figures, extraction, usage = outcome.figures, outcome.extraction, outcome.usage
     record: dict[str, Any] = {
         "format": 1,
         "run_id": run_id,
@@ -1522,13 +1670,13 @@ def run_drill(
         "status": status.value,
         "recorded_at": now(),
         "cell": {**asdict(cell), "profile": cell.profile.value},
-        "environment": record_environment,
-        "worker_settings": dict(worker_settings),
+        "environment": run.record_environment,
+        "worker_settings": dict(setup.worker_settings),
         "provider": (
             provider_block(
-                provider,
+                setup.provider,
                 call_timeout=call_timeout,
-                cap=cap,
+                cap=setup.cap,
                 route="route-a",
                 calls_made=(
                     extraction["calls"]["total"]
@@ -1538,12 +1686,12 @@ def run_drill(
                     else usage["calls"]
                 ),
             )
-            if provider.openrouter
+            if setup.provider.openrouter
             else {"call_timeout": DEFAULT_CALL_TIMEOUT, "cap": DEFAULT_CAP, "route": "route-a"}
         ),
         "timing": {
             **figures["timing"],
-            "submission": submission,
+            "submission": run.submission,
             "tasks": len(workload.tasks),
             "items": workload.items,
             "stop_after_s": stop_after,
@@ -1553,27 +1701,26 @@ def run_drill(
         "claim_gap": figures["claim_gap"],
         "idle_claim_rate": None,
         "resources": {
-            "workers": reaped,
-            "harness": metrics.harness_delta(harness_start, metrics.harness_usage()),
-            "sysload": load,
+            "workers": run.reaped,
+            "harness": metrics.harness_delta(run.harness_start, metrics.harness_usage()),
+            "sysload": run.load,
         },
         "database_stats": None,
         "contention": None,
-        "failures": failures,
+        "failures": outcome.failures,
         "usage": usage,
-        "gate": gate,
+        "gate": outcome.gate,
         "drill": {
             "name": drill.name,
             "injected": drill.injected,
             "injections": drill.injections,
-            "exits_while_running": exits,
-            "restarts": len(fleet.workers) - cell.workers,
-            "measured": measured,
+            "exits_while_running": run.exits,
+            "restarts": len(setup.fleet.workers) - cell.workers,
+            "measured": outcome.measured,
         },
     }
     if extraction is not None:
         record["extraction"] = extraction
-    validate_result({**record, "environment": {**record_environment, "dirty_allowed": True}})
     return record
 
 

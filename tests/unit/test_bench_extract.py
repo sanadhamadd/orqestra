@@ -318,8 +318,8 @@ def test_fixed_point_text_is_never_in_exponent_form(value: Decimal, text: str) -
 
 def test_the_request_text_is_exactly_what_the_adapter_sends() -> None:
     from orqestra.providers.openrouter import ExtractionRequest
-    from tests.unit.test_openrouter_adapter import FakeExchange, FakeTransport, provider_for
-    from tests.unit.test_providers_openrouter import replied
+    from tests.unit.test_openrouter_amount import FakeExchange, FakeTransport, provider_for
+    from tests.unit.test_openrouter_extract import replied
 
     document = DOCUMENTS[3].text + "\\u00e9 é"  # escapes and a non-ASCII character
     transport = FakeTransport(FakeExchange(200, [replied()]))
