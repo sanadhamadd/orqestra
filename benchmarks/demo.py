@@ -451,16 +451,80 @@ def run_demo(
     """Run the demonstration against the empty schema ``url``; write and return its record."""
     run_id = run_id or uuid.uuid4().hex[:12]
     raw_dir.mkdir(parents=True, exist_ok=True)
-    checks: list[Check] = []
+    checks: list[Check] = [_migrate(url, raw_dir, emit)]
+    prepared = _demo_tasks(config, raw_dir, emit)
+    job_id, submit_seconds, submitted = _submit_twice(
+        url, config, prepared.task_file, raw_dir, emit
+    )
+    checks += submitted
+    run = _run_demo_fleet(
+        url, config, worker_settings, job_id, len(prepared.tasks), note, emit, raw_dir
+    )
+    try:
+        conn = run.harness.conn
+        reports = _demo_reports(url, job_id, raw_dir, conn, run.reaped, emit)
+        gate = _demo_gate(conn, job_id, config, prepared, run, reports, checks)
+        figures = metrics.timing_figures(metrics.read_stored_times(conn, job_id))
+        measured = run.drill.measured(conn, job_id, run.fleet)
+        usage = usage_figures(conn, job_id, DEFAULT_CAP)
+    finally:
+        run.harness.close()
+    record = _demo_record(
+        run_id,
+        config,
+        worker_settings,
+        prepared,
+        run,
+        reports,
+        gate,
+        figures=figures,
+        measured=measured,
+        usage=usage,
+        submit_seconds=submit_seconds,
+    )
+    path = write_result(record, out_dir, allow_dirty=allow_dirty)
+    for tag, text in figure_lines(figures, measured):
+        emit(tag, text)
+    emit("result", f"{path} (raw files: {raw_dir})")
+    return DemoOutcome(record, path, gate)
 
+
+# The summary figures the demo prints and records, in this order.
+_SUMMARY_KEYS = (
+    "verified",
+    "rejected",
+    "needs_review",
+    "malformed",
+    "provider_assisted_items",
+    "complete",
+    "integrity_ok",
+)
+
+
+def _migrate(url: str, raw_dir: Path, emit: Emit) -> Check:
+    """Run ``orqestra migrate``; its check, or ``DemoAbortedError`` if it failed."""
     migrated = cli(url, ["migrate"], raw_dir, "migrate")
     ok = migrated.returncode == 0 and migrated.document.get("status") == "ok"
-    checks.append(_check("migrated", ok, {"exit": migrated.returncode}))
+    check = _check("migrated", ok, {"exit": migrated.returncode})
     if not ok:
         msg = f"orqestra migrate failed (exit {migrated.returncode}); see {migrated.stderr_path}"
         raise DemoAbortedError(msg)
     emit("migrate", f"applied {', '.join(migrated.document.get('applied') or []) or 'nothing'}")
+    return check
 
+
+@dataclass(frozen=True, slots=True)
+class _DemoTasks:
+    """The demo's job: its tasks, the oracle's expected outcome and the call bound."""
+
+    tasks: list[dict[str, Any]]
+    expected: Expected
+    bound: int
+    task_file: Path
+
+
+def _demo_tasks(config: DemoConfig, raw_dir: Path, emit: Emit) -> _DemoTasks:
+    """Generate the invoices, build and write the tasks, and say what is expected."""
     invoices = generate_invoices(config.invoices, config.seed)
     tasks = build_tasks(invoices, config.batch, MAX_ATTEMPTS)
     expected = expected_outcome(invoices, config.batch, DEFAULT_CAP)
@@ -474,7 +538,14 @@ def run_demo(
     )
     emit("expected", expected_text(expected))
     emit("bound", f"at most {bound} provider calls: cap {DEFAULT_CAP} x sum of max_attempts")
+    return _DemoTasks(tasks, expected, bound, task_file)
 
+
+def _submit_twice(
+    url: str, config: DemoConfig, task_file: Path, raw_dir: Path, emit: Emit
+) -> tuple[uuid.UUID, float, list[Check]]:
+    """Submit the job, then submit it again with the same key; the job id, the first
+    submission's seconds and the submission checks."""
     submit_args = [
         "job",
         "submit",
@@ -496,9 +567,41 @@ def run_demo(
     second = cli(url, submit_args, raw_dir, "resubmit")
     same = second.document.get("job_id") == first.document.get("job_id")
     emit("resubmit", f"{json.dumps(second.document)} (same job id: {'yes' if same else 'no'})")
-    checks += submission_checks(first, second)
     job_id = uuid.UUID(str(first.document["job_id"]))
+    return job_id, submit_seconds, submission_checks(first, second)
 
+
+@dataclass(frozen=True, slots=True)
+class _DemoRun:
+    """The fleet's run: what ran, how the wait ended and the reaped workers."""
+
+    fleet: DrillFleet
+    harness: Harness
+    drill: KillDrill
+    watch: VictimWatch
+    harness_start: dict[str, Any]
+    record_environment: dict[str, Any]
+    wait_ended: WaitEnded
+    waited: float
+    restarted_ok: bool
+    reaped: list[dict[str, Any]]
+
+
+def _run_demo_fleet(
+    url: str,
+    config: DemoConfig,
+    worker_settings: Mapping[str, str],
+    job_id: uuid.UUID,
+    task_count: int,
+    note: str,
+    emit: Emit,
+    raw_dir: Path,
+) -> _DemoRun:
+    """Start the workers, kill one at a call boundary and wait; stop and reap them all.
+
+    On any exception the harness is closed. The workers are always stopped and reaped
+    and the drill released and closed; otherwise the harness stays open for the read-back.
+    """
     env = process_environment(url, worker_settings)
     fleet = DrillFleet(Profile.INVOICE, env, raw_dir, command=worker_command(Profile.INVOICE))
     harness = Harness(url)
@@ -526,23 +629,9 @@ def run_demo(
             f"{config.workers} x python -m benchmarks.worker, pids "
             + ", ".join(str(h.process.pid) for h in fleet.workers),
         )
-        began = time.monotonic()
-        while time.monotonic() - began < config.stop_after:
-            counts = harness.progress(job_id).task_counts
-            finished = wait_over(counts, drill)
-            if not finished:
-                poll = Poll(harness, job_id, fleet, len(tasks), counts[TaskState.SUCCEEDED], quiet)
-                drill.step(poll)
-                watch.after_step(drill, counts[TaskState.SUCCEEDED], len(tasks), emit)
-            watch.observe(harness.conn, fleet, emit)
-            if finished:
-                wait_ended = WaitEnded.FINISHED
-                break
-            if fleet.alive() == 0:
-                wait_ended = WaitEnded.NO_WORKERS
-                break
-            time.sleep(POLL if drill.injected else INJECTION_POLL)
-        waited = time.monotonic() - began
+        wait_ended, waited = _demo_wait(
+            config, harness, job_id, task_count, fleet, drill, watch, quiet, emit
+        )
     except BaseException:
         harness.close()
         raise
@@ -556,141 +645,206 @@ def run_demo(
         finally:
             drill.release()
             drill.close()
-    try:
-        conn = harness.conn
-        status_cli = cli(url, ["job", "status", str(job_id)], raw_dir, "status")
-        summary_cli = cli(url, ["job", "summary", str(job_id)], raw_dir, "summary")
-        usage_cli = cli(
-            url,
-            ["job", "usage", str(job_id), "--max-provider-calls-per-attempt", str(DEFAULT_CAP)],
-            raw_dir,
-            "usage",
-        )
-        codes = [worker["exit_code"] for worker in reaped]
-        failures = failure_figures(conn, job_id, codes)
-        status_doc, summary_doc, usage_doc = (
-            status_cli.document,
-            summary_cli.document,
-            usage_cli.document,
-        )
-        emit(
-            "status",
-            f"{status_doc.get('job_status')}, tasks {json.dumps(status_doc.get('task_counts'))}; "
-            f"attempts {json.dumps(failures['attempts_by_state'], sort_keys=True)}",
-        )
-        emit(
-            "summary",
-            json.dumps(
-                _condensed(
-                    summary_doc,
-                    (
-                        "verified",
-                        "rejected",
-                        "needs_review",
-                        "malformed",
-                        "provider_assisted_items",
-                        "complete",
-                        "integrity_ok",
-                    ),
-                )
-            ),
-        )
-        budget = usage_doc.get("budget") or {}
-        emit(
-            "usage",
-            json.dumps(
-                {
-                    "finality": usage_doc.get("finality"),
-                    "calls": usage_doc.get("calls"),
-                    "verdict": budget.get("verdict"),
-                    "bound": budget.get("bound"),
-                }
-            ),
-        )
-        wanted = [drill.expected_exit(w["pid"], w["exit_code"]) for w in reaped]
-        gate = run_gate(conn, job_id, Profile.INVOICE, expected, codes, expected_exit_codes=wanted)
-        gate += drill.checks(conn, job_id, fleet)
-        gate += checks
-        gate += watch.checks()
-        gate += [
-            _check(
-                "worker_restarted",
-                watch.restarted and restarted_ok,
-                {"restarts": len(fleet.workers) - config.workers},
-            ),
-            status_check(status_doc, len(tasks)),
-            summary_against_oracle(summary_doc, expected),
-            usage_against_oracle(usage_doc, expected, bound),
-        ]
-        figures = metrics.timing_figures(metrics.read_stored_times(conn, job_id))
-        measured = drill.measured(conn, job_id, fleet)
-        usage = usage_figures(conn, job_id, DEFAULT_CAP)
-    finally:
-        harness.close()
-    status = cell_status(wait_ended, gate)
-    record: dict[str, Any] = {
+    return _DemoRun(
+        fleet,
+        harness,
+        drill,
+        watch,
+        harness_start,
+        record_environment,
+        wait_ended,
+        waited,
+        restarted_ok,
+        reaped,
+    )
+
+
+def _demo_wait(
+    config: DemoConfig,
+    harness: Harness,
+    job_id: uuid.UUID,
+    task_count: int,
+    fleet: DrillFleet,
+    drill: KillDrill,
+    watch: VictimWatch,
+    quiet: float,
+    emit: Emit,
+) -> tuple[WaitEnded, float]:
+    """Poll, letting the drill step, until the job is over, no worker is left or
+    ``stop_after`` has passed; how the wait ended and how long it took."""
+    wait_ended = WaitEnded.STOP_AFTER
+    began = time.monotonic()
+    while time.monotonic() - began < config.stop_after:
+        counts = harness.progress(job_id).task_counts
+        finished = wait_over(counts, drill)
+        if not finished:
+            poll = Poll(harness, job_id, fleet, task_count, counts[TaskState.SUCCEEDED], quiet)
+            drill.step(poll)
+            watch.after_step(drill, counts[TaskState.SUCCEEDED], task_count, emit)
+        watch.observe(harness.conn, fleet, emit)
+        if finished:
+            wait_ended = WaitEnded.FINISHED
+            break
+        if fleet.alive() == 0:
+            wait_ended = WaitEnded.NO_WORKERS
+            break
+        time.sleep(POLL if drill.injected else INJECTION_POLL)
+    waited = time.monotonic() - began
+    return wait_ended, waited
+
+
+@dataclass(frozen=True, slots=True)
+class _Reports:
+    """What the ``orqestra job`` commands and the database report after the run."""
+
+    codes: list[int]
+    failures: dict[str, Any]
+    status_doc: dict[str, Any]
+    summary_doc: dict[str, Any]
+    usage_doc: dict[str, Any]
+    budget: dict[str, Any]
+
+
+def _demo_reports(
+    url: str,
+    job_id: uuid.UUID,
+    raw_dir: Path,
+    conn: psycopg.Connection[Any],
+    reaped: list[dict[str, Any]],
+    emit: Emit,
+) -> _Reports:
+    """Read the job back through ``orqestra job status``, ``summary`` and ``usage``."""
+    status_cli = cli(url, ["job", "status", str(job_id)], raw_dir, "status")
+    summary_cli = cli(url, ["job", "summary", str(job_id)], raw_dir, "summary")
+    usage_cli = cli(
+        url,
+        ["job", "usage", str(job_id), "--max-provider-calls-per-attempt", str(DEFAULT_CAP)],
+        raw_dir,
+        "usage",
+    )
+    codes = [worker["exit_code"] for worker in reaped]
+    failures = failure_figures(conn, job_id, codes)
+    status_doc, summary_doc, usage_doc = (
+        status_cli.document,
+        summary_cli.document,
+        usage_cli.document,
+    )
+    emit(
+        "status",
+        f"{status_doc.get('job_status')}, tasks {json.dumps(status_doc.get('task_counts'))}; "
+        f"attempts {json.dumps(failures['attempts_by_state'], sort_keys=True)}",
+    )
+    emit("summary", json.dumps(_condensed(summary_doc, _SUMMARY_KEYS)))
+    budget = usage_doc.get("budget") or {}
+    emit(
+        "usage",
+        json.dumps(
+            {
+                "finality": usage_doc.get("finality"),
+                "calls": usage_doc.get("calls"),
+                "verdict": budget.get("verdict"),
+                "bound": budget.get("bound"),
+            }
+        ),
+    )
+    return _Reports(codes, failures, status_doc, summary_doc, usage_doc, budget)
+
+
+def _demo_gate(
+    conn: psycopg.Connection[Any],
+    job_id: uuid.UUID,
+    config: DemoConfig,
+    prepared: _DemoTasks,
+    run: _DemoRun,
+    reports: _Reports,
+    checks: list[Check],
+) -> list[Check]:
+    """The gate, the drill's checks, the demo's own checks and the read-back's checks."""
+    drill, fleet, watch = run.drill, run.fleet, run.watch
+    wanted = [drill.expected_exit(w["pid"], w["exit_code"]) for w in run.reaped]
+    gate = run_gate(
+        conn, job_id, Profile.INVOICE, prepared.expected, reports.codes, expected_exit_codes=wanted
+    )
+    gate += drill.checks(conn, job_id, fleet)
+    gate += checks
+    gate += watch.checks()
+    gate += [
+        _check(
+            "worker_restarted",
+            watch.restarted and run.restarted_ok,
+            {"restarts": len(fleet.workers) - config.workers},
+        ),
+        status_check(reports.status_doc, len(prepared.tasks)),
+        summary_against_oracle(reports.summary_doc, prepared.expected),
+        usage_against_oracle(reports.usage_doc, prepared.expected, prepared.bound),
+    ]
+    return gate
+
+
+def _demo_record(
+    run_id: str,
+    config: DemoConfig,
+    worker_settings: Mapping[str, str],
+    prepared: _DemoTasks,
+    run: _DemoRun,
+    reports: _Reports,
+    gate: list[Check],
+    *,
+    figures: dict[str, Any],
+    measured: dict[str, Any],
+    usage: dict[str, Any] | None,
+    submit_seconds: float,
+) -> dict[str, Any]:
+    """The demo's format 1 result record."""
+    status = cell_status(run.wait_ended, gate)
+    tasks = len(prepared.tasks)
+    return {
         "format": 1,
         "run_id": run_id,
         "ladder": "demo",
         "status": status.value,
         "recorded_at": now(),
         "cell": {**asdict(config.cell), "profile": Profile.INVOICE.value},
-        "environment": record_environment,
+        "environment": run.record_environment,
         "worker_settings": dict(worker_settings),
         "provider": {"call_timeout": DEFAULT_CALL_TIMEOUT, "cap": DEFAULT_CAP, "route": "route-a"},
         "timing": {
             **figures["timing"],
-            "submission": {"seconds": submit_seconds, "tasks": len(tasks)},
-            "tasks": len(tasks),
-            "items": expected.invoices,
+            "submission": {"seconds": submit_seconds, "tasks": tasks},
+            "tasks": tasks,
+            "items": prepared.expected.invoices,
             "stop_after_s": config.stop_after,
-            "wait_ended": wait_ended.value,
-            "waited_s": waited,
+            "wait_ended": run.wait_ended.value,
+            "waited_s": run.waited,
         },
         "throughput": figures["throughput"] if status is Status.COMPLETE else None,
         "latency": figures["latency"],
         "claim_gap": figures["claim_gap"],
         "idle_claim_rate": None,
         "resources": {
-            "workers": reaped,
-            "harness": metrics.harness_delta(harness_start, metrics.harness_usage()),
+            "workers": run.reaped,
+            "harness": metrics.harness_delta(run.harness_start, metrics.harness_usage()),
         },
         "database_stats": None,
         "contention": None,
-        "failures": failures,
+        "failures": reports.failures,
         "usage": usage,
         "gate": gate,
         "drill": {
             "name": "demo",
-            "injected": drill.injected,
-            "injections": drill.injections,
-            "restarts": len(fleet.workers) - config.workers,
+            "injected": run.drill.injected,
+            "injections": run.drill.injections,
+            "restarts": len(run.fleet.workers) - config.workers,
             "measured": measured,
             "idempotency_key": config.idempotency_key,
-            "call_bound": bound,
+            "call_bound": prepared.bound,
             "cli": {
-                "status": _condensed(status_doc, ("job_status", "task_counts")),
-                "summary": _condensed(
-                    summary_doc,
-                    (
-                        "verified",
-                        "rejected",
-                        "needs_review",
-                        "malformed",
-                        "provider_assisted_items",
-                        "complete",
-                        "integrity_ok",
-                    ),
-                ),
-                "usage": {"finality": usage_doc.get("finality"), "budget": budget},
+                "status": _condensed(reports.status_doc, ("job_status", "task_counts")),
+                "summary": _condensed(reports.summary_doc, _SUMMARY_KEYS),
+                "usage": {"finality": reports.usage_doc.get("finality"), "budget": reports.budget},
             },
         },
     }
-    path = write_result(record, out_dir, allow_dirty=allow_dirty)
-    for tag, text in figure_lines(figures, measured):
-        emit(tag, text)
-    emit("result", f"{path} (raw files: {raw_dir})")
-    return DemoOutcome(record, path, gate)
 
 
 def run_in_bench_database(
