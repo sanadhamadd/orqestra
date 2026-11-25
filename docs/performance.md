@@ -4,7 +4,7 @@ This page reports what the benchmark harness (`benchmarks/`) measured on one mac
 the measurements show. The tables are generated from the committed result files under
 `benchmarks/results/`. The analysis cites the files and the metrics behind each statement.
 Values computed from measurements are labelled as derived, with their formula. How to run the
-harness is in the README, [Running the benchmarks](../README.md#running-the-benchmarks).
+harness is in [Running the benchmarks](usage.md#running-the-benchmarks).
 
 ## What was measured and how
 
@@ -25,7 +25,7 @@ each result file too.
 
 Each ladder interleaves its repetitions by worker count. Every figure in the tables is the
 median of three repetitions, with the minimum and maximum. The warm-up and the 50,000-invoice
-rung ran once each, the second by the owner's ruling (OD-2). The campaign's results were measured
+rung ran once each, the second by the maintainer's decision. The campaign's results were measured
 on commit `c410ac6` from a clean tree. Every cell and drill ended `complete`; none was re-run.
 
 **The claim index (DEC-069), measured later.** On 2026-11-09, in one session on a fresh
@@ -399,7 +399,7 @@ Files: `*-invoice-10000-b{10,100,1000}-w4-r{1,2,3}.json`.
 **`echo` is database-bound.**
 - Measured: database container CPU p50 rises from 42.2 % at one worker to 81.2 %, 142.4 % and
   287.8 % at two, four and eight (docker stats, 100 % is one core; 11 to 44 samples per cell).
-- Measured: the mean worker CPU utilization falls from 0.32 of a core at one worker to 0.15 at
+- Measured: the mean worker CPU utilisation falls from 0.32 of a core at one worker to 0.15 at
   eight.
 - Measured: sampled `Lock` and `LWLock` waits stay small, with a mean of at most 0.333 sessions
   per sample (at eight workers) and none at one.
@@ -412,7 +412,7 @@ Files: `*-invoice-10000-b{10,100,1000}-w4-r{1,2,3}.json`.
 - Files: `*-wait-400-b0-w{1,8}-r{1,2,3}.json`.
 
 **`invoice` at batch 100 is low on the worker side, and its database CPU is barely sampled.**
-- Measured: the mean worker utilization is 0.47 to 0.74 of a core at 10,000 invoices, and no
+- Measured: the mean worker utilisation is 0.47 to 0.74 of a core at 10,000 invoices, and no
   `Lock` or `LWLock` wait was sampled.
 - Measured: these jobs last about 1 to 3 s, so docker stats took only one or two samples per cell
   (`resources.database.samples`). The database CPU p50 values, 5.3 % to 76.7 %, rest on those
@@ -721,6 +721,10 @@ statuses' total, `waited_s` and `cost.total`):
 - **The large run:** 30,150 invoices at 16 workers in 5,312.6 s (88.5 min), 30,141 exactly right (99.97%), field
   accuracy 99.98%, 30,143 with the expected status, and no invoice lost. 5 of the 16 workers stopped themselves (exit 4); their batches were run again
   by the others, which cost 51 extra calls. The cell is `failed_correctness` only because of those exits.
+- **The crash drill was not a valid crash test.** The d1 drill at 32 workers
+  (`20261117T065459Z-63ade1a-extract-2000-b25-w32-r1.json`) ran into the provider's throttling: 56 tasks failed after
+  192 rate-limited calls, so the run failed on throttling, not on the kill. The large run above, in which 5 of 16
+  workers stopped and no invoice was lost, served as the crash test instead.
 - **Where the time goes:** the provider's share of handler time was 86–92% in every Orqestra `extract` run. With the
   model asked only about ambiguous amounts (100 calls per 2,000 invoices), the rules-first mix ran 2,000 invoices in
   about 13 s (about 153/s) and 10,000 in 65 s at 8 workers.

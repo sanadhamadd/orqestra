@@ -1,10 +1,12 @@
 # Architecture
 
-Orqestra is a Python library and command line that runs batch jobs with PostgreSQL as the
+Orqestra is a general-purpose engine for running large-scale data analytics and AI tasks reliably on
+PostgreSQL: independent workers share a durable task queue, recover automatically from crashes and track the
+cost of every model call. It is a Python library and command line that runs batch jobs with PostgreSQL as the
 single source of truth. A job is split into tasks; each run of a task by a worker is an
 attempt. This page shows how the parts fit together. The reasons behind each rule are in the
 [decision log](decisions.md) and the [ADRs](adr/), and the limits of what is built are in the
-README's [Known limitations](../README.md#known-limitations). This page links to them and does
+[Known limitations](limitations.md) page. This page links to them and does
 not repeat them.
 
 ## Components
@@ -238,4 +240,4 @@ worker sweeps.
 - **No exactly-once execution.** A handler can run more than once for a task; its effects must
   tolerate that.
 
-The full list of limits is the README's [Known limitations](../README.md#known-limitations).
+The full list of limits is in [Known limitations](limitations.md).

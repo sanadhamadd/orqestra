@@ -57,7 +57,7 @@ uv run python -m benchmarks.demo
 
 The working tree must have no uncommitted changes, so the result names the commit it ran,
 unless `--allow-dirty` is given. The README's
-[Running the benchmarks](../README.md#running-the-benchmarks) describes the database guard and
+[Running the benchmarks](usage.md#running-the-benchmarks) describes the database guard and
 the rest of the harness.
 
 ## Options
