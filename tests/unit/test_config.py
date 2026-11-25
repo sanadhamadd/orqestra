@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from orqestra.config import Settings
+from orqestra.worker.settings import WorkerSettings
 
 pytestmark = pytest.mark.unit
 
@@ -11,7 +14,6 @@ def test_defaults() -> None:
     assert settings.environment == "development"
     assert settings.log_level == "INFO"
     assert settings.database_url is None
-    assert settings.worker_concurrency == 4
     assert settings.openrouter_api_key is None
     assert settings.redacted()["openrouter_api_key"] is None
 
@@ -19,16 +21,14 @@ def test_defaults() -> None:
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ORQESTRA_ENVIRONMENT", "test")
     monkeypatch.setenv("ORQESTRA_LOG_LEVEL", "DEBUG")
-    monkeypatch.setenv("ORQESTRA_WORKER_CONCURRENCY", "16")
     settings = Settings()
     assert settings.environment == "test"
     assert settings.log_level == "DEBUG"
-    assert settings.worker_concurrency == 16
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "257", "many"])
-def test_invalid_concurrency_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv("ORQESTRA_WORKER_CONCURRENCY", value)
+@pytest.mark.parametrize("value", ["staging", "PRODUCTION", "prod", "dev"])
+def test_an_unknown_environment_is_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("ORQESTRA_ENVIRONMENT", value)
     with pytest.raises(ValidationError):
         Settings()
 
@@ -94,3 +94,32 @@ def test_openrouter_api_key_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None
     assert secret not in str(settings)
     assert secret not in str(settings.redacted())
     assert settings.redacted()["openrouter_api_key"] == "***"
+
+
+ENV_EXAMPLE = Path(__file__).resolve().parents[2] / ".env.example"
+PROFILE_HEADER = "# Example values, not recommendations"
+
+
+def example_profile() -> dict[str, str]:
+    """The commented ``ORQESTRA_WORKER_*`` lines of ``.env.example``'s example profile."""
+    lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(PROFILE_HEADER))
+    profile: dict[str, str] = {}
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            break
+        name, sep, value = line.removeprefix("# ").partition("=")
+        if sep and name.startswith("ORQESTRA_WORKER_"):
+            profile[name] = value
+    return profile
+
+
+def test_the_example_worker_profile_is_complete_and_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = example_profile()
+    required = {name for name, field in WorkerSettings.model_fields.items() if field.is_required()}
+    named = {name.removeprefix("ORQESTRA_WORKER_").lower() for name in profile}
+    assert required <= named
+    for name, value in profile.items():
+        monkeypatch.setenv(name, value)
+    settings = WorkerSettings()  # validates every relationship, DEC-070's included
+    assert settings.lease.total_seconds() == 4.0

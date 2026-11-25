@@ -9,7 +9,7 @@ Secrets are ``SecretStr`` so they never leak through ``repr`` or logs.
 
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["development", "test", "production"]
@@ -26,9 +26,6 @@ class Settings(BaseSettings):
     # PostgreSQL DSN. Optional for `version` and `health`; every command that uses the
     # database requires it. A blank value counts as not set.
     database_url: SecretStr | None = None
-    # Concurrent task slots per worker process (not OS threads or hosts). Not read by
-    # anything yet: the worker is single-slot by design (DEC-044).
-    worker_concurrency: int = Field(default=4, ge=1, le=256)
     # OpenRouter API key. Optional; no packaged command reads it. Only the unpackaged
     # benchmark worker's live mode uses the adapter (orqestra.providers.openrouter), and it
     # reads the key from the process environment, not through these settings (DEC-071).
@@ -49,6 +46,5 @@ class Settings(BaseSettings):
             "environment": self.environment,
             "log_level": self.log_level,
             "database_url": "***" if self.database_url is not None else None,
-            "worker_concurrency": self.worker_concurrency,
             "openrouter_api_key": "***" if self.openrouter_api_key is not None else None,
         }

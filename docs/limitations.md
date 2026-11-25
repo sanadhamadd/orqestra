@@ -113,8 +113,7 @@
 - There are no default or maximum lease values: callers choose them. Operational bounds
   and per-job-kind policies are not decided yet. `WorkerSettings` requires every timing
   value and has no defaults.
-- `run_handler` cannot interrupt a handler. The existing `Settings.worker_concurrency`
-  (default 4) is validated but not read by anything; the worker is single-slot.
+- `run_handler` cannot interrupt a handler; the worker is single-slot.
 - Handler results are checked more strictly than `jsonb` requires: only exact built-in
   types are accepted (a `tuple`, a `str` enum or a `dict` subclass is refused rather than
   converted), and nesting deeper than about 1,000 levels is refused. Results and failure
