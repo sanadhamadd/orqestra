@@ -50,7 +50,12 @@ def test_health_command_reports_ok(capsys: pytest.CaptureFixture[str]) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert payload["version"] == orqestra.__version__
-    assert payload["settings"]["worker_concurrency"] == 4
+    assert set(payload["settings"]) == {
+        "environment",
+        "log_level",
+        "database_url",
+        "openrouter_api_key",
+    }
 
 
 def test_health_never_prints_secrets(
@@ -83,7 +88,7 @@ def test_health_reports_no_openrouter_api_key_by_default(
 def test_health_reports_invalid_configuration(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("ORQESTRA_WORKER_CONCURRENCY", "0")
+    monkeypatch.setenv("ORQESTRA_LOG_LEVEL", "LOUD")
     assert main(["health"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "error"

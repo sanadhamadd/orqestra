@@ -41,6 +41,11 @@ _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$", re.MULTILINE)
 _LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 _SCHEDULE_LABEL = re.compile(r"\bday ?\d+[a-z]?\b", re.IGNORECASE)
 _OLD_TERM = re.compile(r"\bai\b", re.IGNORECASE)
+# The approved project description names AI tasks: the page may use it, and no other "AI".
+_DESCRIPTION = (
+    "Orqestra is a general-purpose engine for running large-scale data analytics and AI tasks "
+    "reliably on PostgreSQL"
+)
 
 
 def doc_text() -> str:
@@ -278,7 +283,16 @@ def test_the_slug_rule_matches_the_headings_it_is_used_for() -> None:
     assert "known-limitations" in anchors(ROOT / "README.md")
 
 
+def _without_description(text: str) -> str:
+    """``text`` with its words rejoined by single spaces and the approved description removed."""
+    return " ".join(text.split()).replace(_DESCRIPTION, "")
+
+
 def test_the_page_keeps_to_the_repository_wording() -> None:
     text = doc_text()
     assert _SCHEDULE_LABEL.search(text) is None
-    assert _OLD_TERM.search(text) is None
+    assert _OLD_TERM.search(_without_description(text)) is None
+
+
+def test_ai_outside_the_approved_description_is_still_refused() -> None:
+    assert _OLD_TERM.search(_without_description(f"{_DESCRIPTION}. An AI page.")) is not None

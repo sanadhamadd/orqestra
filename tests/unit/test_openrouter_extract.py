@@ -1,6 +1,6 @@
 """The OpenRouter adapter's extraction call (``OpenRouterProvider.extract``).
 
-The amount call is covered by ``test_openrouter_adapter.py``; its fakes are reused
+The amount call is covered by ``test_openrouter_amount.py``; its fakes are reused
 here. No test opens a network connection: every transport is in memory.
 """
 
@@ -25,7 +25,7 @@ from orqestra.providers.openrouter import (
     ResponseDefect,
 )
 from orqestra.providers.transport import TransportFailure, TransportTimeout
-from tests.unit.test_openrouter_adapter import (
+from tests.unit.test_openrouter_amount import (
     CREDENTIAL,
     MODEL,
     ROUTE,
@@ -248,7 +248,7 @@ def test_the_amount_call_is_unchanged_by_an_incomplete_reply() -> None:
     assert defect_of(failure) is ResponseDefect.UNSUPPORTED_CONTENT
 
 
-# --- prompt v2 and the 2,048-token cap (F2) --------------------------------------------------
+# --- prompt v2 and the 2,048-token cap --------------------------------------------------
 
 V1_KEYS = (
     "vendor_name",

@@ -1,53 +1,128 @@
 # Orqestra — engineering decision ledger
 
-Material engineering decisions in WHAT / WHY / RUNNER-UP form. A proposal is not a
-decision: every entry stays **Proposed** until the owner marks it **Accepted** in a
-reviewed change. Trivial edits are not logged. Cross-cutting choices also get an ADR.
+Material engineering decisions, each with what was decided, why, and the runner-up it was
+chosen over. An entry stays **Proposed** until the maintainer accepts it in a reviewed change;
+trivial edits are not logged, and cross-cutting choices also get an ADR in `docs/adr/`.
 
-No inbound API or framework is planned (DEC-062). Deliberately **undecided** (do not
-infer a choice from the code): which
-models to use (the provider direction is OpenRouter, through an adapter that has no
-default model, DEC-060, and is wired only into the benchmark worker behind an opt-in,
-DEC-071), operational lease and
-execution-timeout values and any per-job-kind policy (DEC-034). The worker model and hosting boundary are
-recorded in DEC-054. The DB driver, migration tool and task queue are no longer open:
-see DEC-016, DEC-017 and DEC-033. Operational cancellation grace periods are
-undecided too (DEC-040), and so are operational retry delays (DEC-053).
+Some choices are deliberately left open, so do not infer them from the code: which model to use
+(DEC-060, DEC-071), operational lease, timeout, cancellation-grace and retry values and any
+per-job-kind policy (DEC-034, DEC-040, DEC-053). No inbound API or framework is planned (DEC-062).
+
+## Index
+
+| Decision | Title | Status |
+| --- | --- | --- |
+| [DEC-001](#dec-001--uv-for-dependency-management-and-lockfile) | uv for dependency management and lockfile | Accepted, 2026-11-07 |
+| [DEC-002](#dec-002--python-312) | Python 3.12 | Accepted, 2026-11-07 |
+| [DEC-003](#dec-003--src-layout-one-package-no-empty-subpackages) | src layout, one package, no empty subpackages | Accepted, 2026-11-07 |
+| [DEC-004](#dec-004--ruff-for-formatting-and-linting) | Ruff for formatting and linting | Accepted, 2026-11-07 |
+| [DEC-005](#dec-005--mypy-in-strict-mode-over-src-and-tests) | mypy in strict mode over src and tests | Accepted, 2026-11-07 |
+| [DEC-006](#dec-006--pytest-lanes-by-marker) | pytest lanes by marker | Accepted, 2026-11-07 |
+| [DEC-007](#dec-007--pydantic-settings-for-configuration) | pydantic-settings for configuration | Accepted, 2026-11-07 |
+| [DEC-008](#dec-008--explicit-immutable-transition-table-for-task-states) | Explicit immutable transition table for task states | Accepted, 2026-11-07 |
+| [DEC-009](#dec-009--unknown-exceptions-are-not-retried) | Unknown exceptions are not retried | Accepted, 2026-11-07 |
+| [DEC-010](#dec-010--stdlib-logging-with-a-json-formatter) | Stdlib logging with a JSON formatter | Accepted, 2026-11-07 |
+| [DEC-011](#dec-011--argparse-cli) | argparse CLI | Accepted, 2026-11-07 |
+| [DEC-012](#dec-012--github-actions-pinned-by-commit-sha-with-least-privilege) | GitHub Actions pinned by commit SHA with least privilege | Accepted, 2026-11-07 |
+| [DEC-013](#dec-013--private-tooling-configuration-is-not-tracked) | Private tooling configuration is not tracked | Accepted, 2026-11-07 |
+| [DEC-014](#dec-014--deferred-at-the-start-explicitly-not-chosen) | Deferred at the start (explicitly not chosen) | Proposed, superseded in part |
+| [DEC-015](#dec-015--postgresql-is-the-authoritative-store-for-job--task--attempt) | PostgreSQL is the authoritative store for Job → Task → Attempt | Accepted, 2026-11-07 |
+| [DEC-016](#dec-016--psycopg-3-synchronous-connections-explicit-parameterised-sql) | Psycopg 3, synchronous connections, explicit parameterised SQL | Accepted, 2026-11-07 |
+| [DEC-017](#dec-017--forward-only-sql-migrations-with-an-in-repository-runner) | Forward-only SQL migrations with an in-repository runner | Accepted, 2026-11-07 |
+| [DEC-018](#dec-018--separate-attempt-states-states-stored-as-constrained-text-application-uuids) | Separate attempt states; states stored as constrained text; application UUIDs | Accepted, 2026-11-07 |
+| [DEC-019](#dec-019--tasksattempt_count-is-the-ownership-generation-guarded-in-the-database) | `tasks.attempt_count` is the ownership generation, guarded in the database | Accepted, 2026-11-07 |
+| [DEC-020](#dec-020--cooperative-cancellation) | Cooperative cancellation | Accepted, 2026-11-07 |
+| [DEC-021](#dec-021--read-committed-short-transactions-task-before-attempt-locking-direction) | READ COMMITTED, short transactions, task-before-attempt locking (direction) | Accepted, 2026-11-07 |
+| [DEC-022](#dec-022--job-status-is-derived-from-task-states-direction) | Job status is derived from task states (direction) | Accepted, 2026-11-07 |
+| [DEC-023](#dec-023--fast-and-full-verification-lanes) | Fast and full verification lanes | Accepted, 2026-11-07 |
+| [DEC-024](#dec-024--submission-owns-one-short-read-committed-transaction) | Submission owns one short READ COMMITTED transaction | Accepted, 2026-11-07 |
+| [DEC-025](#dec-025--idempotency-unique-key-on-conflict-do-nothing-stored-content-comparison) | Idempotency: unique key, `ON CONFLICT DO NOTHING`, stored-content comparison | Accepted, 2026-11-07 |
+| [DEC-026](#dec-026--job-and-task-records-are-frozen-slotted-dataclasses-value-rules-stay-in-the-schema) | Job and task records are frozen, slotted dataclasses; value rules stay in the schema | Accepted, 2026-11-07 |
+| [DEC-027](#dec-027--tasks-are-listed-by-task_key-in-code-point-order) | Tasks are listed by `task_key` in code-point order | Accepted, 2026-11-07 |
+| [DEC-028](#dec-028--lifecycle-writes-lock-the-task-then-the-attempt-decide-with-the-policy-and-commit) | Lifecycle writes lock the task, then the attempt, decide with the policy, and commit | Accepted, 2026-11-07 |
+| [DEC-029](#dec-029--completion-is-accepted-only-from-the-current-generation-rejections-are-typed) | Completion is accepted only from the current generation; rejections are typed | Accepted, 2026-11-07 |
+| [DEC-030](#dec-030--result-contract-sql-null-is-no-result-json-null-is-a-valid-result) | Result contract: SQL NULL is "no result"; JSON null is a valid result | Accepted, 2026-11-07 |
+| [DEC-031](#dec-031--job-status-rules) | Job status rules | Accepted, 2026-11-07 |
+| [DEC-032](#dec-032--cancellation-requests-report-what-they-did-and-never-touch-finished-tasks) | Cancellation requests report what they did and never touch finished tasks | Accepted, 2026-11-07 |
+| [DEC-033](#dec-033--postgresql-native-queue-discovery-using-skip-locked) | PostgreSQL-native queue discovery using `SKIP LOCKED` | Accepted, 2026-11-07 |
+| [DEC-034](#dec-034--attempt-leases-with-a-non-renewable-execution-deadline-under-an-explicit-policy) | Attempt leases with a non-renewable execution deadline, under an explicit policy | Accepted, 2026-11-07 |
+| [DEC-035](#dec-035--one-claim-instant-and-a-database-clock-read-after-the-locks) | One claim instant, and a database clock read after the locks | Accepted, 2026-11-07 |
+| [DEC-036](#dec-036--the-heartbeat-renews-under-the-attempt-lock-alone-and-refuses-expired-leases) | The heartbeat renews under the attempt lock alone and refuses expired leases | Accepted, 2026-11-07 |
+| [DEC-037](#dec-037--recovery-revokes-one-expired-attempt-per-transaction-ownership-ends-at-its-commit) | Recovery revokes one expired attempt per transaction; ownership ends at its commit | Accepted, 2026-11-07 |
+| [DEC-038](#dec-038--revoked-attempts-a-distinct-state-the-task-follows-the-transient-failure-rule) | Revoked attempts: a distinct state; the task follows the transient-failure rule | Accepted, 2026-11-07 |
+| [DEC-039](#dec-039--migration-0002-additive-schema-and-a-quiescent-upgrade-with-nowait-locks) | Migration 0002: additive schema and a quiescent upgrade with `NOWAIT` locks | Accepted, 2026-11-07 |
+| [DEC-040](#dec-040--a-cancellation-request-sets-the-running-attempts-lease-to-a-grace-period) | A cancellation request sets the running attempt's lease to a grace period | Accepted, 2026-11-07 |
+| [DEC-041](#dec-041--migration-0003-widens-the-revocation-reasons-versions-switch-together) | Migration 0003 widens the revocation reasons; versions switch together | Accepted, 2026-11-07 |
+| [DEC-042](#dec-042--handlers-are-synchronous-functions-one-pure-boundary-maps-what-they-did-to-an-outcome) | Handlers are synchronous functions; one pure boundary maps what they did to an outcome | Accepted, 2026-11-07 |
+| [DEC-043](#dec-043--a-handler-registry-of-exact-job-kinds-checked-with-the-claims-own-rule) | A handler registry of exact job kinds, checked with the claim's own rule | Accepted, 2026-11-07 |
+| [DEC-044](#dec-044--worker-settings-every-timing-value-required-with-only-the-relationships-safe-operation-needs) | Worker settings: every timing value required, with only the relationships safe operation needs | Accepted, 2026-11-07 |
+| [DEC-045](#dec-045--a-single-slot-worker-a-supervisor-a-handler-thread-and-a-local-watchdog-that-ends-the-process) | A single-slot worker: a supervisor, a handler thread and a local watchdog that ends the process | Accepted, 2026-11-07 |
+| [DEC-046](#dec-046--outcome-policy-database-errors-are-never-handler-failures-an-ambiguous-completion-ends-the-process) | Outcome policy: database errors are never handler failures; an ambiguous completion ends the process | Accepted, 2026-11-07 |
+| [DEC-047](#dec-047--a-lost-completion-answer-is-reconciled-from-one-consistent-postgresql-read-the-handler-never-runs-again) | A lost completion answer is reconciled from one consistent PostgreSQL read; the handler never runs again | Accepted, 2026-11-07 |
+| [DEC-048](#dec-048--a-heartbeat-that-confirms-a-committed-request-tells-the-handler-after-fencing-at-the-grace-end) | A heartbeat that confirms a committed request tells the handler, after fencing at the grace end | Accepted, 2026-11-07 |
+| [DEC-049](#dec-049--graceful-shutdown-a-latched-stop-a-drain-bounded-by-a-watchdog-guard-and-lock-free-signal-handling) | Graceful shutdown: a latched stop, a drain bounded by a watchdog guard, and lock-free signal handling | Accepted, 2026-11-07 |
+| [DEC-050](#dec-050--worker-sessions-bound-their-lock-waits-and-their-idle-transactions) | Worker sessions bound their lock waits and their idle transactions | Accepted, 2026-11-07 |
+| [DEC-051](#dec-051--orqestra-worker-run-explicit-built-in-kinds-fail-fast-checks-then-the-existing-runtime) | `orqestra worker run`: explicit built-in kinds, fail-fast checks, then the existing runtime | Accepted, 2026-11-07 |
+| [DEC-052](#dec-052--an-ordered-item-list-is-partitioned-into-contiguous-fixed-size-batch-tasks-with-index-derived-keys) | An ordered item list is partitioned into contiguous, fixed-size batch tasks with index-derived keys | Accepted, 2026-11-07 |
+| [DEC-053](#dec-053--a-requeued-task-waits-until-a-durable-available_at-from-a-required-policy-with-deterministic-jitter) | A requeued task waits until a durable `available_at`, from a required policy with deterministic jitter | Accepted, 2026-11-07 |
+| [DEC-054](#dec-054--independent-single-slot-workers-without-an-orqestra-owned-service) | Independent single-slot workers without an Orqestra-owned service | Accepted, 2026-11-07 |
+| [DEC-055](#dec-055--invoices-are-verified-by-deterministic-checks-first-a-provider-only-reads-an-ambiguous-amount-string-and-the-same-checks-decide) | Invoices are verified by deterministic checks first; a provider only reads an ambiguous amount string, and the same checks decide | Accepted, 2026-11-07 |
+| [DEC-056](#dec-056--a-jobs-outcomes-are-summarised-in-process-from-one-consistent-snapshot-and-counts-are-final-only-when-the-summary-is-complete) | A job's outcomes are summarised in process from one consistent snapshot, and counts are final only when the summary is complete | Accepted, 2026-11-07 |
+| [DEC-057](#dec-057--every-invoice-provider-call-is-numbered-under-a-required-per-attempt-cap-and-recorded-before-and-after-it-is-made) | Every invoice provider call is numbered under a required per-attempt cap and recorded before and after it is made | Accepted, 2026-11-07 |
+| [DEC-058](#dec-058--an-attempts-usage-capture-is-closed-in-the-transaction-that-ends-it-by-the-workers-own-closure-or-by-recovery-at-a-tier-declared-per-job-kind) | An attempt's usage capture is closed in the transaction that ends it: by the worker's own closure, or by recovery at a tier declared per job kind | Accepted, 2026-11-07 |
+| [DEC-059](#dec-059--the-worker-writes-each-provider-calls-intent-before-the-call-and-its-result-after-it-through-its-supervisor-and-closes-those-kinds-at-t3) | The worker writes each provider call's intent before the call and its result after it, through its supervisor, and closes those kinds at T3 | Accepted, 2026-11-06 |
+| [DEC-060](#dec-060--an-unwired-openrouter-adapter-over-an-injected-http-transport-with-closed-failures-and-a-deadline-checked-before-every-blocking-step) | An unwired OpenRouter adapter over an injected HTTP transport, with closed failures and a deadline checked before every blocking step | Accepted, 2026-11-06 |
+| [DEC-061](#dec-061--a-jobs-provider-usage-is-reported-from-its-ledger-in-the-summarys-snapshot-with-exact-per-unit-totals-and-explicit-finality) | A job's provider usage is reported from its ledger in the summary's snapshot, with exact per-unit totals and explicit finality | Accepted, 2026-11-06 |
+| [DEC-062](#dec-062--before-live-provider-use-no-inbound-api-authorised-live-calls-only-no-prices-in-the-ledger-synthetic-data-until-retention-is-reviewed-gated-registration-and-a-measured-claim-index) | Before live provider use: no inbound API, authorised live calls only, no prices in the ledger, synthetic data until retention is reviewed, gated registration and a measured claim index | Accepted, 2026-11-06 |
+| [DEC-063](#dec-063--the-provider-call-package-is-orqestracalls-and-the-repositorys-wording-names-providers-instead-of-the-old-two-letter-term) | The provider call package is `orqestra.calls`, and the repository's wording names providers instead of the old two-letter term | Accepted, 2026-11-06 |
+| [DEC-064](#dec-064--orqestra-job-submit-sends-a-json-file-of-tasks-through-submit_job-and-orqestra-job-status-prints-a-jobs-derived-status) | `orqestra job submit` sends a JSON file of tasks through `submit_job`, and `orqestra job status` prints a job's derived status | Accepted, 2026-11-07 |
+| [DEC-065](#dec-065--a-jobs-provider-calls-are-checked-against-a-provable-bound-cap--σ-max_attempts-assumed-by-the-operator-and-read-in-one-snapshot-with-the-usage-report) | A job's provider calls are checked against a provable bound, cap × Σ `max_attempts`, assumed by the operator and read in one snapshot with the usage report | Accepted, 2026-11-07 |
+| [DEC-066](#dec-066--orqestra-job-summary-and-orqestra-job-usage-print-an-invoice-jobs-summary-and-usage-report-with-the-call-budget-check-on-request) | `orqestra job summary` and `orqestra job usage` print an invoice job's summary and usage report, with the call budget check on request | Accepted, 2026-11-07 |
+| [DEC-067](#dec-067--library-transactions-decode-instants-in-utc-so-lease-deadline-and-retry-arithmetic-measures-elapsed-time) | Library transactions decode instants in UTC, so lease, deadline and retry arithmetic measures elapsed time | Accepted, 2026-11-08 |
+| [DEC-068](#dec-068--a-confirmed-cancellation-request-moves-the-ownership-fence-to-the-grace-end-earlier-or-later) | A confirmed cancellation request moves the ownership fence to the grace end, earlier or later | Accepted, 2026-11-08 |
+| [DEC-069](#dec-069--the-claim-scan-dominates-the-engines-per-task-cost-at-10000-queued-tasks-so-a-partial-claim-index-is-proposed-as-its-own-task) | The claim scan dominates the engine's per-task cost at 10,000 queued tasks, so a partial claim index is proposed as its own task | Accepted, 2026-11-09 |
+| [DEC-070](#dec-070--a-step-held-back-past-a-heartbeat-may-start-when-it-and-a-full-heartbeat-fit-before-the-fence-settings-with-neither-window-are-refused) | A step held back past a heartbeat may start when it and a full heartbeat fit before the fence; settings with neither window are refused | Accepted, 2026-11-09 |
+| [DEC-071](#dec-071--openrouter-is-wired-into-the-benchmark-invoice-worker-only-off-by-default-live-calls-need-the-maintainers-separate-approval-with-a-dollar-limit) | OpenRouter is wired into the benchmark invoice worker only, off by default; live calls need the maintainer's separate approval with a dollar limit | Accepted, 2026-11-10 |
+| [DEC-072](#dec-072--one-paid-benchmark-campaign-a-low-cost-hosted-model-through-openrouter-a-45-campaign-budget-under-a-50-hard-cap-eight-steps-with-gates-enforced-in-code) | One paid benchmark campaign: a low-cost hosted model through OpenRouter, a $45 campaign budget under a $50 hard cap, eight steps with gates enforced in code | Accepted, 2026-11-16 |
+| [DEC-073](#dec-073--the-benchmark-extraction-handler-retries-a-throttled-call-per-document-inside-its-attempt-and-a-cell-may-pace-its-calls-with-a-shared-file-limiter) | The benchmark extraction handler retries a throttled call per document inside its attempt, and a cell may pace its calls with a shared file limiter | Accepted |
+| [DEC-074](#dec-074--an-idle-supervisor-call-past-its-bound-is-abandoned-and-retried-a-call-made-while-a-task-is-owned-still-ends-the-process-amends-dec-045) | An idle supervisor call past its bound is abandoned and retried; a call made while a task is owned still ends the process (amends DEC-045) | Accepted, 2026-11-17 |
+| [DEC-075](#dec-075--a-renewed-lease-is-mapped-to-the-local-clock-from-its-own-renewal-not-from-the-claim-corrects-dec-045s-fencing) | A renewed lease is mapped to the local clock from its own renewal, not from the claim (corrects DEC-045's fencing) | Accepted, 2026-11-18 |
+| [DEC-076](#dec-076--the-kill-drill-never-keeps-a-worker-stopped-past-half-its-operation-bound) | The kill drill never keeps a worker stopped past half its operation bound | Accepted, 2026-11-23 |
 
 ## Repository foundation
 
 ### DEC-001 — uv for dependency management and lockfile
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · **ADR:** 0002
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · **ADR:** 0002
 - **WHAT:** `uv` manages the virtualenv, resolves and locks dependencies (`uv.lock`), and runs tools.
 - **WHY:** One fast tool for lock, sync, run and Python installation; `uv sync --locked` in CI fails when `uv.lock` is stale; `--frozen` installs the lock as-is.
 - **RUNNER-UP:** Poetry — mature, but a slower resolver and a second configuration dialect.
 
 ### DEC-002 — Python 3.12
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `requires-python >= 3.12`, pinned in `.python-version`.
 - **WHY:** `slots=True` dataclasses, `StrEnum`, better tracebacks; every candidate DB and HTTP library ships 3.12 wheels.
 - **RUNNER-UP:** 3.13 — newer, but fewer verified wheels for the drivers still under evaluation.
 
 ### DEC-003 — src layout, one package, no empty subpackages
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · **ADR:** 0002
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · **ADR:** 0002
 - **WHAT:** `src/orqestra/`; subpackages appear only when they ship tested code.
 - **WHY:** Tests import the installed package, not the working tree; the tree never implies unimplemented behaviour.
 - **RUNNER-UP:** Scaffold every planned package now — looks complete, misleads about status.
 
 ### DEC-004 — Ruff for formatting and linting
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `ruff format` + `ruff check` with pycodestyle, pyflakes, isort, pyupgrade, bugbear, simplify, pytest-style and annotation rules.
 - **WHY:** One fast tool replaces Black, isort and flake8; annotation rules keep the public surface typed.
 - **RUNNER-UP:** Black + isort + flake8 — familiar, three tools, slower.
 
 ### DEC-005 — mypy in strict mode over src and tests
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `mypy --strict` with the pydantic plugin; tests are type-checked too.
 - **WHY:** Strict from day one costs nothing now and is painful to retrofit; pip-installable, no Node toolchain.
 - **RUNNER-UP:** pyright — faster, sharper inference, but adds a Node dependency to dev and CI.
 
 ### DEC-006 — pytest lanes by marker
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** Markers `unit`, `integration`, `e2e`, `performance`; the fast lane runs everything except the last three, and PR CI also runs the `integration` lane (DEC-023); coverage threshold 80% as a heuristic.
 - **WHY:** Maps directly to the charter's test gates and keeps PR CI fast and deterministic.
 - **RUNNER-UP:** Separate test directories only — works, but cannot express "slow" per test.
@@ -55,75 +130,75 @@ undecided too (DEC-040), and so are operational retry delays (DEC-053).
 - **Note (2026-11-08):** no test carries the `e2e` marker yet, and both lanes exclude it; the full submit, process and aggregate path is exercised by integration tests instead (`tests/integration/test_bench_smoke_pg.py`).
 
 ### DEC-007 — pydantic-settings for configuration
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `Settings(BaseSettings)` with `ORQESTRA_` prefix, `.env` in development, `SecretStr` for the DSN, validated ranges.
 - **WHY:** Fails fast on bad values; secrets cannot leak through `repr`. It is used for settings only: job and task records are frozen standard-library dataclasses (DEC-026).
 - **RUNNER-UP:** Hand-rolled `os.environ` parsing — zero dependencies, no validation, silent bad values.
 - **Note (2026-11-08):** `.env` is read from the current directory in every environment, not only in development: `Settings` and `WorkerSettings` set `env_file=".env"` with no condition (`config.py`, `worker/settings.py`), and a variable set in the environment takes precedence.
 
 ### DEC-008 — Explicit immutable transition table for task states
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `TASK_TRANSITIONS` as a `MappingProxyType` of frozensets; `transition()` raises `InvalidTransitionError`.
 - **WHY:** The lifecycle is documented, exhaustively testable, and the single source persistence must enforce with conditional writes.
 - **RUNNER-UP:** A state-machine library — more machinery than five states justify.
-- **Persistence clarification (owner-approved direction, 2026-10-24):** the table stays the single source of *legal transitions* and is unchanged. Persistence must additionally check the task's ownership generation on every authoritative write, because a state-only conditional write cannot tell a current worker from a stale one (DEC-019, ADR-0003).
+- **Persistence clarification (maintainer-approved direction, 2026-10-24):** the table stays the single source of *legal transitions* and is unchanged. Persistence must additionally check the task's ownership generation on every authoritative write, because a state-only conditional write cannot tell a current worker from a stale one (DEC-019, ADR-0003).
 
 ### DEC-009 — Unknown exceptions are not retried
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** Only `TransientError` is retryable; `PermanentError` and any unclassified exception are terminal.
 - **WHY:** Retrying a defect spends time and provider budget and hides the bug; transient classes must be opted into explicitly.
 - **RUNNER-UP:** Retry everything except known-permanent errors — more forgiving, more expensive, masks defects.
-- **Persistence clarification (owner-approved direction, 2026-10-24):** the rule applies to exceptions raised by task handlers, classified by `classify_failure` as transient, permanent or unclassified (unclassified is recorded explicitly and not retried). Worker crashes, lost ownership and lease expiry are recovery events, not handler failures. Database or infrastructure errors must not be recorded as permanent task failures. Cancellation and shutdown signals are control-plane events and are not classified. A rejected stale write is an expected concurrency outcome, not an `InvalidTransitionError` or a task failure. `is_retryable` and the error hierarchy are unchanged.
+- **Persistence clarification (maintainer-approved direction, 2026-10-24):** the rule applies to exceptions raised by task handlers, classified by `classify_failure` as transient, permanent or unclassified (unclassified is recorded explicitly and not retried). Worker crashes, lost ownership and lease expiry are recovery events, not handler failures. Database or infrastructure errors must not be recorded as permanent task failures. Cancellation and shutdown signals are control-plane events and are not classified. A rejected stale write is an expected concurrency outcome, not an `InvalidTransitionError` or a task failure. `is_retryable` and the error hierarchy are unchanged.
 - **Lease and recovery clarification:** an attempt whose lease or deadline expired is recorded as `revoked` with a revocation reason, never as a failed attempt with a failure kind or error details (DEC-038). A task that uses up its budget through revocations ends `failed` because its retries are exhausted, not because a handler failed permanently.
 
 ### DEC-010 — Stdlib logging with a JSON formatter
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `JsonFormatter` emitting one object per line with optional `job_id`/`task_id`/`attempt_id`/`worker_id`.
 - **WHY:** Zero dependencies and structured correlation IDs from the first commit.
 - **RUNNER-UP:** structlog — better context binding; revisit with the worker runtime, when worker context grows.
 
 ### DEC-011 — argparse CLI
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `orqestra version|health|migrate`, `orqestra worker run` and `orqestra job submit|status|summary|usage` via argparse.
 - **WHY:** Zero dependencies; no inbound API or web framework is planned (DEC-062).
 - **RUNNER-UP:** Typer — nicer UX, adds a dependency before the HTTP choice is made.
 
 ### DEC-012 — GitHub Actions pinned by commit SHA with least privilege
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** `permissions: contents: read`; actions pinned to full SHAs with the tag in a comment; `uv sync --locked`.
 - **WHY:** Immutable action references and read-only tokens are the charter's supply-chain baseline.
 - **RUNNER-UP:** Tag pins (`@v7`) — readable, mutable.
 
 ### DEC-013 — Private tooling configuration is not tracked
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:** Machine-local tool configuration and session files are git-ignored (patterns in `.gitignore`); general contributor guidance is tracked in `docs/development.md`.
-- **WHY:** Owner decision: local tool configuration and session records are specific to one machine, may hold private notes, and are not part of the product; tracked documentation should describe the software. Deviates from the initial planning layout, which proposed a tracked tool-specific instruction file.
+- **WHY:** Maintainer decision: local tool configuration and session records are specific to one machine, may hold private notes, and are not part of the product; tracked documentation should describe the software. Deviates from the initial planning layout, which proposed a tracked tool-specific instruction file.
 - **RUNNER-UP:** Track a tool-specific instruction file — visible to contributors, but mixes machine-local material into the public record.
 - **Note (2026-11-09):** the patterns moved from `.gitignore` to each developer's `.git/info/exclude`, so that the repository names no tool; `docs/development.md` says so.
 
 ### DEC-014 — Deferred at the start (explicitly not chosen)
-- **Status:** Proposed, superseded in part: Docker Compose (`compose.yaml`, PR #33) and the architecture document (`docs/architecture.md`, PR #38) now exist; the other seven deferrals stand. The `LICENSE` is deferred until publication (owner, 2026-11-08): until then Orqestra is not licensed and all rights are reserved.
+- **Status:** Proposed, superseded in part: Docker Compose (`compose.yaml`, PR #33), the architecture document (`docs/architecture.md`, PR #38), Dependabot (`.github/dependabot.yml`, PR #92), code scanning (`.github/workflows/codeql.yml`, PR #92) and `SECURITY.md` (PR #91) now exist; the other five deferrals stand. The `LICENSE` is deferred until publication (maintainer, 2026-11-08). All rights reserved; no licence is granted.
 - **WHAT:** Docker Compose, Dockerfile, pre-commit, security scanners, Dependabot, issue templates, architecture doc, `LICENSE`, `CHANGELOG`.
-- **WHY:** None supports an immediate engineering objective; Docker could not be verified locally today (daemon not running) and unverified config is not committed.
+- **WHY:** None supports an immediate engineering objective, and unverified configuration is not committed.
 - **RUNNER-UP:** Ship them all at the start — fuller skeleton, more unverified surface.
 
 ## PostgreSQL persistence foundation
 
-Entries DEC-015 to DEC-023 record directions the owner approved on 2026-10-24 after an
-architecture audit and an independent review. The owner accepted them on
+Entries DEC-015 to DEC-023 record directions the maintainer approved on 2026-10-24 after an
+architecture audit and an independent review. The maintainer accepted them on
 2026-11-07. "Implemented" means verified by the tests named under
 VERIFICATION; "direction" means not yet implemented.
 
 ### DEC-015 — PostgreSQL is the authoritative store for Job → Task → Attempt
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · **ADR:** 0003 · implemented (schema)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · **ADR:** 0003 · implemented (schema)
 - **WHAT:** Jobs, tasks and attempts live in PostgreSQL 16; every authoritative state change is a PostgreSQL transaction. SQLite is not a target.
 - **WHY:** Durable, transactional row locks and constraints give claiming, fencing and recovery a single source of truth independent of any future queue.
 - **RUNNER-UP:** A broker (Redis, RabbitMQ) as the system of record — fast delivery, but no relational invariants or transactional history.
 - **TRADE-OFF:** One database is a single point of failure and a throughput ceiling; accepted at this project's scale.
 - **VERIFICATION:** `tests/integration/test_migrations.py`, `tests/integration/test_schema_constraints.py`.
 
-### DEC-016 — Psycopg 3, synchronous connections, explicit parameterized SQL
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented (migration runner)
+### DEC-016 — Psycopg 3, synchronous connections, explicit parameterised SQL
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented (migration runner)
 - **WHAT:** `psycopg[binary]>=3.2,<4` (locked at 3.3.6, bundled libpq 18). No ORM, no async database layer.
 - **WHY:** Transaction boundaries, conditional updates, row counts and locking stay visible in the code and testable.
 - **RUNNER-UP:** SQLAlchemy Core — composable SQL, but an extra abstraction and dependency over the statements that matter most.
@@ -131,7 +206,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** strict mypy over the persistence code; integration tests run through psycopg against PostgreSQL 16.
 
 ### DEC-017 — Forward-only SQL migrations with an in-repository runner
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented
 - **WHAT:** Versioned `NNNN_name.sql` files shipped in the package; `orqestra.persistence.migrate` applies each in its own transaction under `pg_advisory_xact_lock`, records version, name and SHA-256 checksum in `schema_migrations`, and refuses edited, renamed or unknown history. Migration SQL runs through PL/pgSQL `EXECUTE`, where PostgreSQL itself rejects transaction control and non-transactional statements, so no SQL is parsed on the client.
 - **WHY:** Locking, checksums and history are built in, with no dependency beyond the approved driver.
 - **RUNNER-UP:** Alembic with hand-written SQL — mature and widely known, but adds SQLAlchemy and Mako and has no built-in lock or checksum.
@@ -140,7 +215,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **Note (2026-11-09):** each migration transaction now starts with `LOCK TABLE schema_migrations IN SHARE ROW EXCLUSIVE MODE`, which takes no snapshot, then takes `pg_advisory_xact_lock`, and only then reads the history; a first run creates the history table under the advisory lock in its first migration's transaction, and a runner that loses that race rolls back and takes the table's lock instead. Runners therefore serialise whatever the session's default isolation (a REPEATABLE READ snapshot taken at the advisory SELECT had read the history from before the previous runner committed). A runner of the previous code racing a new one takes the locks in the other order and can be aborted as a deadlock (`40P01`, a `MigrationError`), never applied twice. `tests/integration/test_migrate.py`.
 
 ### DEC-018 — Separate attempt states; states stored as constrained text; application UUIDs
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented
 - **WHAT:** `AttemptState` (running → succeeded | failed | cancelled | revoked; `revoked` added by DEC-038 and migration 0002) beside the unchanged five-state `TaskState`; `FailureKind` for failed attempts. Stored as `text` with named `CHECK` constraints. UUID keys generated by the application.
 - **WHY:** Attempt history and failure provenance without overloading task states; text constraints can be changed with a migration, unlike enum values; IDs are known before insert.
 - **RUNNER-UP:** Native PostgreSQL enums; `bigint` identity keys.
@@ -148,7 +223,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** `tests/unit/test_states.py`, `tests/unit/test_policy.py`; `test_stored_state_values_match_the_domain`.
 
 ### DEC-019 — `tasks.attempt_count` is the ownership generation, guarded in the database
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · **ADR:** 0003 · guard implemented; generation-checked completion implemented with the transactional attempt lifecycle (DEC-029)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · **ADR:** 0003 · guard implemented; generation-checked completion implemented with the transactional attempt lifecycle (DEC-029)
 - **WHAT:** Attempt *N* holds generation *N*. The count starts at 0, changes only on a `queued → running` claim, by exactly +1, never decreases and never exceeds `max_attempts`. A narrow trigger (`tasks_attempt_count_fencing`) rejects any other change; it does not restate the transition table.
 - **WHY:** A state-only conditional write accepts a stale worker's result after the task was requeued and reclaimed. The generation guard is the one invariant whose violation would be silent, so the database enforces it.
 - **RUNNER-UP:** A separate `generation` column, or relying on write-path discipline and tests alone.
@@ -157,7 +232,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** trigger tests for legal claims, decreases, resets, skipped generations, unrelated increments, frozen terminal tasks and retry exhaustion.
 
 ### DEC-020 — Cooperative cancellation
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · policy, schema and writes implemented (transactional attempt lifecycle, DEC-032); grace period later
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · policy, schema and writes implemented (transactional attempt lifecycle, DEC-032); grace period later
 - **WHAT:** A request cancels a queued task immediately. A running task records `cancel_requested_at` and keeps running. A legitimate success may still win; an outcome that would requeue cancels instead; other terminal outcomes are recorded truthfully. A future recovery step must revoke ownership after a bounded grace period.
 - **WHY:** Attempt and usage records stay truthful while work is in flight, and no retries start after a request.
 - **RUNNER-UP:** Immediate cancellation of running tasks, fencing off late results — simpler state, but the database would show no live attempt while a worker still spends.
@@ -167,16 +242,16 @@ VERIFICATION; "direction" means not yet implemented.
 - **Cancellation grace note:** the bounded grace period now exists (DEC-040). A request carries a grace duration and sets the running attempt's lease to end that long after it; heartbeats stop renewing it, and recovery then cancels the task whatever budget is left. The cooperative rules above are unchanged within the grace period.
 
 ### DEC-021 — READ COMMITTED, short transactions, task-before-attempt locking (direction)
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented: job submission (DEC-024) and the attempt lifecycle (DEC-028)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented: job submission (DEC-024) and the attempt lifecycle (DEC-028)
 - **WHAT:** Authoritative writes are single conditional statements or lock-then-decide transactions (`SELECT … FOR UPDATE` on the task, then its attempt) under READ COMMITTED. No transaction is held open during external or provider work.
-- **WHY:** Row locks plus re-checked conditions give compare-and-set without serialization-failure retry loops; one lock order prevents deadlocks.
+- **WHY:** Row locks plus re-checked conditions give compare-and-set without serialisation-failure retry loops; one lock order prevents deadlocks.
 - **RUNNER-UP:** SERIALIZABLE isolation with retries.
 - **TRADE-OFF:** Cross-table invariants rely on the write paths and their tests.
 - **VERIFICATION:** Transactional lifecycle concurrency tests (competing starts, stale generations, cancellation races).
 - **Lease and recovery note:** the heartbeat (DEC-036) and the provider-usage intent insert, which reads its attempt `FOR KEY SHARE` (DEC-058), are the writes that lock only the attempt row.
 
 ### DEC-022 — Job status is derived from task states (direction)
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented; the rules are DEC-031
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented; the rules are DEC-031
 - **WHAT:** No mutable job-state column; status is computed from task-state counts. Revisit only with a correctness need or reproducible measurements.
 - **WHY:** No redundant state to drift and no hot job row updated by every task.
 - **RUNNER-UP:** Stored job state or counters.
@@ -184,7 +259,7 @@ VERIFICATION; "direction" means not yet implemented.
 - **VERIFICATION:** Transactional lifecycle tests of the derivation.
 
 ### DEC-023 — Fast and full verification lanes
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented; both lanes passed on GitHub for PR #2 and for `main` after its merge
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented; both lanes passed on GitHub for PR #2 and for `main` after its merge
 - **WHAT:** `make check` = format, lint, mypy, unit tests (coverage reported). `make verify` = lint, mypy, unit + PostgreSQL integration tests with `--cov-fail-under=80`, and a wheel check that every migration is packaged. It fails if `ORQESTRA_TEST_DATABASE_URL` is unset. Integration tests refuse any database other than a local `orqestra_test`. CI runs both lanes, the second against `postgres:16.15` pinned by digest.
 - **WHY:** "Verified" must mean the persistence tests ran; the threshold applies where persistence code is exercised.
 - **RUNNER-UP:** Keep the 80% threshold on the unit-only run — it fails once database code is covered only by integration tests.
@@ -194,11 +269,11 @@ VERIFICATION; "direction" means not yet implemented.
 ## Transactional job submission
 
 Entries DEC-024 to DEC-027 record implementation choices within the approved persistence
-direction. The owner accepted them on 2026-11-07. No
+direction. The maintainer accepted them on 2026-11-07. No
 schema change was needed.
 
 ### DEC-024 — Submission owns one short READ COMMITTED transaction
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented (`orqestra.persistence.jobs.submit_job`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented (`orqestra.persistence.jobs.submit_job`)
 - **WHAT:** `submit_job(conn, submission)` takes a caller's connection. It refuses one whose caller holds an open, failed or busy transaction (a `RuntimeError` naming the status), and leaves a closed or broken connection to psycopg's own connection error. It sets `READ COMMITTED` for its own transaction, inserts the job row and then every task in a single `INSERT … SELECT FROM unnest(…)`, and commits. Reads (`get_job`, `get_task`, `list_tasks`) are single statements; on a non-autocommit connection psycopg opens an implicit transaction for them that the caller ends. Every function reads through its own tuple-row cursor, so the connection's row factory does not matter.
 - **WHY:** Atomicity and idempotent replay depend on the submission committing on its own. A function that joined a caller's transaction could be held open or rolled back later, keeping other submitters with the same key waiting. Setting the isolation level makes behaviour independent of session, server and psycopg connection settings (DEC-021). Mapping rows by position from a cursor the function controls means a connection configured with, say, `dict_row` cannot turn rows into wrong records: before this was fixed, such a connection reported a conflicting submission as a successful replay of a garbage job. One statement for all tasks keeps the transaction to three round trips whatever the task count.
 - **RUNNER-UP:** Caller-managed transactions, so submission could be combined with other writes — more composable, but the commit point and its duration would no longer be the function's. Inserting tasks with `executemany` — equally atomic, but more statements per submission.
@@ -206,7 +281,7 @@ schema change was needed.
 - **VERIFICATION:** `tests/integration/test_job_submission.py`: rejected submissions, failing either at the job insert or at a task insert, leave no rows behind; a test-only trigger that fails the third task reports that the job and two tasks existed before rollback; the function refuses implicit, explicit and failed caller transactions and leaves them as they were; a closed or server-terminated connection raises `psycopg.OperationalError`; a connection lost mid-submission stores nothing and frees the key; it commits on a non-autocommit connection, and one connection stays usable after success, constraint failure, conflict and replay, in both modes; it works on a `dict_row` connection; a waiting duplicate still replays under a `serializable` session default and under psycopg's `isolation_level = SERIALIZABLE`.
 
 ### DEC-025 — Idempotency: unique key, `ON CONFLICT DO NOTHING`, stored-content comparison
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented
 - **WHAT:** `jobs_idempotency_key_unique` arbitrates. The job insert uses `ON CONFLICT ON CONSTRAINT jobs_idempotency_key_unique DO NOTHING`, so a concurrent submission with the same key waits for the first to commit or roll back. When the key is taken, one query loads the existing job and compares the request with its stored `kind` and tasks (`task_key`, `payload` by `jsonb` equality, `max_attempts`). An identical request returns the existing job with `created=False`; any difference raises `IdempotencyConflictError`.
 - **WHY:** The stored rows already hold the entire logical request, so no new column is needed. PostgreSQL's unique index gives one winner under any concurrency; comparing in SQL uses `jsonb` semantics rather than Python equality, where `True == 1`.
 - **RUNNER-UP:** A request-fingerprint column (hash of canonical JSON) — constant-cost comparison, but it needs a schema change and a canonical form every client must reproduce. An advisory lock on the key's hash, or SERIALIZABLE isolation with retries — extra mechanisms beside a unique index that already serialises the conflict.
@@ -214,7 +289,7 @@ schema change was needed.
 - **VERIFICATION:** identical replays, including reordered tasks and reformatted JSON, store nothing; seven kinds of content change and eight JSON differences (type, order, float rounding, Unicode normalisation, case) are rejected; a replay the database cannot evaluate raises the database's error, not a conflict; a lock timeout while waiting on the key raises `LockNotAvailable` and leaves the connection reusable; 10 rounds × 8 concurrent identical submitters create exactly one job each; 10 rounds × 8 concurrent submitters split across two contents store one job and reject the losers. Deterministic gated tests observe the second submitter blocked on the first's transaction lock (`pg_locks`), then show it replaying after a commit, rejected after a conflicting commit, and taking the key after a rollback. Locally, removing `ON CONFLICT` failed 31 tests and removing the comparison failed 22.
 
 ### DEC-026 — Job and task records are frozen, slotted dataclasses; value rules stay in the schema
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented (`orqestra.domain.jobs`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented (`orqestra.domain.jobs`)
 - **WHAT:** `TaskSpec` and `JobSubmission` describe a request; `Job` and `Task` mirror stored rows, with `Task.state` as a `TaskState`. `JobSubmission` rejects an empty task list and repeated task keys. Non-blank text and the retry-limit range are left to the named database constraints and surface as `psycopg` integrity errors after rollback.
 - **WHY:** Standard library only, immutable and cheap, consistent with the approved direction. Checks that span the whole request belong to the request. Restating column rules in Python would create a second copy that could drift.
 - **RUNNER-UP:** Pydantic models — already a dependency and good at validation, but heavier for internal records and a second validation layer over the constraints.
@@ -222,7 +297,7 @@ schema change was needed.
 - **VERIFICATION:** `tests/unit/test_jobs.py`; the rejected-submission integration tests assert the violated constraint names.
 
 ### DEC-027 — Tasks are listed by `task_key` in code-point order
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented
 - **WHAT:** `list_tasks` orders by `task_key COLLATE "C"`. Task keys are unique within a job, so the order is total. Submission order is not stored.
 - **WHY:** Deterministic without a new column, and independent of the database locale: it matches Python's `sorted`, whereas the default `en_US.UTF-8` collation sorts `a` before `B`.
 - **RUNNER-UP:** A `position` column preserving submission order — a schema change with no demonstrated requirement yet.
@@ -232,12 +307,12 @@ schema change was needed.
 ## Transactional attempt lifecycle
 
 Entries DEC-028 to DEC-032 record implementation choices within the approved persistence
-direction (ADR-0003, DEC-019 to DEC-022). The owner accepted
+direction (ADR-0003, DEC-019 to DEC-022). The maintainer accepted
 them on 2026-11-07. No schema change, migration or dependency was needed, and the
 lifecycle policy functions and transition tables are unchanged.
 
 ### DEC-028 — Lifecycle writes lock the task, then the attempt, decide with the policy, and commit
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented (`orqestra.persistence.lifecycle`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented (`orqestra.persistence.lifecycle`)
 - **WHAT:** `start_attempt`, `complete_attempt` and `request_cancellation` each own one short READ COMMITTED transaction (the guard shared with `submit_job`). Each one locks the task row (`SELECT … FOR UPDATE`) before anything else; completion then locks its attempt row. The domain functions decide (`can_transition`, `next_task_state`, `state_after_cancel_request`, `transition`, `transition_attempt`), the writes follow, and the transaction commits. Starting a task claims it (`queued → running`, `attempt_count + 1`) and inserts attempt *N = attempt_count* in the same transaction. No transaction spans task execution: a start commits before the work and a completion is a separate transaction.
 - **WHY:** One lock order (task, then attempt) on every path means no deadlocks. Every writer of a task serialises on its row, so each decision sees the latest committed state. Deciding in Python keeps the retry and cancellation rules in one place (DEC-008, DEC-020), and the lock gives a precise reason for every rejection.
 - **RUNNER-UP:** Single conditional `UPDATE … WHERE state = … AND attempt_count = …` statements — fewer round trips, but the policy would be restated in SQL and a rejection would need a second query to explain itself. SERIALIZABLE with retries — no explicit locks, but retry loops on every write path.
@@ -245,7 +320,7 @@ lifecycle policy functions and transition tables are unchanged.
 - **VERIFICATION:** `tests/integration/test_attempt_lifecycle.py`: 20 rounds × 8 concurrent starters yield exactly one attempt each; a gated test observes the losing starter blocked on the winner's row lock (`pg_locks`), then refused; a failing attempt insert (constraint, or a test-only trigger reporting the task already `running` at generation 1) rolls the claim back; 5 rounds × 6 competing workers start exactly `max_attempts` attempts, numbered 1..5. A whole-schema invariant check runs at the end of every test and after every race round. Locally, removing the task lock on start failed 8 tests; removing it on completion failed 5; removing the start or completion transaction failed 10 and 13; disabling the transition-table check on start failed 19. Removing only the attempt lock failed none: the task lock alone serialises every writer, so the attempt lock is defence in depth.
 
 ### DEC-029 — Completion is accepted only from the current generation; rejections are typed
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented
 - **WHAT:** `complete_attempt(conn, attempt_id, *, generation=N, outcome=…, retry_policy, usage_closure=None)` takes effect only when the attempt's number is *N*, the task's `attempt_count` is *N*, and the attempt is still running. Otherwise it changes nothing and raises:
   - `StaleAttemptError` — the generation does not match, or a newer one exists.
   - `AttemptFinishedError` — the current attempt already ended (a duplicate completion).
@@ -259,7 +334,7 @@ lifecycle policy functions and transition tables are unchanged.
 - **VERIFICATION:** a generation older than the current one, its attempt already failed and requeued, cannot record success, permanent or transient failure, and the newer attempt's result stands. A test stand-in for future lease recovery revokes a running attempt; the slow worker then cannot overwrite the new result. Mismatched generations (0, older, future) are rejected. Five kinds of duplicate completion change nothing, including after a requeue. 20 rounds × 4 concurrent completions of one attempt record exactly one result. A completion that fails at the attempt update or at the task update leaves both untouched and can be retried. A connection terminated mid-completion records nothing. Locally, removing the generation check failed 5 tests, removing the finished check failed 10, and ignoring a pending cancellation request failed 4.
 
 ### DEC-030 — Result contract: SQL NULL is "no result"; JSON null is a valid result
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented; no schema change
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented; no schema change
 - **WHAT:** A succeeded attempt's result is stored as `jsonb` on its task, always as a JSON value: a result of `None` is stored as the jsonb value `'null'`, never SQL `NULL`. `Task.result` is meaningful only when `Task.state` is `SUCCEEDED`; every other task has SQL `NULL`, enforced by `tasks_result_iff_succeeded`.
 - **WHY:** The schema's existing constraint already makes the task's state the unambiguous signal of whether a result exists, so a result that is JSON null needs no new column and is not silently confused with "no result".
 - **RUNNER-UP:** Forbid JSON null results — simpler to read, but it rejects a legitimate JSON value. Wrap results (`{"value": …}`) or add a `has_result` column — unambiguous on their own, but either changes the stored format or needs a migration.
@@ -267,7 +342,7 @@ lifecycle policy functions and transition tables are unchanged.
 - **VERIFICATION:** `test_a_success_stores_its_result_and_json_null_is_a_result` checks `result IS NULL` and `jsonb_typeof` for six result kinds, including `null`, `false` and `0`; storing JSON null as SQL NULL fails it.
 
 ### DEC-031 — Job status rules
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented (`derive_job_status`, `get_job_progress`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented (`derive_job_status`, `get_job_progress`)
 - **WHAT:** From the number of tasks in each state:
   - `queued` — every task is queued, including tasks requeued for a retry.
   - `running` — some task is queued or running, but not every task is queued.
@@ -282,7 +357,7 @@ lifecycle policy functions and transition tables are unchanged.
 - **VERIFICATION:** `tests/unit/test_jobs.py` checks every combination of 0–2 tasks in each of the five states (242 cases) against an independent restatement of the rules. An integration test walks a four-task job through queued, running, requeued, mixed and failed states.
 
 ### DEC-032 — Cancellation requests report what they did and never touch finished tasks
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · implemented (`request_cancellation`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · implemented (`request_cancellation`)
 - **WHAT:** `request_cancellation` returns one of four outcomes:
   - `cancelled` — the task was queued; it now has `cancel_requested_at = finished_at`.
   - `requested` — the task is running and keeps running (DEC-020).
@@ -296,7 +371,7 @@ lifecycle policy functions and transition tables are unchanged.
 ## PostgreSQL task discovery
 
 ### DEC-033 — PostgreSQL-native queue discovery using `SKIP LOCKED`
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-25) · implemented (`claim_next_attempt`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-25) · implemented (`claim_next_attempt`)
 - **WHAT:** PostgreSQL is the task queue; there is no separate broker. `claim_next_attempt(conn, worker_id)` locks the first claimable task with `SELECT … WHERE state = ANY(<sources of running>) ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED`, then claims it in the same transaction through the private `_claim` step it shares with `start_attempt`: transition check, generation advance and attempt insert. It returns the new attempt, or `None` when nothing is claimable. The claimable states come from the transition table (`allowed_sources`), not a literal.
 - **WHY:** Tasks already live in PostgreSQL (DEC-015), so claiming a row and starting its attempt is one transaction with no second system to keep consistent. `SKIP LOCKED` lets concurrent claimants take distinct tasks without waiting for each other or for a cancellation in progress. Sharing `_claim` keeps one authoritative implementation of the claim, guarded by the existing fencing trigger.
 - **RUNNER-UP:** An external broker (Redis, RabbitMQ) delivering task IDs — it pushes work and scales independently, but it is a second system that must agree with the authoritative rows (DEC-015's runner-up). Within PostgreSQL, a single `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED) RETURNING` saves a round trip, but it would restate the claim SQL and bypass the domain transition check.
@@ -316,7 +391,7 @@ lifecycle policy functions and transition tables are unchanged.
 
   Locally, replacing `SKIP LOCKED` with a waiting `FOR UPDATE` failed 3 tests, removing the row lock failed 7 (the fencing trigger rejected the colliding claims), claiming from any state failed 11, removing the ordering failed 2, and removing the owned transaction failed 11.
 - **Lease and recovery note:** the lease migration (0002, DEC-039) does not add the claim-ordering index: it is a performance change and stays deferred until measured. Claims now take a lease policy (DEC-034), and a revoked task is requeued with its original `created_at`, so it too is claimed again without backoff.
-- **Job-kind filter note:** Accepted with DEC-033 (owner, 2026-11-07; was Proposed) · owner-approved scope (2026-10-26) · implemented; merged in PR #8 (`46acdd9`), with both CI jobs passing for the pull request (run 40397331066) and for `main` (run 40397973812). The worker contracts moved the kind check, unchanged, to `orqestra.domain.kinds.check_job_kinds`, shared with the handler registry (DEC-043).
+- **Job-kind filter note:** Accepted with DEC-033 (maintainer, 2026-11-07; was Proposed) · maintainer-approved scope (2026-10-26) · implemented; merged in PR #8 (`46acdd9`), with both CI jobs passing for the pull request (run 40397331066) and for `main` (run 40397973812). The worker contracts moved the kind check, unchanged, to `orqestra.domain.kinds.check_job_kinds`, shared with the handler registry (DEC-043).
   - **WHAT:** `claim_next_attempt(conn, worker_id, *, kinds, policy)` takes a required, non-empty collection of supported job kinds. Discovery adds `AND EXISTS (SELECT FROM jobs WHERE jobs.id = tasks.job_id AND jobs.kind = ANY(<kinds>))` to the same `FOR UPDATE SKIP LOCKED` query, so the filter is part of the atomic claim; ordering, the task-before-attempt lock order, `_claim`, fencing and the owned transaction are unchanged. Kinds match exactly. A bare string or bytes, a non-collection, an empty collection, a non-string kind, a blank kind or a kind with a NUL character raises `TypeError` or `ValueError` before any statement is sent; duplicates are accepted and collapsed. "Blank" is the database's rule for job kinds, `jobs_kind_not_blank` (`btrim(kind) <> ''`, where `btrim` trims spaces only), checked in Python as `kind.strip(" ")`, so every kind a job can have can be claimed, including one containing a tab or a newline. There is no unfiltered claim.
   - **WHY:** A worker can only run the kinds it has handlers for. Without the filter it would claim a task it cannot run, and could only fail or release it: that uses an attempt of the task's budget, records an outcome that says nothing about the task, and, because a requeued task keeps its place, can hold up the work behind it. Filtering inside the locking query means a claimant never locks, counts or reorders a task it cannot run.
   - **RUNNER-UP:** Denormalising the kind onto `tasks` (a `tasks.kind` column, possibly indexed with the claim order) avoids the per-candidate join, but needs a migration and a copy of an immutable job fact; deferred until claim cost is measured. Also rejected: one catch-all handler per worker, or filtering after the claim (which uses budget), or an optional `kinds` defaulting to "any" (a silent, unsafe fallback).
@@ -333,16 +408,16 @@ lifecycle policy functions and transition tables are unchanged.
 
 ## Attempt leases, execution deadlines and recovery
 
-Entries DEC-034 to DEC-039 record the lease and recovery design the owner approved on 2026-10-26 after
+Entries DEC-034 to DEC-039 record the lease and recovery design the maintainer approved on 2026-10-26 after
 an architecture audit, an independent review and a PostgreSQL locking investigation. The
-owner accepted them on 2026-11-07. "Implemented" means
+maintainer accepted them on 2026-11-07. "Implemented" means
 verified by the tests named, locally and in GitHub CI: they were merged in PR #6
 (`a031666`), with both CI jobs passing for `main` (run 40260902718). These are
 building blocks: there is no worker loop, nothing schedules recovery, and a revoked worker
 is not stopped (left to the worker runtime).
 
 ### DEC-034 — Attempt leases with a non-renewable execution deadline, under an explicit policy
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented (`orqestra.domain.leases`, migration 0002)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented (`orqestra.domain.leases`, migration 0002)
 - **WHAT:** Each attempt stores `lease_expires_at` and `deadline_at`, set at claim from one instant: the deadline is the claim instant plus `execution_timeout`, the lease the claim instant plus `lease`, capped at the deadline. A heartbeat sets the lease to `policy.lease` from now, capped at the deadline and never lower than before. The deadline never changes, enforced by the trigger `attempts_deadline_immutable`. An attempt may be revoked once the database time reaches `lease_expires_at`. The reason follows from the stored facts: a lease that reached its deadline cap means `deadline_exceeded`, any other expired lease `lease_expired`. `LeasePolicy(lease, execution_timeout)` is a required keyword argument of `start_attempt` and `claim_next_attempt`. Both values must be positive `timedelta`s within the representable range, `lease` cannot exceed `execution_timeout`, and a deadline beyond `datetime`'s range rolls the claim back with `ValueError`. There are no defaults.
 - **WHY:** A heartbeat proves that a worker is alive, not that its work progresses: a worker whose handler hangs can renew its lease forever. A deadline that no heartbeat can extend bounds that case (R-EXEC-04). Capping the lease at the deadline leaves recovery with one predicate. Keeping leases on the attempt keeps, with each attempt's history, the facts its revocation was decided on. The policy is required because an optional "no lease" would bring back work that nobody recovers, and numeric defaults are an operational decision not yet made.
 - **RUNNER-UP:** The lease on the task row: one place to look, but it loses per-attempt history. An independent deadline checked beside the lease: two predicates, and a precedence rule when both have expired. Defaults in `Settings`: convenient, but they invent operational values.
@@ -350,12 +425,12 @@ is not stopped (left to the worker runtime).
   - A slow but healthy attempt is revoked at its deadline even while it heartbeats; choosing the timeout for each kind of work is open.
   - A worker that dies in its last lease window before the deadline is recorded as `deadline_exceeded`.
   - Every caller must pass a policy; the existing test call sites were updated.
-  - Operational bounds (maximum lease and timeout, heartbeat interval, per-job-kind policies) are undecided and need owner approval before the worker runtime.
+  - Operational bounds (maximum lease and timeout, heartbeat interval, per-job-kind policies) are undecided and need maintainer approval before the worker runtime.
 - **VERIFICATION:** `tests/unit/test_leases.py` (validation, expiry at the exact instant and one microsecond either side, the cap, never shortening, representability); `tests/integration/test_attempt_lifecycle.py` sections 17 and 18, including a lease kept alive by heartbeats until its deadline and then revoked as `deadline_exceeded`.
 - **Cancellation grace note:** the revocation reason has a third case. In order: a lease at its deadline is `deadline_exceeded`; otherwise a lease that ended after a cancellation request made while it held is `cancellation_grace_expired`; otherwise `lease_expired`. A cancellation request is the one write besides a heartbeat that sets the lease, and it may shorten it (DEC-040).
 
 ### DEC-035 — One claim instant, and a database clock read after the locks
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented
 - **WHAT:** The claim's `UPDATE tasks … SET updated_at = statement_timestamp() … RETURNING updated_at` is the claim instant. It becomes the attempt's `started_at` and the base of its lease and deadline. `renew_lease` and `revoke_next_expired` read `statement_timestamp()` in a separate statement after taking the row locks their decision depends on, and decide expiry in Python against the freshly locked rows. Other timestamps still use `now()`, except a requeued task's `available_at`, which DEC-053 takes from the clock read after the locks.
 - **WHY:** `now()` is fixed when the transaction starts, before any lock wait. A claim that waited for a task row would get a shorter lease, possibly one that had already expired by its commit. The claim `UPDATE` runs after the task lock is held on both claim paths, so its statement timestamp leaves the wait out. One value keeps `started_at`, the lease, the deadline and the task's `updated_at` consistent. Reading the clock after the locks means a decision is never older than the rows it compares.
 - **RUNNER-UP:** `clock_timestamp()` captured once after the lock: equally fresh, but evaluated on every call, so a later edit could give the columns different instants. `statement_timestamp()` of the locking statement: taken before that statement's own wait.
@@ -365,7 +440,7 @@ is not stopped (left to the worker runtime).
 - **Session time zone note:** the instants it reads are decoded in UTC inside the library's own transaction, so expiry is decided on instants, not wall times, whatever the session TimeZone (DEC-067).
 
 ### DEC-036 — The heartbeat renews under the attempt lock alone and refuses expired leases
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented (`renew_lease`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented (`renew_lease`)
 - **WHAT:** `renew_lease(conn, attempt_id, *, generation, worker_id, policy)` locks only the attempt row. It checks the generation, the worker, that the attempt is running and that its lease has not expired, then writes the renewed lease. It rejects with `NotFoundError`, `StaleAttemptError`, `WorkerMismatchError`, `AttemptRevokedError`, `AttemptFinishedError` or `LeaseExpiredError` (with the reason), changing nothing. To describe a stale rejection it reads the task's generation without a lock.
 - **WHY:** Heartbeats are the most frequent write. A transaction that holds a single row lock and never waits for another while holding it cannot take part in a lock cycle with the task-first operations. The heartbeat does not update `task_id`, so the foreign-key check takes no lock on the task, and the deadline trigger does not read `tasks`. Refusing to renew an expired lease makes eligibility monotonic: once recovery may revoke an attempt, nothing makes it ineligible again, and the worker learns at once that it must stop.
 - **RUNNER-UP:** Lock the task, then the attempt, like the other writes: also free of deadlocks, but it contends with every writer of the task. Accept renewals until a revocation commits (proposed during the audit): saves a late heartbeat, but recovery eligibility could flip back.
@@ -381,7 +456,7 @@ is not stopped (left to the worker runtime).
 - **Session time zone note:** refusing an expired lease now also holds across a daylight-saving change in the session TimeZone, because the heartbeat compares UTC instants (DEC-067).
 
 ### DEC-037 — Recovery revokes one expired attempt per transaction; ownership ends at its commit
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented (`revoke_next_expired`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented (`revoke_next_expired`)
 - **WHAT:** `revoke_next_expired(conn, *, retry_policy, usage_capture=None)` works in five steps:
   1. Lock, with `FOR UPDATE OF t SKIP LOCKED`, the task of the most overdue running attempt whose lease has expired.
   2. Lock that attempt.
@@ -413,7 +488,7 @@ is not stopped (left to the worker runtime).
 - **Recovery correction note (DEC-050):** a recovery that waits for the attempt's row lock now waits at most `lock_timeout` and then fails with `55P03`; the sweep ends and is retried at the next interval. The lock order is unchanged.
 
 ### DEC-038 — Revoked attempts: a distinct state; the task follows the transient-failure rule
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented
 - **WHAT:** `AttemptState.REVOKED` is terminal and carries `revoked_reason`; it has no failure kind or error details. For a revoked attempt, `next_task_state` returns `queued` while attempts remain (`cancelled` if a request is pending) and `failed` once none remain, whether or not a request is pending.
 - **WHY:**
   - DEC-009: lost ownership is a recovery event, not a handler failure, so the attempt records what happened.
@@ -429,7 +504,7 @@ is not stopped (left to the worker runtime).
 - **Retry scheduling note (DEC-053):** a `lease_expired` or `deadline_exceeded` revocation that requeues now also schedules a retry delay, exactly as a transient failure does, so a deterministic hang is no longer retried back to back. `next_task_state` is unchanged.
 
 ### DEC-039 — Migration 0002: additive schema and a quiescent upgrade with `NOWAIT` locks
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented (`0002_attempt_leases.sql`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented (`0002_attempt_leases.sql`)
 - **WHAT:** Migration 0002 runs in order:
   1. Require READ COMMITTED.
   2. `LOCK TABLE tasks IN EXCLUSIVE MODE NOWAIT`, then `LOCK TABLE attempts IN ACCESS EXCLUSIVE MODE NOWAIT`. If either fails, raise `lock_not_available` (`55P03`) with an operator message.
@@ -459,8 +534,8 @@ is not stopped (left to the worker runtime).
 
 ## Bounded cancellation grace period
 
-Entries DEC-040 and DEC-041 record the cancellation grace design the owner approved after an
-architecture review and an independent review. The owner accepted them on
+Entries DEC-040 and DEC-041 record the cancellation grace design the maintainer approved after an
+architecture review and an independent review. The maintainer accepted them on
 2026-11-07; "implemented" means verified by the tests named,
 locally and in GitHub CI: they were merged in PR #7 (`d83afeb`), with both CI jobs
 passing for the pull request (run 40271111779) and for `main` after the merge (run
@@ -468,7 +543,7 @@ passing for the pull request (run 40271111779) and for `main` after the merge (r
 interruption and scheduled recovery remain for the worker runtime.
 
 ### DEC-040 — A cancellation request sets the running attempt's lease to a grace period
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented
 - **WHAT:** `request_cancellation(conn, task_id, *, grace)` requires a positive, representable `timedelta`, checked before any write, with no default. For a running task, in one transaction, it:
   1. locks the task, then its running attempt;
   2. records `cancel_requested_at` at one instant taken after those locks;
@@ -510,7 +585,7 @@ interruption and scheduled recovery remain for the worker runtime.
   - Locally, 17 mutants, including a heartbeat that ignores the request, a request that does not lock the attempt or does not reset the lease, a request that revives an expired lease, swapped precedence, a budget-dependent outcome, a request timed by `now()`, and a heartbeat that locks the task, each fail tests.
 
 ### DEC-041 — Migration 0003 widens the revocation reasons; versions switch together
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented (`0003_cancellation_grace.sql`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented (`0003_cancellation_grace.sql`)
 - **WHAT:** 0003 takes `LOCK TABLE attempts IN ACCESS EXCLUSIVE MODE NOWAIT` (`55P03` with an operator message if any session uses it), then replaces `attempts_revoked_reason_valid` to admit `cancellation_grace_expired`. It keeps `attempts_revoked_reason_matches_lease`, which already admits the new reason exactly when the lease ended before the deadline, and every other 0002 constraint and trigger. It adds no column or index, takes no `tasks` lock, has no running-work refusal and no isolation check. Rollout: stop all application processes → apply 0003 → start only grace-period code; draining first is preferable.
 - **WHY:**
   - Every stored row satisfies the widened rule and running attempts are unaffected, so the schema change needs no quiescence.
@@ -535,14 +610,14 @@ interruption and scheduled recovery remain for the worker runtime.
 
 Entries DEC-042 to DEC-044 record the worker contracts agreed after the worker design
 reconciliation (single-slot process, main-thread supervisor, handler thread, and the
-C1–C5 reliability contracts). The owner accepted them on
+C1–C5 reliability contracts). The maintainer accepted them on
 2026-11-07; "implemented" means verified by the tests named, locally and in GitHub
 CI: they were merged in PR #9 (`823530a`), with both CI jobs passing for the pull
 request (run 40408021385) and for `main` (run 40408731149). These entries are the
 contracts; the first runtime that uses them is the first worker runtime (DEC-045, DEC-046).
 
 ### DEC-042 — Handlers are synchronous functions; one pure boundary maps what they did to an outcome
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented locally (`orqestra.worker.handlers`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented locally (`orqestra.worker.handlers`)
 - **WHAT:**
   - A handler is `Callable[[TaskContext, JsonValue], JsonValue]`. `TaskContext` is frozen and holds the task and attempt IDs, the attempt number, the job kind and a `CancellationSignal`. It has no database connection.
   - `CancellationSignal(event)` is a read-only view of a `threading.Event` the worker owns and sets once it has observed a committed cancellation request. It offers `is_set()` and `wait(timeout)` only; its event cannot be set, cleared, replaced or deleted through it, and `TaskContext` refuses anything but such a view, including the event itself.
@@ -587,7 +662,7 @@ contracts; the first runtime that uses them is the first worker runtime (DEC-045
   Locally, these mutants each failed tests: cancelling without an observed request (1), classifying control-plane signals (12), catching only `Exception` (1), accepting NaN (6), NUL (3), surrogates (2), tuples (2), non-string keys (4) or cycles (2), registering coroutine functions (2), and not escaping failure text (4). After review: a context accepting the raw event (3), a signal exposing `set()` (2), a signal with writable attributes (1), keeping the original object (7), not copying dicts (7) or lists (6), not closing an unstarted coroutine (1), closing every coroutine (1), and closing any awaitable with a `close()` (2).
 
 ### DEC-043 — A handler registry of exact job kinds, checked with the claim's own rule
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented locally (`HandlerRegistry`, `orqestra.domain.kinds`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented locally (`HandlerRegistry`, `orqestra.domain.kinds`)
 - **WHAT:**
   - `HandlerRegistry(mapping)` is an immutable `Mapping[str, Handler]` in kind order. It needs at least one kind; kinds are checked by `check_job_kinds`; every handler must be callable and not a coroutine, generator or async-generator function. Lookups are exact, and there is no fallback handler.
   - `registry.kinds` is the sorted tuple a worker passes to `claim_next_attempt(..., kinds=...)`.
@@ -598,14 +673,14 @@ contracts; the first runtime that uses them is the first worker runtime (DEC-045
 - **VERIFICATION:** `tests/unit/test_kinds.py` (accepted kinds including tab, newline, CRLF and no-break space; 17 refused inputs); `tests/unit/test_worker_handlers.py` (exact, sorted kinds usable by the claim; no fallback for case, spacing, prefix or wildcard variants; immutability; callable objects and partials accepted; 14 refused registries). The existing section-22 claim tests in `tests/integration/test_attempt_lifecycle.py` pass against the moved check.
 
 ### DEC-044 — Worker settings: every timing value required, with only the relationships safe operation needs
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction · implemented locally (`orqestra.worker.settings.WorkerSettings`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented locally (`orqestra.worker.settings.WorkerSettings`)
 - **WHAT:**
   - `WorkerSettings` (pydantic-settings, prefix `ORQESTRA_WORKER_`, frozen) requires `lease`, `execution_timeout`, `heartbeat_interval`, `db_operation_timeout`, `fence_margin`, `poll_interval`, `recovery_interval`, `recovery_batch_limit` and `shutdown_timeout`. None has a default. Environment durations are ISO 8601 (`PT30S`) or `HH:MM:SS`; a bare number has no unit and is refused.
   - Each duration is positive and representable, except `shutdown_timeout`, which may be zero. `recovery_batch_limit` is at least 1. `db_operation_timeout` is at least 1 ms, because PostgreSQL's `statement_timeout` counts whole milliseconds and 0 disables it.
   - Relationships: `LeasePolicy(lease, execution_timeout)` is valid (`lease_policy`); `db_operation_timeout < heartbeat_interval`; `heartbeat_interval + db_operation_timeout + fence_margin < lease`.
   - The database connection is the existing `ORQESTRA_DATABASE_URL`. The existing `Settings.worker_concurrency` (default 4) is unchanged and not read: the worker is single-slot by approved direction.
 - **WHY:**
-  - Operational values need the owner's approval (DEC-034), so none is invented.
+  - Operational values need the maintainer's approval (DEC-034), so none is invented.
   - The relationships are the ones a healthy worker needs: a database call must end before the next heartbeat is due, and a heartbeat sent on time must be confirmed before the worker's local fencing margin is reached, or every worker would fence itself.
   - Nothing promises recovery progress: no relationship involving `poll_interval`, `recovery_interval` or `recovery_batch_limit` is claimed.
 - **RUNNER-UP:** Defaults derived from the lease (for example a heartbeat every third of it), or extra fields on the existing `Settings` — fewer variables, but an invented production policy, and the worker's required values would become optional for every other command.
@@ -619,19 +694,20 @@ contracts; the first runtime that uses them is the first worker runtime (DEC-045
 - **Recovery correction note (DEC-050):** a tenth required setting, `lock_timeout`, at least 1 ms and, in whole milliseconds rounded up, strictly shorter than `db_operation_timeout`, which is therefore at least 2 ms. Millisecond rounding is now exact for every supervisor bound (floating point had made some, such as 2007 ms, 1 ms too long).
 - **Fencing guarantee correction note (2026-11-09):** the WHY above overstates the fencing relationship. `heartbeat_interval + db_operation_timeout + fence_margin < lease` means that a heartbeat sent on time and taking its full database time is confirmed while more than `fence_margin` of the lease it renews really remains. The worker's local fence comes earlier than that by the attempt's claim latency: the time from the local clock read just before the claim was sent to the claim's `statement_timestamp()`, which the operation guard keeps to about `db_operation_timeout`. Every ownership deadline is mapped from the claim (`local_deadline`, DEC-045). The first heartbeat is scheduled from the same clock read, so the latency cancels out; each later one is scheduled from when the previous one was sent, so it does not. Settings this check accepts can therefore fence a healthy worker (exit 3; recovery then uses one attempt of the task's budget) whose claim took longer than `lease − (heartbeat_interval + db_operation_timeout + fence_margin)`. The check is unchanged: a fence that comes early never lets a handler outlive its lease. `heartbeat_interval + 2 × db_operation_timeout + fence_margin < lease` leaves room for any claim the operation guard lets through; it is an operator rule and is not checked. Pinned by `tests/unit/test_worker_runtime.py::test_a_renewed_fence_is_early_by_the_claims_latency`.
 - **Step window and century notes (DEC-070, 2026-11-09):** two more relationships are checked. Settings where `heartbeat_interval < 2 × db_operation_timeout` and `lease < 3 × db_operation_timeout + fence_margin` are refused, because no usage record or sweep step could then start between heartbeats that take their full database time (DEC-070). `execution_timeout` and `retry_max_delay` must leave every deadline and retry time representable for at least a century from now: a longer one made a claim or a recovery sweep raise `ValueError` for an unrepresentable timestamp. Verified by `tests/unit/test_worker_settings.py` (each rule's boundary, refused and accepted).
+- **Note (2026-11-25):** `Settings.worker_concurrency` and `ORQESTRA_WORKER_CONCURRENCY` were removed; nothing read them, and the worker stays single-slot (DEC-054).
 
 ## The first worker runtime
 
 Entries DEC-045 and DEC-046 record the first single-slot worker runtime and its local
 watchdog, agreed after a read-only probe showed that a stalled database call can hold the
-supervisor indefinitely. The owner accepted them on 2026-11-07;
+supervisor indefinitely. The maintainer accepted them on 2026-11-07;
 "implemented" means verified by the tests named, locally and in GitHub CI: they
 were merged in PR #10 (`d498698`), with both CI jobs passing for the pull request
 (run 40487174691) and for `main` (run 40488034469). There is no command or service that
 runs a worker yet.
 
 ### DEC-045 — A single-slot worker: a supervisor, a handler thread and a local watchdog that ends the process
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented locally (`orqestra.worker.runtime`, `orqestra.worker.fence`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented locally (`orqestra.worker.runtime`, `orqestra.worker.fence`)
 - **Note (2026-11-17):** amended by DEC-074. A supervisor call made while the worker owns no task (a claim, an idle sweep step) that outlives its bound is now abandoned and retried, up to `idle_stall_limit` times in a row, instead of ending the process. Every call made while a handler runs or awaits settlement still ends it, as below. The text below is kept as decided.
 - **Note (2026-11-18):** corrected by DEC-075. A renewed lease, and a cancellation's grace end, are now mapped to the local clock from that heartbeat's own answer (the clock read before it was sent and the database's `now`), not from the claim, and the fence is set exactly there, earlier or later. A database clock step or drift after the claim therefore no longer carries into later fences; the TRADE-OFF's clock step is now confined to one heartbeat. The text below is kept as decided.
 - **WHAT:**
@@ -736,7 +812,7 @@ runs a worker yet.
 - **Fence liveness notes (2026-11-09):** three ways a fence could stop are closed. `end_process` writes its last line on a writer started with `_thread.start_new_thread` and waits for it at most 0.1 s, so stderr that is a full pipe nobody reads can no longer block the exit; the writer is started with `_thread`, not `threading.Thread`, so the exit depends on no `threading` lock or bookkeeping, although the second signal's handler runs it on the main thread, which may be inside `threading`'s own code (DEC-049; on Python 3.12 the lock `Thread.start` takes is reentrant, so no deadlock was found there). The watchdog thread's wait is cut to an hour, so a deadline beyond `threading.TIMEOUT_MAX` (a lease, execution timeout or drain of centuries) no longer ends that thread with `OverflowError` and turns every guard off. A recovery sweep refused with `ValueError` (an unrepresentable retry time) ends the process as a defect (exit 7, `sweep_refused`), as a refused completion does, instead of escaping as exit 3 or a traceback; the settings refuse the delays that reach it (DEC-044 note). The WHY's "room for at least one sweep step per heartbeat interval" holds only with `heartbeat_interval >= 2 × db_operation_timeout`; DEC-070 adds the second window and refuses settings with neither. Verified by `tests/unit/test_worker_fence.py` (a real process whose stderr is a full pipe; `end_process` inside `Thread.start`'s lock; a deadline past `TIMEOUT_MAX`; a sooner deadline, moved, restricted or newly armed, waking the sleeping thread) and `tests/unit/test_worker_runtime.py` (the sweep's defect exit; the sweep's cadence from its first step, also when a step fails; the fence from the clock read before the claim and the hold from the one after it).
 
 ### DEC-046 — Outcome policy: database errors are never handler failures; an ambiguous completion ends the process
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); the ambiguous case is reconciled by DEC-047
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-26) · implemented locally (`Worker`, `classify_completion_error`); the ambiguous case is reconciled by DEC-047
 - **WHAT:**
   - **The handler's outcome** is recorded with `complete_attempt`, the authoritative lifecycle operation. Lease expiry is never checked locally before completing, so a completion still counts until recovery commits.
   - **Ownership already ended** (`AttemptRevokedError`, `StaleAttemptError`): the outcome is discarded.
@@ -776,7 +852,7 @@ runs a worker yet.
 ## Reconciling a completion whose answer was lost
 
 Entry DEC-047 records the C4 reconciliation agreed in the worker reliability design audit.
-The owner accepted it on 2026-11-07; "implemented" means
+The maintainer accepted it on 2026-11-07; "implemented" means
 verified by the tests named, locally and in GitHub CI: it was merged in PR #11
 (`278cb74`), with both CI jobs passing for the pull request (run 40520647309) and for
 `main` (run 40524368913). Cooperative cancellation (DEC-048) and graceful
@@ -784,7 +860,7 @@ shutdown (DEC-049) are not part of it.
 - **Graceful shutdown note:** exit 9 is added for shutdown. `run` returns only through a controlled stop: an unexpected exception while a handler runs still ends the process (exit 3); `SystemExit` with a success code is raised as `UncontrolledExitError`; any other exception propagates, so the process exits nonzero (DEC-049).
 
 ### DEC-047 — A lost completion answer is reconciled from one consistent PostgreSQL read; the handler never runs again
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-27) · implemented locally (`read_completion_evidence`, `Worker`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-27) · implemented locally (`read_completion_evidence`, `Worker`)
 - **WHAT:**
   - **Evidence read.** `read_completion_evidence(conn, attempt_id, *, generation, outcome)` is read-only: one `SELECT` joins the attempt to its task, so both come from one statement snapshot. It returns a `CompletionEvidence`:
     - `RUNNING`: the attempt runs, and its task runs at this generation;
@@ -876,14 +952,14 @@ shutdown (DEC-049) are not part of it.
 ## Cooperative cancellation
 
 Entry DEC-048 records cooperative cancellation, agreed in the worker reliability design
-audit. The owner accepted it on 2026-11-07;
+audit. The maintainer accepted it on 2026-11-07;
 "implemented" means verified by the tests named, locally and in GitHub CI: it was
 merged in PR #12 (`308bb0a`), with both CI jobs passing for the pull request (run
 40598713849) and for `main` (run 40599609791). Graceful shutdown (DEC-049) is
 not part of it.
 
 ### DEC-048 — A heartbeat that confirms a committed request tells the handler, after fencing at the grace end
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-27) · implemented locally (`Worker`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-27) · implemented locally (`Worker`)
 - **WHAT:**
   - **One event per attempt.** `_Running` keeps a `threading.Event`, created unset when the handler starts. The handler receives only the existing read-only `CancellationSignal` over it, in `TaskContext.cancellation`.
   - **Telling the handler.** When `renew_lease` raises `CancellationRequestedError`, which it does only after reading a committed `cancel_requested_at`, the supervisor:
@@ -945,17 +1021,17 @@ not part of it.
 ## Graceful shutdown
 
 Entry DEC-049 records graceful, bounded shutdown, agreed in the graceful shutdown design
-audit and its clarification (owner decisions O1–O10). The owner accepted
+audit and its clarification. The maintainer accepted
 it on 2026-11-07; "implemented" means verified by the tests named, locally
 and in GitHub CI: it was merged in PR #13 (`155d319`), with both CI jobs passing for
 the pull request (run 40669564020) and for `main` (run 40671619033). There is still no
 command or service that runs a worker.
 
 ### DEC-049 — Graceful shutdown: a latched stop, a drain bounded by a watchdog guard, and lock-free signal handling
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-28) · implemented locally (`Worker.request_stop`, `orqestra.worker.shutdown`, `Guard.DRAIN`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-28) · implemented locally (`Worker.request_stop`, `orqestra.worker.shutdown`, `Guard.DRAIN`)
 - **WHAT:**
   - **Stop requests.** `Worker.request_stop()` sets a flag and writes one byte to the worker's nonblocking self-pipe. It takes no lock, so a signal handler may call it. The supervisor empties the pipe before it reads any state and then waits on it (`poll`), so the handler's end, a stop request or a signal ends a wait at once and no wake is lost.
-  - **The latch** is the supervisor's first read of the flag that finds it set: at the top of its loop; after each database call of a step that makes several (after the claim and after the task read, so a claimed task is not read further; between an evidence read and its rewrite); or in the pre-start check, the last read before `thread.start()`. So a stop is latched at most one database call, the one in flight, after it was requested. It is the shutdown's linearization point. From the latch on, the supervisor sends no claim, starts no handler and starts no sweep.
+  - **The latch** is the supervisor's first read of the flag that finds it set: at the top of its loop; after each database call of a step that makes several (after the claim and after the task read, so a claimed task is not read further; between an evidence read and its rewrite); or in the pre-start check, the last read before `thread.start()`. So a stop is latched at most one database call, the one in flight, after it was requested. It is the shutdown's linearisation point. From the latch on, the supervisor sends no claim, starts no handler and starts no sweep.
     - A handler that started after the request was stored but before the latch was already running, and it is drained.
     - A claim answered after the latch is not started (`claimed_task_not_started`). It is left to recovery.
   - **Draining.** If a task is held at the latch, the watchdog's drain guard is armed at `latch + shutdown_timeout`. Heartbeats, completion and reconciliation continue.
@@ -1038,13 +1114,13 @@ command or service that runs a worker.
 
 Entry DEC-050 records a correction found while testing the worker command (DEC-051): a worker frozen inside a
 database transaction blocked recovery of its attempt, and ended the workers that tried.
-The owner accepted it on 2026-11-07; "implemented" means
+The maintainer accepted it on 2026-11-07; "implemented" means
 verified by the tests named, locally and in GitHub CI: it was merged in PR #14 (`0eab699`),
 with both CI jobs passing for the pull request (run 40711775654) and for `main` (run
 40713618712).
 
 ### DEC-050 — Worker sessions bound their lock waits and their idle transactions
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-28) · implemented (`WorkerSettings.lock_timeout`, `supervisor_conninfo`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-28) · implemented (`WorkerSettings.lock_timeout`, `supervisor_conninfo`)
 - **WHAT:**
   - **A required setting**, `lock_timeout`: at least 1 ms and, in the whole milliseconds PostgreSQL uses (rounded up, by exact `timedelta` arithmetic), strictly shorter than `db_operation_timeout`. There is no default.
   - **Session options** on every worker supervisor connection, keeping existing `options` such as a `search_path`:
@@ -1062,7 +1138,7 @@ with both CI jobs passing for the pull request (run 40711775654) and for `main` 
     - The idle bound releases the lock, but up to `2 × db_operation_timeout` after the frozen heartbeat began. The lease may end before that whenever `db_operation_timeout > fence_margin`, and a recovering worker would then still wait and die.
     - The lock bound keeps a recovering worker that meets an ordinary lock wait alive, but the lock is never released.
   - **The idle bound can derive from `db_operation_timeout`.** Every supervisor transaction runs inside one call under the operation guard, so a running supervisor never sits idle in a transaction that long.
-  - **The lock bound needs its own value.** Deriving it from `db_operation_timeout` would invent a ratio, and operational values need the owner's approval (DEC-034).
+  - **The lock bound needs its own value.** Deriving it from `db_operation_timeout` would invent a ratio, and operational values need the maintainer's approval (DEC-034).
 - **RUNNER-UP:**
   - **Recovery taking the attempt lock with `NOWAIT` or `SKIP LOCKED`** (with the idle bound): precise, but it changes `lifecycle.py` and DEC-037, and does not protect heartbeats or completions that wait for a lock other clients hold.
   - **Deriving `lock_timeout` as a fraction of `db_operation_timeout`:** one fewer variable, but an invented ratio.
@@ -1101,13 +1177,13 @@ with both CI jobs passing for the pull request (run 40711775654) and for `main` 
 ## A command that runs a worker
 
 Entry DEC-051 records `orqestra worker run`, agreed in the worker command design audit
-(owner decisions 01–08). The owner accepted it on 2026-11-07;
+The maintainer accepted it on 2026-11-07;
 "implemented" means verified by the tests named, locally and in GitHub CI: it was
 merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (run
 40760433076) and for `main` (run 40761239383).
 
 ### DEC-051 — `orqestra worker run`: explicit built-in kinds, fail-fast checks, then the existing runtime
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-28) · implemented (`orqestra.cli`, `orqestra.worker.builtin`, `persistence.migrate.verify_current`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-28) · implemented (`orqestra.cli`, `orqestra.worker.builtin`, `persistence.migrate.verify_current`)
 - **WHAT:**
   - **The command.** `orqestra worker run --kind KIND [--kind KIND …]`, a subcommand of the existing argparse CLI. `--kind` is required (argparse exits 2 without it) and repeatable; duplicates collapse.
   - **A fixed registry.** `orqestra.worker.builtin` holds the only handlers, two diagnostics for development and tests. Kinds are checked by `check_job_kinds` and matched exactly; nothing is imported dynamically.
@@ -1120,7 +1196,7 @@ merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (ru
     4. `ORQESTRA_DATABASE_URL` is set and parses; a malformed one is reported generically.
     5. One bounded `connect_supervisor` connection runs `verify_current`.
   - **`verify_current`.** One `SET TRANSACTION READ ONLY` transaction of catalog and history `SELECT`s, with no migration lock. It requires the history to equal the packaged migrations exactly, refusing:
-    - an uninitialized schema, or an empty history;
+    - an uninitialised schema, or an empty history;
     - a history that is behind (a prefix), ahead, renamed, edited or has a gap;
     - no current schema.
 
@@ -1167,7 +1243,7 @@ merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (ru
     - a current schema passes with nothing changed, on a connection whose transactions are all read-only;
     - the check sends exactly `SET TRANSACTION READ ONLY` and then only `SELECT`s;
     - it does not wait for a held migration lock;
-    - seven bad histories (uninitialized, empty, behind, ahead, renamed, tampered, gap) and a missing schema are each refused with the schema left exactly as it was.
+    - seven bad histories (uninitialised, empty, behind, ahead, renamed, tampered, gap) and a missing schema are each refused with the schema left exactly as it was.
   - **`tests/integration/test_worker_cli.py`** (the installed `orqestra` script, real processes):
     - **refused starts:** a schema that is behind, an unreachable database with a password, and production with a diagnostic kind each exit 1 with a JSON error, never log `worker_started`, never print the password, and leave the task queued;
     - **two workers and ten tasks:** while one holds a 10 s wait, the other completes all nine echoes. Every task has exactly one attempt and its payload as its result, and an unsupported kind stays queued with no attempt;
@@ -1180,13 +1256,13 @@ merged in PR #15 (`71fab72`), with both CI jobs passing for the pull request (ru
 
 ## Deterministic task partitioning
 
-Entry DEC-052 records the partitioner, agreed in the partitioning read-only assessment. The owner
+Entry DEC-052 records the partitioner, agreed in the partitioning read-only assessment. The maintainer
 accepted it on 2026-11-07. It was merged in PR #16
 (`da5b4b3`), with both CI lanes passing for the pull request (run 40770878527) and for
 `main` (run 40771746389).
 
 ### DEC-052 — An ordered item list is partitioned into contiguous, fixed-size batch tasks with index-derived keys
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-10-28) · implemented locally (`orqestra.domain.partitioning.partition`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-10-28) · implemented locally (`orqestra.domain.partitioning.partition`)
 - **WHAT:**
   - **The function.** `partition(items, *, batch_size, max_attempts, key_prefix="batch") -> tuple[TaskSpec, ...]` is pure, standard library only, and has no database, worker or invoice knowledge.
   - **Batches.** Contiguous slices of `batch_size` in input order; the last may be shorter. Repeated items are kept.
@@ -1238,13 +1314,13 @@ accepted it on 2026-11-07. It was merged in PR #16
 
 ## Durable retry scheduling
 
-Entry DEC-053 records retry backoff, agreed in the retry scheduling assessment (decisions D1–D4).
-The owner accepted it on 2026-11-07. The original
+Entry DEC-053 records retry backoff, agreed in the retry scheduling assessment.
+The maintainer accepted it on 2026-11-07. The original
 GitHub Actions run 41538196569 passed both lanes on head `e4aa59b`; later checks are
 recorded on PR #17.
 
 ### DEC-053 — A requeued task waits until a durable `available_at`, from a required policy with deterministic jitter
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (retry scheduling decisions D1–D4) · implemented on PR #17 (`orqestra.domain.retry`, migration 0004, `orqestra.persistence.lifecycle`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction · implemented on PR #17 (`orqestra.domain.retry`, migration 0004, `orqestra.persistence.lifecycle`)
 - **WHAT:**
   - **Durable eligibility (D1).** Migration 0004 adds `tasks.available_at timestamptz NOT NULL DEFAULT now()`. A task may be claimed only when `available_at <= statement_timestamp()`. Both claim paths check it inside the atomic claim: discovery's `FOR UPDATE SKIP LOCKED` query and the claim's `UPDATE … WHERE`, so a refused claim updates no row.
   - **When a retry is scheduled (D2).** Only when the task is requeued: a transient failure with attempts left, or a `lease_expired` or `deadline_exceeded` revocation with attempts left and no cancellation request. Then `available_at` = the database clock read after the locks (DEC-035) + `retry_delay(policy, task_id, n)`, where *n* is the ended attempt's generation. A success, a permanent or unclassified failure, exhausted retries and any cancellation, including `cancellation_grace_expired`, leave it unchanged.
@@ -1287,7 +1363,7 @@ recorded on PR #17.
 ## Worker architecture
 
 ### DEC-054 — Independent single-slot workers without an Orqestra-owned service
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · owner-approved direction (2026-11-03, worker architecture revision r2 `8d656bd386ecee65e8db5214ca59a2879bed02b2c10c8a2f6effc0387a8c0a46`)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · maintainer-approved direction (2026-11-03)
 - **WHAT:**
   - One `orqestra worker run` process has one handler slot. Scale by running N independent worker processes against PostgreSQL; do not add in-process threads or asyncio slots.
   - This architecture adds no Orqestra-owned worker service or restart supervisor. The operator starts workers with identical settings and owns restart policy; deployment is out of scope.
@@ -1296,16 +1372,16 @@ recorded on PR #17.
 - **WHY:**
   - DEC-044/045 already define the single-slot process model and require process termination when ownership cannot be confirmed. Multiple slots in one process would reopen that design.
   - Before PR #18, worker tests covered multi-process execution and crash recovery but not a handler that outlives its execution deadline and the resulting `deadline_exceeded` revocation. PR #18 closes that coverage gap without changing production code.
-  - No service or default timing values are needed to verify the approved worker behavior; both require separate operational decisions or measurement.
+  - No service or default timing values are needed to verify the approved worker behaviour; both require separate operational decisions or measurement.
 - **RUNNER-UP:** Multiple worker slots in one process (threads or asyncio), or an Orqestra-owned worker supervisor. These reopen the DEC-045 stop model or the undecided hosting boundary.
 - **WHY NOT:** The existing runtime can end a process when a handler may have lost ownership; it cannot safely isolate sibling slots inside that process. DEC-051 also records that Orqestra owns no service or supervisor.
 - **TRADE-OFF:** The operator must launch enough workers for progress and keep their settings consistent. Orqestra provides no restart or recovery-time guarantee while no compatible worker is live.
-- **VERIFICATION:** `tests/integration/test_worker_process.py::test_a_handler_outliving_the_execution_timeout_is_fenced_and_revoked_as_deadline_exceeded` (PR #18) holds a handler open past its six-second test deadline, confirms the worker exits with the fenced result before the lease ends, and checks that recovery records `deadline_exceeded` and requeues the task. The test also rules out connection-loss, lease-loss, and cancellation as the reason for fencing. This is integration coverage; it does not add production behavior. Existing tests continue to cover stale-worker fencing, SIGKILL recovery, and one authoritative result.
+- **VERIFICATION:** `tests/integration/test_worker_process.py::test_a_handler_outliving_the_execution_timeout_is_fenced_and_revoked_as_deadline_exceeded` (PR #18) holds a handler open past its six-second test deadline, confirms the worker exits with the fenced result before the lease ends, and checks that recovery records `deadline_exceeded` and requeues the task. The test also rules out connection-loss, lease-loss, and cancellation as the reason for fencing. This is integration coverage; it does not add production behaviour. Existing tests continue to cover stale-worker fencing, SIGKILL recovery, and one authoritative result.
 
 ## Invoice verification
 
 ### DEC-055 — Invoices are verified by deterministic checks first; a provider only reads an ambiguous amount string, and the same checks decide
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **WHAT:**
   - **Statuses.** Each synthetic invoice becomes `verified`, `rejected`, `needs_review` or `malformed`. The schema is closed: `invoice_id`, non-empty `lines` of `line_id`, `quantity` and `unit_amount`, and `total`. Identifiers match `[A-Za-z0-9._-]{1,64}` and are never sent to a provider or stored in a result. An amount is an integer below 10^64 in opaque minor units, an ASCII digit string, or an *ambiguous* non-blank printable string of up to 64 characters. There is no tax, currency, rounding, date or vendor rule.
   - **Rules.** `quantity_positive` per line and `total_matches_lines`. Any `FAIL` is `rejected` and all `PASS` is `verified`, both without a provider call.
@@ -1328,13 +1404,13 @@ recorded on PR #17.
   - The stored `routing` is an audit of which route the decision chose, for the attempt that completed. It is not usage accounting: calls made by failed or revoked attempts are not represented, and provider-reported usage is not part of it; the usage ledger records it (migration 0005, DEC-059). *Amended by DEC-057:* with a recorder, every call's intent is recorded per `attempt_id` before the call is made, including the calls of failed or revoked attempts. Its result is recorded only when the outcome is known: `answered` with the provider's `usage`, if it reported one, for a `ProviderResponse`; `failed` with its code and no usage for a provider error. Any other exception, a return that is not a `ProviderResponse`, a `BaseException`, a failed `record_result` or a process interrupted before the result leaves only the intent. The durable `UsageSink` of DEC-059 writes these records to the usage ledger, and the stored result still excludes them.
   - The schema is tiny and synthetic. A different schema changes only `model.py` and `checks.py`.
   - There is no cap on provider calls per invoice; it would be an invented policy and remains undecided. *Amended by DEC-057:* there is still no per-invoice cap, but the caller must now set a per-attempt cap.
-- **VERIFICATION:** Unit tests cover normalization, both rules, routing (including an exhaustive small-space comparison and permutation invariance), the provider contract and mock, every path of verification, the handler through `run_handler`, a golden replay, the persisted-result shape, an import scan and a runtime network guard. One integration test runs partition, submit, claim, handler and completion against PostgreSQL and reads the retry time after a transient provider error. The results of the fixed test profile are recorded on the pull request, not here.
+- **VERIFICATION:** Unit tests cover normalisation, both rules, routing (including an exhaustive small-space comparison and permutation invariance), the provider contract and mock, every path of verification, the handler through `run_handler`, a golden replay, the persisted-result shape, an import scan and a runtime network guard. One integration test runs partition, submit, claim, handler and completion against PostgreSQL and reads the retry time after a transient provider error. The results of the fixed test profile are recorded on the pull request, not here.
 - **Note (2026-11-08):** a `ProviderRequest` also carries a content-derived `request_id` and the call's `timeout` (`calls/provider.py`), as ADR-0005 states; neither adds invoice data.
 
 ## Invoice job summary
 
-### DEC-056 — A job's outcomes are summarized in process from one consistent snapshot, and counts are final only when the summary is complete
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · the architecture was owner-approved (revision `D6REVIEW-r2`, SHA-256 `628dd2cc4f0c17332b4c881fad8280676e4190a0a04cde2b9ef75dfc08474582`). This entry treats DEC-055's stored result shape as validated input.
+### DEC-056 — A job's outcomes are summarised in process from one consistent snapshot, and counts are final only when the summary is complete
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · the architecture was maintainer-approved. This entry treats DEC-055's stored result shape as validated input.
 - **WHAT:**
   - **Entry point.** `orqestra.aggregation.invoice.summarize_invoice_job(conn, job_id)` returns an `InvoiceJobSummary`, `None` for an unknown job, `WrongJobKindError` for another kind (before any task is read) and `ValueError` for a job without tasks. A caller already inside a transaction gets `RuntimeError`, as for every operation that owns its transaction. Content problems are reported, never raised. No migration, table, command, HTTP API or dependency is added.
   - **Snapshot.** `orqestra.persistence.snapshots.job_batch_snapshot` runs one `REPEATABLE READ, READ ONLY` transaction whose first statement is `SET TRANSACTION`. It reads the job row, then streams the job's tasks through a named server-side cursor ordered by `task_key COLLATE "C"`, in chunks of `fetch_size` rows. It takes no row locks, does not block workers, and ends the transaction (commit on a normal exit, rollback on an error) however the block is left, including an abandoned stream.
@@ -1362,7 +1438,7 @@ recorded on PR #17.
 ## Provider call recording
 
 ### DEC-057 — Every invoice provider call is numbered under a required per-attempt cap and recorded before and after it is made
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · the design was agreed as revision `RECORDER-r2` (SHA-256 `0ac89d9e569b6f246be23f8173597002038346ae59be4fa2b5a2c464932e25a3`). It amends DEC-055's handler signature and its "no cap" trade-off.
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · the design was agreed in a design review. It amends DEC-055's handler signature and its "no cap" trade-off.
 - **WHAT:**
   - **Records.** `orqestra.calls.recording` is pure: it imports only `dataclasses`, `enum`, `typing`, `uuid` and `orqestra.calls.provider`. A `ProviderCallIntent` holds `attempt_id`, `call_seq` (0 to `MAX_CALL_SEQ = 2**31 - 1`), the absolute `item_index` (0 to `MAX_CALL_SEQ`), `route_id`, `capability`, `field_kind` and `estimated_cost_units` (0 to `MAX_COST_UNITS = 2**63 - 1`). These are the usage ledger's `INTEGER` and `BIGINT` ranges (`orqestra.persistence.provider_usage`). `route_id` and `capability` are only checked to be strings. On the verification path, `route_id` comes from a checked `RouteOption`, which uses the ledger's identifier pattern, and `capability` is the constant `interpret_amount`, so the ledger accepts every intent made there once a durable recorder adds the provider. An intent built directly can carry a `route_id` the ledger refuses; a durable recorder then raises in `record_intent`, before the call. A `ProviderCallResult` holds `attempt_id`, `call_seq`, `outcome` (`answered` or `failed`, the ledger's values), `failure_code` (set exactly when failed) and the provider's own `usage`. Its numbering and outcome fit the ledger, but `usage` is bounded only by `ProviderUsage` (up to 64 characters, any number of decimal places), which is looser than the ledger's amount range (below `1E+20`, at most 18 decimal places). Both are frozen and keyword-only, and both refuse a wrong type or value without quoting it. Neither carries a raw string, a request id, the reply's value, a prompt or `reported_cost_units`.
   - **What a durable recorder adds.** A record does not name the provider, job, task or prompt version; the ledger's intent requires the provider. A durable recorder adds those from its own wiring, so `orqestra.calls` never depends on the worker.
@@ -1391,7 +1467,7 @@ recorded on PR #17.
 ## Provider usage closure
 
 ### DEC-058 — An attempt's usage capture is closed in the transaction that ends it: by the worker's own closure, or by recovery at a tier declared per job kind
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · the architecture was agreed in design revision `CLOSURE-r2` (SHA-256 `9311d3256c2c8f5926d2eb78885df71c66b3596ad40efe3f86dd103433f2f8c0`). *Numbering:* it was proposed alongside DEC-057 under the same number and is renumbered DEC-058. The `DEC-057` references in `src/orqestra/persistence/lifecycle.py`, `src/orqestra/persistence/provider_usage.py` and `tests/integration/test_usage_closure_pg.py` mean this entry; those in `src/orqestra/workloads/invoice/handler.py` and `tests/unit/test_invoice_isolation.py` mean DEC-057. *Note (2026-11-18):* the seven references in `lifecycle.py`, `provider_usage.py` and `test_usage_closure_pg.py` now cite DEC-058.
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · the architecture was agreed in a design review. *Numbering:* it was proposed alongside DEC-057 under the same number and is renumbered DEC-058. The `DEC-057` references in `src/orqestra/persistence/lifecycle.py`, `src/orqestra/persistence/provider_usage.py` and `tests/integration/test_usage_closure_pg.py` mean this entry; those in `src/orqestra/workloads/invoice/handler.py` and `tests/unit/test_invoice_isolation.py` mean DEC-057. *Note (2026-11-18):* the seven references in `lifecycle.py`, `provider_usage.py` and `test_usage_closure_pg.py` now cite DEC-058.
 - **WHAT:**
   - **Worker closure.** `complete_attempt(..., usage_closure=None)` takes an optional `UsageClosure`. Before any I/O it must be a `UsageClosure` (`TypeError`), name this attempt and be closed by `WORKER` (`ValueError`). Inside the completion's own transaction the order is: task lock, attempt lock, fencing checks, attempt update, task update, then the closure on the same cursor, by `record_usage_closure`'s rule: an identical stored closure is a replay (`created=False`), a different one raises `UsageReplayConflictError`, and a complete closure that does not count every intent, each with its result, raises `CaptureNotCompleteError`. Any error rolls back the transition too. Every outcome closes, a requeuing transient failure included: the closure belongs to the attempt. `AttemptCompletion.usage_closure` returns it. `CaptureNotCompleteError` is a defect of the caller's count; nothing was recorded, and the caller may complete again with an `incomplete` closure.
   - **Recovery closure.** `revoke_next_expired(..., usage_capture=None)` takes a mapping from job kind to `CaptureTier`, checked before any I/O and copied: not a mapping, or a tier that is not a `CaptureTier`, is a `TypeError`; the kinds are checked by `check_job_kinds`, so an empty mapping, a blank kind, a NUL or a non-`str` kind is refused. After the revocation's attempt and task updates, in the same transaction, it reads the job's kind without a lock (a kind never changes, as discovery assumes). An unmapped kind gets no closure. At T3, the capture is `complete` with the number of intents when none lacks a result, `complete(0)` for none, and `incomplete` otherwise; at T1 and T2 it is `incomplete`. It is always closed by `RECOVERY`. Its write rule never raises a replay conflict: an existing closure is kept and returned with `created=False`; otherwise it inserts with `ON CONFLICT DO NOTHING`, and if a concurrent closure committed first, that one is re-read and returned. Waiting behind an in-flight closure insert for the same attempt is bounded by `lock_timeout` (DEC-050). `AttemptRevocation.usage_closure` returns it.
@@ -1420,13 +1496,13 @@ recorded on PR #17.
 ## Provider usage sink
 
 ### DEC-059 — The worker writes each provider call's intent before the call and its result after it, through its supervisor, and closes those kinds at T3
-- **Status:** Accepted (owner, 2026-11-06; was Proposed) · its architecture is design revision `SINK-r2` (SHA-256 `e798b77feb09ae0d2d9c49d17a876880a44c822c4ece67140d4b8f5dc50e81df`). Later corrections made while verifying the implementation (wording, the exit code of a refused usage record, and test evidence) change no architecture and do not supersede `SINK-r2`. It is the durable recorder DEC-057 and DEC-058 left open. No migration.
+- **Status:** Accepted (maintainer, 2026-11-06; was Proposed) · its architecture was agreed in a design review. Later corrections made while verifying the implementation (wording, the exit code of a refused usage record, and test evidence) change no architecture and do not supersede that design. It is the durable recorder DEC-057 and DEC-058 left open. No migration.
 - **WHAT:**
   - **Sink.** `orqestra.worker.usage.UsageSink(kinds, provider_for_route, model_for_route=None, prompt_version=None)` is checked at construction against the ledger's identifier and text rules and does no I/O. `sink.recorder` is a `ProviderCallRecorder` for handler factories; `Worker(usage=sink)` binds the sink to one worker, and every sink kind must be a registered kind.
   - **The T3 contract.** Every handler registered for a sink kind must record every provider call through `sink.recorder`. Otherwise both the worker's closure and recovery's would claim `complete` for fewer calls than were made (DEC-058's over-claim). This change documents the contract and enforces nothing; checking it at registration is a required future step. Every worker of a fleet must use the same kind-to-tier map.
   - **Handoff.** One lock and condition guard a single request slot. `record_intent` converts the record purely (adding the provider, model and prompt version), and raises `ValueError` before posting for an unmapped route, an attempt other than the bound running one, a `call_seq` that does not start at 0 and go up by 1, or a value outside the ledger's rules: as in DEC-057, the task fails and no call is made. A second post while one waits is a `RuntimeError`. If cancellation is already known it raises `HandlerCancelled`; otherwise it posts, wakes the supervisor and waits. `ACKED` means the row committed and the call is made; `CANCELLED` raises `HandlerCancelled`. `record_result` converts the amount to an exact `Decimal`; an amount the ledger cannot hold (`1E+20` or more, more than 18 decimal places) writes no row, clamps and zeroes nothing, leaves the call unresolved, logs `usage_result_unrepresentable` with ids and `call_seq` only, and lets the handler go on. Otherwise it posts and waits; a result never raises for a ledger failure. A result that names no acknowledged, unanswered intent is refused with `ValueError`, as `InMemoryCallRecorder` refuses it.
   - **Cancellation.** The supervisor withdraws (`CANCELLED`) an intent still waiting when it sets the cancellation event, and never takes an intent after that; both are supervisor actions on one thread, so the order is exact. An acknowledged intent is a call in flight: it goes ahead, and its result is never withdrawn. An intent whose earlier write may have committed (a lost answer) and is then withdrawn makes the closure `incomplete`.
-  - **Which exit ends an unrecordable record.** While a handler waits, the ownership guard stays armed at the local lease expiry minus `fence_margin`, and the lease is capped at `deadline_at` (`initial_lease`, `renewed_lease`). In a real process the fence therefore always ends the process first: exit 3, `ownership_deadline_passed`, no call, and nothing recorded for the attempt; an unresolved call is closed `incomplete` by recovery at T3. The supervisor's exit 8 (below) stays as defense in depth behind the fence.
+  - **Which exit ends an unrecordable record.** While a handler waits, the ownership guard stays armed at the local lease expiry minus `fence_margin`, and the lease is capped at `deadline_at` (`initial_lease`, `renewed_lease`). In a real process the fence therefore always ends the process first: exit 3, `ownership_deadline_passed`, no call, and nothing recorded for the attempt; an unresolved call is closed `incomplete` by recovery at T3. The supervisor's exit 8 (below) stays as defence in depth behind the fence.
   - **Backstop.** A handler waits at most until the attempt's local deadline D plus `usage_handoff_bound(settings) + 2 × db_operation_timeout`, that is D + 5 bounds, then raises `UsageHandoffExpiredError`, a `BaseException` that is never classified (exit 5, no call). While heartbeats succeed or are not due, that is strictly later than the supervisor's worst case, D + 4 bounds: a retry due at D may still wait for (1) a step in progress and (2) a heartbeat, then (3) lose a write's answer and (4) fail the immediate replay, which has no deadline check, before it reaches exit 8. Heartbeats that keep failing are retried within one bound, so the reserve rule holds usage writes back as it holds sweeps and exit 8 may never come; the fence (exit 3, first in a real process) or this backstop (exit 5) then ends the process. Safety is unchanged: no call is made without its committed intent.
   - **Limits (pure, tested, not wired).** `check_provider_call_budget(settings, *, max_provider_calls_per_attempt, provider_call_timeout)` raises `ValueError` unless `cap × (provider_call_timeout + 2 × usage_handoff_bound) ≤ execution_timeout − fence_margin`, compared exactly in whole microseconds; the cap is an `int` from 0 to `MAX_CALL_SEQ` (a `bool` is refused). `WorkerSettings` gains no field. Both `usage_handoff_bound` and this budget are limits for the case with no failures; retries and replays are bounded by the attempt's deadline and by the ownership fence, not by them.
   - **Scheduling.** `Step.USAGE` and `Timing.usage_due` (default `None`, so a `Timing` built without it still works). While a handler runs: a due heartbeat first; then a waiting record if `heartbeat_due is None` or `heartbeat_due − now ≥ sweep_reserve` (the sweep rule); then a sweep. Records are written while a stopping worker drains.
@@ -1446,12 +1522,12 @@ recorded on PR #17.
   - An unrepresentable amount leaves a billed call unresolved by design.
   - The T3 contract and the fleet-wide tier map are documented, not enforced.
   - The handler's backstop raises a `BaseException`: an attempt whose supervisor never answered is never recorded by this worker, and recovery decides.
-- **VERIFICATION:** All tests use synthetic provider doubles; none calls a real provider. Unit tests (`tests/unit/test_worker_usage.py`) cover `next_step` with a waiting record (heartbeat first, the reserve, `heartbeat_due is None`, before sweeps, while draining, every wait finite, and a simulation in which heartbeats are never late and records always progress), a `Timing` built the old way, the handoff (withdrawal on cancellation, no post once cancelled, a result never withdrawn, an acknowledged call going ahead, a second post refused, the backstop as a never-classified signal at D + 5 bounds, more than the supervisor's 4-bound worst case, which a fake-clock test walks through), every refusal before a post, the conversions (exact `Decimal`s and scales, every failure code, `1E+20` and 19 decimal places left unresolved), the budget check and its boundaries, the wiring rules with messages that quote no value, and the supervisor's step with injected ledger writes (retry spacing, the deadline, lost answers replayed, every defect, the late intent, the closure passed to the completion, the tier map passed to sweeps, ids-only diagnostics). PostgreSQL tests (`tests/integration/test_worker_usage_pg.py`, a real `Worker` and, where needed, `PgProxy`, whose `drop_commit` generalizes `drop_completion` to any marked statement) cover every call with its two rows and `complete(n)`, cancellation while an intent waits (no row, no call, `complete(0)`) and during a call (the result written, `complete(1)`, cancelled), lost intent and result answers committed and rolled back (one row and one call each), a retryable error, intents unrecordable until the deadline (exit 8, never 5, no call, after the ownership guard had already expired, which in a real process is exit 3 first), a rejection (exit 7, nothing failed), a late intent (exit 3, no call, `lower_bound`) and a late result (accepted), an unrepresentable amount (the task succeeds, `incomplete`, ids-only logs), and heartbeat cadence while records are written. Process tests (`tests/integration/test_worker_process.py`, a sink-wired `metered` kind) include the named disproof test, in which sweeps and heartbeats compete with waiting intents (orphan leases staggered so at least one is revoked after the metered attempt started and before the stall) and the database then stalls: renewals keep their cadence, no call runs without its committed row, nothing is failed, the process exits 4 or 3, recovery closes the attempt at T3 and the retry numbers its calls from 0; plus a fence during a stalled call (exit 3, unresolved, `incomplete`), a stalled intent write (exit 4, no call) and SIGKILL mid-batch. `tests/integration/test_worker_usage_performance.py` (marked `performance` and `integration`) measures the per-call cost against the in-memory recorder and direct ledger writes and asserts correctness only. The results of the fixed test profile are recorded on the pull request, not here.
+- **VERIFICATION:** All tests use synthetic provider doubles; none calls a real provider. Unit tests (`tests/unit/test_worker_usage.py`) cover `next_step` with a waiting record (heartbeat first, the reserve, `heartbeat_due is None`, before sweeps, while draining, every wait finite, and a simulation in which heartbeats are never late and records always progress), a `Timing` built the old way, the handoff (withdrawal on cancellation, no post once cancelled, a result never withdrawn, an acknowledged call going ahead, a second post refused, the backstop as a never-classified signal at D + 5 bounds, more than the supervisor's 4-bound worst case, which a fake-clock test walks through), every refusal before a post, the conversions (exact `Decimal`s and scales, every failure code, `1E+20` and 19 decimal places left unresolved), the budget check and its boundaries, the wiring rules with messages that quote no value, and the supervisor's step with injected ledger writes (retry spacing, the deadline, lost answers replayed, every defect, the late intent, the closure passed to the completion, the tier map passed to sweeps, ids-only diagnostics). PostgreSQL tests (`tests/integration/test_worker_usage_pg.py`, a real `Worker` and, where needed, `PgProxy`, whose `drop_commit` generalises `drop_completion` to any marked statement) cover every call with its two rows and `complete(n)`, cancellation while an intent waits (no row, no call, `complete(0)`) and during a call (the result written, `complete(1)`, cancelled), lost intent and result answers committed and rolled back (one row and one call each), a retryable error, intents unrecordable until the deadline (exit 8, never 5, no call, after the ownership guard had already expired, which in a real process is exit 3 first), a rejection (exit 7, nothing failed), a late intent (exit 3, no call, `lower_bound`) and a late result (accepted), an unrepresentable amount (the task succeeds, `incomplete`, ids-only logs), and heartbeat cadence while records are written. Process tests (`tests/integration/test_worker_process.py`, a sink-wired `metered` kind) include the named disproof test, in which sweeps and heartbeats compete with waiting intents (orphan leases staggered so at least one is revoked after the metered attempt started and before the stall) and the database then stalls: renewals keep their cadence, no call runs without its committed row, nothing is failed, the process exits 4 or 3, recovery closes the attempt at T3 and the retry numbers its calls from 0; plus a fence during a stalled call (exit 3, unresolved, `incomplete`), a stalled intent write (exit 4, no call) and SIGKILL mid-batch. `tests/integration/test_worker_usage_performance.py` (marked `performance` and `integration`) measures the per-call cost against the in-memory recorder and direct ledger writes and asserts correctness only. The results of the fixed test profile are recorded on the pull request, not here.
 
 ## OpenRouter adapter
 
 ### DEC-060 — An unwired OpenRouter adapter over an injected HTTP transport, with closed failures and a deadline checked before every blocking step
-- **Status:** Accepted (owner, 2026-11-06; was Proposed) · it follows the owner's resolved direction for a future outbound adapter (OpenRouter, the standard library only, no default model, no live calls, never log credentials, prompts or responses).
+- **Status:** Accepted (maintainer, 2026-11-06; was Proposed) · it follows the maintainer's resolved direction for a future outbound adapter (OpenRouter, the standard library only, no default model, no live calls, never log credentials, prompts or responses).
 - **Note (2026-11-18):** amended by DEC-071. The adapter is no longer unwired: it is wired into the unpackaged benchmark worker only, off by default, and imported by `benchmarks/live.py`, `benchmarks/extract.py` and `benchmarks/baseline.py`; DEC-072 ran its one live campaign and DEC-073 retries its extraction calls. No other `src` module imports the package, and it is still in no packaged worker, handler or command. The text below is kept as decided.
 - **WHAT:**
   - **Package.** A new `orqestra.providers` package, outside the offline-scanned provider-contract and workload packages. `transport.py` holds `Deadline`, the `HttpTransport` and `HttpExchange` protocols and the fixed-text `TransportTimeout` and `TransportFailure`. `stdlib_transport.py` holds `HttpsTransport` (`http.client` and `ssl`). `openrouter.py` holds `OpenRouterConfig`, `OpenRouterProvider`, `CallReport`, `ResponseDefect` and `OpenRouterProtocolError`. The package imports only the standard library, the provider contract module, `orqestra.domain` and itself; only `stdlib_transport.py` may import `http`, `ssl` or `socket`. No other module imports the package, so the adapter is unwired.
@@ -1477,7 +1553,7 @@ recorded on PR #17.
   - 500 and 504 are not retried, and strict parsing may reject a valid future response shape.
   - The ledger's `CallFailure` has no protocol-violation code. The change that wires the adapter in decides how to store that outcome; no schema changes here.
 - **VERIFICATION:**
-  - `tests/unit/test_openrouter_adapter.py` uses a fake transport and a fake clock. It covers every documented status and ten others; embedded errors; malformed bodies, including bad UTF-8, `NaN`, duplicate keys, 100,000-level nesting and an integer over the digit limit; schema and identifier failures; the size cap; usage limits and fixed-point cost text; the deadline, including a slow chunked body, no reads after expiry and an expired budget that never reaches the transport; the route map and configuration; and redaction of the credential, prompt and response from `str`, `repr`, `args`, formatted tracebacks and logs, with empty exception chains.
+  - `tests/unit/test_openrouter_amount.py` uses a fake transport and a fake clock. It covers every documented status and ten others; embedded errors; malformed bodies, including bad UTF-8, `NaN`, duplicate keys, 100,000-level nesting and an integer over the digit limit; schema and identifier failures; the size cap; usage limits and fixed-point cost text; the deadline, including a slow chunked body, no reads after expiry and an expired budget that never reaches the transport; the route map and configuration; and redaction of the credential, prompt and response from `str`, `repr`, `args`, formatted tracebacks and logs, with empty exception chains.
   - `tests/unit/test_provider_transport.py` runs the real `HttpsTransport` against a stand-in for `HTTPSConnection`. It covers the fixed endpoint, the timeout set before each step, the debug level and proxy settings, closing on every path, and the mapping of each kind of standard-library exception. Through a subclass of the real class, it also checks real request framing and an illegal header value, and that a credential-quoting header error and a `BadStatusLine` carrying remote text both reach the adapter only as `unavailable`.
   - `tests/unit/test_provider_boundaries.py` adds an import scan of the package with its own self-tests, a check that nothing outside the package imports it, a fresh-interpreter check that importing the adapter loads neither `http.client` nor `ssl`, equality of the mirrored limits with the ledger's, and a round trip of an answer at every limit into `CallIntent` and `CallResult`.
   - `tests/unit/test_config.py` and `tests/unit/test_cli.py` check that the new key defaults to `None` and is masked.
@@ -1486,7 +1562,7 @@ recorded on PR #17.
 ## Provider usage report
 
 ### DEC-061 — A job's provider usage is reported from its ledger in the summary's snapshot, with exact per-unit totals and explicit finality
-- **Status:** Accepted (owner, 2026-11-06; was Proposed) · the architecture was owner-approved.
+- **Status:** Accepted (maintainer, 2026-11-06; was Proposed) · the architecture was maintainer-approved.
 - **WHAT:**
   - **Entry point.** `orqestra.aggregation.usage.report_job_usage(conn, job_id)` returns a `JobUsageReport` for an invoice job, `None` for an unknown job, `WrongJobKindError` for another kind (before anything else is read), `ValueError` for a job without tasks and `RuntimeError` inside a caller's transaction, exactly as DEC-056. `summary.py`, `invoice.py`, the migrations, the runtime and the adapters are unchanged.
   - **Snapshot.** `JobBatchSnapshot` gains `usage_totals()` and `attempt_usage()`, run in its one `REPEATABLE READ, READ ONLY` transaction after the job-row read, so the totals, the attempt rows and the task rows describe one state. `usage_totals()` is one `GROUPING SETS ((unit, attempt state), (unit))` query over `provider_calls` (filtered on its indexed `job_id`) joined to results and attempts, summing `reported_amount` in `numeric` and grouping on `reported_unit COLLATE "C"`. `attempt_usage()` streams one row per attempt through a second named cursor, ordered by `task_key COLLATE "C"` and `attempt_number`: intents, answered, failed and unresolved calls, settled calls without an amount, late intents and results, the estimates of unresolved calls and how many had none, and the closure. `tasks()` is unchanged, and every open cursor is closed when the block ends.
@@ -1503,17 +1579,17 @@ recorded on PR #17.
 - **TRADE-OFF:**
   - `JobBatchSnapshot` has a second named-cursor stream, and the snapshot holds back vacuum for as long as the read lasts.
   - The builder keeps one `(attempt number, answered, capture)` entry per succeeded attempt until its task is read, comparable to the summary's per-task triples, and builds one throwaway `SummaryBuilder` per succeeded task.
-  - Tokens and closure tiers are not totalled in this version; units are not normalized or converted, and there is no price, currency or cost.
+  - Tokens and closure tiers are not totalled in this version; units are not normalised or converted, and there is no price, currency or cost.
   - Invoice jobs only (`WrongJobKindError`), matching the report's place beside the invoice summary. `CLOSED` describes the snapshot only, since a later write can contradict a closure.
 - **VERIFICATION:** Unit tests (`tests/unit/test_usage_report.py`) cover the capture table over every finished attempt state and closure, intent and unresolved combination, a running attempt in every case, an exhaustive property check of `CLOSED`, `NOT_CAPTURED` and `OPEN`, job finality, not-captured versus zero, contradicted closures, every cross-check path including parity with `SummaryBuilder` on corrupt results, per-state totals and conservation, the sample bound and order independence, frozen and zero-filled output, and that no value from the data reaches an anomaly. Integration tests (`tests/integration/test_job_usage_report_pg.py`, real PostgreSQL) run a task revoked through lease expiry, failed transiently and then succeeded, and check the per-state split, totals, exposure and finality, then a late result; a missing closure, not captured versus a true zero, a contradicted closure and a job cancelled before any attempt; distinct units (`credits`, `Credits`, `µ-credits`), preserved scale (`0.25 + 1.50 = 1.75`) and an exact 39-digit sum, a failed call with usage and calls without usage; open finality for a running attempt and a queued task; the cross-check with real handler results from `MockProvider`, against `summarize_invoice_job`; a late result and a late intent committed after the job read are not seen, and a companion test with `READ COMMITTED` sees them; two fixed-order gates commit on another session between two reads of the same report: a late answer committed after the totals and before the attempts leaves the totals' call count equal to the answered calls, and a completion committed after the attempts and before the tasks leaves a running job with an open attempt, while a `READ COMMITTED` companion for each shows the mismatch (credits counted once beside two answered calls; a succeeded task beside a running attempt), so both tests are sensitive to the level; reports read while a writer thread records calls each satisfy conservation and never go backwards; three seeded random ledgers match an independent oracle built from `read_attempt_usage` and summed under an exact context; and the snapshot contract (isolation and read-only inside it, no table changed, the connection idle after success, an error and an abandoned stream in both commit modes, a caller transaction refused, a missing job, another kind refused before any ledger read, identical reports at fetch sizes 1, 2 and 1,000). A test marked `performance` seeds 50,000 invoices at batch sizes 1, 100 and 1,000 with set-based SQL that respects the fencing guard, and records the environment (including the test process's CPU affinity and cgroup CPU quota where available), row counts, wall time, `tracemalloc` peak, RSS and `EXPLAIN (ANALYZE, BUFFERS)` summaries of both ledger queries on standard output and in JUnit properties, asserting correctness only. The results of the fixed test profile are recorded on the pull request, not here.
 
 ## Provider use boundaries
 
-### DEC-062 — Before live provider use: no inbound API, authorized live calls only, no prices in the ledger, synthetic data until retention is reviewed, gated registration and a measured claim index
-- **Status:** Accepted (owner, 2026-11-06; was Proposed) · the inbound-API direction is the owner's recorded guidance of 2026-11-03. It narrows the "Costs" guidance in `docs/development.md` and adds registration conditions to DEC-057 and DEC-058 without changing their text. None of it is implemented by this entry.
+### DEC-062 — Before live provider use: no inbound API, authorised live calls only, no prices in the ledger, synthetic data until retention is reviewed, gated registration and a measured claim index
+- **Status:** Accepted (maintainer, 2026-11-06; was Proposed) · the inbound-API direction is the maintainer's recorded guidance of 2026-11-03. It narrows the "Costs" guidance in `docs/development.md` and adds registration conditions to DEC-057 and DEC-058 without changing their text. None of it is implemented by this entry.
 - **WHAT:**
   - **No inbound API.** No inbound Orqestra API or web framework is planned. Jobs are submitted and read through the Python interfaces; the CLI runs migrations and workers. Any future inbound service needs its own decision, covering its framework, authentication and hosting.
-  - **Live calls.** Neither the change that builds the provider adapter (DEC-060) nor the change that wires it into a worker makes a live provider call. Every live call needs the maintainer's separate, explicit authorization, which names its scope. Ordinary tests stay offline.
+  - **Live calls.** Neither the change that builds the provider adapter (DEC-060) nor the change that wires it into a worker makes a live provider call. Every live call needs the maintainer's separate, explicit authorisation, which names its scope. Ordinary tests stay offline.
   - **No prices.** The usage ledger keeps the provider-reported amount with the unit label the provider declared, plus the provider, model and token counts. It records no price, published price version or currency, and nothing converts a reported amount into money. Provider-reported figures stay separate from route estimates.
   - **Retention.** Version 1 has no deletion or retention mechanism: the ledger refuses `UPDATE` and `DELETE`, and no function removes its rows. Only synthetic data is recorded until a retention policy is reviewed and accepted.
   - **Per-job spend.** A per-job spend gate, if one is added, is advisory. Only the per-attempt call cap (DEC-057) is enforced.
@@ -1522,7 +1598,7 @@ recorded on PR #17.
     - the per-attempt cap is required and set;
     - the cap has been validated against the worker's timing, so that cap × (per-call timeout + the recorder's write bound) fits within `execution_timeout − fence_margin` (DEC-057 leaves that check to the wiring);
     - the job kind's tier in `usage_capture` matches what its recorder writes (DEC-058);
-    - live calls are authorized as above.
+    - live calls are authorised as above.
   - **Claim index.** Claim ordering (DEC-033) is measured against the CI PostgreSQL image (`postgres:16.15`, pinned by digest), and the observations are recorded on the pull request that makes them. The partial index DEC-033 left open is added only if repeated measurements show that the scan-and-sort cost matters and the index's write overhead is acceptable. No fixed threshold is set.
 - **WHY:**
   - Orqestra runs as independent single-slot workers with no service of its own (DEC-054). An inbound API would add an authentication boundary, a framework dependency and a hosting model that no requirement asks for. Recording that stops "API framework" reading as a pending choice.
@@ -1539,7 +1615,7 @@ recorded on PR #17.
 - **WHY NOT:**
   - The header would keep listing an API framework as undecided, and `docs/development.md` would keep asking for a price version the ledger doesn't store.
   - The change that registers invoice verification could land without the conditions it must meet.
-  - An enforced per-job spend limit was also considered: a row-locked counter on the job, taken before every billable call. It was not chosen. It serializes every call of a job on one row and adds a lock outside the task, attempt and closure order that DEC-058 keeps cycle-free. It would also still need a price to turn calls into spend.
+  - An enforced per-job spend limit was also considered: a row-locked counter on the job, taken before every billable call. It was not chosen. It serialises every call of a job on one row and adds a lock outside the task, attempt and closure order that DEC-058 keeps cycle-free. It would also still need a price to turn calls into spend.
 - **TRADE-OFF:**
   - With no inbound API, external systems can't submit or read jobs, so any integration waits for a new decision.
   - The ledger can't give a money figure. A cost report needs a later decision on a price source and its versioning.
@@ -1553,12 +1629,12 @@ recorded on PR #17.
 ## Provider call package name
 
 ### DEC-063 — The provider call package is `orqestra.calls`, and the repository's wording names providers instead of the old two-letter term
-- **Status:** Accepted (owner, 2026-11-06; was Proposed) · it follows the owner's naming rule of 2026-11-06. It changes no earlier decision: entries and ADRs that used the old term or package path are reworded for that term only, with their numbers, dates, statuses and meaning unchanged.
+- **Status:** Accepted (maintainer, 2026-11-06; was Proposed) · it follows the maintainer's naming rule of 2026-11-06. It changes no earlier decision: entries and ADRs that used the old term or package path are reworded for that term only, with their numbers, dates, statuses and meaning unchanged.
 - **WHAT:**
   - **Rename.** The package that holds the provider-neutral call contract (request and response types, the scripted mock, call recording and route selection) moves from its old two-letter path to `orqestra.calls`, keeping its modules (`provider`, `mock`, `recording`, `routing`) and their history. Its unit tests become `tests/unit/test_calls_*.py`, and every import, string module path and layer name in the isolation and boundary tests follows.
   - **Wording.** The README, `pyproject.toml`, the package docstring, the docs and the ADRs describe the work in provider terms: "provider adapters", "provider call", "provider work", "provider budget" and "cost-aware provider orchestration". The `development.md` section is now "Invoice and provider workloads". OpenRouter's host name stays as it is, because the adapter must name the host it calls.
   - **No behaviour change.** No logic, signature, error code, setting name, stored value or migration changes.
-- **WHY:** The owner's naming rule of 2026-11-06 removes the term from the repository, the old package path included, apart from OpenRouter's host name.
+- **WHY:** The maintainer's naming rule of 2026-11-06 removes the term from the repository, the old package path included, apart from OpenRouter's host name.
 - **RUNNER-UP:** `orqestra.inference`.
 - **WHY NOT:** It implies model inference only, while the package also covers route selection and call recording.
 - **TRADE-OFF:**
@@ -1569,7 +1645,7 @@ recorded on PR #17.
 ## CLI job submission and status
 
 ### DEC-064 — `orqestra job submit` sends a JSON file of tasks through `submit_job`, and `orqestra job status` prints a job's derived status
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · it adds two commands to the argparse CLI of DEC-051 and changes no persistence, schema or dependency; the CLI framework choice stays open.
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · it adds two commands to the argparse CLI of DEC-051 and changes no persistence, schema or dependency; the CLI framework choice stays open.
 - **WHAT:**
   - **Commands.** `orqestra job submit --kind KIND [--idempotency-key KEY] [--max-attempts N] TASKS_FILE` and `orqestra job status JOB_ID`, under a new `job` subcommand.
   - **Input.** `TASKS_FILE` is a path, or `-` for standard input: a UTF-8 JSON array of task objects with exactly `task_key` (a string), `payload` (any JSON value) and an optional integer `max_attempts`. A task without `max_attempts` takes `--max-attempts`, which has no default (DEC-034), so a task with neither is refused. Unknown fields, repeated keys in an object, numbers that are not finite (`NaN`, `Infinity`, or a literal such as `1e400` that overflows a double), strings and object keys anywhere in a task that cannot be encoded as UTF-8 (a lone surrogate, which JSON allows as an escape), and nesting deeper than the parser can follow are refused before the database is reached, with messages that name the task index and field, never a value. `--kind` and `--idempotency-key` values that are not UTF-8 (a byte such as `\xff` on the command line arrives as a lone surrogate) are refused the same way. Numbers with a fraction or an exponent are read as doubles, as Python's `json` reads them. `--kind` is checked with `check_job_kinds`, which refuses only a blank kind and a NUL, as the `jobs_kind_not_blank` constraint does for blanks. Everything else is `JobSubmission` and `submit_job`'s own validation and idempotency (DEC-025), unchanged.
@@ -1594,14 +1670,14 @@ recorded on PR #17.
 ## Provider call budget
 
 ### DEC-065 — A job's provider calls are checked against a provable bound, cap × Σ `max_attempts`, assumed by the operator and read in one snapshot with the usage report
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · it adds a read-only check over the usage report of DEC-061, within DEC-062: no price, no currency and no enforcement. No migration and no new dependency.
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · it adds a read-only check over the usage report of DEC-061, within DEC-062: no price, no currency and no enforcement. No migration and no new dependency.
 - **WHAT:**
   - **Bound.** `call_bound(max_attempts_total, cap)` in `orqestra.aggregation.budget` returns `cap × max_attempts_total`, the most provider calls a job's attempts can make. Every attempt is held to `cap` calls (DEC-057), and a task starts at most `max_attempts` attempts (DEC-019; `tasks_attempt_count_range`). The bound can be computed before submission, from the task file. `cap` follows the per-attempt cap's own rule (`check_call_cap`: an integer, not a boolean, from 0 to `MAX_CALL_SEQ`), and `max_attempts_total` must be a non-negative integer.
   - **Check.** `check_call_budget(report, max_attempts_total=…, cap=…)` returns a `CallBudgetCheck`: `cap`, `max_attempts_total`, `bound`, the report's `calls` and `finality`, a verdict, `unknown_reason` and `cap_source = "operator"`.
     - `exceeded` when `calls > bound`, at any finality. Recorded calls only grow, so even a lower bound over the limit proves the overrun: the assumed cap is wrong, a worker ran with a larger one, or there is a defect.
     - `within` when the report is `CLOSED` and `calls ≤ bound`. It holds for that snapshot only: the ledger accepts late writes, which can contradict a closed report.
     - `unknown` otherwise, with the report's finality (`open` or `lower_bound`) as the reason. A job whose attempts recorded nothing and closed nothing is a lower bound, so it is `unknown`, never `within`.
-  - **One snapshot.** `read_job_call_budget(conn, job_id, cap=…)` opens one `job_batch_snapshot`. It folds the usage first, through `read_job_usage` (the former private `_read` of `report_job_usage`, renamed with no change in behavior), so another kind of job raises `WrongJobKindError` before any ledger row or task is read. Then it reads `JobBatchSnapshot.max_attempts_total()`, a new bounded query (`sum(max_attempts)` of the job's tasks), in the same `REPEATABLE READ, READ ONLY` transaction. The snapshot takes no row lock. An invalid `cap` is refused before anything is read.
+  - **One snapshot.** `read_job_call_budget(conn, job_id, cap=…)` opens one `job_batch_snapshot`. It folds the usage first, through `read_job_usage` (the former private `_read` of `report_job_usage`, renamed with no change in behaviour), so another kind of job raises `WrongJobKindError` before any ledger row or task is read. Then it reads `JobBatchSnapshot.max_attempts_total()`, a new bounded query (`sum(max_attempts)` of the job's tasks), in the same `REPEATABLE READ, READ ONLY` transaction. The snapshot takes no row lock. An invalid `cap` is refused before anything is read.
   - Reported amounts and `estimated_exposure_units` stay in the usage report and are never added to the check.
 - **WHY:**
   - The blueprint asks for a bounded budget policy, and DEC-062 rules out prices, currencies and an enforced per-job counter. A count of calls is the one budget figure that needs neither.
@@ -1623,7 +1699,7 @@ recorded on PR #17.
 ## CLI job summary and usage
 
 ### DEC-066 — `orqestra job summary` and `orqestra job usage` print an invoice job's summary and usage report, with the call budget check on request
-- **Status:** Accepted (owner, 2026-11-07; was Proposed) · it adds two read-only commands to the `job` subcommand of DEC-064 and changes no persistence, schema or dependency.
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed) · it adds two read-only commands to the `job` subcommand of DEC-064 and changes no persistence, schema or dependency.
 - **WHAT:**
   - **Commands.** `orqestra job summary JOB_ID` and `orqestra job usage JOB_ID [--max-provider-calls-per-attempt N]`.
   - **Sequence.** Exactly DEC-064's: settings, the connection string checked without echoing it, an autocommit connection, then `verify_current` before any read. Summary calls `summarize_invoice_job` (DEC-056). Usage calls `report_job_usage` (DEC-061) or, with `--max-provider-calls-per-attempt`, `read_job_call_budget` (DEC-065), so the report and the check come from one snapshot and the job is read once.
@@ -1641,12 +1717,12 @@ recorded on PR #17.
   - Task keys appear in anomaly samples. They are the submitter's identifiers, not payload values, and the summary already carries them.
   - The cap is the operator's assumption, as in DEC-065; the command cannot check it.
   - As in DEC-064, the commands set no timeout of their own, and there is still no command to list jobs or show their tasks.
-- **VERIFICATION:** Unit tests (`tests/unit/test_cli.py`) print a summary and a usage report built field by field, compare each document's keys with the dataclass fields so a new field cannot be dropped silently, check a small amount printed without an exponent, the budget for `exceeded`, `unknown` and `within`, a cap of 0 and of `MAX_CALL_SEQ`, the refusal of a negative cap and of one above `MAX_CALL_SEQ` before the database without the value, argparse errors for a missing or malformed `JOB_ID` or cap, and for each command an unknown job, another kind without its name, a job without tasks, a schema that is not current, a database error by type and SQLSTATE, invalid and missing settings, a malformed URL and an unreachable database without secrets. PostgreSQL tests (`tests/integration/test_cli_jobs_pg.py`) compare each command's output, except `observed_at`, with the library's own result serialized the same way: a complete job run through the real handler (no invoice value in the output), a job with succeeded, failed and running tasks, a retried task's usage, the budget `exceeded` and `unknown` on that task and `within` on a closed job. They also refuse an unknown job, an echo job (without its kind), an unmigrated schema, and report a missing ledger table by type and SQLSTATE.
+- **VERIFICATION:** Unit tests (`tests/unit/test_cli.py`) print a summary and a usage report built field by field, compare each document's keys with the dataclass fields so a new field cannot be dropped silently, check a small amount printed without an exponent, the budget for `exceeded`, `unknown` and `within`, a cap of 0 and of `MAX_CALL_SEQ`, the refusal of a negative cap and of one above `MAX_CALL_SEQ` before the database without the value, argparse errors for a missing or malformed `JOB_ID` or cap, and for each command an unknown job, another kind without its name, a job without tasks, a schema that is not current, a database error by type and SQLSTATE, invalid and missing settings, a malformed URL and an unreachable database without secrets. PostgreSQL tests (`tests/integration/test_cli_jobs_pg.py`) compare each command's output, except `observed_at`, with the library's own result serialised the same way: a complete job run through the real handler (no invoice value in the output), a job with succeeded, failed and running tasks, a retried task's usage, the budget `exceeded` and `unknown` on that task and `within` on a closed job. They also refuse an unknown job, an echo job (without its kind), an unmigrated schema, and report a missing ledger table by type and SQLSTATE.
 
 ## Session time zone
 
 ### DEC-067 — Library transactions decode instants in UTC, so lease, deadline and retry arithmetic measures elapsed time
-- **Status:** Accepted (owner full-auto rule, 2026-11-08) · implemented (`owned_transaction`, `local_deadline`, the claim hold) · cites ADR-0003 (the database clock decides)
+- **Status:** Accepted (maintainer's standing approval, 2026-11-08) · implemented (`owned_transaction`, `local_deadline`, the claim hold) · cites ADR-0003 (the database clock decides)
 - **WHAT:**
   - `owned_transaction` runs `SET LOCAL TimeZone = 'UTC'` as its own statement, right after the isolation statement. Every `timestamptz` decoded inside a library-owned transaction is therefore a `datetime.UTC` value. The setting is transaction-local: commit or rollback restores the caller's session zone.
   - `local_deadline` converts both instants to UTC before subtracting, and refuses naive ones. The hold of a claimed but unstarted attempt (DEC-049) goes through it.
@@ -1672,7 +1748,7 @@ recorded on PR #17.
   - One more statement per owned transaction, heartbeats and claims included. The measurement campaign measures this code.
   - In a session whose TimeZone is not UTC, `orqestra job submit` prints `created_at` with `+00:00` while `orqestra job status` keeps the session's offset; the instant is the same.
   - Correctness relies on psycopg reading the session TimeZone for each query's loaders, and on PostgreSQL reporting the revert of `SET LOCAL`. The integration tests check both.
-  - Open: a CI lane whose test sessions use a TimeZone with daylight saving (needs the owner).
+  - Open: a CI lane whose test sessions use a TimeZone with daylight saving (needs the maintainer).
 - **VERIFICATION:**
   - `tests/integration/test_attempt_lifecycle.py`, section 24:
     - with the session in Europe/London, instants read on the 2026-10-25 fold inside `owned_transaction` are UTC; the expired lease is `lease_expired`, 40 minutes past; a 2 h lease from before the fold is exactly 2 h long;
@@ -1695,7 +1771,7 @@ recorded on PR #17.
 ## Cancellation grace fence
 
 ### DEC-068 — A confirmed cancellation request moves the ownership fence to the grace end, earlier or later
-- **Status:** Accepted (owner full-auto rule, 2026-11-08) · implemented (`Watchdog.move_to`, the cancellation branch of the worker's heartbeat) · amends DEC-045 and DEC-048 through their notes
+- **Status:** Accepted (maintainer's standing approval, 2026-11-08) · implemented (`Watchdog.move_to`, the cancellation branch of the worker's heartbeat) · amends DEC-045 and DEC-048 through their notes
 - **WHAT:**
   - `Watchdog.move_to(token, deadline)` sets the ownership guard's deadline to exactly `deadline`, earlier or later, in one update under the watchdog's lock. It refuses a non-finite deadline and the drain and operation guards, and returns `False`, changing nothing, for a token no longer armed.
   - When a heartbeat raises `CancellationRequestedError`, the supervisor stops renewing, moves the fence to the request's lease end (the grace end) mapped to the local clock, less `fence_margin`, and only then sets the handler's cancellation event (DEC-048's order). It was `restrict`, which kept the earlier of the two.
@@ -1734,11 +1810,11 @@ recorded on PR #17.
 ## Claim index
 
 ### DEC-069 — The claim scan dominates the engine's per-task cost at 10,000 queued tasks, so a partial claim index is proposed as its own task
-- **Status:** Accepted (owner, 2026-11-09; was Proposed) · decides OD-7 on the measurement campaign's data (`docs/performance.md`) · implemented by migration 0006 (note below)
+- **Status:** Accepted (maintainer, 2026-11-09; was Proposed) · decides, on the measurement campaign's data (`docs/performance.md`), whether the claim index DEC-033 left open is needed (DEC-062) · implemented by migration 0006 (note below)
 - **WHAT:**
-  - The condition OD-7 set for a claim index holds: claim latency grows with queue depth enough to dominate `echo`'s per-task overhead at 10,000 tasks.
+  - The condition DEC-062 set for a claim index holds: claim latency grows with queue depth enough to dominate `echo`'s per-task overhead at 10,000 tasks.
   - Migration 0006, a partial index that serves the claim's discovery statement (DEC-033), is proposed as a separate task. That task designs the index and measures it.
-  - No index is added by this entry, and nothing changes until the owner accepts it.
+  - No index is added by this entry, and nothing changes until the maintainer accepts it.
 - **WHY:**
   - **Claim latency grows with depth.** Measured: the claim's p50 is 1.875 ms at 1,000 queued tasks, 6.403 ms at 10,000, 28.497 ms at 50,000 and 54.677 ms at 100,000, all eligible. Every depth and variant scans `tasks` sequentially, sorts, then takes `LockRows`, on a table of the same size for every variant at each depth. Source: `benchmarks/results/claims/20261109T011052Z-c410ac6-claims.json`.
   - **At 10,000 tasks it is as large as the engine's whole per-task overhead.** Derived: `echo`'s per-task overhead at one worker is 0.006 s (makespan × W ÷ tasks − service time p50). The claim alone costs 6.403 ms at that depth. Source: `benchmarks/results/*-c410ac6-echo-10000-b0-w{1,2,4,8}-r{1,2,3}.json`.
@@ -1748,13 +1824,13 @@ recorded on PR #17.
     - an efficiency of 0.52 at eight workers (derived).
   - **Invoice batches do not show it, because they are few tasks.** A 10,000-invoice job at batch 100 is only 100 tasks, so the scan is short there.
 - **RUNNER-UP:**
-  - (a) No index in this foundation; record the curve (OD-7's default).
+  - (a) No index in this foundation; record the curve (DEC-062's default).
   - Making the index part of the campaign's task.
 - **WHY NOT:**
-  - (a) is OD-7's choice only if the condition does not hold, and it holds.
+  - (a) is DEC-062's default only if the condition does not hold, and it holds.
   - The campaign task changes no schema. DEC-062 also adds an index only after *repeated* measurements show the scan-and-sort cost matters and the index's write overhead is acceptable. This campaign measured the claim curve once and measured no index's write cost.
 - **TRADE-OFF:**
-  - Until an index lands, claim cost grows with the size of `tasks`, because the plan scans the whole table. The curve was measured with queued tasks only. On this machine, 50,000 to 100,000 queued tasks cost 28.497 to 54.677 ms per claim (p50).
+  - Until an index lands, claim cost grows with the size of `tasks`, because the plan scans the whole table. The curve was measured with queued tasks only. On the measurement machine (`docs/performance.md`), 50,000 to 100,000 queued tasks cost 28.497 to 54.677 ms per claim (p50).
   - The proposed task must re-measure the curve, with and without the index. It must also measure the index's cost on submission and on each task state change, as DEC-062 asks, before the index is accepted.
 - **VERIFICATION:** the measurement campaign's result files named above, generated into `docs/performance.md` by `python -m benchmarks.report`. The proposed task verifies the index itself.
 - **Note (2026-11-09):** implemented by migration 0006, `tasks_claim_order ON tasks (created_at, id) WHERE state = 'queued'`.
@@ -1768,7 +1844,7 @@ recorded on PR #17.
 ## Supervisor step window
 
 ### DEC-070 — A step held back past a heartbeat may start when it and a full heartbeat fit before the fence; settings with neither window are refused
-- **Status:** Accepted (owner full-auto rule, 2026-11-09) · implemented (`next_step`, `Timing.fence_due`, `WorkerSettings`) · amends DEC-044 and DEC-045 through their notes
+- **Status:** Accepted (maintainer's standing approval, 2026-11-09) · implemented (`next_step`, `Timing.fence_due`, `WorkerSettings`) · amends DEC-044 and DEC-045 through their notes
 - **WHAT:**
   - While a handler runs, a usage write or a sweep step (DEC-045, DEC-059) may start if it can take its full `db_operation_timeout` and still end before the next heartbeat is due, as before, **or**, if it was already due when the last heartbeat call returned, if it and a heartbeat after it can both take their full `db_operation_timeout` and still end before the armed ownership deadline.
   - A step that falls due between heartbeats waits for the next one as before; only a step the first window missed right after a heartbeat uses the second.
@@ -1789,8 +1865,8 @@ recorded on PR #17.
 
 ## Benchmark provider
 
-### DEC-071 — OpenRouter is wired into the benchmark invoice worker only, off by default; live calls need the owner's separate approval with a dollar limit
-- **Status:** Accepted (owner, 2026-11-10: "Approve, offline only") · implemented (`benchmarks/live.py`, `benchmarks/worker.py`, `benchmarks/run.py`) · a live campaign ran on 2026-11-17 (DEC-072); its results are kept outside the repository
+### DEC-071 — OpenRouter is wired into the benchmark invoice worker only, off by default; live calls need the maintainer's separate approval with a dollar limit
+- **Status:** Accepted (maintainer, 2026-11-10, offline use only) · implemented (`benchmarks/live.py`, `benchmarks/worker.py`, `benchmarks/run.py`) · a live campaign ran on 2026-11-17 (DEC-072); its results are committed in `benchmarks/results/campaigns/20261117T014319Z-63ade1a/` and summarised in `docs/performance.md`
 - **Note (2026-11-16):** narrowed by DEC-072. The crash drill `benchmarks.drills d1` now also takes the provider flags, with the invoice mix or the extraction workload (`--workload extract`), sharing one call counter across killed and replacement workers; `d2`, `d3a`, `d3b` and `d4` refuse them, and `benchmarks.ladder` still has none. The text below is kept as decided.
 - **WHAT:**
   - **Provider choice.** The benchmark invoice worker is answered by the offline double `SeparatorReader` by default, or by the OpenRouter adapter (DEC-060, unchanged) with `--provider openrouter`. Only `python -m benchmarks.run`, a single cell, accepts that flag; `benchmarks.ladder` and `benchmarks.drills` have none and always use the double. `orqestra worker run` stays diagnostics-only (DEC-051, DEC-062), and no `src` module imports `orqestra.providers`.
@@ -1808,7 +1884,7 @@ recorded on PR #17.
   - **Dry run.** `--dry-run` runs the whole path (real workers, usage ledger, counter, adapter and response parsing) against `CannedTransport`, which answers in memory with a well-formed OpenRouter body: the raw value without separators, the requested model, and synthetic usage (`0.000001` credits a call). It prints, labelled "dry run: canned responses, no network, no cost", the oracle's expected calls, the maximum, the call budget bound (DEC-065) and whether `--call-timeout` fits the execution timeout; after the cell, the requests the canned transport answered, the ledger's calls and the counter.
   - **Where a real transport is made.** Only `build_openrouter_provider`, only for a live run, which imports `stdlib_transport` there, so a dry run never loads the network modules. A live cell passes the key to its workers in their environment only, never in an argument, a log or the result.
   - **Ledger and result.** The ledger records provider `openrouter`, the model, the adapter's `PROMPT_VERSION` and the reported credits in `openrouter_credits`, with no price and no invented token counts (DEC-062). The gate's usage check compares calls with the oracle, and credits only for a dry run. The result's `provider` block is `{name, model, max_provider_calls, dry_run, call_timeout, cap, route, calls_made, usage_unit}`; the double's block gains `name: "bench-double"`.
-- **WHY:** the owner approved wiring the adapter offline only. DEC-062's "Live calls" requires each live call to be authorized separately, naming its scope, and its "Registration" keeps the packaged command unwired. DEC-060's adapter is used as built. A spent budget is an operational limit, not a judgement on an invoice: `needs_review` would label invoices that were never asked about, and `PERMANENT` also stops retries from spending more.
+- **WHY:** the maintainer approved wiring the adapter offline only. DEC-062's "Live calls" requires each live call to be authorised separately, naming its scope, and its "Registration" keeps the packaged command unwired. DEC-060's adapter is used as built. A spent budget is an operational limit, not a judgement on an invoice: `needs_review` would label invoices that were never asked about, and `PERMANENT` also stops retries from spending more.
 - **RUNNER-UP:**
   - (a) enforcing the maximum inside `ProviderCalls`, giving `needs_review`;
   - (b) a database row lock as the counter;
@@ -1831,9 +1907,9 @@ recorded on PR #17.
 - **Cross-references:** DEC-051, DEC-055, DEC-057, DEC-059, DEC-060, DEC-062, DEC-065.
 
 ### DEC-072 — One paid benchmark campaign: a low-cost hosted model through OpenRouter, a $45 campaign budget under a $50 hard cap, eight steps with gates enforced in code
-- **Status:** Accepted (owner, 2026-11-16: "approve, $50 cap, start building") · implemented (`benchmarks/campaign.py`, `benchmarks/baseline.py`) · a live campaign ran on 2026-11-17; its results are kept outside the repository
+- **Status:** Accepted (maintainer, 2026-11-16, with a $50 hard cap) · implemented (`benchmarks/campaign.py`, `benchmarks/baseline.py`) · a live campaign ran on 2026-11-17; its results are committed in `benchmarks/results/campaigns/20261117T014319Z-63ade1a/` and summarised in `docs/performance.md`
 - **WHAT:**
-  - **Scope of the approval.** One campaign of live calls, to show how long Orqestra takes on document work and to find what to improve. The model is a low-cost hosted model selected by the owner, recorded per run: the campaign takes it only as `--model` and writes it into each result. Calls go through the OpenRouter adapter (DEC-060), the usage ledger and the call maximum (DEC-071), routed on the owner's own provider key. The account carries a $50 hard cap. The campaign plans to spend at most $45 of it; the $5 between them is the reserve described under **Budget**.
+  - **Scope of the approval.** One campaign of live calls, to show how long Orqestra takes on document work and to find what to improve. The model is a low-cost hosted model selected by the maintainer, recorded per run: the campaign takes it only as `--model` and writes it into each result. Calls go through the OpenRouter adapter (DEC-060), the usage ledger and the call maximum (DEC-071), routed on the maintainer's own provider key. The account carries a $50 hard cap. The campaign plans to spend at most $45 of it; the $5 between them is the reserve described under **Budget**.
   - **The runner.** `python -m benchmarks.campaign run --model M (--allow-live-calls --price-in-per-mtok P --price-out-per-mtok Q | --dry-run)` runs the steps below in order, strictly one cell at a time. Every cell is one subprocess of an existing command (`benchmarks.run`, `benchmarks.drills`, `benchmarks.baseline`) against the isolated `orqestra_bench` database, so the campaign adds no second path to the provider. The key comes only from `ORQESTRA_OPENROUTER_API_KEY` in the environment, read from the macOS Keychain by the operator at run time; the campaign checks that it is set and passes it to live children in their environment only. A dry run removes it from every child environment and runs the whole campaign on the canned transport: no network, no key, no cost. The per-million-token prices are arguments, required for a live run, and recorded with the results; a dry run plans with synthetic prices, marked as such.
   - **Steps.** All cells use the extraction workload unless stated.
     1. Pilot: 100 invoices, tasks of 25, 4 workers.
@@ -1856,7 +1932,7 @@ recorded on PR #17.
   - **Billing check.** Written after step 5 and again, final, at the end: the model, the campaign's UTC start and end, and per cell and in total the ledger's calls, token cost and credits beside each cell's independent call counter, with their differences reported, never assumed zero. Under own-key routing the credits and the token cost can differ. The router's and the upstream provider console's figures for that window are entered afterwards, separately, with `python -m benchmarks.campaign reconcile <id> --router-reported-usd X --upstream-reported-usd Y`.
   - **Records.** Results go under `benchmarks/results/campaigns/<id>/` (a dry run's under `build/bench/campaigns/<id>/`), beside `campaign-log.jsonl`, one event per line (each command, budget figures, every gate decision with its value and threshold, skips and sizing, result paths and exit codes), the `campaign.json` summary and the billing check. `--resume <id>` never reruns a started cell, and a started cell without a result stays charged.
   - **Provider surface.** The extraction workload adds `OpenRouterProvider.extract(ExtractionRequest) -> ExtractionReport` (capability `extract_invoice`, prompt `extract-invoice.v1`, temperature 0, `max_tokens` 1,024; DEC-060's `interpret` is unchanged). `ProviderCallIntent.field_kind` becomes optional, for a call about a whole document rather than one amount, and `ProviderCallResult` gains five optional fields (the model served, the generation id, input and output tokens, latency) that `ledger_result` passes to the ledger's existing columns. No migration. The campaign reads the prompt's size and `max_tokens` through one small seam (`ExtractLimits`), so its bound follows the workload's own definitions. The ledger still holds no prices (DEC-062): prices exist only in the campaign's arguments and result files.
-- **WHY:** the owner approved the spend and its cap for this purpose. Running every cell through the existing commands keeps one tested path to the provider and the ledger, and sizing each cell's call maximum from a per-call bound turns the budget into a limit enforced before each request rather than an accounting after it.
+- **WHY:** the maintainer approved the spend and its cap for this purpose. Running every cell through the existing commands keeps one tested path to the provider and the ledger, and sizing each cell's call maximum from a per-call bound turns the budget into a limit enforced before each request rather than an accounting after it.
 - **RUNNER-UP:**
   - (a) a campaign that calls `run_cell` in process;
   - (b) the budget checked once per step instead of per cell;
@@ -1880,7 +1956,7 @@ recorded on PR #17.
 - **Cross-references:** DEC-054, DEC-060, DEC-062, DEC-065, DEC-071.
 
 ### DEC-073 — The benchmark extraction handler retries a throttled call per document inside its attempt, and a cell may pace its calls with a shared file limiter
-- **Status:** Accepted (batch live-fixes, task F1) · implemented (`benchmarks/extract.py`, `benchmarks/ratelimit.py`, `benchmarks/worker.py`, `benchmarks/result.py`) · a live campaign ran on 2026-11-17 (DEC-072), the one this entry's WHY describes; its results are kept outside the repository
+- **Status:** Accepted · implemented (`benchmarks/extract.py`, `benchmarks/ratelimit.py`, `benchmarks/worker.py`, `benchmarks/result.py`) · a live campaign ran on 2026-11-17 (DEC-072), the one this entry's WHY describes; its results are committed in `benchmarks/results/campaigns/20261117T014319Z-63ade1a/` and summarised in `docs/performance.md`
 - **WHAT:**
   - **Per-document retry.** In the extraction handler (`extraction_handler`, the benchmark's job kind `invoice_extraction` only), a call that fails `rate_limited` or `unavailable` is followed by another try of the same document inside the same attempt, rather than ending the attempt. Each try is its own ledger call: a new intent and result with the next `call_seq` and the same `item_index`, and one reservation from the cell's call counter (DEC-071), so every try is recorded and charged. The loop moves to the next document only after an answer, so a document already answered is never called again in that attempt. A try happens only while all of these hold:
     1. the document has had fewer than 6 tries;
@@ -1891,7 +1967,7 @@ recorded on PR #17.
     The wait after try *k* is the engine's DEC-053 shape, in [capped / 2, capped] with capped = min(16 s, 1 s × 2^(k−1)), with its deterministic jitter keyed by the attempt and the document: at most 31 s over six tries. A timeout, every permanent code and every protocol violation end the attempt as before, and so does a throttle once any bound is reached; the engine's retry (DEC-053) then takes over. A timeout is not retried because a timed-out request may still be running, and billing, at the provider. `unavailable` also covers a transport failure after the request was sent, so a retried try may be billed twice; that is accepted because every try is its own ledger call, and an unanswered one is charged at the cell's per-call ceiling (DEC-072). The gate's `extraction_usage` check accepts, in a succeeded attempt, failed calls only of these two codes that the same attempt followed with another try of the same document.
   - **Shared pace.** With `--rate-limit-per-s N --rate-limit-file PATH` (always together, extract workload only; off when absent), every worker process of a cell paces its calls on one file, so the fleet starts calls at least 1/N s apart with no burst. The file holds the wall-clock time of the next free slot and is updated as the call counter is (DEC-071): under an exclusive `flock` on `PATH.lock`, whose identity never changes, a synced temporary file is `os.replace`d over it, so a kill leaves the old or the new value and the kernel releases the lock. A missing file is a free slot now, and the first reservation creates it. The lock is taken without blocking and polled until the caller's wait runs out; the delay to a reserved slot is returned and waited by the caller (cancellably), never under the lock. Before each try's intent the handler reserves a slot and waits for it, and only then records the intent, which reserves the call from the counter. A slot is waited for at most `LIMITER_MAX_WAIT` (10 s). Pacing has its own time allowance beside the calls': a paced attempt keeps `LIMITER_MAX_WAIT` for each document still to call, so a slot's wait never eats the time a later call needs, and a cell paced within its rate never fails an attempt for pacing. Pacing therefore needs headroom in the execution timeout as well as in the cap: the run harness adds batch × `LIMITER_MAX_WAIT` to a paced cell's execution timeout. No slot in time counts as a 429 for that document, with no intent and no call, under the same retry bounds. A file that cannot be read, or a slot more than 60 s ahead (the wall clock went back), counts as a free slot now.
   - **Partial-cell figures.** The `extraction` block gains `documents_processed`, the documents with an item result. Accuracy is scored over those documents, `cost.per_1000_invoices` and `per_1000_invoices_succeeded` divide by them (by every document when none was processed: the spend with nothing to show), and `retries` counts attempts beyond the first of each task that ran. `calls.retried_in_attempt` counts the throttled tries followed by another try. In a complete cell each existing figure is unchanged. A result written before this keeps validating without `documents_processed`.
-  - **The extraction prompt** (task F2): version `extract-invoice.v2` asks for minified one-line JSON with no code fence and no commentary, with the same reply schema; `max_tokens` rises from 1,024 to 2,048. The version `extract-invoice.v1` is never reused, so a result names the prompt it measured.
+  - **The extraction prompt**: version `extract-invoice.v2` asks for minified one-line JSON with no code fence and no commentary, with the same reply schema; `max_tokens` rises from 1,024 to 2,048. The version `extract-invoice.v1` is never reused, so a result names the prompt it measured.
 - **WHY:** in the paid campaign (DEC-072), every 32-worker cell failed: the provider throttled for about 45 s, each task had 3 attempts with at most about 1.5 s of backoff, and one 429 failed a batch of 25 whose retry called every document again, about 40 % of those cells' cost. Retrying the one document keeps the answered ones, and pacing below the provider's limit keeps a cell from provoking the throttle at all. Eight replies in about 56,000 were cut off at 1,024 tokens while replies averaged 523 tokens and 81 % of the cost.
 - **RUNNER-UP:**
   - (a) only a longer engine retry budget (more attempts, longer delays);
@@ -1899,7 +1975,7 @@ recorded on PR #17.
   - (c) a per-worker pace (each worker at N / workers);
   - (d) a database row as the shared pace.
 - **WHY NOT:**
-  - (a) every retry still calls every document of the batch again, so cost grows with each 429. Task F3 does lengthen the engine budget for live cells, as the fallback when a document runs out of tries.
+  - (a) every retry still calls every document of the batch again, so cost grows with each 429. The engine budget for live cells is lengthened separately, as the fallback when a document runs out of tries.
   - (b) the transport exposes no headers (`HttpExchange`), so it needs a change to `src/orqestra/providers`, which is high risk; it is left for later.
   - (c) wastes rate while workers idle, and must be recomputed when a worker is replaced.
   - (d) adds a write per call to the database whose stalls the benchmark is measuring.
@@ -1918,7 +1994,7 @@ recorded on PR #17.
 - **Cross-references:** DEC-009, DEC-053, DEC-054, DEC-065, DEC-071, DEC-072.
 
 ### DEC-074 — An idle supervisor call past its bound is abandoned and retried; a call made while a task is owned still ends the process (amends DEC-045)
-- **Status:** Accepted (owner, 2026-11-17: "Yes, fix it"; batch db-pause, task D1) · implemented (`orqestra.worker.fence`, `orqestra.worker.runtime`, `orqestra.worker.settings`)
+- **Status:** Accepted (maintainer, 2026-11-17) · implemented (`orqestra.worker.fence`, `orqestra.worker.runtime`, `orqestra.worker.settings`)
 - **WHAT:**
   - **Ownership decides.** A supervisor database call is *idle* when it is one of `IDLE_OPERATIONS` (`claim`, `revoke_next_expired`, `settle_abandoned`) and no handler runs or awaits settlement. Every other call is *owning*: the heartbeat, provider usage records, a sweep step while a handler runs, the completion and its evidence read. The two reads of a claimed task not yet started (`read_task`, `read_job`) also keep the fail-fast: the worker then holds a claimed attempt, none of the re-check's stalls was one, and the worker CLI's tests rely on a freeze there ending the process. An owning call that outlives `db_operation_timeout` ends the process (exit 4) exactly as DEC-045 decided.
   - **An idle call is aborted, not fatal.** It arms the watchdog's OPERATION guard with an abort (`Watchdog.arm_abortable`). Past the bound, the watchdog shuts that connection's socket (`shutdown(2)` on a duplicate descriptor, from the watchdog thread) instead of ending the process, and moves the same guard one backstop later with no abort: one bound, and never less than the connect timeout, so a connect stalled by a frozen server fails (and counts as an idle stall) before the backstop could fire. If the call still has not returned then, the process ends (exit 4). With OWNERSHIP or DRAIN armed at that moment, it ends at once.
@@ -1949,7 +2025,7 @@ recorded on PR #17.
 - **Cross-references:** DEC-045, DEC-046, DEC-050, DEC-053, DEC-070.
 
 ### DEC-075 — A renewed lease is mapped to the local clock from its own renewal, not from the claim (corrects DEC-045's fencing)
-- **Status:** Accepted (batch audit-fixes, task E1, from the read-only audit's finding M1, 2026-11-18) · implemented (`orqestra.persistence.lifecycle`, `orqestra.worker.runtime`, `orqestra.worker.fence`)
+- **Status:** Accepted (2026-11-18, from a read-only audit) · implemented (`orqestra.persistence.lifecycle`, `orqestra.worker.runtime`, `orqestra.worker.fence`)
 - **WHAT:**
   - **The finding.** Every database instant of a running attempt was mapped to the local clock as `anchor + (instant − started_at)`, with `anchor` the local clock read before the claim was sent and `started_at` the claim's database instant, and never updated. After renewal *k* the ownership fence was `anchor + (db_now_k − started_at) + lease − fence_margin`. A database clock step of +X after the claim (an NTP step, a VM resume) put that fence, and every later one, X after the lease really ends, so a handler could outlive its lease by X − `fence_margin` while recovery on another worker, judged in database time, revoked and reclaimed its task: writes stayed generation-fenced, external side effects ran twice. A step back fenced a healthy worker early, and rate drift accumulated over the whole attempt. The cancellation grace end and the attempt's deadline (the completion's and usage records' give-up points) were mapped the same way.
   - **The rule.** `renew_lease_at` returns the renewed attempt with the database's `now` its new lease was computed from, read in the same transaction (`LeaseRenewal`); `renew_lease` keeps its signature as a wrapper. `CancellationRequestedError` carries the same `now`. After each confirmed answer the worker maps every instant of the attempt from that exchange: `sent + (instant − now)`, `sent` being the local clock read before the call. The ownership fence becomes `sent + (lease_expires_at − now) − fence_margin`, set exactly with `move_to`, earlier or later. Before the first confirmed renewal the claim's mapping stands, as before.
@@ -1976,9 +2052,9 @@ recorded on PR #17.
 - **Cross-references:** DEC-040, DEC-044, DEC-045, DEC-048, DEC-067, DEC-070, DEC-074.
 
 ### DEC-076 — The kill drill never keeps a worker stopped past half its operation bound
-- **Status:** Accepted (batch drill-freeze, task X1, owner 2026-11-23: fix the crash-drill flaw now) · implemented (`benchmarks/drills.py`, `benchmarks/demo.py`)
+- **Status:** Accepted (maintainer, 2026-11-23) · implemented (`benchmarks/drills.py`, `benchmarks/demo.py`)
 - **WHAT:**
-  - **The finding.** To choose a victim without racing its completion, `freeze_victims` stops every live worker, waits until the database is quiet, reads the running attempts' owners and continues the rest (plan 2.9). The quiet wait allowed `2 × db_operation_timeout + 1 s`, so a worker stopped inside a guarded call was continued after its operation deadline and ended itself (exit 4, DEC-045): the drill, not the worker, made the failure. It failed the demo and the drill tests on loaded machines.
+  - **The finding.** To choose a victim without racing its completion, `freeze_victims` stops every live worker, waits until the database is quiet, reads the running attempts' owners and continues the rest. The quiet wait allowed `2 × db_operation_timeout + 1 s`, so a worker stopped inside a guarded call was continued after its operation deadline and ended itself (exit 4, DEC-045): the drill, not the worker, made the failure. It failed the demo and the drill tests on loaded machines.
   - **The window.** A freeze keeps no worker stopped longer than `freeze_window` = half the workers' `db_operation_timeout`, counted from the first SIGSTOP (1.5 s at the live cells' 3 s bound, 0.4 s at the 0.8 s test profile). One deadline covers the whole stopped time: one `ps` read of every worker's state, the quiet wait, the owner read, and the at-call-boundary read of a chosen victim (`KillDrill`). If the workers have not all stopped, the database is not quiet, or the owners are not read by then, every worker is continued and the freeze is tried again on a later poll.
   - **The margin.** The other half of the bound covers the part of a guarded call that ran before its SIGSTOP and the reads and SIGCONTs that end a freeze. A worker frozen more than half way into a slow call can still pass its bound before it is continued; that risk is accepted, not removed.
   - **Quiet means no worker statement.** Only connections named `orqestra-worker` (every worker connection, `runtime.supervisor_conninfo`) are counted, because only a worker can end this job's attempts; another client of the same database no longer keeps it busy.

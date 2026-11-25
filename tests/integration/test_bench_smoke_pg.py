@@ -3,7 +3,7 @@
 Each test runs one cell through ``benchmarks.run.run_cell``: real worker
 processes (the benchmark worker for ``invoice``, the installed ``orqestra worker
 run`` for ``echo``), a job submitted through ``orqestra job submit``, and the
-profile's correctness gate (plan 2.6). Only the gate is asserted, never a
+profile's correctness gate. Only the gate is asserted, never a
 measured timing: ``STOP`` is a bound on a hung run, not an expectation.
 
 A worker's database bound is still a requirement on the machine: a call that
@@ -142,7 +142,7 @@ def test_an_invoice_cell_passes_its_gate(
     assert kinds is not None
     assert kinds[0] == kinds[1] > 0
     assert "extraction" not in record
-    sysload = record["resources"]["sysload"]  # T4: every run measures the machine's load
+    sysload = record["resources"]["sysload"]  # every run measures the machine's load
     assert sysload["samples"] >= 1
     assert set(sysload["metrics"]) == {
         "worker_cpu_cores",
@@ -238,7 +238,7 @@ def test_a_cell_stopped_at_its_limit_measures_no_idle_rate(
     assert record["database_stats"]["commits"]["method"].startswith("not measured")
 
 
-# --- drills (plan 2.10: D1 with one worker, and D3a) --------------------------------------
+# --- drills (D1 with one worker, and D3a) --------------------------------------
 
 
 def _drill_passes(record: dict[str, Any], drill: str) -> None:

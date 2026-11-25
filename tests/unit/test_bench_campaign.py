@@ -610,7 +610,7 @@ def test_a_live_command_passes_prices_only_where_the_model_reads_every_document(
     assert drill[3:4] == ["d1"]
     assert drill[drill.index("--victims") + 1] == "2"
     assert drill[drill.index("--workers") + 1] == "32"
-    # The crash drill reads every document too (T4), so it is priced like the pilot.
+    # The crash drill reads every document too, so it is priced like the pilot.
     assert drill[drill.index("--workload") + 1] == "extract"
     assert drill[drill.index("--price-in-per-mtok") + 1] == "0.31"
     assert drill[drill.index("--price-out-per-mtok") + 1] == "1.17"
@@ -1202,7 +1202,7 @@ def test_the_campaign_imports_no_network_module_and_names_no_model() -> None:
     assert not [text for text in constants if slug.fullmatch(text)]
 
 
-# --- every argv of the approved plan is accepted by its tool (T4) ----------------------------
+# --- every argv of the campaign plan is accepted by its tool ----------------------------
 
 
 class _NoDocuments:
@@ -1261,7 +1261,7 @@ def test_every_command_of_the_approved_plan_passes_its_tools_own_refusals(
         assert SENTINEL not in json.dumps(argv)
 
 
-# --- an unreadable counter never aborts the campaign (K1) -----------------------------------
+# --- an unreadable counter never aborts the campaign -----------------------------------
 
 
 def empty_counter(raw: Path, run_id: str, written: float) -> Path:

@@ -4,7 +4,7 @@ This page reports what the benchmark harness (`benchmarks/`) measured on one mac
 the measurements show. The tables are generated from the committed result files under
 `benchmarks/results/`. The analysis cites the files and the metrics behind each statement.
 Values computed from measurements are labelled as derived, with their formula. How to run the
-harness is in the README, [Running the benchmarks](../README.md#running-the-benchmarks).
+harness is in [Running the benchmarks](usage.md#running-the-benchmarks).
 
 ## What was measured and how
 
@@ -25,7 +25,7 @@ each result file too.
 
 Each ladder interleaves its repetitions by worker count. Every figure in the tables is the
 median of three repetitions, with the minimum and maximum. The warm-up and the 50,000-invoice
-rung ran once each, the second by the owner's ruling (OD-2). The campaign's results were measured
+rung ran once each, the second by the maintainer's decision. The campaign's results were measured
 on commit `c410ac6` from a clean tree. Every cell and drill ended `complete`; none was re-run.
 
 **The claim index (DEC-069), measured later.** On 2026-11-09, in one session on a fresh
@@ -307,30 +307,30 @@ Each row is one result file, shown as written: nothing is pooled across files or
 
 | File | Mode | Cell | Status | Calls | Call latency p50 / p95 / p99 (ms) | Provider share of handler time | Field accuracy | Needs review | Cost per 1,000 invoices | Retries | 429s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `campaigns/20261117T014319Z-63ade1a/20261117T014434Z-63ade1a-extract-100-b25-w4-r1.json` | live | extract 100 b25 w4 | complete | 100 | 2327 / 2932 / 3136 | 90.1 % | 1.000 | 2 | 0.3283070 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T030547Z-63ade1a-extract-2000-b25-w4-r1.json` | live | extract 2000 b25 w4 | complete | 2000 | 2272 / 3053 / 3416 | 90.8 % | 1.000 | 40 | 0.3231395 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T031637Z-63ade1a-extract-2000-b25-w8-r1.json` | live | extract 2000 b25 w8 | complete | 2000 | 2285 / 3146 / 3939 | 91.0 % | 1.000 | 40 | 0.32339925 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T032206Z-63ade1a-extract-2000-b25-w16-r1.json` | live | extract 2000 b25 w16 | complete | 2000 | 2274 / 3084 / 3592 | 91.2 % | 1.000 | 40 | 0.3235385 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T032409Z-63ade1a-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | failed_correctness | 1286 | 2267 / 3086 / 3644 | 88.1 % | 0.326 | 12 | 0.17568675 USD | 142 | 196 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T043125Z-63ade1a-extract-2000-b25-w4-r2.json` | live | extract 2000 b25 w4 | complete | 2000 | 2295 / 3061 / 3447 | 90.8 % | 1.000 | 40 | 0.3236485 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T044215Z-63ade1a-extract-2000-b25-w8-r2.json` | live | extract 2000 b25 w8 | complete | 2000 | 2280 / 3187 / 3967 | 91.3 % | 1.000 | 40 | 0.32345575 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T044752Z-63ade1a-extract-2000-b25-w16-r2.json` | live | extract 2000 b25 w16 | complete | 2000 | 2286 / 3068 / 3438 | 90.8 % | 0.999 | 41 | 0.3227555 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T045005Z-63ade1a-extract-2000-b25-w32-r2.json` | live | extract 2000 b25 w32 | failed_correctness | 1363 | 2261 / 3077 / 3477 | 88.6 % | 0.339 | 16 | 0.1889148 USD | 139 | 192 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T061222Z-63ade1a-extract-2000-b25-w4-r3.json` | live | extract 2000 b25 w4 | complete | 2000 | 2335 / 3169 / 3813 | 90.6 % | 1.000 | 40 | 0.3244125 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T062312Z-63ade1a-extract-2000-b25-w8-r3.json` | live | extract 2000 b25 w8 | complete | 2000 | 2304 / 3103 / 3452 | 90.6 % | 0.999 | 41 | 0.3236835 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T062848Z-63ade1a-extract-2000-b25-w16-r3.json` | live | extract 2000 b25 w16 | complete | 2000 | 2303 / 3093 / 3427 | 90.7 % | 0.999 | 41 | 0.32401325 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T063118Z-63ade1a-extract-2000-b25-w32-r3.json` | live | extract 2000 b25 w32 | failed_correctness | 1419 | 2302 / 3113 / 3482 | 88.0 % | 0.323 | 17 | 0.19918375 USD | 136 | 190 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T063642Z-63ade1a-extract-1000-b5-w8-r1.json` | live | extract 1000 b5 w8 | complete | 1000 | 2290 / 3096 / 3441 | 91.1 % | 1.000 | 20 | 0.3210369 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T064208Z-63ade1a-extract-1000-b25-w8-r1.json` | live | extract 1000 b25 w8 | complete | 1000 | 2290 / 3036 / 3368 | 90.9 % | 1.000 | 20 | 0.3189014 USD | 0 | 0 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T065038Z-63ade1a-extract-1000-b100-w8-r1.json` | live | extract 1000 b100 w8 | complete | 1000 | 2317 / 3093 / 3489 | 91.1 % | 1.000 | 20 | 0.3221194 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T014434Z-63ade1a-extract-100-b25-w4-r1.json` | live | extract 100 b25 w4 | complete | 100 | 2327 / 2932 / 3136 | 90.1 % | 1.000 | 2 | 0.3283 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T030547Z-63ade1a-extract-2000-b25-w4-r1.json` | live | extract 2000 b25 w4 | complete | 2000 | 2272 / 3053 / 3416 | 90.8 % | 1.000 | 40 | 0.3231 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T031637Z-63ade1a-extract-2000-b25-w8-r1.json` | live | extract 2000 b25 w8 | complete | 2000 | 2285 / 3146 / 3939 | 91.0 % | 1.000 | 40 | 0.3234 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T032206Z-63ade1a-extract-2000-b25-w16-r1.json` | live | extract 2000 b25 w16 | complete | 2000 | 2274 / 3084 / 3592 | 91.2 % | 1.000 | 40 | 0.3235 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T032409Z-63ade1a-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | failed_correctness | 1286 | 2267 / 3086 / 3644 | 88.1 % | 0.326 | 12 | 0.1757 USD | 142 | 196 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T043125Z-63ade1a-extract-2000-b25-w4-r2.json` | live | extract 2000 b25 w4 | complete | 2000 | 2295 / 3061 / 3447 | 90.8 % | 1.000 | 40 | 0.3236 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T044215Z-63ade1a-extract-2000-b25-w8-r2.json` | live | extract 2000 b25 w8 | complete | 2000 | 2280 / 3187 / 3967 | 91.3 % | 1.000 | 40 | 0.3235 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T044752Z-63ade1a-extract-2000-b25-w16-r2.json` | live | extract 2000 b25 w16 | complete | 2000 | 2286 / 3068 / 3438 | 90.8 % | 0.999 | 41 | 0.3228 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T045005Z-63ade1a-extract-2000-b25-w32-r2.json` | live | extract 2000 b25 w32 | failed_correctness | 1363 | 2261 / 3077 / 3477 | 88.6 % | 0.339 | 16 | 0.1889 USD | 139 | 192 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T061222Z-63ade1a-extract-2000-b25-w4-r3.json` | live | extract 2000 b25 w4 | complete | 2000 | 2335 / 3169 / 3813 | 90.6 % | 1.000 | 40 | 0.3244 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T062312Z-63ade1a-extract-2000-b25-w8-r3.json` | live | extract 2000 b25 w8 | complete | 2000 | 2304 / 3103 / 3452 | 90.6 % | 0.999 | 41 | 0.3237 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T062848Z-63ade1a-extract-2000-b25-w16-r3.json` | live | extract 2000 b25 w16 | complete | 2000 | 2303 / 3093 / 3427 | 90.7 % | 0.999 | 41 | 0.3240 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T063118Z-63ade1a-extract-2000-b25-w32-r3.json` | live | extract 2000 b25 w32 | failed_correctness | 1419 | 2302 / 3113 / 3482 | 88.0 % | 0.323 | 17 | 0.1992 USD | 136 | 190 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T063642Z-63ade1a-extract-1000-b5-w8-r1.json` | live | extract 1000 b5 w8 | complete | 1000 | 2290 / 3096 / 3441 | 91.1 % | 1.000 | 20 | 0.3210 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T064208Z-63ade1a-extract-1000-b25-w8-r1.json` | live | extract 1000 b25 w8 | complete | 1000 | 2290 / 3036 / 3368 | 90.9 % | 1.000 | 20 | 0.3189 USD | 0 | 0 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065038Z-63ade1a-extract-1000-b100-w8-r1.json` | live | extract 1000 b100 w8 | complete | 1000 | 2317 / 3093 / 3489 | 91.1 % | 1.000 | 20 | 0.3221 USD | 0 | 0 |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065058Z-63ade1a-invoice-2000-b25-w8-r1.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065118Z-63ade1a-invoice-2000-b25-w8-r2.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065138Z-63ade1a-invoice-2000-b25-w8-r3.json` | live | invoice 2000 b25 w8 | complete | 100 | — | — | — | — | — | — | — |
 | `campaigns/20261117T014319Z-63ade1a/20261117T065249Z-63ade1a-invoice-10000-b100-w8-r1.json` | live | invoice 10000 b100 w8 | complete | 500 | — | — | — | — | — | — | — |
-| `campaigns/20261117T014319Z-63ade1a/20261117T065742Z-63ade1a-extract-2000-b5-w32-r1.json` | live | extract 2000 b5 w32 | failed_correctness | 2360 | 2269 / 3098 / 3511 | 86.2 % | 0.503 | 21 | 0.2941235 USD | 416 | 530 |
-| `campaigns/20261117T014319Z-63ade1a/20261117T114003Z-63ade1a-extract-30150-b25-w16-r1.json` | live | extract 30150 b25 w16 | failed_correctness | 30201 | 2399 / 3220 / 3662 | 90.5 % | 1.000 | 607 | 0.3251070713101160862354892206 USD | 5 | 0 |
-| `campaigns/recheck-98f6b7c/20261117T155510Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2276 | 2427 / 3305 / 3797 | 48.5 % | 1.000 | 40 | 0.37447975 USD | 48 | 6 |
-| `campaigns/recheck-98f6b7c/20261117T155949Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2342 | 2373 / 3185 / 3569 | 67.0 % | 1.000 | 40 | 0.3573173 USD | 10 | 204 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T065742Z-63ade1a-extract-2000-b5-w32-r1.json` | live | extract 2000 b5 w32 | failed_correctness | 2360 | 2269 / 3098 / 3511 | 86.2 % | 0.503 | 21 | 0.2941 USD | 416 | 530 |
+| `campaigns/20261117T014319Z-63ade1a/20261117T114003Z-63ade1a-extract-30150-b25-w16-r1.json` | live | extract 30150 b25 w16 | failed_correctness | 30201 | 2399 / 3220 / 3662 | 90.5 % | 1.000 | 607 | 0.3251 USD | 5 | 0 |
+| `campaigns/recheck-98f6b7c/20261117T155510Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2276 | 2427 / 3305 / 3797 | 48.5 % | 1.000 | 40 | 0.3745 USD | 48 | 6 |
+| `campaigns/recheck-98f6b7c/20261117T155949Z-98f6b7c-extract-2000-b25-w32-r1.json` | live | extract 2000 b25 w32 | complete | 2342 | 2373 / 3185 / 3569 | 67.0 % | 1.000 | 40 | 0.3573 USD | 10 | 204 |
 
 | File | Mode | Drill | Cell | Status | Gate | Kill to next attempt p50 (s) | Lost tasks | Duplicate calls | Calls repeated after recovery | Calls |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -399,7 +399,7 @@ Files: `*-invoice-10000-b{10,100,1000}-w4-r{1,2,3}.json`.
 **`echo` is database-bound.**
 - Measured: database container CPU p50 rises from 42.2 % at one worker to 81.2 %, 142.4 % and
   287.8 % at two, four and eight (docker stats, 100 % is one core; 11 to 44 samples per cell).
-- Measured: the mean worker CPU utilization falls from 0.32 of a core at one worker to 0.15 at
+- Measured: the mean worker CPU utilisation falls from 0.32 of a core at one worker to 0.15 at
   eight.
 - Measured: sampled `Lock` and `LWLock` waits stay small, with a mean of at most 0.333 sessions
   per sample (at eight workers) and none at one.
@@ -412,7 +412,7 @@ Files: `*-invoice-10000-b{10,100,1000}-w4-r{1,2,3}.json`.
 - Files: `*-wait-400-b0-w{1,8}-r{1,2,3}.json`.
 
 **`invoice` at batch 100 is low on the worker side, and its database CPU is barely sampled.**
-- Measured: the mean worker utilization is 0.47 to 0.74 of a core at 10,000 invoices, and no
+- Measured: the mean worker utilisation is 0.47 to 0.74 of a core at 10,000 invoices, and no
   `Lock` or `LWLock` wait was sampled.
 - Measured: these jobs last about 1 to 3 s, so docker stats took only one or two samples per cell
   (`resources.database.samples`). The database CPU p50 values, 5.3 % to 76.7 %, rest on those
@@ -721,6 +721,10 @@ statuses' total, `waited_s` and `cost.total`):
 - **The large run:** 30,150 invoices at 16 workers in 5,312.6 s (88.5 min), 30,141 exactly right (99.97%), field
   accuracy 99.98%, 30,143 with the expected status, and no invoice lost. 5 of the 16 workers stopped themselves (exit 4); their batches were run again
   by the others, which cost 51 extra calls. The cell is `failed_correctness` only because of those exits.
+- **The crash drill was not a valid crash test.** The d1 drill at 32 workers
+  (`20261117T065459Z-63ade1a-extract-2000-b25-w32-r1.json`) ran into the provider's throttling: 56 tasks failed after
+  192 rate-limited calls, so the run failed on throttling, not on the kill. The large run above, in which 5 of 16
+  workers stopped and no invoice was lost, served as the crash test instead.
 - **Where the time goes:** the provider's share of handler time was 86–92% in every Orqestra `extract` run. With the
   model asked only about ambiguous amounts (100 calls per 2,000 invoices), the rules-first mix ran 2,000 invoices in
   about 13 s (about 153/s) and 10,000 in 65 s at 8 workers.

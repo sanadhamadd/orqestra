@@ -1,6 +1,6 @@
 """The paid benchmark campaign (DEC-072): ``python -m benchmarks.campaign``.
 
-``run`` executes the approved plan's eight steps in order, one cell at a time. Every
+``run`` executes the campaign plan's eight steps in order, one cell at a time. Every
 cell is one subprocess of an existing command, ``benchmarks.run``,
 ``benchmarks.drills`` or ``benchmarks.baseline``, so the campaign never calls the
 provider itself and every refusal those commands make still applies. The model comes
@@ -191,7 +191,7 @@ def mix_calls(size: int, batch: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class CampaignPlan:
-    """The sizes of every step; ``APPROVED_PLAN`` is the owner's (DEC-072)."""
+    """The sizes of every step; ``APPROVED_PLAN`` is the plan DEC-072 accepted."""
 
     pilot: int = 100
     pilot_batch: int = 25
@@ -1447,7 +1447,7 @@ def main(
     parser = argparse.ArgumentParser(prog="python -m benchmarks.campaign", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run the campaign's steps in order")
-    run.add_argument("--model", required=True, help="the model slug the owner selected")
+    run.add_argument("--model", required=True, help="the model slug, recorded in every result")
     mode = run.add_mutually_exclusive_group(required=True)
     mode.add_argument("--allow-live-calls", action="store_true", help="real, billable calls")
     mode.add_argument("--dry-run", action="store_true", help="canned transport, no key, no cost")

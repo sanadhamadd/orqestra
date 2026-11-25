@@ -958,7 +958,7 @@ def extraction_block(
     statuses: Sequence[Status],
     prices: Prices,
 ) -> dict[str, Any]:
-    """The result's ``extraction`` block, in the shape the T1 plan pins; counts only.
+    """The result's ``extraction`` block, in a pinned shape; counts only.
 
     ``documents_processed`` counts the documents with an item result. Accuracy is
     scored over those documents, the cost per 1,000 is per processed document, and

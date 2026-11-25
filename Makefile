@@ -3,7 +3,11 @@
 #   make verify  full lane: adds PostgreSQL integration tests, the combined
 #                coverage threshold and a package check. Required for
 #                persistence changes; needs ORQESTRA_TEST_DATABASE_URL.
-.PHONY: sync fmt lint type test check require-test-db test-all package-check verify
+# Local helpers, not run by CI:
+#   make db-up   start the Docker Compose PostgreSQL and wait until it is healthy
+#   make demo    the end-to-end demonstration; needs ORQESTRA_BENCH_DATABASE_URL
+.PHONY: sync fmt lint type test check require-test-db test-all package-check verify \
+	db-up require-bench-db demo
 
 sync:
 	uv sync --frozen
@@ -44,3 +48,17 @@ package-check:
 	uv run python scripts/check_package.py check build/package-check
 
 verify: require-test-db lint type test-all package-check
+
+# The local Compose database (compose.yaml, docs/development.md).
+db-up:
+	docker compose up -d --wait
+
+require-bench-db:
+	@test -n "$$ORQESTRA_BENCH_DATABASE_URL" || { \
+		echo "ORQESTRA_BENCH_DATABASE_URL is not set: make demo needs the local" \
+			"orqestra_bench PostgreSQL database (see docs/demo.md)" >&2; \
+		exit 1; }
+
+# The end-to-end demonstration (docs/demo.md).
+demo: require-bench-db
+	uv run python -m benchmarks.demo

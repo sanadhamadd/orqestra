@@ -49,7 +49,7 @@ replacements included, is waited for until it has logged ``worker_started``.
 (``CheckpointWatch``) and records each checkpoint that ended during the cell in
 ``database_stats.checkpoints``, so a slowdown can be set beside them.
 
-**The correctness gate** (plan 2.6) decides whether the cell counts. A cell
+**The correctness gate** decides whether the cell counts. A cell
 that fails any check is ``failed_correctness`` and reports no throughput:
 
 1. ``terminal``: every task is terminal and the job has the expected status;
@@ -72,8 +72,8 @@ job, so their checks refuse a non-invoice profile before reading anything.
 is given, which only this command and the crash drill ``benchmarks.drills d1``
 accept (the other drills refuse it; ``benchmarks.ladder`` has no provider flag). It
 needs ``--model``, ``--max-provider-calls`` and either ``--dry-run`` (canned
-responses, no network, no cost) or ``--allow-live-calls`` (real, billable calls: the
-owner's separate approval, with a dollar limit set on the key, is required first). The cell's call
+responses, no network, no cost) or ``--allow-live-calls`` (real, billable calls: they
+need an explicit opt-in and a key with a dollar limit set on it). The cell's call
 maximum is a counter file in the cell's raw directory, created before any worker
 starts; ``ORQESTRA_OPENROUTER_API_KEY`` is passed to the workers only for a live
 run. With OpenRouter the usage check compares the calls with the oracle, and the
@@ -184,7 +184,7 @@ POLL = 0.2
 STATS_SETTLE = 2.0
 TOKENS = "tokens"
 
-# The measurement timing of plan 2.4: test values recorded in every result, not
+# The measurement timing: test values recorded in every result, not
 # recommendations (DEC-034). They pass WorkerSettings' relationships: 1 s < 2 s;
 # 2 + 1 + 2 = 5 s < 10 s; 500 ms < 1,000 ms.
 BENCH_WORKER_SETTINGS: Mapping[str, str] = {
@@ -624,7 +624,7 @@ def _require_invoice(profile: Profile) -> None:
 def summary_check(
     conn: metrics.Conn, job_id: uuid.UUID, profile: Profile, expected: Expected
 ) -> dict[str, Any]:
-    """Gate item 5: the job's invoice summary against the oracle (plan 2.6)."""
+    """Gate item 5: the job's invoice summary against the oracle."""
     _require_invoice(profile)
     summary = summarize_invoice_job(conn, job_id)
     if summary is None:
@@ -669,7 +669,7 @@ def usage_check(
     clean: bool,
     provider: ProviderChoice = DOUBLE,
 ) -> dict[str, Any]:
-    """Gate item 6: the usage report and call budget against the oracle (plan 2.6).
+    """Gate item 6: the usage report and call budget against the oracle.
 
     The succeeded attempts' calls and tokens are exact in every run. ``clean``
     means no task needed a second attempt, so the job totals must equal them
@@ -772,7 +772,7 @@ def run_gate(
     documents: int | None = None,
     exits_while_running: Sequence[int] = (),
 ) -> list[dict[str, Any]]:
-    """Every gate check of plan 2.6 that applies to ``profile``, in order.
+    """Every gate check that applies to ``profile``, in order.
 
     For ``extract``, ``documents`` is the cell's document count. ``exit_codes`` are the
     workers stopped at the end; ``exits_while_running`` the codes of the ones that
@@ -1081,9 +1081,75 @@ def run_cell(
     the provider. ``rate_limit_per_s`` (extract only) is passed to every worker with
     the cell's limiter file. A worker that exits mid-cell is replaced (module docstring).
     """
-    run_id = run_id or uuid.uuid4().hex[:12]
+    run = _CellRun(
+        url=url,
+        cell=cell,
+        worker_settings=worker_settings,
+        raw_dir=raw_dir,
+        stop_after=stop_after,
+        run_id=run_id or uuid.uuid4().hex[:12],
+        ladder=ladder,
+        idle_window=idle_window,
+        container=container,
+        hook=hook,
+        provider=provider,
+        call_timeout=call_timeout,
+        prices=prices,
+        rate_limit_per_s=rate_limit_per_s,
+    )
     # Validated once, before any worker starts: every value read below comes from here.
     validated = bench_settings(worker_settings)
+    _refuse_cell(run)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    setup = _cell_setup(run)
+    with (
+        psycopg.connect(url, autocommit=True) as conn,
+        psycopg.connect(url, autocommit=True) as sampling,
+    ):
+        record_environment = environment(conn, container=container, note=note)
+        harness_start = metrics.harness_usage()
+        own = [conn.info.backend_pid]  # the harness's polling backend, left out of contention
+        samplers = _cell_samplers(url, setup.fleet)
+        try:
+            wait = _measure_job(run, conn, sampling, setup, samplers, own)
+        finally:
+            reaped = _stop_cell(samplers, setup.fleet, validated)
+        outcome = _cell_outcome(run, conn, setup, wait, reaped, harness_start, samplers)
+    record = _cell_record(run, setup, wait, outcome, validated, record_environment, samplers.load)
+    # Whether a dirty tree's record may be written is the writer's decision; its shape is
+    # checked here either way.
+    validate_result({**record, "environment": {**record_environment, "dirty_allowed": True}})
+    return record
+
+
+@dataclass(frozen=True, slots=True)
+class _CellRun:
+    """``run_cell``'s arguments, as its helpers read them."""
+
+    url: str
+    cell: Cell
+    worker_settings: Mapping[str, str]
+    raw_dir: Path
+    stop_after: float
+    run_id: str
+    ladder: str
+    idle_window: float
+    container: str | None
+    hook: Callable[[Running], None] | None
+    provider: ProviderChoice
+    call_timeout: str
+    prices: extract.Prices | None
+    rate_limit_per_s: Decimal | None
+
+
+def _refuse_cell(run: _CellRun) -> None:
+    """Raise ``ValueError`` if ``run_cell`` cannot run its cell as given."""
+    cell, provider, prices, rate_limit_per_s = (
+        run.cell,
+        run.provider,
+        run.prices,
+        run.rate_limit_per_s,
+    )
     refusal = provider.refusal(os.environ)
     if refusal is not None:
         raise ValueError(refusal)
@@ -1097,255 +1163,418 @@ def run_cell(
     if rate_limit_per_s is not None and not extracting:
         msg = "--rate-limit-per-s applies only to the extract profile"
         raise ValueError(msg)
-    raw_dir.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _CellSetup:
+    """What ``run_cell`` builds before any worker starts."""
+
+    max_attempts: int
+    workload: Workload
+    cap: int
+    fleet: Fleet
+
+
+def _cell_setup(run: _CellRun) -> _CellSetup:
+    """The workload, the call counter (OpenRouter only), the cap and the fleet."""
+    cell, provider, raw_dir = run.cell, run.provider, run.raw_dir
     max_attempts = max_attempts_for(provider)
     workload = build_workload(cell, max_attempts)
-    env = process_environment(url, worker_settings, provider)
+    env = process_environment(run.url, run.worker_settings, provider)
     budget_file = create_budget_file(raw_dir / BUDGET_FILE_NAME) if provider.openrouter else None
     cap = cell_cap(cell)
-    extra = extract_worker_extra(cell, provider, raw_dir, rate_limit_per_s)
+    extra = extract_worker_extra(cell, provider, raw_dir, run.rate_limit_per_s)
     fleet = Fleet(
         cell.profile,
         env,
         raw_dir,
         provider=provider,
         budget_file=budget_file,
-        call_timeout=call_timeout,
+        call_timeout=run.call_timeout,
         cap=cap,
         extra=extra,
     )
-    with (
-        psycopg.connect(url, autocommit=True) as conn,
-        psycopg.connect(url, autocommit=True) as sampling,
-    ):
-        record_environment = environment(conn, container=container, note=note)
-        harness_start = metrics.harness_usage()
-        own = [conn.info.backend_pid]  # the harness's polling backend, left out of contention
-        contention: metrics.Sampler | None = None
-        docker: metrics.Sampler | None = None
-        # Machine load from the submission to the end of the wait, on its own connection,
-        # whose backend is left out of contention like the harness's own (``own``).
-        sysload_backends: list[int] = []
+    return _CellSetup(max_attempts, workload, cap, fleet)
 
-        def sysload_connect() -> metrics.Conn:
-            connection = psycopg.connect(url, autocommit=True)
-            sysload_backends.append(connection.info.backend_pid)
-            return connection
 
-        sysload = SysloadSampler(
-            lambda: [h.process.pid for h in fleet.workers if h.exited is None], sysload_connect
+@dataclass(slots=True)
+class _CellSamplers:
+    """The cell's samplers, so that ``_stop_cell`` stops whichever of them started."""
+
+    sysload: SysloadSampler
+    sysload_backends: list[int]
+    contention: metrics.Sampler | None = None
+    docker: metrics.Sampler | None = None
+    load: dict[str, Any] | None = None
+
+
+def _cell_samplers(url: str, fleet: Fleet) -> _CellSamplers:
+    """The machine-load sampler, not started; the job's samplers start with the job."""
+    # Machine load from the submission to the end of the wait, on its own connection,
+    # whose backend is left out of contention like the harness's own (``own``).
+    sysload_backends: list[int] = []
+
+    def sysload_connect() -> metrics.Conn:
+        connection = psycopg.connect(url, autocommit=True)
+        sysload_backends.append(connection.info.backend_pid)
+        return connection
+
+    sysload = SysloadSampler(
+        lambda: [h.process.pid for h in fleet.workers if h.exited is None], sysload_connect
+    )
+    return _CellSamplers(sysload, sysload_backends)
+
+
+@dataclass(frozen=True, slots=True)
+class _CellWait:
+    """What the measured wait for the job produced."""
+
+    job_id: uuid.UUID
+    submission: dict[str, Any]
+    wait_ended: WaitEnded
+    waited: float
+    exits_while_running: list[dict[str, Any]]
+    before: dict[str, Any]
+    after: dict[str, Any]
+    before_job: float
+    after_job: float
+    checkpoints: CheckpointWatch
+    contention_samples: list[Any]
+    contention_window: float
+    docker_samples: list[Any] | None
+    docker_window: float
+    idle_rate: dict[str, Any] | None
+
+
+def _measure_job(
+    run: _CellRun,
+    conn: psycopg.Connection[Any],
+    sampling: psycopg.Connection[Any],
+    setup: _CellSetup,
+    samplers: _CellSamplers,
+    own: list[int],
+) -> _CellWait:
+    """Start the workers, submit the job and wait for it, sampling from the submission on."""
+    cell, fleet, container = run.cell, setup.fleet, run.container
+    for _ in range(cell.workers):
+        fleet.start()
+    fleet.wait_started()
+    before = metrics.read_only(conn, metrics.database_counters)
+    checkpoints = CheckpointWatch(conn)
+    counted = time.monotonic()
+    job_id, submission = submit(run.url, KIND_OF[cell.profile], setup.workload.tasks, run.raw_dir)
+    # The samplers cover the job alone: from the submission to the end of the wait.
+    contention = metrics.Sampler(
+        lambda: metrics.read_only(
+            sampling,
+            partial(metrics.contention_sample, exclude=[*own, *samplers.sysload_backends]),
         )
-        load: dict[str, Any] | None = None
-        exits_while_running: list[dict[str, Any]] = []
-        try:
-            for _ in range(cell.workers):
-                fleet.start()
-            fleet.wait_started()
-            before = metrics.read_only(conn, metrics.database_counters)
-            checkpoints = CheckpointWatch(conn)
-            counted = time.monotonic()
-            job_id, submission = submit(url, KIND_OF[cell.profile], workload.tasks, raw_dir)
-            # The samplers cover the job alone: from the submission to the end of the wait.
-            contention = metrics.Sampler(
-                lambda: metrics.read_only(
-                    sampling,
-                    partial(metrics.contention_sample, exclude=[*own, *sysload_backends]),
-                )
-            ).start()
-            if container:
-                docker = metrics.Sampler(lambda: metrics.docker_stats_sample(container)).start()
-            sysload.start()
-            began = time.monotonic()
-            checkpoints.sample(0.0)
-            before_job = began - counted
-            wait_ended = WaitEnded.STOP_AFTER
-            while time.monotonic() - began < stop_after:
-                if checkpoints.due(time.monotonic() - began):
-                    checkpoints.sample(time.monotonic() - began)
-                progress = metrics.read_only(conn, partial(get_job_progress, job_id=job_id))
-                assert progress is not None
-                counts = progress.task_counts
-                if counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0:
-                    wait_ended = WaitEnded.FINISHED
-                    break
-                if hook is not None:
-                    hook(Running(conn, job_id, fleet, time.monotonic() - began, counts))
-                exits_while_running += fleet.supervise(
-                    time.monotonic() - began, replacement_limit(cell.workers)
-                )
-                if fleet.alive() == 0 and not fleet.pending:
-                    wait_ended = WaitEnded.NO_WORKERS
-                    break
-                time.sleep(POLL)
-            ended = time.monotonic()
-            waited = ended - began
-            load = sysload.stop()
-            contention_samples = contention.stop()
-            contention_window = time.monotonic() - began
-            # A docker stats reading takes about a second, so its window is its own.
-            docker_samples = docker.stop() if docker else None
-            docker_window = time.monotonic() - began
-            time.sleep(STATS_SETTLE)
-            after = metrics.read_only(conn, metrics.database_counters)
+    ).start()
+    samplers.contention = contention
+    docker: metrics.Sampler | None = None
+    if container:
+        docker = metrics.Sampler(lambda: metrics.docker_stats_sample(container)).start()
+        samplers.docker = docker
+    samplers.sysload.start()
+    began = time.monotonic()
+    checkpoints.sample(0.0)
+    before_job = began - counted
+    wait_ended, exits_while_running = _poll_job(run, conn, job_id, fleet, checkpoints, began)
+    ended = time.monotonic()
+    waited = ended - began
+    samplers.load = samplers.sysload.stop()
+    contention_samples = contention.stop()
+    contention_window = time.monotonic() - began
+    # A docker stats reading takes about a second, so its window is its own.
+    docker_samples = docker.stop() if docker else None
+    docker_window = time.monotonic() - began
+    time.sleep(STATS_SETTLE)
+    after = metrics.read_only(conn, metrics.database_counters)
+    checkpoints.sample(time.monotonic() - began)
+    after_job = time.monotonic() - ended
+    idle_rate: dict[str, Any] | None = None
+    if wait_ended is WaitEnded.FINISHED:  # otherwise work may still be running
+        idle_rate = _idle_claim_rate(conn, after, run.idle_window)
+    return _CellWait(
+        job_id,
+        submission,
+        wait_ended,
+        waited,
+        exits_while_running,
+        before,
+        after,
+        before_job,
+        after_job,
+        checkpoints,
+        contention_samples,
+        contention_window,
+        docker_samples,
+        docker_window,
+        idle_rate,
+    )
+
+
+def _poll_job(
+    run: _CellRun,
+    conn: psycopg.Connection[Any],
+    job_id: uuid.UUID,
+    fleet: Fleet,
+    checkpoints: CheckpointWatch,
+    began: float,
+) -> tuple[WaitEnded, list[dict[str, Any]]]:
+    """Poll until the job is finished, no worker is left or ``stop_after`` has passed."""
+    cell, stop_after, hook = run.cell, run.stop_after, run.hook
+    exits_while_running: list[dict[str, Any]] = []
+    wait_ended = WaitEnded.STOP_AFTER
+    while time.monotonic() - began < stop_after:
+        if checkpoints.due(time.monotonic() - began):
             checkpoints.sample(time.monotonic() - began)
-            after_job = time.monotonic() - ended
-            idle_rate: dict[str, Any] | None = None
-            if wait_ended is WaitEnded.FINISHED:  # otherwise work may still be running
-                idle_began = time.monotonic()
-                time.sleep(idle_window)
-                idle_after = metrics.read_only(conn, metrics.database_counters)
-                idle_seconds = time.monotonic() - idle_began
-                idle_commits = (
-                    idle_after["database"]["xact_commit"] - after["database"]["xact_commit"]
-                )
-                idle_rate = {
-                    "commits": idle_commits,
-                    "window_s": idle_seconds,
-                    "per_s": metrics.rate(idle_commits, idle_seconds),
-                    "formula": (
-                        "pg_stat_database xact_commit delta over an idle window after the "
-                        "finished job; the harness's reads roll back and never commit"
-                    ),
-                }
-        finally:
-            if load is None:
-                load = sysload.stop()  # idempotent; only an exception reaches here running
-            shutdown = validated.shutdown_timeout.total_seconds()
-            fleet.settle()  # a replacement still starting would die of the SIGTERM
-            reaped = fleet.stop(timeout=shutdown + 10.0)
-            for sampler in (contention, docker):
-                if sampler is not None:
-                    sampler.stop()  # idempotent; only an exception reaches here running
-        harness = metrics.harness_delta(harness_start, metrics.harness_usage())
-        assert contention is not None  # the wait ran, so its sampler did
-        contention_errors = contention.errors
-        exit_codes = [worker["exit_code"] for worker in reaped]
-        stopped_codes = [
-            handle.exited["exit_code"]
-            for handle in fleet.workers
-            if not handle.died and handle.exited is not None
-        ]
-        times = metrics.read_stored_times(conn, job_id)
-        figures = metrics.timing_figures(times)
-        gate = run_gate(
+        progress = metrics.read_only(conn, partial(get_job_progress, job_id=job_id))
+        assert progress is not None
+        counts = progress.task_counts
+        if counts[TaskState.QUEUED] + counts[TaskState.RUNNING] == 0:
+            wait_ended = WaitEnded.FINISHED
+            break
+        if hook is not None:
+            hook(Running(conn, job_id, fleet, time.monotonic() - began, counts))
+        exits_while_running += fleet.supervise(
+            time.monotonic() - began, replacement_limit(cell.workers)
+        )
+        if fleet.alive() == 0 and not fleet.pending:
+            wait_ended = WaitEnded.NO_WORKERS
+            break
+        time.sleep(POLL)
+    return wait_ended, exits_while_running
+
+
+def _idle_claim_rate(
+    conn: psycopg.Connection[Any], after: Mapping[str, Any], idle_window: float
+) -> dict[str, Any]:
+    """The commits of an idle window after the finished job (``idle_claim_rate``)."""
+    idle_began = time.monotonic()
+    time.sleep(idle_window)
+    idle_after = metrics.read_only(conn, metrics.database_counters)
+    idle_seconds = time.monotonic() - idle_began
+    idle_commits = idle_after["database"]["xact_commit"] - after["database"]["xact_commit"]
+    return {
+        "commits": idle_commits,
+        "window_s": idle_seconds,
+        "per_s": metrics.rate(idle_commits, idle_seconds),
+        "formula": (
+            "pg_stat_database xact_commit delta over an idle window after the "
+            "finished job; the harness's reads roll back and never commit"
+        ),
+    }
+
+
+def _stop_cell(
+    samplers: _CellSamplers, fleet: Fleet, validated: WorkerSettings
+) -> list[dict[str, Any]]:
+    """Stop the samplers and the fleet, whether the wait ended or raised; the reaped workers."""
+    if samplers.load is None:
+        samplers.load = (
+            samplers.sysload.stop()
+        )  # idempotent; only an exception reaches here running
+    shutdown = validated.shutdown_timeout.total_seconds()
+    fleet.settle()  # a replacement still starting would die of the SIGTERM
+    reaped = fleet.stop(timeout=shutdown + 10.0)
+    for sampler in (samplers.contention, samplers.docker):
+        if sampler is not None:
+            sampler.stop()  # idempotent; only an exception reaches here running
+    return reaped
+
+
+@dataclass(frozen=True, slots=True)
+class _CellOutcome:
+    """What the cell's database says once its workers have stopped."""
+
+    harness: dict[str, Any]
+    contention_errors: int
+    reaped: list[dict[str, Any]]
+    figures: dict[str, Any]
+    gate: list[dict[str, Any]]
+    failures: dict[str, Any]
+    usage: dict[str, Any] | None
+    extraction: dict[str, Any] | None
+
+
+def _cell_outcome(
+    run: _CellRun,
+    conn: psycopg.Connection[Any],
+    setup: _CellSetup,
+    wait: _CellWait,
+    reaped: list[dict[str, Any]],
+    harness_start: Mapping[str, Any],
+    samplers: _CellSamplers,
+) -> _CellOutcome:
+    """The harness's own usage, the timing figures, the gate, failures, usage and extraction."""
+    cell, provider, prices = run.cell, run.provider, run.prices
+    extracting = cell.profile is Profile.EXTRACT
+    workload, fleet, job_id = setup.workload, setup.fleet, wait.job_id
+    harness = metrics.harness_delta(harness_start, metrics.harness_usage())
+    assert samplers.contention is not None  # the wait ran, so its sampler did
+    contention_errors = samplers.contention.errors
+    exit_codes = [worker["exit_code"] for worker in reaped]
+    stopped_codes = [
+        handle.exited["exit_code"]
+        for handle in fleet.workers
+        if not handle.died and handle.exited is not None
+    ]
+    times = metrics.read_stored_times(conn, job_id)
+    figures = metrics.timing_figures(times)
+    gate = run_gate(
+        conn,
+        job_id,
+        cell.profile,
+        workload.expected,
+        stopped_codes,
+        provider=provider,
+        documents=workload.items if extracting else None,
+        exits_while_running=[died["exit_code"] for died in wait.exits_while_running],
+    )
+    failures = failure_figures(conn, job_id, exit_codes)
+    failures["exits_while_running"] = wait.exits_while_running
+    failures["replacements"] = fleet.replaced
+    usage = usage_figures(conn, job_id, DEFAULT_CAP) if cell.profile is Profile.INVOICE else None
+    extraction: dict[str, Any] | None = None
+    if extracting:
+        assert workload.documents is not None
+        assert prices is not None
+        extraction = extract.extraction_block(
             conn,
             job_id,
-            cell.profile,
-            workload.expected,
-            stopped_codes,
-            provider=provider,
-            documents=workload.items if extracting else None,
-            exits_while_running=[died["exit_code"] for died in exits_while_running],
+            [document.expected for document in workload.documents],
+            [document.expected_status for document in workload.documents],
+            prices,
         )
-        failures = failure_figures(conn, job_id, exit_codes)
-        failures["exits_while_running"] = exits_while_running
-        failures["replacements"] = fleet.replaced
-        usage = (
-            usage_figures(conn, job_id, DEFAULT_CAP) if cell.profile is Profile.INVOICE else None
-        )
-        extraction: dict[str, Any] | None = None
-        if extracting:
-            assert workload.documents is not None
-            assert prices is not None
-            extraction = extract.extraction_block(
-                conn,
-                job_id,
-                [document.expected for document in workload.documents],
-                [document.expected_status for document in workload.documents],
-                prices,
-            )
-    status = cell_status(wait_ended, gate)
-    database_stats = metrics.delta(before, after)
-    tasks = len(workload.tasks)
-    commits = metrics.job_commits(
-        database_stats["database"]["xact_commit"],
-        None if idle_rate is None else idle_rate["per_s"],
-        before_job + after_job,
-        None if idle_rate is None else idle_rate["window_s"],
-        implied_idle_rate(cell.workers, validated),
+    return _CellOutcome(
+        harness, contention_errors, reaped, figures, gate, failures, usage, extraction
     )
-    database_stats["commits"] = commits
-    database_stats["checkpoints"] = checkpoints.summary()
-    database_stats["commits_per_task"] = (
-        None if commits["job_commits"] is None else metrics.rate(commits["job_commits"], tasks)
-    )
-    makespan = figures["timing"]["makespan_s"]
+
+
+def _cell_record(
+    run: _CellRun,
+    setup: _CellSetup,
+    wait: _CellWait,
+    outcome: _CellOutcome,
+    validated: WorkerSettings,
+    record_environment: dict[str, Any],
+    load: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The cell's format 1 result record."""
+    cell = run.cell
+    status = cell_status(wait.wait_ended, outcome.gate)
+    tasks = len(setup.workload.tasks)
+    figures = outcome.figures
     record: dict[str, Any] = {
         "format": 1,
-        "run_id": run_id,
-        "ladder": ladder,
+        "run_id": run.run_id,
+        "ladder": run.ladder,
         "status": status.value,
         "recorded_at": now(),
         "cell": {**asdict(cell), "profile": cell.profile.value},
         "environment": record_environment,
-        "worker_settings": dict(worker_settings),
-        "provider": (
-            provider_block(
-                provider,
-                call_timeout=call_timeout,
-                cap=cap,
-                route="route-a",
-                calls_made=(
-                    extraction["calls"]["total"]
-                    if extraction is not None
-                    else None
-                    if usage is None
-                    else usage["calls"]
-                ),
-            )
-            | (
-                {"max_attempts": max_attempts, "rate_limit_per_s": _text(rate_limit_per_s)}
-                if provider.openrouter
-                else {}  # the double's block is unchanged
-            )
-            if cell.profile in BATCHED
-            else None
-        ),
+        "worker_settings": dict(run.worker_settings),
+        "provider": _cell_provider(run, setup, outcome),
         "timing": {
             **figures["timing"],
-            "submission": submission,
+            "submission": wait.submission,
             "tasks": tasks,
-            "items": workload.items,
-            "stop_after_s": stop_after,
-            "wait_ended": wait_ended.value,
-            "waited_s": waited,
+            "items": setup.workload.items,
+            "stop_after_s": run.stop_after,
+            "wait_ended": wait.wait_ended.value,
+            "waited_s": wait.waited,
         },
         "throughput": figures["throughput"] if status is Status.COMPLETE else None,
         "latency": figures["latency"],
         "claim_gap": figures["claim_gap"],
-        "idle_claim_rate": idle_rate,
-        "resources": {
-            "workers": [
-                {
-                    **worker,
-                    "cpu_utilization": metrics.rate(worker["user_s"] + worker["sys_s"], makespan),
-                }
-                for worker in reaped
-            ],
-            "harness": harness,
-            "sysload": load,
-            "database": (
-                metrics.summarize_docker(docker_samples, docker_window)
-                if docker_samples is not None
-                else metrics.NOT_MEASURED
-            ),
-        },
-        "database_stats": database_stats,
+        "idle_claim_rate": wait.idle_rate,
+        "resources": _cell_resources(wait, outcome, load, figures["timing"]["makespan_s"]),
+        "database_stats": _cell_database_stats(cell, wait, validated, tasks),
         "contention": {
-            **metrics.summarize_contention(contention_samples, contention_window),
-            "sample_errors": contention_errors,
+            **metrics.summarize_contention(wait.contention_samples, wait.contention_window),
+            "sample_errors": outcome.contention_errors,
         },
-        "failures": failures,
-        "usage": usage,
-        "gate": gate,
+        "failures": outcome.failures,
+        "usage": outcome.usage,
+        "gate": outcome.gate,
         "drill": None,
     }
-    if extraction is not None:
-        record["extraction"] = extraction
-    # Whether a dirty tree's record may be written is the writer's decision; its shape is
-    # checked here either way.
-    validate_result({**record, "environment": {**record_environment, "dirty_allowed": True}})
+    if outcome.extraction is not None:
+        record["extraction"] = outcome.extraction
     return record
+
+
+def _cell_provider(
+    run: _CellRun, setup: _CellSetup, outcome: _CellOutcome
+) -> dict[str, Any] | None:
+    """The record's ``provider`` block: ``None`` for a profile that makes no provider call."""
+    provider, extraction, usage = run.provider, outcome.extraction, outcome.usage
+    return (
+        provider_block(
+            provider,
+            call_timeout=run.call_timeout,
+            cap=setup.cap,
+            route="route-a",
+            calls_made=(
+                extraction["calls"]["total"]
+                if extraction is not None
+                else None
+                if usage is None
+                else usage["calls"]
+            ),
+        )
+        | (
+            {"max_attempts": setup.max_attempts, "rate_limit_per_s": _text(run.rate_limit_per_s)}
+            if provider.openrouter
+            else {}  # the double's block is unchanged
+        )
+        if run.cell.profile in BATCHED
+        else None
+    )
+
+
+def _cell_resources(
+    wait: _CellWait, outcome: _CellOutcome, load: dict[str, Any] | None, makespan: Any
+) -> dict[str, Any]:
+    """The record's ``resources`` block: the workers, the harness, the machine and the server."""
+    return {
+        "workers": [
+            {
+                **worker,
+                "cpu_utilization": metrics.rate(worker["user_s"] + worker["sys_s"], makespan),
+            }
+            for worker in outcome.reaped
+        ],
+        "harness": outcome.harness,
+        "sysload": load,
+        "database": (
+            metrics.summarize_docker(wait.docker_samples, wait.docker_window)
+            if wait.docker_samples is not None
+            else metrics.NOT_MEASURED
+        ),
+    }
+
+
+def _cell_database_stats(
+    cell: Cell, wait: _CellWait, validated: WorkerSettings, tasks: int
+) -> dict[str, Any]:
+    """The record's ``database_stats``: the counter delta, the job's commits and checkpoints."""
+    idle_rate = wait.idle_rate
+    database_stats = metrics.delta(wait.before, wait.after)
+    commits = metrics.job_commits(
+        database_stats["database"]["xact_commit"],
+        None if idle_rate is None else idle_rate["per_s"],
+        wait.before_job + wait.after_job,
+        None if idle_rate is None else idle_rate["window_s"],
+        implied_idle_rate(cell.workers, validated),
+    )
+    database_stats["commits"] = commits
+    database_stats["checkpoints"] = wait.checkpoints.summary()
+    database_stats["commits_per_task"] = (
+        None if commits["job_commits"] is None else metrics.rate(commits["job_commits"], tasks)
+    )
+    return database_stats
 
 
 def _text(value: Decimal | None) -> str | None:
@@ -1449,7 +1678,7 @@ def add_provider_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-live-calls",
         action="store_true",
-        help="openrouter: make real, billable calls (needs the owner's approval, DEC-071)",
+        help="openrouter: real, billable calls (explicit opt-in; use a spend-limited key, DEC-071)",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="openrouter: canned responses, no network, no cost"

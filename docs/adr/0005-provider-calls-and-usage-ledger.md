@@ -1,6 +1,6 @@
 # ADR-0005: Provider calls: deterministic checks decide; intent-first usage ledger; no prices
 
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **Date:** 2026-11-07
 - **Ledger entries:** DEC-055, DEC-057 … DEC-062; applied by DEC-065 and DEC-066
 
@@ -55,9 +55,9 @@ crash cannot hide it, and what a report of those calls can honestly claim.
   every blocking step, and logs nothing. No other `src` module imports it; its only users are
   `benchmarks/live.py`, `benchmarks/extract.py` and `benchmarks/baseline.py`, opt-in.
 - **Live use is gated** (DEC-062). There is no inbound API. Every live provider call needs
-  the maintainer's separate authorization; only synthetic data is recorded until a retention
+  the maintainer's separate authorisation; only synthetic data is recorded until a retention
   policy is accepted; and invoice verification is registered with a worker only when a
-  durable recorder, a validated cap, a matching capture tier and authorized live calls are
+  durable recorder, a validated cap, a matching capture tier and authorised live calls are
   all in place.
 
 ## Consequences
@@ -100,7 +100,7 @@ versioning, and the provider would decide statuses that deterministic checks can
   closed once they are spent. Its tests and its dry run use an in-memory transport. No `src`
   module imports the adapter, invoice verification is still not registered with
   `orqestra worker run`, and no live provider call has been made; each one still needs the
-  owner's separate authorization (DEC-062). The text above is unchanged.
+  maintainer's separate authorisation (DEC-062). The text above is unchanged.
 - **2026-11-18, DEC-072 and DEC-073.** A live campaign ran on 2026-11-17 (DEC-072), through
   the unpackaged benchmarks only; its results are kept outside the repository. The adapter's
   users are now `benchmarks/live.py`, `benchmarks/extract.py` and `benchmarks/baseline.py`,

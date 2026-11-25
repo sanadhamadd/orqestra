@@ -24,7 +24,8 @@
 - **Always closed.** A failed request closes its connection before raising; a
   response is closed by its exchange's ``close``.
 
-Limits (see the README): the standard library has no timeout for name lookup
+Limits (docs/usage.md, "OpenRouter adapter (benchmark opt-in only)"): the
+standard library has no timeout for name lookup
 (``getaddrinfo``). Every other blocking step (connecting to each address in turn; the
 TLS handshake; sending; reading the response head; each body read) is given the time
 left when that step starts, and the time is checked again only before the next step.

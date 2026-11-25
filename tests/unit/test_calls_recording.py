@@ -225,7 +225,7 @@ def test_the_in_memory_recorder_refuses_what_is_not_a_record() -> None:
         recorder.record_result(wrong)
 
 
-# --- a whole-document call, and what a result says about the call (T1) -----------------------
+# --- a whole-document call, and what a result says about the call -----------------------
 
 
 def test_an_intent_may_carry_no_field_kind_for_a_whole_document() -> None:

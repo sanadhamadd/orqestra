@@ -209,7 +209,7 @@ def docker_state(container: str | None) -> dict[str, Any] | str:
 
 
 def environment(conn: Conn, *, container: str | None = None, note: str = "") -> dict[str, Any]:
-    """Everything needed to say where and on what a cell ran (plan 2.7 and 2.8)."""
+    """Everything needed to say where and on what a cell ran."""
     lock = ROOT / "uv.lock"
     return {
         **code_state(),

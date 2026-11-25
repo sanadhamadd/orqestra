@@ -1,6 +1,6 @@
 # ADR-0001: Record architecture decisions
 
-- **Status:** Accepted (owner, 2026-11-08; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-08; was Proposed)
 - **Date:** 2026-10-22
 
 ## Context
@@ -16,7 +16,7 @@ binding. Decisions therefore need a durable, reviewable home.
 - Cross-cutting or expensive-to-reverse choices get an ADR in `docs/adr/` using this
   format: Status, Date, Context, Decision, Consequences.
 - ADRs and ledger entries are created as **Proposed** and become **Accepted** only when
-  the owner says so in a reviewed change. Superseded records are kept and linked.
+  the maintainer says so in a reviewed change. Superseded records are kept and linked.
 
 ## Consequences
 

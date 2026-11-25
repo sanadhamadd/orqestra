@@ -750,7 +750,7 @@ def test_a_result_file_alone_does_not_make_the_tree_dirty(tmp_path: Path) -> Non
     assert code_state(tmp_path)["git_dirty"] is True
 
 
-# --- the extraction block the report reads (T1's pinned shape) -------------------------------
+# --- the extraction block the report reads (its pinned shape) -------------------------------
 
 
 def _extraction() -> dict[str, Any]:
