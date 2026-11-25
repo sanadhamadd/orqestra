@@ -299,7 +299,7 @@ def test_an_unusable_reply_is_its_reason() -> None:
     assert parse_reply(None) == Unusable(Reason.REPLY_INCOMPLETE)
 
 
-# --- T4: fixed-point text, the request text, the largest call ---------------------------
+# --- fixed-point text, the request text, the largest call ---------------------------
 
 
 @pytest.mark.parametrize(

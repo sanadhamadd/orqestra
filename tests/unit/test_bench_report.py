@@ -646,13 +646,13 @@ def test_print_with_readme_prints_the_readme_block(
     assert capsys.readouterr().out == report.render_readme(tmp_path)
 
 
-# --- real-provider runs (DEC-071, T2) ------------------------------------------------------
+# --- real-provider runs (DEC-071) ------------------------------------------------------
 
 MODEL = "vendor/model-a"
 
 
 def extraction_block(**changes: Any) -> dict[str, Any]:
-    """T1's pinned ``extraction`` block, with the keys the report reads."""
+    """The pinned ``extraction`` block, with the keys the report reads."""
     block: dict[str, Any] = {
         "documents": 40,
         "calls": {

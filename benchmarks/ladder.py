@@ -1,4 +1,4 @@
-"""Named ladders of cells, run in interleaved order with stop rules (plan 2.4).
+"""Named ladders of cells, run in interleaved order with stop rules.
 
 ``python -m benchmarks.ladder <name>`` runs every cell of a ladder against the
 benchmark database (``benchmarks.run``), one result file per cell:

@@ -118,8 +118,8 @@ class ProviderChoice:
             return None
         if not self.allow_live_calls and not self.dry_run:
             return (
-                "openrouter makes live, billable calls: pass --allow-live-calls (the owner's "
-                "approval is required, DEC-071), or --dry-run"
+                "openrouter makes live, billable calls: pass --allow-live-calls (an explicit "
+                "opt-in; use a spend-limited key, DEC-071), or --dry-run"
             )
         if not self.model:
             return "--provider openrouter needs --model"

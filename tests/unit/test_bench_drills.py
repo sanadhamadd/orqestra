@@ -572,7 +572,7 @@ def test_an_owner_read_that_ends_past_the_window_continues_everyone(fleet: Any) 
     assert freezes.log[-1]["quiet"] is False
 
 
-# --- the crash drill with a live provider (DEC-071, T2) ------------------------------------
+# --- the crash drill with a live provider (DEC-071) ------------------------------------
 
 MODEL = "vendor/model-a"
 SENTINEL = "sk-or-v1-SENTINEL-not-a-real-key-0123456789abcdef"
@@ -721,7 +721,7 @@ def test_the_provider_is_refused_with_a_drill_other_than_d1() -> None:
         )
 
 
-# --- d1 on the extraction workload (T4) ------------------------------------------------------
+# --- d1 on the extraction workload ------------------------------------------------------
 
 EXTRACT_DRY = [
     "--workload",

@@ -119,7 +119,7 @@ def new_sink(kinds: tuple[str, ...] = ("k",)) -> UsageSink:
         # usage waits inside the heartbeat's reserve, like a sweep
         ({"running": True, "heartbeat_due": 101.9, "usage_due": 100.0}, (Step.WAIT, 1.9)),
         ({"running": True, "heartbeat_due": 102.0, "usage_due": 100.0}, (Step.USAGE, 0.0)),
-        # renewals stopped after a confirmed cancellation: usage is never held back (O3)
+        # renewals stopped after a confirmed cancellation: usage is never held back
         ({"running": True, "heartbeat_due": None, "usage_due": 100.0}, (Step.USAGE, 0.0)),
         # usage outranks sweeps
         (
@@ -1079,7 +1079,7 @@ def test_usage_diagnostics_carry_ids_only(make: Any, caplog: pytest.LogCaptureFi
             assert secret not in text
 
 
-# --- the call's metadata reaches the ledger (T1) -----------------------------------------------
+# --- the call's metadata reaches the ledger -----------------------------------------------
 
 
 def test_the_calls_metadata_is_passed_through_unchanged() -> None:

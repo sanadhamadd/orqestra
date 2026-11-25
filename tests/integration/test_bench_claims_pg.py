@@ -188,7 +188,7 @@ def test_the_distribution_uses_nearest_rank() -> None:
     assert distribution([]) == {"n": 0, "p50": 0.0, "p95": 0.0, "max": 0.0}
 
 
-# --- churn (P2: the claim index under concurrent claiming) ----------------------------
+# --- churn (the claim index under concurrent claiming) ----------------------------
 
 
 @pytest.mark.parametrize("condition", list(Condition), ids=[c.value for c in Condition])

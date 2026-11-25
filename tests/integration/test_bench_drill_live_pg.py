@@ -1,4 +1,4 @@
-"""The crash drill (d1) on the OpenRouter adapter, as a dry run (DEC-071, T2).
+"""The crash drill (d1) on the OpenRouter adapter, as a dry run (DEC-071).
 
 In the default integration lane, so every submit and CI run it: real worker
 processes, real PostgreSQL and the real adapter, answered by ``CannedTransport``,
@@ -152,7 +152,7 @@ def test_d1_on_a_dry_run_provider_loses_nothing_and_leaks_nothing(
     assert [name for name, text in texts.items() if SENTINEL in text] == []
 
 
-# The extraction workload (T4): every document is one call, so a batch of 25 is 25 calls.
+# The extraction workload: every document is one call, so a batch of 25 is 25 calls.
 EXTRACT_CELL = Cell(Profile.EXTRACT, size=300, batch=25, workers=2)
 
 

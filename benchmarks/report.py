@@ -1,7 +1,7 @@
 """The generated tables of ``docs/performance.md``: ``python -m benchmarks.report``.
 
-The tables are rendered from the committed result files, never typed (plan
-2.7). Every file is validated first, and an invalid one stops the report:
+The tables are rendered from the committed result files, never typed.
+Every file is validated first, and an invalid one stops the report:
 
 - cell results: ``benchmarks/results/*.json`` (``benchmarks.result``, format 1);
 - claim-cost results: ``benchmarks/results/claims/*.json`` (``benchmarks.claims``);
@@ -16,9 +16,9 @@ a table of its own and is never pooled with the others. Drill results have
 their own table and never enter the performance tables.
 
 **Figures.** A cell's repetitions are summarized as the median with the
-minimum and maximum, ``median [min, max]`` (plan 2.8), never as a mean alone.
+minimum and maximum, ``median [min, max]``, never as a mean alone.
 A figure a repetition lacks is left out of that column's median, and the
-count is then shown. The derived figures of plan 2.12 are computed from those
+count is then shown. The derived figures are computed from those
 medians and labelled with their formulas:
 
 - ``S(W)`` = median makespan items/s at ``W`` workers / the median at 1 worker,

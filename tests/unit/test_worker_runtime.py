@@ -1607,7 +1607,7 @@ def test_a_backend_still_running_is_another_idle_stall_and_still_no_claim(
 
 
 def test_a_claim_that_returns_after_its_abort_is_honoured(harness: Harness) -> None:
-    # B's R1: the abort fires, but the claim's answer arrived: it is a valid claim.
+    # The abort fires, but the claim's answer arrived: it is a valid claim.
     harness.monkeypatch.setattr(runtime, "claim_next_attempt", stalls_then(harness, attempt))
     harness.monkeypatch.setattr(runtime, "get_task", lambda *a, **k: ClaimedTask())
     harness.monkeypatch.setattr(runtime, "get_job", lambda *a, **k: ClaimedJob())
@@ -1791,7 +1791,7 @@ def test_without_a_clock_step_the_fence_is_the_claims_mapping(harness: Harness) 
     harness.clock.now = 110.0
     harness.renew(renewed_to(40.0))
     harness.worker._heartbeat(running)
-    assert harness.deadline() == 100.0 + 40.0 - 3.0  # as before E1, on a sane clock
+    assert harness.deadline() == 100.0 + 40.0 - 3.0  # as before DEC-075, on a sane clock
 
 
 def test_a_renewal_moves_the_fence_earlier_when_a_step_makes_the_deadline_cap_bite(

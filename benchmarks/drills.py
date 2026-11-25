@@ -1,9 +1,9 @@
-"""Failure drills (plan 2.9): ``python -m benchmarks.drills <drill>``.
+"""Failure drills: ``python -m benchmarks.drills <drill>``.
 
 Each drill runs the ``invoice`` profile (by default 2,000 invoices, batch 100,
 4 workers, ``benchmarks.run.BENCH_WORKER_SETTINGS``) in a fresh run schema of
 the benchmark database, injects one failure, and then applies the profile's
-correctness gate (plan 2.6) with the drill-adjusted oracle, plus the drill's
+correctness gate with the drill-adjusted oracle, plus the drill's
 own checks. A drill result is a format 1 record with ``ladder: "drill"`` and
 no throughput; it is written under ``benchmarks/results/drills/``, which no
 ladder or performance table reads.
@@ -1236,7 +1236,7 @@ class DrillWorkload:
 
 
 def extract_workload(cell: Cell) -> DrillWorkload:
-    """The extraction workload's tasks for ``cell``: T1's documents, one call each."""
+    """The extraction workload's tasks for ``cell``: the extraction documents, one call each."""
     built = build_workload(cell)
     assert built.documents is not None
     return DrillWorkload(built.tasks, None, documents=built.documents)
@@ -1274,7 +1274,7 @@ def _line_total(invoice: JsonValue) -> int:
 
 
 def retry_workload(invoices: Sequence[JsonValue], batch: int) -> tuple[DrillWorkload, Poison]:
-    """Batch 1 holds an always-failing total and batch 2 a fail-once total (plan 2.9 b, c)."""
+    """Batch 1 holds an always-failing total and batch 2 a fail-once total."""
     if -(-len(invoices) // batch) < 3:
         msg = "the retry job needs at least three batches"
         raise ValueError(msg)

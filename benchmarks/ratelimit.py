@@ -6,7 +6,7 @@ apart, so the whole fleet starts at most ``per_s`` calls in any second, with no 
 It paces; it never counts spend (the cell's ``CallBudget`` does that, DEC-071).
 
 The file holds one number, the wall-clock time of the next free slot. It is updated
-like the call counter (DEC-071, K1): under an exclusive ``flock`` on ``<path>.lock``, a
+like the call counter (DEC-071): under an exclusive ``flock`` on ``<path>.lock``, a
 lock file whose identity never changes, the new value is written to a temporary file,
 ``os.replace``d over ``path`` and its directory synced (``benchmarks.filelock``, shared
 with the counter). A process killed at any point leaves the old value or the new one,

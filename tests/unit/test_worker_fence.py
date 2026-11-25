@@ -563,7 +563,7 @@ def test_exit_codes_are_stable() -> None:
     }
 
 
-# --- the watchdog's reason line is not lost on a loaded machine (F2) ---------------------------
+# --- the watchdog's reason line is not lost on a loaded machine ---------------------------
 
 # stderr writes slowed to 0.5 s, as a loaded machine delayed the writer in the campaign. The
 # main thread blocks as in a stalled database call; the watchdog's OPERATION guard ends it.
@@ -629,7 +629,7 @@ def test_the_bounds_are_short_for_a_signal_and_one_second_for_the_watchdog() -> 
     assert fence._WATCHDOG_LINE_WRITE_BOUND == 1.0
 
 
-# --- the line's wait never runs past the lease (F2, C's review) -------------------------------
+# --- the line's wait never runs past the lease -------------------------------
 
 
 @pytest.mark.parametrize(
