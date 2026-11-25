@@ -213,7 +213,7 @@ JSON
 JOB_ID=$(uv run orqestra job submit --kind diagnostic.echo --max-attempts 3 echo-tasks.json \
     | uv run python -c 'import json, sys; print(json.load(sys.stdin)["job_id"])')
 
-# Test values only, not recommendations (DEC-034), as in "Running a worker" below.
+# Test values only, not recommendations (DEC-034), as in "Running a worker" in docs/usage.md.
 export ORQESTRA_WORKER_LEASE=PT4S ORQESTRA_WORKER_EXECUTION_TIMEOUT=PT5M \
     ORQESTRA_WORKER_HEARTBEAT_INTERVAL=PT1S ORQESTRA_WORKER_DB_OPERATION_TIMEOUT=PT0.8S \
     ORQESTRA_WORKER_LOCK_TIMEOUT=PT0.3S ORQESTRA_WORKER_FENCE_MARGIN=PT1S \
