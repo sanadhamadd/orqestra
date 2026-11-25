@@ -112,12 +112,14 @@ def test_an_environment_duration_needs_a_unit(monkeypatch: pytest.MonkeyPatch, v
     assert [loc for loc, _ in errors(info)] == [("lease",)]
 
 
-def test_worker_concurrency_is_neither_read_nor_affected(monkeypatch: pytest.MonkeyPatch) -> None:
-    # ORQESTRA_WORKER_CONCURRENCY shares the worker prefix but belongs to Settings.
+def test_no_setting_names_a_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The worker is single-slot: neither settings class has a concurrency field, and a
+    # stray ORQESTRA_WORKER_CONCURRENCY is ignored by both.
     monkeypatch.setenv("ORQESTRA_WORKER_CONCURRENCY", "8")
     worker = settings()
-    assert "concurrency" not in type(worker).model_fields
-    assert Settings().worker_concurrency == 8
+    assert not [name for name in type(worker).model_fields if "concurrency" in name]
+    assert not [name for name in Settings.model_fields if "concurrency" in name]
+    assert "worker_concurrency" not in Settings().redacted()
 
 
 @pytest.mark.parametrize("value", [timedelta(0), -US, timedelta(seconds=-5)], ids=str)

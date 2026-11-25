@@ -1,6 +1,6 @@
 # ADR-0003: Authoritative execution state in PostgreSQL with generation fencing
 
-- **Status:** Accepted (owner, 2026-11-08; was Proposed) · owner-approved direction (2026-10-24)
+- **Status:** Accepted (maintainer, 2026-11-08; was Proposed) · maintainer-approved direction (2026-10-24)
 - **Date:** 2026-10-24
 - **Ledger entries:** DEC-015 … DEC-023; implemented through DEC-024 … DEC-051 and DEC-053
 

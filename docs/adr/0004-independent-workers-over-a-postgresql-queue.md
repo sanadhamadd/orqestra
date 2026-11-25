@@ -1,6 +1,6 @@
 # ADR-0004: Independent single-slot workers over a PostgreSQL queue
 
-- **Status:** Accepted (owner, 2026-11-07; was Proposed)
+- **Status:** Accepted (maintainer, 2026-11-07; was Proposed)
 - **Date:** 2026-11-07
 - **Ledger entries:** DEC-033, DEC-044, DEC-045 … DEC-051, DEC-053, DEC-054
 

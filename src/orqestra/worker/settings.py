@@ -8,8 +8,7 @@ from the environment with the prefix ``ORQESTRA_WORKER_`` (or a local
 ``.env``). Durations there are ISO 8601 durations such as ``PT30S`` (or
 ``HH:MM:SS``); a bare number has no unit and is refused.
 
-The worker is single-slot: one task at a time per process. The existing
-``Settings.worker_concurrency`` is not read by the worker.
+The worker is single-slot: one task at a time per process.
 
 Checked here are the relationships a healthy worker needs: the lease rules of
 ``LeasePolicy``; a database call that ends before the next heartbeat is due;
