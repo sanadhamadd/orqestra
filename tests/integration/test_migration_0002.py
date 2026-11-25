@@ -161,7 +161,9 @@ def assert_not_upgraded(conn: Conn) -> None:
     ).fetchone()
     assert row == (False,)
     row = conn.execute(
-        "SELECT count(*) FROM pg_trigger WHERE tgname = 'attempts_deadline_immutable'"
+        "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE t.tgname = 'attempts_deadline_immutable' AND n.nspname = current_schema()"
     ).fetchone()
     assert row == (0,)
 
