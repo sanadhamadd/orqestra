@@ -34,3 +34,8 @@ updates:
     groups:
       docker-compose:
         patterns: ["*"]
+    ignore:
+      # A new PostgreSQL major cannot open an older data directory: upgrade on purpose, with a
+      # dump and restore, and the CI service image in ci.yml in the same change.
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
