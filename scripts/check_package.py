@@ -32,10 +32,11 @@ PACKAGE = (
     re.compile(r"orqestra/persistence/migrations/[0-9]{4}_[a-z0-9_]+\.sql"),
 )
 WHEEL_METADATA = re.compile(
-    r"orqestra-[^/]+\.dist-info/(?:METADATA|WHEEL|RECORD|entry_points\.txt)"
+    r"orqestra-[^/]+\.dist-info/(?:METADATA|WHEEL|RECORD|entry_points\.txt|licenses/LICENSE)"
 )
-# hatchling always adds PKG-INFO and the project's .gitignore to an sdist.
-SDIST_TOP = frozenset({"PKG-INFO", "pyproject.toml", "README.md", ".gitignore"})
+# hatchling always adds PKG-INFO and the project's .gitignore to an sdist, and LICENSE to both
+# artifacts: the all-rights-reserved terms ship with every copy of the package.
+SDIST_TOP = frozenset({"PKG-INFO", "pyproject.toml", "README.md", ".gitignore", "LICENSE"})
 
 
 def _package_member(name: str) -> bool:
