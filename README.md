@@ -265,4 +265,4 @@ What Orqestra does not do yet, and the limits of what it does, are listed in
 
 ## Licence
 
-All rights reserved; no licence is granted.
+Copyright (c) 2026 Sanad Hamad. All rights reserved. The code is published to be read and evaluated, not reused; see [LICENSE](LICENSE).
