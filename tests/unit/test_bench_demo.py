@@ -47,6 +47,8 @@ DOC = ROOT / "docs" / "demo.md"
 _LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 _SCHEDULE_LABEL = re.compile(r"\bday ?\d+[a-z]?\b", re.IGNORECASE)
 _OLD_TERM = re.compile(r"\bai\b", re.IGNORECASE)
+# The copyright and AI-use notice that opens every page is legal boilerplate, not page wording.
+_NOTICE = re.compile(r"\A<!--\n.*?All rights reserved\..*?-->\n\n?", re.S)
 
 
 def default_oracle() -> Any:
@@ -354,7 +356,7 @@ def test_one_worker_is_refused_before_anything_runs(
 
 
 def test_the_page_explains_every_printed_line() -> None:
-    text = DOC.read_text(encoding="utf-8")
+    text = _NOTICE.sub("", DOC.read_text(encoding="utf-8"), count=1)
     for tag in TAGS:
         assert f"`{tag}`" in text, tag
     assert "DEC-062" in text
