@@ -29,6 +29,12 @@ dist/
 htmlcov/
 coverage.xml
 
+# Private keys and certificates never belong in the repository
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Local environment files; the example stays tracked
 .env
 .env.*

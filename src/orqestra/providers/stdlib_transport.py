@@ -172,7 +172,11 @@ class HttpsTransport:
     """An ``HttpTransport`` that sends one POST to OpenRouter over TLS."""
 
     def __init__(self, context: ssl.SSLContext | None = None) -> None:
-        self._context = ssl.create_default_context() if context is None else context
+        if context is None:
+            context = ssl.create_default_context()
+            # TLS 1.0 and 1.1 are deprecated (RFC 8996); never negotiate below 1.2.
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+        self._context = context
 
     def post(
         self, *, path: str, headers: Mapping[str, str], body: bytes, deadline: Deadline

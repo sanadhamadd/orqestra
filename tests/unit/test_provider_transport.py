@@ -607,3 +607,10 @@ def test_a_bad_status_line_with_remote_text_is_only_unavailable(
     assert exc.code is TransientCode.UNAVAILABLE
     (connection,) = socketless
     assert connection.sock is None  # closed
+
+
+def test_the_default_tls_context_refuses_anything_older_than_tls_1_2() -> None:
+    context = stdlib_transport.HttpsTransport()._context
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert context.check_hostname
